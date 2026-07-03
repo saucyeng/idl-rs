@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["core", "bridge", "cli"]
+
+# Dev (flutter run) builds: cargokit maps Flutter debug → cargo dev profile.
+# The engine must still run at release-grade speed — parse/DSP at opt-level 0
+# is 10-50x slower and reads as "the app is slow". The "*" wildcard covers
+# dependencies (sci-rs, nalgebra, rustfft); workspace members need explicit
+# entries because cargo's wildcard excludes them.
+#
+# `debug = "line-tables-only"` trims the heavy variable/type debuginfo (full by
+# default) to just the line tables — much lighter to emit and link on every
+# incremental build, while keeping panic backtraces' file:line. Zero runtime
+# cost. The cdylib Flutter loads needs no Rust symbol info.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.idl-rs]
+opt-level = 3
+
+[profile.dev.package.idl_rs_bridge]
+opt-level = 3

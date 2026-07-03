@@ -1,0 +1,19 @@
+# Package name uses underscores to match the cdylib filename (`idl_rs_bridge`).
+# cargokit (the desktop/mobile build tool) derives the expected artifact name
+# directly from the package name without dash→underscore normalization, so a
+# dashed name (`idl-rs-bridge`) would make it look for `idl-rs-bridge.dll` while
+# cargo emits `idl_rs_bridge.dll`. This crate is the unpublished FRB shim, so
+# the underscore name does not affect the published `idl-rs` brand.
+[package]
+name = "idl_rs_bridge"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[lib]
+name = "idl_rs_bridge"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+idl-rs = { path = "../core" }
+flutter_rust_bridge = "=2.12.0"
