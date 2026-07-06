@@ -1,6 +1,5 @@
 //! Table evaluation engine (model + cell-formula evaluation). Reuses
-//! `crate::math` — no second evaluator. See design
-//! `docs/superpowers/specs/2026-06-15-modular-tables-design.md`.
+//! `crate::math` — no second evaluator.
 pub mod eval;
 pub mod model;
 

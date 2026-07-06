@@ -1,7 +1,6 @@
 //! FIT (Garmin) activity export. Reads GPS + heart rate from a `SessionHandle`,
 //! maps them to FIT messages, and writes a complete `.fit` file. The low-level
-//! byte framing lives in `encoder`. See
-//! docs/superpowers/specs/2026-06-09-fit-export-design.md.
+//! byte framing lives in `encoder`.
 
 mod encoder;
 

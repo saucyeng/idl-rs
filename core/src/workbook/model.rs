@@ -1,8 +1,7 @@
 //! The portable analysis workbook as the engine sees it. `math_channels` and
 //! table blocks (via [`Workbook::tables`]) are surfaced; charts / axes / layout
 //! are display state and are not modeled (serde drops the unknown fields). See
-//! the shipped app format in
-//! `docs/superpowers/specs/2026-05-26-portable-workbooks-design.md`.
+//! the shipped app format.
 
 use crate::config::VersionedConfig;
 use crate::math::channel_def::MathChannelDef;

@@ -8,8 +8,6 @@
 //!
 //! - **Hardtail** drops the rear-unsprung gyro bias and both rear wheel states.
 //! - **Wheels-first (M2a)** holds the steering states frozen (steering is M2b).
-//!
-//! See docs/superpowers/specs/2026-06-23-suspension-estimator-design.md §3, §4.
 
 use crate::estimate::geometry::{BikeGeometry, Topology};
 

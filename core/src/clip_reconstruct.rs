@@ -7,7 +7,6 @@
 //! its derivatives (jerk = a′, jounce = a″) are physically close to truth.
 //!
 //! Pure functions — data in, data out. No Flutter, no I/O.
-//! See docs/superpowers/specs/2026-05-29-declip-imu-reconstruction-design.md.
 
 use nalgebra::{Matrix2, Vector2};
 
@@ -495,8 +494,7 @@ fn reconstruct_clipped(
 /// a fitted smooth asymmetric pulse, so jerk and jounce derived downstream
 /// (`differentiate`) are physical. Non-clipped input is returned unchanged.
 ///
-/// Tuned shape constants live in [default_params]. See
-/// docs/superpowers/specs/2026-05-29-declip-imu-reconstruction-design.md.
+/// Tuned shape constants live in [default_params].
 pub fn declip(accel: &[f64], sample_rate_hz: f64) -> Vec<f64> {
     reconstruct_clipped(accel, sample_rate_hz, &default_params())
 }

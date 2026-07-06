@@ -1,7 +1,6 @@
 //! Portable-workbook (`.idl0wb`) support for the engine: read the file and
 //! apply its math channels to a session. Read-only on the format — authoring
-//! stays in the app. See
-//! `docs/superpowers/specs/2026-06-01-idl-rs-phase-3b-workbook-cli-design.md`.
+//! stays in the app.
 
 pub mod apply;
 pub mod model;

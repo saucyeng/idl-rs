@@ -2,7 +2,6 @@
 //!
 //! Reduces N raw samples to 2 floats per bucket (min, max) so fl_chart
 //! can render an envelope that preserves spike fidelity at any zoom.
-//! See docs/superpowers/specs/2026-05-27-analyze-tile-decimation-design.md.
 
 /// Bucket size at tier k is `TIER_BASE.pow(k)` raw samples.
 pub const TIER_BASE: u32 = 8;

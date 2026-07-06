@@ -5,8 +5,6 @@
 //! smoother (M5) are recursive/stateful/joint and compose the manifold primitives
 //! (`crate::rotation`) plus the model traits and state defined here. User-facing
 //! outputs surface as derived channels (virtual sensors).
-//!
-//! See docs/superpowers/specs/2026-06-23-suspension-estimator-design.md.
 
 pub mod detect;
 pub mod geometry;

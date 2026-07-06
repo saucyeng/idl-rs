@@ -29,8 +29,7 @@ pub struct ChannelValue {
 /// A `Vec3` is an **intermediate** value: charts plot scalars, so the top-level
 /// result of an expression must reduce to a scalar channel. A vector expression
 /// is reduced via `vx`/`vy`/`vz` (component) or `norm` (magnitude) — a top-level
-/// `Vec3` is rejected by [`evaluate`](crate::math::evaluate). See SPEC §19 and
-/// `docs/superpowers/specs/2026-06-15-vector-math-primitives-design.md`.
+/// `Vec3` is rejected by [`evaluate`](crate::math::evaluate). See SPEC §19.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Vec3Value {
     /// X component — a scalar (broadcast) or a per-sample channel.

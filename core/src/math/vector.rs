@@ -9,8 +9,6 @@
 //!
 //! `Vec3` is an intermediate value only: the top-level result of an expression
 //! must reduce to a scalar channel (`vx`/`vy`/`vz` or `norm`).
-//!
-//! See `docs/superpowers/specs/2026-06-15-vector-math-primitives-design.md`.
 
 use nalgebra::{Matrix3, Rotation3, Unit, Vector3};
 

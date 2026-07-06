@@ -8,8 +8,6 @@
 //! linkage solver that produces these samples is an authoring-time concern and is
 //! deferred. The front (telescoping fork) is a straight prismatic path with a
 //! constant tangent.
-//!
-//! See docs/superpowers/specs/2026-06-23-suspension-estimator-design.md §6.
 
 use nalgebra::{Quaternion, UnitQuaternion, Vector3};
 

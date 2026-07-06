@@ -7,8 +7,6 @@
 //! output is byte-identical. The display path never materializes: it reads
 //! decimated min/max tiles, which fold over the raw values and scale the
 //! resulting pair (see [`RawColumn::min_max`]).
-//!
-//! See `docs/superpowers/specs/2026-06-03-compact-raw-storage-design.md`.
 
 /// Per-channel sample storage.
 ///

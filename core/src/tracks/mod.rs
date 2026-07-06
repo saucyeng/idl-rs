@@ -1,8 +1,7 @@
 //! Track matching: assign session GPS to known tracks and coalesce contiguous
 //! on-track runs into visit windows. Pure: reads GPS from the session handle
 //! (via `crate::gps`), takes reference polylines as input, returns windows.
-//! Ported from the Dart `TrackMatcher`. See
-//! `docs/superpowers/specs/2026-06-01-idl-rs-phase-4b-track-matching-design.md`.
+//! Ported from the Dart `TrackMatcher`.
 
 pub mod detect;
 pub mod geometry;
