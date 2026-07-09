@@ -707,6 +707,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "idl-rs",
+ "idl-rs-video-export",
  "serde",
  "serde_json",
 ]
