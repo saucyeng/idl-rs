@@ -14,8 +14,8 @@ pub mod reader;
 pub mod records;
 pub mod v3;
 
-#[cfg(test)]
-mod test_buffers;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod test_buffers;
 
 use crate::session::{ParseError, ParseResult};
 
