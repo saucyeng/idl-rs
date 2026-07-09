@@ -77,31 +77,14 @@ pub enum TableEvalFormat {
 /// Dispatch a `table` sub-action through its envelope wrapper.
 pub fn run(action: TableAction) -> ExitCode {
     match action {
-        TableAction::Eval {
-            session,
-            workbook,
-            track,
-            table,
-            format,
-        } => emit_structured(
+        TableAction::Eval { session, workbook, track, table, format } => emit_structured(
             "table eval",
-            cmd_eval(
-                &session,
-                &workbook,
-                track.as_deref(),
-                table.as_deref(),
-                format,
-            ),
+            cmd_eval(&session, &workbook, track.as_deref(), table.as_deref(), format),
         ),
         TableAction::List { workbook, format } => {
             emit_structured("table list", cmd_list(&workbook, format))
         }
-        TableAction::Check {
-            session,
-            workbook,
-            track,
-            format,
-        } => emit_structured(
+        TableAction::Check { session, workbook, track, format } => emit_structured(
             "table check",
             cmd_check(session.as_deref(), &workbook, track.as_deref(), format),
         ),
@@ -149,10 +132,7 @@ fn cmd_list(workbook: &Path, format: OutFormat) -> Result<Structured, CliError> 
     let tables = load_tables(workbook)?;
     let entries = list_entries(&tables);
     match format {
-        OutFormat::Json => Ok(Structured::Json {
-            data: json!({ "tables": entries }),
-            warnings: vec![],
-        }),
+        OutFormat::Json => Ok(Structured::Json { data: json!({ "tables": entries }), warnings: vec![] }),
         OutFormat::Text => {
             print_list_text(&entries);
             Ok(Structured::Text)
@@ -166,13 +146,7 @@ fn print_list_text(entries: &[ListEntry]) {
         return;
     }
     for e in entries {
-        println!(
-            "{}  [{}]  {} cols, {} rows",
-            e.worksheet,
-            e.block_id,
-            e.columns.len(),
-            e.row_count
-        );
+        println!("{}  [{}]  {} cols, {} rows", e.worksheet, e.block_id, e.columns.len(), e.row_count);
     }
 }
 
@@ -204,10 +178,7 @@ struct EvalTablePayload {
 
 /// Select the tables to evaluate: all, or the one matching `id` (else
 /// `not_found` with the available block ids for self-correction).
-fn select_tables(
-    tables: Vec<WorkbookTable>,
-    id: Option<&str>,
-) -> Result<Vec<WorkbookTable>, CliError> {
+fn select_tables(tables: Vec<WorkbookTable>, id: Option<&str>) -> Result<Vec<WorkbookTable>, CliError> {
     match id {
         None => Ok(tables),
         Some(want) => {
@@ -235,13 +206,7 @@ fn detect_laps_for(handle: &SessionHandle, track: &Path) -> Result<Vec<Lap>, Cli
             json!({ "track": t.name }),
         )
     })?;
-    Ok(detect_laps(
-        handle,
-        timing,
-        &t.sector_gates,
-        &t.neutral_zones,
-        None,
-    ))
+    Ok(detect_laps(handle, timing, &t.sector_gates, &t.neutral_zones, None))
 }
 
 fn cmd_eval(
@@ -255,9 +220,7 @@ fn cmd_eval(
     let handle = load(session)?;
 
     // Lap detection only when a selected table binds laps; then --track is required.
-    let needs_laps = selected
-        .iter()
-        .any(|wt| wt.table.rows.iter().any(|r| r.context.is_some()));
+    let needs_laps = selected.iter().any(|wt| wt.table.rows.iter().any(|r| r.context.is_some()));
     let laps: Vec<Lap> = match (needs_laps, track) {
         (true, None) => {
             let wt = selected
@@ -296,9 +259,7 @@ fn cmd_eval(
                         kind: "lap_out_of_range".into(),
                         message: format!(
                             "table '{}' row {r} lap {} is past the {} detected laps",
-                            wt.block_id,
-                            ctx.lap_index,
-                            laps.len()
+                            wt.block_id, ctx.lap_index, laps.len()
                         ),
                     });
                 }
@@ -309,10 +270,7 @@ fn cmd_eval(
     }
 
     match format {
-        TableEvalFormat::Json => Ok(Structured::Json {
-            data: json!({ "tables": payloads }),
-            warnings,
-        }),
+        TableEvalFormat::Json => Ok(Structured::Json { data: json!({ "tables": payloads }), warnings }),
         TableEvalFormat::Text => {
             for w in &warnings {
                 eprintln!("warning: {}", w.message);
@@ -372,11 +330,8 @@ fn eval_csv_string(tables: &[EvalTablePayload]) -> String {
             out.push('\n');
         }
         out.push_str(&format!("# {} ({})\n", t.worksheet, t.block_id));
-        let header: Vec<String> = t
-            .columns
-            .iter()
-            .map(|c| c.name.clone().unwrap_or_else(|| c.id.clone()))
-            .collect();
+        let header: Vec<String> =
+            t.columns.iter().map(|c| c.name.clone().unwrap_or_else(|| c.id.clone())).collect();
         out.push_str(&format!("{}\n", header.join(",")));
         for row in &t.rows {
             let fields: Vec<String> = row.cells.iter().map(cell_field).collect();
@@ -393,11 +348,8 @@ fn eval_text_string(tables: &[EvalTablePayload]) -> String {
     let mut out = String::new();
     for t in tables {
         out.push_str(&format!("{} [{}]\n", t.worksheet, t.block_id));
-        let header: Vec<String> = t
-            .columns
-            .iter()
-            .map(|c| c.name.clone().unwrap_or_else(|| c.id.clone()))
-            .collect();
+        let header: Vec<String> =
+            t.columns.iter().map(|c| c.name.clone().unwrap_or_else(|| c.id.clone())).collect();
         out.push_str(&format!("{}\n", header.join("  ")));
         for row in &t.rows {
             let fields: Vec<String> = row.cells.iter().map(cell_field).collect();
@@ -429,9 +381,7 @@ fn cmd_check(
     let session_eval: Option<(SessionHandle, Vec<Lap>)> = match session {
         Some(sp) => {
             let handle = load(sp)?;
-            let needs_laps = tables
-                .iter()
-                .any(|wt| wt.table.rows.iter().any(|r| r.context.is_some()));
+            let needs_laps = tables.iter().any(|wt| wt.table.rows.iter().any(|r| r.context.is_some()));
             let laps = match (needs_laps, track) {
                 (true, Some(tp)) => detect_laps_for(&handle, tp)?,
                 _ => Vec::new(),
@@ -472,10 +422,7 @@ fn cmd_check(
     }
 
     match format {
-        OutFormat::Json => Ok(Structured::Json {
-            data: json!({ "tables": out }),
-            warnings: vec![],
-        }),
+        OutFormat::Json => Ok(Structured::Json { data: json!({ "tables": out }), warnings: vec![] }),
         OutFormat::Text => {
             print!("{}", check_text_string(&out));
             Ok(Structured::Text)
@@ -519,12 +466,7 @@ mod tests {
             overlay_target_id: None,
             table: TableModel {
                 columns: cols,
-                rows: (0..rows)
-                    .map(|i| Row {
-                        id: format!("r{i}"),
-                        context: None,
-                    })
-                    .collect(),
+                rows: (0..rows).map(|i| Row { id: format!("r{i}"), context: None }).collect(),
                 cells: (0..rows).map(|_| vec![]).collect(),
             },
         }
@@ -537,16 +479,8 @@ mod tests {
             "WS",
             "blk",
             vec![
-                Column {
-                    id: "c0".into(),
-                    name: Some("lap".into()),
-                    template: None,
-                },
-                Column {
-                    id: "c1".into(),
-                    name: None,
-                    template: None,
-                },
+                Column { id: "c0".into(), name: Some("lap".into()), template: None },
+                Column { id: "c1".into(), name: None, template: None },
             ],
             2,
         );
@@ -563,10 +497,7 @@ mod tests {
     #[test]
     fn select_tables_unknown_id_is_not_found_with_available() {
         // Arrange
-        let tables = vec![
-            table_with("WS", "a", vec![], 0),
-            table_with("WS", "b", vec![], 0),
-        ];
+        let tables = vec![table_with("WS", "a", vec![], 0), table_with("WS", "b", vec![], 0)];
 
         // Act
         let err = select_tables(tables, Some("zzz")).unwrap_err();
@@ -580,10 +511,7 @@ mod tests {
     #[test]
     fn select_tables_filters_to_one() {
         // Arrange
-        let tables = vec![
-            table_with("WS", "a", vec![], 0),
-            table_with("WS", "b", vec![], 0),
-        ];
+        let tables = vec![table_with("WS", "a", vec![], 0), table_with("WS", "b", vec![], 0)];
 
         // Act
         let got = select_tables(tables, Some("b")).unwrap();
@@ -602,29 +530,15 @@ mod tests {
             placement: "inFlow".into(),
             overlay_target_id: None,
             columns: vec![
-                Column {
-                    id: "c0".into(),
-                    name: Some("a".into()),
-                    template: None,
-                },
-                Column {
-                    id: "c1".into(),
-                    name: Some("b".into()),
-                    template: None,
-                },
+                Column { id: "c0".into(), name: Some("a".into()), template: None },
+                Column { id: "c1".into(), name: Some("b".into()), template: None },
             ],
             rows: vec![EvalRowPayload {
                 context: None,
                 window: None,
                 cells: vec![
-                    CellResult {
-                        value: Some(1.5),
-                        error: None,
-                    },
-                    CellResult {
-                        value: None,
-                        error: Some("boom".into()),
-                    },
+                    CellResult { value: Some(1.5), error: None },
+                    CellResult { value: None, error: Some("boom".into()) },
                 ],
             }],
         }];
@@ -640,11 +554,7 @@ mod tests {
     #[test]
     fn check_text_summarizes_clean_and_problem_tables() {
         // Arrange — one clean table, one with a static problem.
-        let clean = CheckTablePayload {
-            block_id: "ok".into(),
-            worksheet: "WS".into(),
-            problems: vec![],
-        };
+        let clean = CheckTablePayload { block_id: "ok".into(), worksheet: "WS".into(), problems: vec![] };
         let bad = CheckTablePayload {
             block_id: "bad".into(),
             worksheet: "WS".into(),

@@ -117,12 +117,7 @@ fn recover_region(buf: &[u8], start: usize) -> Option<RecoveredRegion> {
     if h.len() < marker_off + 4 {
         return None; // buffer too short to confirm the header
     }
-    let marker = u32::from_le_bytes([
-        h[marker_off],
-        h[marker_off + 1],
-        h[marker_off + 2],
-        h[marker_off + 3],
-    ]);
+    let marker = u32::from_le_bytes([h[marker_off], h[marker_off + 1], h[marker_off + 2], h[marker_off + 3]]);
     if marker != MARKER {
         return None;
     }
@@ -155,21 +150,14 @@ fn recover_region(buf: &[u8], start: usize) -> Option<RecoveredRegion> {
         records += 1;
     }
 
-    Some(RecoveredRegion {
-        len: pos,
-        records,
-        session_id,
-        clean_end,
-        buffer_bound,
-    })
+    Some(RecoveredRegion { len: pos, records, session_id, clean_end, buffer_bound })
 }
 
 /// Read `buf.len()` bytes from `off` into `buf`, returning how many were read
 /// (short only at end-of-device/file). `off` and `buf.len()` should be
 /// sector-aligned for raw `\\.\PhysicalDrive` access.
 fn read_block(f: &mut File, off: u64, buf: &mut [u8]) -> Result<usize, String> {
-    f.seek(SeekFrom::Start(off))
-        .map_err(|e| format!("seek to {off} failed: {e}"))?;
+    f.seek(SeekFrom::Start(off)).map_err(|e| format!("seek to {off} failed: {e}"))?;
     let mut total = 0;
     while total < buf.len() {
         match f.read(&mut buf[total..]) {
@@ -337,10 +325,7 @@ pub fn scan_all(device: &Path, out_dir: Option<&Path>, scan_limit: u64) -> Resul
         return Ok(());
     }
 
-    println!(
-        "{:<34} {:>16} {:>13} {:>12} {:>6}",
-        "SESSION", "OFFSET", "BYTES", "RECORDS", "END"
-    );
+    println!("{:<34} {:>16} {:>13} {:>12} {:>6}", "SESSION", "OFFSET", "BYTES", "RECORDS", "END");
     for (abs, region, _) in &found {
         println!(
             "{:<34} {:>16} {:>13} {:>12} {:>6}",
@@ -374,10 +359,7 @@ pub fn scan_all(device: &Path, out_dir: Option<&Path>, scan_limit: u64) -> Resul
 /// Walk the whole source, returning every recoverable session as
 /// `(offset, region, bytes)`. Skips false-positive magics; advances past each
 /// recovered region so records are never re-scanned as headers.
-fn scan_regions(
-    f: &mut File,
-    scan_limit: u64,
-) -> Result<Vec<(u64, RecoveredRegion, Vec<u8>)>, String> {
+fn scan_regions(f: &mut File, scan_limit: u64) -> Result<Vec<(u64, RecoveredRegion, Vec<u8>)>, String> {
     let mut out = Vec::new();
     let mut pos = 0u64;
     loop {
@@ -449,8 +431,7 @@ mod tests {
     }
 
     const UUID: [u8; 16] = [
-        0x33, 0x3e, 0xf6, 0x08, 0xcb, 0x9c, 0xee, 0x47, 0x88, 0x2b, 0x48, 0x00, 0x0a, 0x38, 0xf2,
-        0x47,
+        0x33, 0x3e, 0xf6, 0x08, 0xcb, 0x9c, 0xee, 0x47, 0x88, 0x2b, 0x48, 0x00, 0x0a, 0x38, 0xf2, 0x47,
     ];
     const UUID_HEX: &str = "333ef608cb9cee47882b48000a38f247";
 

@@ -68,20 +68,12 @@ pub struct CliError {
 impl CliError {
     /// Construct an error with no `details`.
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-            details: None,
-        }
+        Self { kind, message: message.into(), details: None }
     }
 
     /// Construct an error carrying an open `details` object.
     pub fn with_details(kind: ErrorKind, message: impl Into<String>, details: Value) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-            details: Some(details),
-        }
+        Self { kind, message: message.into(), details: Some(details) }
     }
 
     /// An `io` error — a file could not be read or written.
@@ -117,10 +109,7 @@ impl Warning {
     /// The `truncated_log` warning: the source log ended mid-record and only
     /// the data before the truncation point is present.
     pub fn truncated_log(message: impl Into<String>) -> Self {
-        Self {
-            kind: "truncated_log".to_string(),
-            message: message.into(),
-        }
+        Self { kind: "truncated_log".to_string(), message: message.into() }
     }
 }
 
@@ -132,11 +121,9 @@ impl From<ParseError> for CliError {
     fn from(e: ParseError) -> Self {
         match e {
             // A file present but unusable for parsing.
-            ParseError::InvalidMagicBytes(m) => CliError::with_details(
-                ErrorKind::InvalidInput,
-                m,
-                json!({ "expected_magic": "IDL0" }),
-            ),
+            ParseError::InvalidMagicBytes(m) => {
+                CliError::with_details(ErrorKind::InvalidInput, m, json!({ "expected_magic": "IDL0" }))
+            }
             ParseError::UnsupportedSchemaVersion(m) => CliError::new(ErrorKind::InvalidInput, m),
             // A *fatal* truncation (the recoverable case becomes a warning, not
             // an error — see `Warning::truncated_log`).
@@ -185,10 +172,9 @@ impl From<ExportError> for CliError {
                 json!({ "entity": "channel", "name": name }),
             ),
             ExportError::Io(e) => CliError::new(ErrorKind::Io, format!("write failed: {e}")),
-            ExportError::Json(e) => CliError::new(
-                ErrorKind::Internal,
-                format!("json serialization failed: {e}"),
-            ),
+            ExportError::Json(e) => {
+                CliError::new(ErrorKind::Internal, format!("json serialization failed: {e}"))
+            }
         }
     }
 }
@@ -308,11 +294,7 @@ mod tests {
 
     /// Parse a `CliError`'s serialized `kind` string.
     fn kind_str(e: &CliError) -> String {
-        serde_json::to_value(e.kind)
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string()
+        serde_json::to_value(e.kind).unwrap().as_str().unwrap().to_string()
     }
 
     // --- ParseError → kind ---------------------------------------------------
@@ -467,14 +449,8 @@ mod tests {
 
     #[test]
     fn error_kind_serializes_snake_case() {
-        assert_eq!(
-            kind_str(&CliError::new(ErrorKind::InvalidInput, "")),
-            "invalid_input"
-        );
-        assert_eq!(
-            kind_str(&CliError::new(ErrorKind::NotFound, "")),
-            "not_found"
-        );
+        assert_eq!(kind_str(&CliError::new(ErrorKind::InvalidInput, "")), "invalid_input");
+        assert_eq!(kind_str(&CliError::new(ErrorKind::NotFound, "")), "not_found");
         assert_eq!(kind_str(&CliError::new(ErrorKind::Io, "")), "io");
     }
 
@@ -523,10 +499,7 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["command"], "laps");
         assert_eq!(v["data"], json!({ "laps": [] }));
-        assert!(
-            v.get("warnings").is_none(),
-            "empty warnings must be omitted"
-        );
+        assert!(v.get("warnings").is_none(), "empty warnings must be omitted");
         assert!(v.get("error").is_none());
     }
 
