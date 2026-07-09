@@ -60,9 +60,6 @@ impl ExportPlan {
             args.extend(["-ss".into(), format!("{start:.3}")]);
         }
         args.extend(["-i".into(), self.video.display().to_string()]);
-        if let Some(dur) = self.duration_s {
-            args.extend(["-t".into(), format!("{dur:.3}")]);
-        }
         args.extend([
             "-f".into(),
             "rawvideo".into(),
@@ -82,6 +79,9 @@ impl ExportPlan {
         if self.probe.has_audio {
             args.extend(["-map".into(), "0:a".into(), "-c:a".into(), "copy".into()]);
         }
+        if let Some(dur) = self.duration_s {
+            args.extend(["-t".into(), format!("{dur:.3}")]);
+        }
         args.extend([
             "-r".into(),
             fps,
@@ -93,6 +93,9 @@ impl ExportPlan {
             "yuv420p".into(),
             "-movflags".into(),
             "+faststart".into(),
+            // The `.part` suffix defeats extension-based muxer inference.
+            "-f".into(),
+            "mp4".into(),
             part_path.display().to_string(),
         ]);
         args
@@ -188,8 +191,6 @@ mod tests {
             "10.000",
             "-i",
             "in.mp4",
-            "-t",
-            "5.000",
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -208,6 +209,8 @@ mod tests {
             "0:a",
             "-c:a",
             "copy",
+            "-t",
+            "5.000",
             "-r",
             "30.000000",
             "-vsync",
@@ -218,6 +221,8 @@ mod tests {
             "yuv420p",
             "-movflags",
             "+faststart",
+            "-f",
+            "mp4",
             "out.mp4.part",
         ]
         .iter()

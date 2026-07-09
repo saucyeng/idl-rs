@@ -152,10 +152,18 @@ where
 
     if let Some(err) = failed {
         let _ = child.kill();
-        let _ = child.wait();
-        let _ = stderr_tail.join();
+        let status = child.wait();
+        let tail = stderr_tail.join().unwrap_or_default();
         let _ = std::fs::remove_file(&part);
-        return Err(err);
+        // A broken pipe usually means ffmpeg itself died — its stderr is the
+        // real diagnosis, so promote it over the bare pipe error.
+        return Err(match (err.kind, status) {
+            (ExportErrorKind::Pipe, Ok(st)) if !st.success() => ExportError::new(
+                ExportErrorKind::FfmpegFailed,
+                format!("ffmpeg exited with {st}: {}", tail.trim()),
+            ),
+            _ => err,
+        });
     }
 
     drop(stdin); // EOF → ffmpeg finalizes the file.
