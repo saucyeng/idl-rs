@@ -28,14 +28,17 @@ use idl_rs::fft::{Averaging, Detrend, FftWindow, Scaling};
 use idl_rs::laps::detect_laps;
 use idl_rs::laps::model::Lap;
 use idl_rs::math::MathLapContext;
+use idl_rs::overlay::sample::SampleContext;
 use idl_rs::session::handle::{ChannelMeta, SessionHandle, SessionMeta};
 use idl_rs::session::Channel;
 use idl_rs::track_artifact::{self, Track};
 use idl_rs::tracks::{detect_visits, VisitParams, VisitWindow};
+use idl_rs::video::render::render_overlay_frame;
 use idl_rs::video::{gpmf, mp4box, sync::estimate_sync, VideoError, VideoErrorKind};
 use idl_rs::workbook::{self, ApplyReport};
 
 use envelope::{emit_bulk, emit_structured, CliError, ErrorKind, Structured, Warning};
+use idl_rs_video_export::{run_export, ExportError, ExportErrorKind, ExportPlan, Progress};
 
 #[derive(Parser)]
 #[command(
@@ -116,6 +119,42 @@ enum Command {
     /// Inspect a video container or estimate the video-session sync offset.
     #[command(subcommand)]
     Video(VideoCmd),
+    /// Render a workbook overlay layout onto a video (sidecar ffmpeg).
+    Overlay {
+        /// Path to an `.idl0` log file.
+        file: PathBuf,
+        /// Path to an `.mp4`/`.mov` video file.
+        #[arg(long)]
+        video: PathBuf,
+        /// Path to an `.idl0wb` workbook holding the overlay layout(s).
+        #[arg(long)]
+        workbook: PathBuf,
+        /// Layout name; may be omitted when the workbook has exactly one.
+        #[arg(long)]
+        layout: Option<String>,
+        /// `.idl0t` track for the lap panel (omitted: lap elements render
+        /// no-data).
+        #[arg(long)]
+        track: Option<PathBuf>,
+        /// Manual sync offset in seconds (skips auto-sync).
+        #[arg(long)]
+        offset: Option<f64>,
+        /// Clip start in video seconds.
+        #[arg(long)]
+        start: Option<f64>,
+        /// Clip duration in seconds.
+        #[arg(long)]
+        duration: Option<f64>,
+        /// Output path; default: `<video stem>_overlay.mp4` beside the video.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// ffmpeg video encoder.
+        #[arg(long, default_value = "libx264")]
+        encoder: String,
+        /// Path to the ffmpeg binary (ffprobe is resolved beside it).
+        #[arg(long, default_value = "ffmpeg")]
+        ffmpeg: String,
+    },
     /// Compute the Welch spectrum of one channel (optionally windowed by
     /// `--from` / `--to`) and emit frequency+magnitude pairs. Wraps
     /// `welch_channel` / `welch_channel_windowed` in the engine; the FFT input
@@ -438,6 +477,34 @@ fn main() -> ExitCode {
             video,
             format,
         }) => emit_structured("video sync", cmd_video_sync(&file, &video, format)),
+        Command::Overlay {
+            file,
+            video,
+            workbook,
+            layout,
+            track,
+            offset,
+            start,
+            duration,
+            output,
+            encoder,
+            ffmpeg,
+        } => emit_bulk(
+            "overlay",
+            cmd_overlay(
+                &file,
+                &video,
+                &workbook,
+                layout.as_deref(),
+                track.as_deref(),
+                offset,
+                start,
+                duration,
+                output,
+                encoder,
+                ffmpeg,
+            ),
+        ),
         Command::Fft {
             file,
             channel,
@@ -1080,6 +1147,148 @@ fn write_math_sink(
 }
 
 /// Parse a log file into an owned [`SessionHandle`] (synthesis runs inside).
+/// Map an `idl-rs-video-export` error onto the envelope's error kinds.
+fn export_err(e: ExportError) -> CliError {
+    let kind = match e.kind {
+        ExportErrorKind::FfmpegMissing => ErrorKind::Usage,
+        ExportErrorKind::Probe => ErrorKind::InvalidInput,
+        ExportErrorKind::Pipe | ExportErrorKind::FfmpegFailed | ExportErrorKind::Io => {
+            ErrorKind::Io
+        }
+        ExportErrorKind::Cancelled => ErrorKind::Internal,
+    };
+    CliError::new(kind, e.message)
+}
+
+/// `ffprobe` binary path beside the given `ffmpeg` path (or bare name).
+fn ffprobe_beside(ffmpeg: &str) -> String {
+    let p = Path::new(ffmpeg);
+    let probe_name = match p.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name.replacen("ffmpeg", "ffprobe", 1),
+        None => "ffprobe".to_string(),
+    };
+    match p.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(probe_name).display().to_string(),
+        _ => probe_name,
+    }
+}
+
+/// `overlay` — render a workbook overlay layout onto a video (SPEC 33.6).
+/// Bulk command: the artifact is the output video; errors envelope to stderr.
+#[allow(clippy::too_many_arguments)]
+fn cmd_overlay(
+    file: &Path,
+    video: &Path,
+    wb_path: &Path,
+    layout_name: Option<&str>,
+    track: Option<&Path>,
+    offset: Option<f64>,
+    start: Option<f64>,
+    duration: Option<f64>,
+    output: Option<PathBuf>,
+    encoder: String,
+    ffmpeg: String,
+) -> Result<(), CliError> {
+    let handle = load(file)?;
+    let wb = workbook::read_workbook(wb_path)?;
+
+    // Math channels into the handle's store first — layout channels may be
+    // math outputs. Per-channel failures degrade those elements to no-data.
+    let report = workbook::apply_workbook(&handle, &wb, &MathLapContext::empty());
+    for r in report.results.iter().filter(|r| r.error.is_some()) {
+        eprintln!(
+            "warning: math channel '{}' skipped: {}",
+            r.name,
+            r.error.as_ref().unwrap().message
+        );
+    }
+
+    let layout = wb.overlay_layout(layout_name).map_err(CliError::usage)?;
+
+    // Laps for the lap panel (optional --track; the FIT export precedent).
+    let laps = match track {
+        Some(tp) => {
+            let t = track_artifact::read_track(tp)?;
+            match t.timing.as_ref() {
+                Some(timing) => {
+                    detect_laps(&handle, timing, &t.sector_gates, &t.neutral_zones, None)
+                }
+                None => {
+                    eprintln!(
+                        "warning: track '{}' has no timing gates; lap panel renders no-data",
+                        t.name
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+
+    // Sync offset: manual wins; else GPMF, else creation time.
+    let video_path = path_str(video)?;
+    let offset_s = match offset {
+        Some(o) => o,
+        None => {
+            let info = mp4box::read_info_path(video_path).map_err(video_err)?;
+            let telemetry = match mp4box::read_gpmd_samples_path(video_path) {
+                Ok(samples) => Some(gpmf::parse_gpmf(&samples).map_err(video_err)?),
+                Err(e) if e.kind == VideoErrorKind::NoGpmf => None,
+                Err(e) => return Err(video_err(e)),
+            };
+            let est = estimate_sync(telemetry.as_ref(), &info, &handle).map_err(video_err)?;
+            eprintln!(
+                "sync: {:.3} s (method: {:?}, confidence: {:.1})",
+                est.offset_s, est.method, est.confidence
+            );
+            est.offset_s
+        }
+    };
+
+    // Plan the export.
+    let probe = idl_rs_video_export::probe(video, &ffprobe_beside(&ffmpeg)).map_err(export_err)?;
+    let default_name = {
+        let stem = video
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("video");
+        video.with_file_name(format!("{stem}_overlay.mp4"))
+    };
+    let plan = ExportPlan {
+        video: video.to_path_buf(),
+        output: output.unwrap_or(default_name),
+        probe,
+        start_s: start,
+        duration_s: duration,
+        encoder,
+        ffmpeg_path: ffmpeg,
+    };
+
+    // Prepared sampling context; frame i → video clock → session clock.
+    let ctx = SampleContext::prepare(&handle, layout, laps);
+    let (fw, fh) = plan.frame_dims();
+    let clip0 = start.unwrap_or(0.0);
+    let fps = plan.probe.fps;
+    let layout = layout.clone();
+    let render = move |i: u64| {
+        let t_video = clip0 + i as f64 / fps;
+        let sample = ctx.sample(t_video + offset_s);
+        render_overlay_frame(&layout, &sample, ctx.track_polyline(), fw, fh)
+    };
+
+    run_export(
+        &plan,
+        render,
+        &mut |p: Progress| {
+            eprint!("\r{} / {} frames", p.frames_done, p.frames_total);
+        },
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .map_err(export_err)?;
+    eprintln!("\nwrote {}", plan.output.display());
+    Ok(())
+}
+
 /// Map an engine `VideoError` onto the envelope's closed error kinds.
 fn video_err(e: VideoError) -> CliError {
     let kind = match e.kind {
