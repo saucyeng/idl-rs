@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "bridge", "cli"]
+members = ["core", "bridge", "cli", "video-export"]
 
 # Dev (flutter run) builds: cargokit maps Flutter debug → cargo dev profile.
 # The engine must still run at release-grade speed — parse/DSP at opt-level 0
@@ -22,4 +22,7 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.idl_rs_bridge]
+opt-level = 3
+
+[profile.dev.package.idl-rs-video-export]
 opt-level = 3
