@@ -32,6 +32,7 @@ use idl_rs::session::handle::{ChannelMeta, SessionHandle, SessionMeta};
 use idl_rs::session::Channel;
 use idl_rs::track_artifact::{self, Track};
 use idl_rs::tracks::{detect_visits, VisitParams, VisitWindow};
+use idl_rs::video::{gpmf, mp4box, sync::estimate_sync, VideoError, VideoErrorKind};
 use idl_rs::workbook::{self, ApplyReport};
 
 use envelope::{emit_bulk, emit_structured, CliError, ErrorKind, Structured, Warning};
@@ -112,6 +113,9 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutFormat::Text)]
         format: OutFormat,
     },
+    /// Inspect a video container or estimate the video-session sync offset.
+    #[command(subcommand)]
+    Video(VideoCmd),
     /// Compute the Welch spectrum of one channel (optionally windowed by
     /// `--from` / `--to`) and emit frequency+magnitude pairs. Wraps
     /// `welch_channel` / `welch_channel_windowed` in the engine; the FFT input
@@ -388,6 +392,32 @@ impl ScalingArg {
 /// Dispatch each subcommand through its envelope wrapper. clap handles
 /// pre-dispatch usage errors itself (exit 2, native stderr message);
 /// everything past parse goes through the JSON envelope.
+
+/// `video` subcommands (SPEC 33.6).
+#[derive(Subcommand)]
+enum VideoCmd {
+    /// Container facts + GPMF presence (pure-Rust walker; no ffprobe needed).
+    Probe {
+        /// Path to an `.mp4`/`.mov` video file.
+        #[arg(long)]
+        video: PathBuf,
+        /// Output format: text (default) or json.
+        #[arg(long, value_enum, default_value_t = OutFormat::Text)]
+        format: OutFormat,
+    },
+    /// Estimate the sync offset (GPMF UTC anchor, else creation time).
+    Sync {
+        /// Path to an `.idl0` log file.
+        file: PathBuf,
+        /// Path to an `.mp4`/`.mov` video file.
+        #[arg(long)]
+        video: PathBuf,
+        /// Output format: text (default) or json.
+        #[arg(long, value_enum, default_value_t = OutFormat::Text)]
+        format: OutFormat,
+    },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -395,29 +425,101 @@ fn main() -> ExitCode {
         Command::Channels { file, format } => {
             emit_structured("channels", cmd_channels(&file, format))
         }
-        Command::Laps { file, track, format } => {
-            emit_structured("laps", cmd_laps(&file, &track, format))
+        Command::Laps {
+            file,
+            track,
+            format,
+        } => emit_structured("laps", cmd_laps(&file, &track, format)),
+        Command::Video(VideoCmd::Probe { video, format }) => {
+            emit_structured("video probe", cmd_video_probe(&video, format))
         }
-        Command::Fft { file, channel, from, to, window, nperseg, noverlap, detrend, averaging, scaling, format } => {
-            emit_structured("fft", cmd_fft(&file, &channel, from, to, window, nperseg, noverlap, detrend, averaging, scaling, format))
-        }
-        Command::Spectrogram { file, channel, from, to, window, nperseg, noverlap, detrend, scaling, format } => {
-            emit_structured("spectrogram", cmd_spectrogram(&file, &channel, from, to, window, nperseg, noverlap, detrend, scaling, format))
-        }
-        Command::Visits { file, tracks, format } => {
-            emit_structured("visits", cmd_visits(&file, &tracks, format))
-        }
-        Command::Export { file, output, format, channels } => {
-            emit_bulk("export", cmd_export(&file, output.as_deref(), format, channels))
-        }
-        Command::Math { file, workbook, output, format, include_base, channels } => emit_bulk(
-            "math",
-            cmd_math(&file, &workbook, output.as_deref(), format, include_base, channels),
+        Command::Video(VideoCmd::Sync {
+            file,
+            video,
+            format,
+        }) => emit_structured("video sync", cmd_video_sync(&file, &video, format)),
+        Command::Fft {
+            file,
+            channel,
+            from,
+            to,
+            window,
+            nperseg,
+            noverlap,
+            detrend,
+            averaging,
+            scaling,
+            format,
+        } => emit_structured(
+            "fft",
+            cmd_fft(
+                &file, &channel, from, to, window, nperseg, noverlap, detrend, averaging, scaling,
+                format,
+            ),
         ),
-        Command::Fit { file, output, sport, track } => {
-            emit_bulk("fit", cmd_fit(&file, output, sport, track.as_deref()))
-        }
-        Command::Recover { device, output, session_id, scan_limit, window, from } => emit_bulk(
+        Command::Spectrogram {
+            file,
+            channel,
+            from,
+            to,
+            window,
+            nperseg,
+            noverlap,
+            detrend,
+            scaling,
+            format,
+        } => emit_structured(
+            "spectrogram",
+            cmd_spectrogram(
+                &file, &channel, from, to, window, nperseg, noverlap, detrend, scaling, format,
+            ),
+        ),
+        Command::Visits {
+            file,
+            tracks,
+            format,
+        } => emit_structured("visits", cmd_visits(&file, &tracks, format)),
+        Command::Export {
+            file,
+            output,
+            format,
+            channels,
+        } => emit_bulk(
+            "export",
+            cmd_export(&file, output.as_deref(), format, channels),
+        ),
+        Command::Math {
+            file,
+            workbook,
+            output,
+            format,
+            include_base,
+            channels,
+        } => emit_bulk(
+            "math",
+            cmd_math(
+                &file,
+                &workbook,
+                output.as_deref(),
+                format,
+                include_base,
+                channels,
+            ),
+        ),
+        Command::Fit {
+            file,
+            output,
+            sport,
+            track,
+        } => emit_bulk("fit", cmd_fit(&file, output, sport, track.as_deref())),
+        Command::Recover {
+            device,
+            output,
+            session_id,
+            scan_limit,
+            window,
+            from,
+        } => emit_bulk(
             "recover",
             recover::run(
                 &device,
@@ -428,7 +530,11 @@ fn main() -> ExitCode {
                 from.unwrap_or(0),
             ),
         ),
-        Command::Scan { device, out_dir, scan_limit } => emit_bulk(
+        Command::Scan {
+            device,
+            out_dir,
+            scan_limit,
+        } => emit_bulk(
             "scan",
             recover::scan_all(&device, out_dir.as_deref(), scan_limit.unwrap_or(u64::MAX)),
         ),
@@ -499,7 +605,10 @@ fn cmd_channels(file: &Path, format: OutFormat) -> Result<Structured, CliError> 
 fn cmd_laps(file: &Path, track: &Path, format: OutFormat) -> Result<Structured, CliError> {
     let handle = load(file)?;
     let t = track_artifact::read_track(track)?;
-    let timing = t.timing.as_ref().ok_or_else(|| no_timing_error(&t.name, track))?;
+    let timing = t
+        .timing
+        .as_ref()
+        .ok_or_else(|| no_timing_error(&t.name, track))?;
     let laps = detect_laps(&handle, timing, &t.sector_gates, &t.neutral_zones, None);
     let meta = handle.metadata();
     match format {
@@ -584,12 +693,18 @@ fn fft_json_data(
     averaging: Averaging,
     scaling: Scaling,
 ) -> Result<Value, CliError> {
-    let available: Vec<String> = handle.channels().into_iter().map(|c| c.channel_id).collect();
+    let available: Vec<String> = handle
+        .channels()
+        .into_iter()
+        .map(|c| c.channel_id)
+        .collect();
     if !available.iter().any(|c| c == channel) {
         return Err(CliError::unknown_channel(channel, &available));
     }
     let r = match (from, to) {
-        (None, None) => handle.welch_channel(channel, window, nperseg, noverlap, detrend, averaging, scaling),
+        (None, None) => handle.welch_channel(
+            channel, window, nperseg, noverlap, detrend, averaging, scaling,
+        ),
         (f, t) => {
             let dur = handle.metadata().duration_ms as f64 / 1000.0;
             handle.welch_channel_windowed(
@@ -678,14 +793,19 @@ fn spectrogram_json_data(
     detrend: Detrend,
     scaling: Scaling,
 ) -> Result<Value, CliError> {
-    let available: Vec<String> = handle.channels().into_iter().map(|c| c.channel_id).collect();
+    let available: Vec<String> = handle
+        .channels()
+        .into_iter()
+        .map(|c| c.channel_id)
+        .collect();
     if !available.iter().any(|c| c == channel) {
         return Err(CliError::unknown_channel(channel, &available));
     }
     let dur = handle.metadata().duration_ms as f64 / 1000.0;
     let t0 = from.unwrap_or(0.0);
     let t1 = to.unwrap_or(dur);
-    let s = handle.spectrogram_channel(channel, t0, t1, window, nperseg, noverlap, detrend, scaling);
+    let s =
+        handle.spectrogram_channel(channel, t0, t1, window, nperseg, noverlap, detrend, scaling);
     Ok(json!({
         "channel": channel,
         "freqs_hz": s.freqs_hz,
@@ -806,7 +926,10 @@ fn cmd_fit(
     let laps = match track {
         Some(track_path) => {
             let t = track_artifact::read_track(track_path)?;
-            let timing = t.timing.as_ref().ok_or_else(|| no_timing_error(&t.name, track_path))?;
+            let timing = t
+                .timing
+                .as_ref()
+                .ok_or_else(|| no_timing_error(&t.name, track_path))?;
             let detected = detect_laps(&handle, timing, &t.sector_gates, &t.neutral_zones, None);
             Some(
                 detected
@@ -822,7 +945,10 @@ fn cmd_fit(
         None => None,
     };
     let out_path = output.unwrap_or_else(|| default_fit_output(file));
-    let opts = FitOptions { sport: sport.into(), laps };
+    let opts = FitOptions {
+        sport: sport.into(),
+        laps,
+    };
     let f = File::create(&out_path)
         .map_err(|e| CliError::io(format!("cannot write {}: {e}", out_path.display())))?;
     let mut wtr = BufWriter::new(f);
@@ -844,14 +970,24 @@ fn print_laps(laps: &[Lap]) {
         println!("no laps detected");
         return;
     }
-    println!("{:>4} {:>14} {:>14} {:>14}", "LAP", "START(ms)", "LAP(ms)", "RAW(ms)");
+    println!(
+        "{:>4} {:>14} {:>14} {:>14}",
+        "LAP", "START(ms)", "LAP(ms)", "RAW(ms)"
+    );
     for l in laps {
-        println!("{:>4} {:>14} {:>14} {:>14}", l.lap_number, l.start_ms, l.lap_time_ms, l.raw_elapsed_ms);
+        println!(
+            "{:>4} {:>14} {:>14} {:>14}",
+            l.lap_number, l.start_ms, l.lap_time_ms, l.raw_elapsed_ms
+        );
         for s in &l.sectors {
             println!("       sector {:<12} {:>14}", s.name, s.end_ms - s.start_ms);
         }
         for z in &l.neutral_zone_visits {
-            println!("       neutral {:<12} -{:>13}", z.name, z.exit_ms - z.enter_ms);
+            println!(
+                "       neutral {:<12} -{:>13}",
+                z.name,
+                z.exit_ms - z.enter_ms
+            );
         }
     }
 }
@@ -862,7 +998,10 @@ fn print_visits(windows: &[VisitWindow], name_of: &dyn Fn(&str) -> String) {
         println!("no track visits detected");
         return;
     }
-    println!("{:<24} {:>14} {:>14} {:>14}", "TRACK", "START(ms)", "END(ms)", "DURATION(ms)");
+    println!(
+        "{:<24} {:>14} {:>14} {:>14}",
+        "TRACK", "START(ms)", "END(ms)", "DURATION(ms)"
+    );
     for w in windows {
         println!(
             "{:<24} {:>14} {:>14} {:>14}",
@@ -921,7 +1060,8 @@ fn write_math_sink(
                 .map_err(|e| CliError::io(format!("cannot write {}: {e}", path.display())))?;
             let mut w = BufWriter::new(file);
             let r = export::write_channels(meta, synthesized_ids, channels, &mut w, fmt, options);
-            w.flush().map_err(|e| CliError::io(format!("cannot write {}: {e}", path.display())))?;
+            w.flush()
+                .map_err(|e| CliError::io(format!("cannot write {}: {e}", path.display())))?;
             r
         }
         None => {
@@ -940,15 +1080,103 @@ fn write_math_sink(
 }
 
 /// Parse a log file into an owned [`SessionHandle`] (synthesis runs inside).
+/// Map an engine `VideoError` onto the envelope's closed error kinds.
+fn video_err(e: VideoError) -> CliError {
+    let kind = match e.kind {
+        VideoErrorKind::Io => ErrorKind::Io,
+        VideoErrorKind::Parse | VideoErrorKind::NoOverlap => ErrorKind::InvalidInput,
+        VideoErrorKind::NoGpmf => ErrorKind::NotFound,
+        VideoErrorKind::Export => ErrorKind::Internal,
+    };
+    CliError::new(kind, e.message)
+}
+
+/// UTF-8 path or a usage error (video files, like session paths).
+fn path_str(path: &Path) -> Result<&str, CliError> {
+    path.to_str()
+        .ok_or_else(|| CliError::usage("path is not valid UTF-8"))
+}
+
+/// `video probe` — container facts via the pure-Rust ISO-BMFF walker.
+fn cmd_video_probe(video: &Path, format: OutFormat) -> Result<Structured, CliError> {
+    let info = mp4box::read_info_path(path_str(video)?).map_err(video_err)?;
+    match format {
+        OutFormat::Text => {
+            println!("width:         {}", info.width);
+            println!("height:        {}", info.height);
+            println!("fps:           {:.3}", info.fps);
+            println!("duration_s:    {:.3}", info.duration_s);
+            match info.creation_time_utc_ms {
+                Some(ms) => println!("creation_utc:  {ms} ms"),
+                None => println!("creation_utc:  (unset)"),
+            }
+            println!(
+                "gpmf:          {}",
+                if info.has_gpmd { "present" } else { "absent" }
+            );
+            Ok(Structured::Text)
+        }
+        OutFormat::Json => Ok(Structured::Json {
+            data: json!({
+                "width": info.width,
+                "height": info.height,
+                "fps": info.fps,
+                "duration_s": info.duration_s,
+                "creation_time_utc_ms": info.creation_time_utc_ms,
+                "has_gpmd": info.has_gpmd,
+            }),
+            warnings: vec![],
+        }),
+    }
+}
+
+/// `video sync` — offset estimate; GPMF absence falls through to
+/// creation-time (normal, not an error).
+fn cmd_video_sync(file: &Path, video: &Path, format: OutFormat) -> Result<Structured, CliError> {
+    let handle = load(file)?;
+    let video_path = path_str(video)?;
+    let info = mp4box::read_info_path(video_path).map_err(video_err)?;
+    let telemetry = match mp4box::read_gpmd_samples_path(video_path) {
+        Ok(samples) => Some(gpmf::parse_gpmf(&samples).map_err(video_err)?),
+        Err(e) if e.kind == VideoErrorKind::NoGpmf => None,
+        Err(e) => return Err(video_err(e)),
+    };
+    let est = estimate_sync(telemetry.as_ref(), &info, &handle).map_err(video_err)?;
+    match format {
+        OutFormat::Text => {
+            println!(
+                "offset: {:.3} s  (method: {}, confidence: {:.1})",
+                est.offset_s,
+                match est.method {
+                    idl_rs::video::sync::SyncMethod::Gpmf => "gpmf",
+                    idl_rs::video::sync::SyncMethod::CreationTime => "creation_time",
+                },
+                est.confidence
+            );
+            println!("pass --offset to `idl-rs overlay` to override");
+            Ok(Structured::Text)
+        }
+        OutFormat::Json => Ok(Structured::Json {
+            data: serde_json::to_value(&est).expect("SyncEstimate serializes"),
+            warnings: vec![],
+        }),
+    }
+}
+
 fn load(path: &Path) -> Result<SessionHandle, CliError> {
-    let path_str = path.to_str().ok_or_else(|| CliError::usage("path is not valid UTF-8"))?;
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| CliError::usage("path is not valid UTF-8"))?;
     Ok(SessionHandle::from_path(path_str)?)
 }
 
 /// Resolve the export format: explicit flag wins, else the output extension,
 /// else CSV for stdout. Unknown/missing extension with no flag is a `usage`
 /// error.
-fn resolve_format(explicit: Option<FormatArg>, output: Option<&Path>) -> Result<ExportFormat, CliError> {
+fn resolve_format(
+    explicit: Option<FormatArg>,
+    output: Option<&Path>,
+) -> Result<ExportFormat, CliError> {
     if let Some(f) = explicit {
         return Ok(f.into());
     }
@@ -983,7 +1211,8 @@ fn export_to_sink(
                 .map_err(|e| CliError::io(format!("cannot write {}: {e}", path.display())))?;
             let mut w = BufWriter::new(file);
             let r = export::write(handle, &mut w, fmt, options);
-            w.flush().map_err(|e| CliError::io(format!("cannot write {}: {e}", path.display())))?;
+            w.flush()
+                .map_err(|e| CliError::io(format!("cannot write {}: {e}", path.display())))?;
             r
         }
         None => {
@@ -1000,8 +1229,11 @@ fn export_to_sink(
 fn export_error_to_cli(e: export::ExportError, handle: &SessionHandle) -> CliError {
     match e {
         export::ExportError::UnknownChannel(name) => {
-            let available: Vec<String> =
-                handle.channels().into_iter().map(|c| c.channel_id).collect();
+            let available: Vec<String> = handle
+                .channels()
+                .into_iter()
+                .map(|c| c.channel_id)
+                .collect();
             CliError::unknown_channel(&name, &available)
         }
         other => CliError::from(other),
@@ -1012,7 +1244,10 @@ fn export_error_to_cli(e: export::ExportError, handle: &SessionHandle) -> CliErr
 fn no_timing_error(name: &str, track: &Path) -> CliError {
     CliError::with_details(
         ErrorKind::InvalidInput,
-        format!("track '{}' has no lap timing configured", display_or_dash(name)),
+        format!(
+            "track '{}' has no lap timing configured",
+            display_or_dash(name)
+        ),
         json!({ "track": track.display().to_string() }),
     )
 }
@@ -1043,14 +1278,20 @@ fn print_info(meta: &SessionMeta) {
 }
 
 fn print_channels(channels: &[ChannelMeta]) {
-    println!("{:<20} {:>10} {:>10} {:>7}", "CHANNEL", "RATE(Hz)", "SAMPLES", "SYNTH");
+    println!(
+        "{:<20} {:>10} {:>10} {:>7}",
+        "CHANNEL", "RATE(Hz)", "SAMPLES", "SYNTH"
+    );
     for c in channels {
         let rate = if c.sample_rate_hz == 0.0 {
             "event".to_string()
         } else {
             format!("{:.3}", c.sample_rate_hz)
         };
-        println!("{:<20} {:>10} {:>10} {:>7}", c.channel_id, rate, c.length, c.synthesized);
+        println!(
+            "{:<20} {:>10} {:>10} {:>7}",
+            c.channel_id, rate, c.length, c.synthesized
+        );
     }
 }
 
@@ -1266,7 +1507,10 @@ mod tests {
         // Act + Assert — each CLI arg maps to the expected engine variant.
         assert!(matches!(WindowArg::Hann.to_engine(), FftWindow::Hann));
         assert!(matches!(WindowArg::Hamming.to_engine(), FftWindow::Hamming));
-        assert!(matches!(WindowArg::Rect.to_engine(), FftWindow::Rectangular));
+        assert!(matches!(
+            WindowArg::Rect.to_engine(),
+            FftWindow::Rectangular
+        ));
     }
 
     #[test]
@@ -1279,18 +1523,27 @@ mod tests {
     #[test]
     fn averaging_arg_maps_to_engine_variants() {
         assert!(matches!(AveragingArg::Mean.to_engine(), Averaging::Mean));
-        assert!(matches!(AveragingArg::Median.to_engine(), Averaging::Median));
+        assert!(matches!(
+            AveragingArg::Median.to_engine(),
+            Averaging::Median
+        ));
     }
 
     #[test]
     fn scaling_arg_maps_to_engine_variants() {
-        assert!(matches!(ScalingArg::Magnitude.to_engine(), Scaling::Magnitude));
+        assert!(matches!(
+            ScalingArg::Magnitude.to_engine(),
+            Scaling::Magnitude
+        ));
         assert!(matches!(ScalingArg::Density.to_engine(), Scaling::Density));
     }
 
     fn derived_report() -> ApplyReport {
         ApplyReport {
-            results: vec![ChannelApplyResult { name: "D".to_string(), error: None }],
+            results: vec![ChannelApplyResult {
+                name: "D".to_string(),
+                error: None,
+            }],
             evaluated: vec![Channel::from_f64("D", 10.0, vec![2.0, 4.0], None)],
         }
     }
@@ -1396,7 +1649,10 @@ mod tests {
     fn sport_arg_maps_to_fit_sport() {
         // Act + Assert
         assert_eq!(FitSport::from(SportArg::Cycling), FitSport::Cycling);
-        assert_eq!(FitSport::from(SportArg::Motorcycling), FitSport::Motorcycling);
+        assert_eq!(
+            FitSport::from(SportArg::Motorcycling),
+            FitSport::Motorcycling
+        );
         assert_eq!(FitSport::from(SportArg::Running), FitSport::Running);
         assert_eq!(FitSport::from(SportArg::Generic), FitSport::Generic);
     }

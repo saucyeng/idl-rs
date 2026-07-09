@@ -8,7 +8,7 @@
 //! (per-sample date/time included), with `GPSU` (UTC string) as time anchor.
 
 use crate::video::mp4box::GpmdSample;
-use crate::video::{VideoError, VideoErrorKind};
+use crate::video::VideoError;
 
 /// One camera GPS fix on the video clock.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -249,6 +249,7 @@ fn collect_streams(payload: &[u8], out: &mut Vec<StreamGps>) -> Result<(), Video
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video::VideoErrorKind;
 
     /// Build one KLV item (padded to 4-byte alignment).
     fn klv(key: &[u8; 4], type_char: u8, struct_size: u8, repeat: u16, value: &[u8]) -> Vec<u8> {
