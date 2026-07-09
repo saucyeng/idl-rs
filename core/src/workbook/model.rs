@@ -5,10 +5,12 @@
 
 use crate::config::VersionedConfig;
 use crate::math::channel_def::MathChannelDef;
+use crate::overlay::model::OverlayLayout;
 use crate::table::model::TableModel;
 
-/// Highest `workbook_version` this engine can read.
-pub const SUPPORTED_WORKBOOK_VERSION: u32 = 1;
+/// Highest `workbook_version` this engine can read. v2 added the additive
+/// `overlay_layouts` field (SPEC §33.1).
+pub const SUPPORTED_WORKBOOK_VERSION: u32 = 2;
 
 fn default_workbook_version() -> u32 {
     1
@@ -33,6 +35,9 @@ pub struct Workbook {
     /// [`Workbook::tables`].
     #[serde(default)]
     pub(crate) worksheets: Vec<WorksheetRaw>,
+    /// Overlay layouts (SPEC §33.1); empty when absent (v1 files).
+    #[serde(default)]
+    pub overlay_layouts: Vec<OverlayLayout>,
 }
 
 impl VersionedConfig for Workbook {
@@ -71,7 +76,9 @@ struct BlockRaw {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum BlockContentRaw {
-    Table { table: TableModel },
+    Table {
+        table: TableModel,
+    },
     #[serde(other)]
     Other,
 }
@@ -112,6 +119,34 @@ impl Workbook {
                 })
             })
             .collect()
+    }
+
+    /// Select an overlay layout by `name`, or the sole layout when `name` is
+    /// `None`. `Err` carries a user-facing message listing available names
+    /// (surfaced verbatim by the CLI's `--layout` handling).
+    pub fn overlay_layout(&self, name: Option<&str>) -> Result<&OverlayLayout, String> {
+        let names = || {
+            self.overlay_layouts
+                .iter()
+                .map(|l| l.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match name {
+            Some(n) => self
+                .overlay_layouts
+                .iter()
+                .find(|l| l.name == n)
+                .ok_or_else(|| format!("no overlay layout named '{n}'; available: {}", names())),
+            None => match self.overlay_layouts.len() {
+                0 => Err("workbook has no overlay layouts".to_string()),
+                1 => Ok(&self.overlay_layouts[0]),
+                _ => Err(format!(
+                    "workbook has multiple overlay layouts, pass --layout; available: {}",
+                    names()
+                )),
+            },
+        }
     }
 }
 
@@ -156,10 +191,60 @@ mod tests {
     #[test]
     fn tables_empty_when_no_worksheets() {
         // Act — a workbook with no worksheets field.
-        let wb: Workbook =
-            serde_json::from_str(r#"{ "workbook_id":"w", "name":"n" }"#).unwrap();
+        let wb: Workbook = serde_json::from_str(r#"{ "workbook_id":"w", "name":"n" }"#).unwrap();
 
         // Assert
         assert!(wb.tables().is_empty());
+    }
+
+    #[test]
+    fn workbook_v2_with_overlay_layouts_parses_layout_list() {
+        // Arrange
+        let json = r#"{
+          "workbook_id": "w1", "name": "wb", "workbook_version": 2,
+          "overlay_layouts": [
+            { "id": "L1", "name": "A", "canvas": "1920x1080",
+              "elements": [ { "type": "track_map", "rect": [0.8, 0.0, 0.2, 0.3] } ] }
+          ]
+        }"#;
+
+        // Act
+        let wb = crate::workbook::read::parse_workbook(json.as_bytes()).unwrap();
+
+        // Assert
+        assert_eq!(wb.overlay_layouts.len(), 1);
+        assert_eq!(wb.overlay_layouts[0].name, "A");
+    }
+
+    #[test]
+    fn workbook_v1_without_field_has_empty_layouts_and_still_parses() {
+        // Arrange
+        let json = r#"{ "workbook_id": "w1", "name": "wb", "workbook_version": 1 }"#;
+
+        // Act
+        let wb = crate::workbook::read::parse_workbook(json.as_bytes()).unwrap();
+
+        // Assert
+        assert!(wb.overlay_layouts.is_empty());
+    }
+
+    #[test]
+    fn overlay_layout_none_with_two_layouts_errs_listing_names() {
+        // Arrange
+        let json = r#"{ "workbook_id": "w1", "name": "wb", "workbook_version": 2,
+          "overlay_layouts": [
+            { "id": "L1", "name": "A", "canvas": "1920x1080", "elements": [] },
+            { "id": "L2", "name": "B", "canvas": "1920x1080", "elements": [] } ] }"#;
+        let wb = crate::workbook::read::parse_workbook(json.as_bytes()).unwrap();
+
+        // Act
+        let err = wb.overlay_layout(None).unwrap_err();
+        let ok = wb.overlay_layout(Some("B")).unwrap();
+        let missing = wb.overlay_layout(Some("C")).unwrap_err();
+
+        // Assert
+        assert!(err.contains("A") && err.contains("B"));
+        assert_eq!(ok.name, "B");
+        assert!(missing.contains("'C'") && missing.contains("A, B"));
     }
 }

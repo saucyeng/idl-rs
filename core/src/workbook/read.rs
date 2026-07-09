@@ -44,7 +44,10 @@ mod tests {
         assert_eq!(wb.workbook_id, "wb-1");
         assert_eq!(wb.math_channels.len(), 2);
         assert_eq!(wb.math_channels[0].name, "ForkVelocity");
-        assert_eq!(wb.math_channels[0].expression, "differentiate([ForkTravel])");
+        assert_eq!(
+            wb.math_channels[0].expression,
+            "differentiate([ForkTravel])"
+        );
     }
 
     #[test]

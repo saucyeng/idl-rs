@@ -56,11 +56,22 @@ pub fn apply_workbook(
         match evaluate(&def.expression, handle, lap_ctx) {
             Ok(out) => {
                 handle.store_math(&def.name, out.sample_rate_hz, out.samples.clone());
-                evaluated.push(Channel::from_f64(def.name.clone(), out.sample_rate_hz, out.samples, None));
-                results.push(ChannelApplyResult { name: def.name.clone(), error: None });
+                evaluated.push(Channel::from_f64(
+                    def.name.clone(),
+                    out.sample_rate_hz,
+                    out.samples,
+                    None,
+                ));
+                results.push(ChannelApplyResult {
+                    name: def.name.clone(),
+                    error: None,
+                });
             }
             Err(e) => {
-                results.push(ChannelApplyResult { name: def.name.clone(), error: Some(e) });
+                results.push(ChannelApplyResult {
+                    name: def.name.clone(),
+                    error: Some(e),
+                });
             }
         }
     }
@@ -85,7 +96,12 @@ mod tests {
     }
 
     fn base(id: &str, samples: Vec<f64>) -> ChannelInput {
-        ChannelInput { channel_id: id.to_string(), sample_rate_hz: 10.0, samples, sample_times_secs: None }
+        ChannelInput {
+            channel_id: id.to_string(),
+            sample_rate_hz: 10.0,
+            samples,
+            sample_times_secs: None,
+        }
     }
 
     fn workbook_with(channels: &[(&str, &str)]) -> Workbook {
@@ -94,10 +110,14 @@ mod tests {
             name: "test".to_string(),
             math_channels: channels
                 .iter()
-                .map(|(n, e)| MathChannelDef { name: n.to_string(), expression: e.to_string() })
+                .map(|(n, e)| MathChannelDef {
+                    name: n.to_string(),
+                    expression: e.to_string(),
+                })
                 .collect(),
             workbook_version: 1,
             worksheets: Vec::new(),
+            overlay_layouts: Vec::new(),
         }
     }
 
@@ -112,9 +132,17 @@ mod tests {
 
         // Assert — both ok, both present in evaluated.
         assert!(report.results.iter().all(|r| r.error.is_none()));
-        let ids: Vec<&str> = report.evaluated.iter().map(|c| c.channel_id.as_str()).collect();
+        let ids: Vec<&str> = report
+            .evaluated
+            .iter()
+            .map(|c| c.channel_id.as_str())
+            .collect();
         assert!(ids.contains(&"Double") && ids.contains(&"Half"));
-        let double = report.evaluated.iter().find(|c| c.channel_id == "Double").unwrap();
+        let double = report
+            .evaluated
+            .iter()
+            .find(|c| c.channel_id == "Double")
+            .unwrap();
         assert_eq!(double.materialize(), vec![4.0, 8.0]);
     }
 
@@ -128,7 +156,11 @@ mod tests {
         let report = apply_workbook(&h, &wb, &MathLapContext::empty());
 
         // Assert — A evaluated correctly using B (10, 20) → (11, 21).
-        let a = report.evaluated.iter().find(|c| c.channel_id == "A").unwrap();
+        let a = report
+            .evaluated
+            .iter()
+            .find(|c| c.channel_id == "A")
+            .unwrap();
         assert_eq!(a.materialize(), vec![11.0, 21.0]);
     }
 
@@ -144,7 +176,10 @@ mod tests {
 
         // Assert — Plain ok and in evaluated; V failed with NoLapContext, absent.
         let v = report.results.iter().find(|r| r.name == "V").unwrap();
-        assert!(matches!(v.error.as_ref().unwrap().kind, MathEvalErrorKind::NoLapContext));
+        assert!(matches!(
+            v.error.as_ref().unwrap().kind,
+            MathEvalErrorKind::NoLapContext
+        ));
         assert!(report.evaluated.iter().all(|c| c.channel_id != "V"));
         assert!(report.evaluated.iter().any(|c| c.channel_id == "Plain"));
     }
