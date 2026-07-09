@@ -17,6 +17,7 @@ pub mod histogram;
 pub mod integration;
 pub mod laps;
 pub mod math;
+pub mod overlay;
 pub mod parse;
 pub mod rotation;
 pub mod scatter;
