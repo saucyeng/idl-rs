@@ -2,7 +2,9 @@
 //! sync-offset estimation at link time. The export driver is NOT bridged in
 //! phase 2 — desktop export UI is phase 3.
 
-use idl_rs::session::handle::SessionHandle;
+use crate::frb_generated::RustOpaque;
+
+pub use idl_rs::session::handle::SessionHandle;
 use idl_rs::video::gpmf::parse_gpmf;
 use idl_rs::video::mp4box::{read_gpmd_samples_path, read_info_path};
 use idl_rs::video::sync::{estimate_sync, SyncMethod};
@@ -79,7 +81,7 @@ pub fn video_probe(path: String) -> Result<VideoInfo, VideoFailure> {
 /// anchor when present, else container creation time. GPMF *absence* falls
 /// through silently (normal); other errors surface. SPEC §33.3.
 pub fn estimate_video_sync(
-    handle: &SessionHandle,
+    handle: RustOpaque<SessionHandle>,
     video_path: String,
 ) -> Result<VideoSyncOutcome, VideoFailure> {
     let info = read_info_path(&video_path)?;
@@ -88,7 +90,7 @@ pub fn estimate_video_sync(
         Err(e) if e.kind == VideoErrorKind::NoGpmf => None,
         Err(e) => return Err(e.into()),
     };
-    let est = estimate_sync(telemetry.as_ref(), &info, handle)?;
+    let est = estimate_sync(telemetry.as_ref(), &info, &handle)?;
     Ok(VideoSyncOutcome {
         offset_s: est.offset_s,
         confidence: est.confidence,
