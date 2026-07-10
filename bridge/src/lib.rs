@@ -25,3 +25,4 @@ pub mod session;
 pub mod spectrogram;
 pub mod table;
 pub mod tracks;
+pub mod video;
