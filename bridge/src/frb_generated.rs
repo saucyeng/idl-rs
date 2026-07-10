@@ -26,6 +26,7 @@
 
 // Section: imports
 
+use crate::video::*;
 use crate::*;
 use flutter_rust_bridge::for_generated::byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
 use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
@@ -39,7 +40,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -134379657;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1233993136;
 
 // Section: executor
 
@@ -357,6 +358,59 @@ fn wire__crate__session__estimate_suspension_into_store_impl(
                     Ok(output_ok)
                 })(
                 ))
+            }
+        },
+    )
+}
+fn wire__crate__video__estimate_video_sync_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "estimate_video_sync",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_handle = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<SessionHandle>,
+            >>::sse_decode(&mut deserializer);
+            let api_video_path = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, crate::video::VideoFailure>((move || {
+                    let mut api_handle_guard = None;
+                    let decode_indices_ =
+                        flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                            flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                &api_handle,
+                                0,
+                                false,
+                            ),
+                        ]);
+                    for i in decode_indices_ {
+                        match i {
+                            0 => api_handle_guard = Some(api_handle.lockable_decode_sync_ref()),
+                            _ => unreachable!(),
+                        }
+                    }
+                    let api_handle_guard = api_handle_guard.unwrap();
+                    let output_ok =
+                        crate::video::estimate_video_sync(&*api_handle_guard, api_video_path)?;
+                    Ok(output_ok)
+                })())
             }
         },
     )
@@ -1202,6 +1256,39 @@ fn wire__crate__session__variance_traces_impl(
         },
     )
 }
+fn wire__crate__video__video_probe_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "video_probe",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_path = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, crate::video::VideoFailure>((move || {
+                    let output_ok = crate::video::video_probe(api_path)?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 fn wire__crate__session__welch_channel_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -1455,10 +1542,23 @@ const _: fn() = || {
 // Section: related_funcs
 
 flutter_rust_bridge::frb_generated_moi_arc_impl_value!(SessionHandle);
+flutter_rust_bridge::frb_generated_moi_arc_impl_value!(
+    flutter_rust_bridge::for_generated::RustAutoOpaqueInner<SessionHandle>
+);
 
 // Section: dart2rust
 
 impl SseDecode for RustOpaqueMoi<SessionHandle> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <usize>::sse_decode(deserializer);
+        return decode_rust_opaque_moi(inner);
+    }
+}
+
+impl SseDecode
+    for RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<SessionHandle>>
+{
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         let mut inner = <usize>::sse_decode(deserializer);
@@ -2646,6 +2746,79 @@ impl SseDecode for usize {
     }
 }
 
+impl SseDecode for crate::video::VideoFailure {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_kind = <crate::video::VideoFailureKind>::sse_decode(deserializer);
+        let mut var_message = <String>::sse_decode(deserializer);
+        return crate::video::VideoFailure {
+            kind: var_kind,
+            message: var_message,
+        };
+    }
+}
+
+impl SseDecode for crate::video::VideoFailureKind {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::video::VideoFailureKind::Io,
+            1 => crate::video::VideoFailureKind::Parse,
+            2 => crate::video::VideoFailureKind::NoGpmf,
+            3 => crate::video::VideoFailureKind::NoOverlap,
+            4 => crate::video::VideoFailureKind::Export,
+            _ => unreachable!("Invalid variant for VideoFailureKind: {}", inner),
+        };
+    }
+}
+
+impl SseDecode for crate::video::VideoInfo {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_width = <u32>::sse_decode(deserializer);
+        let mut var_height = <u32>::sse_decode(deserializer);
+        let mut var_fps = <f64>::sse_decode(deserializer);
+        let mut var_durationS = <f64>::sse_decode(deserializer);
+        let mut var_creationTimeUtcMs = <Option<i64>>::sse_decode(deserializer);
+        let mut var_hasGpmd = <bool>::sse_decode(deserializer);
+        return crate::video::VideoInfo {
+            width: var_width,
+            height: var_height,
+            fps: var_fps,
+            duration_s: var_durationS,
+            creation_time_utc_ms: var_creationTimeUtcMs,
+            has_gpmd: var_hasGpmd,
+        };
+    }
+}
+
+impl SseDecode for crate::video::VideoSyncMethod {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::video::VideoSyncMethod::Gpmf,
+            1 => crate::video::VideoSyncMethod::CreationTime,
+            _ => unreachable!("Invalid variant for VideoSyncMethod: {}", inner),
+        };
+    }
+}
+
+impl SseDecode for crate::video::VideoSyncOutcome {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_offsetS = <f64>::sse_decode(deserializer);
+        let mut var_confidence = <f64>::sse_decode(deserializer);
+        let mut var_method = <crate::video::VideoSyncMethod>::sse_decode(deserializer);
+        return crate::video::VideoSyncOutcome {
+            offset_s: var_offsetS,
+            confidence: var_confidence,
+            method: var_method,
+        };
+    }
+}
+
 impl SseDecode for crate::tracks::VisitWindow {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -2694,31 +2867,33 @@ fn pde_ffi_dispatcher_primary_impl(
             rust_vec_len,
             data_len,
         ),
-        9 => wire__crate__math__eval_math_into_store_impl(port, ptr, rust_vec_len, data_len),
-        10 => wire__crate__session__evaluate_table_impl(port, ptr, rust_vec_len, data_len),
-        11 => wire__crate__session__evaluate_table_multi_impl(port, ptr, rust_vec_len, data_len),
-        12 => wire__crate__session__export_fit_to_vec_impl(port, ptr, rust_vec_len, data_len),
-        13 => wire__crate__tracks__gps_channel_values_impl(port, ptr, rust_vec_len, data_len),
-        14 => wire__crate__tracks__gps_track_impl(port, ptr, rust_vec_len, data_len),
-        15 => wire__crate__session__materialize_f64_impl(port, ptr, rust_vec_len, data_len),
-        16 => wire__crate__session__parse_session_impl(port, ptr, rust_vec_len, data_len),
-        17 => wire__crate__session__parse_session_from_path_impl(port, ptr, rust_vec_len, data_len),
-        18 => wire__crate__math__resolve_math_dependencies_impl(port, ptr, rust_vec_len, data_len),
-        19 => wire__crate__session__retain_derived_impl(port, ptr, rust_vec_len, data_len),
-        20 => wire__crate__scatter__scatter_density_impl(port, ptr, rust_vec_len, data_len),
-        21 => wire__crate__scatter__scatter_points_impl(port, ptr, rust_vec_len, data_len),
-        22 => wire__crate__session__session_channels_impl(port, ptr, rust_vec_len, data_len),
-        23 => wire__crate__session__session_from_channels_impl(port, ptr, rust_vec_len, data_len),
-        24 => wire__crate__session__session_metadata_impl(port, ptr, rust_vec_len, data_len),
-        25 => wire__crate__session__session_resident_bytes_impl(port, ptr, rust_vec_len, data_len),
-        26 => wire__crate__session__slice_lap_into_store_impl(port, ptr, rust_vec_len, data_len),
-        27 => wire__crate__session__spectrogram_channel_impl(port, ptr, rust_vec_len, data_len),
-        28 => {
+        9 => wire__crate__video__estimate_video_sync_impl(port, ptr, rust_vec_len, data_len),
+        10 => wire__crate__math__eval_math_into_store_impl(port, ptr, rust_vec_len, data_len),
+        11 => wire__crate__session__evaluate_table_impl(port, ptr, rust_vec_len, data_len),
+        12 => wire__crate__session__evaluate_table_multi_impl(port, ptr, rust_vec_len, data_len),
+        13 => wire__crate__session__export_fit_to_vec_impl(port, ptr, rust_vec_len, data_len),
+        14 => wire__crate__tracks__gps_channel_values_impl(port, ptr, rust_vec_len, data_len),
+        15 => wire__crate__tracks__gps_track_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__session__materialize_f64_impl(port, ptr, rust_vec_len, data_len),
+        17 => wire__crate__session__parse_session_impl(port, ptr, rust_vec_len, data_len),
+        18 => wire__crate__session__parse_session_from_path_impl(port, ptr, rust_vec_len, data_len),
+        19 => wire__crate__math__resolve_math_dependencies_impl(port, ptr, rust_vec_len, data_len),
+        20 => wire__crate__session__retain_derived_impl(port, ptr, rust_vec_len, data_len),
+        21 => wire__crate__scatter__scatter_density_impl(port, ptr, rust_vec_len, data_len),
+        22 => wire__crate__scatter__scatter_points_impl(port, ptr, rust_vec_len, data_len),
+        23 => wire__crate__session__session_channels_impl(port, ptr, rust_vec_len, data_len),
+        24 => wire__crate__session__session_from_channels_impl(port, ptr, rust_vec_len, data_len),
+        25 => wire__crate__session__session_metadata_impl(port, ptr, rust_vec_len, data_len),
+        26 => wire__crate__session__session_resident_bytes_impl(port, ptr, rust_vec_len, data_len),
+        27 => wire__crate__session__slice_lap_into_store_impl(port, ptr, rust_vec_len, data_len),
+        28 => wire__crate__session__spectrogram_channel_impl(port, ptr, rust_vec_len, data_len),
+        29 => {
             wire__crate__session__suspension_config_default_impl(port, ptr, rust_vec_len, data_len)
         }
-        29 => wire__crate__session__variance_traces_impl(port, ptr, rust_vec_len, data_len),
-        30 => wire__crate__session__welch_channel_impl(port, ptr, rust_vec_len, data_len),
-        31 => wire__crate__session__welch_channel_windowed_impl(port, ptr, rust_vec_len, data_len),
+        30 => wire__crate__session__variance_traces_impl(port, ptr, rust_vec_len, data_len),
+        31 => wire__crate__video__video_probe_impl(port, ptr, rust_vec_len, data_len),
+        32 => wire__crate__session__welch_channel_impl(port, ptr, rust_vec_len, data_len),
+        33 => wire__crate__session__welch_channel_windowed_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -3664,6 +3839,106 @@ impl flutter_rust_bridge::IntoIntoDart<crate::tracks::TrackArg> for crate::track
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::video::VideoFailure {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.kind.into_into_dart().into_dart(),
+            self.message.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::video::VideoFailure {}
+impl flutter_rust_bridge::IntoIntoDart<crate::video::VideoFailure> for crate::video::VideoFailure {
+    fn into_into_dart(self) -> crate::video::VideoFailure {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::video::VideoFailureKind {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::Io => 0.into_dart(),
+            Self::Parse => 1.into_dart(),
+            Self::NoGpmf => 2.into_dart(),
+            Self::NoOverlap => 3.into_dart(),
+            Self::Export => 4.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::video::VideoFailureKind
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::video::VideoFailureKind>
+    for crate::video::VideoFailureKind
+{
+    fn into_into_dart(self) -> crate::video::VideoFailureKind {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::video::VideoInfo {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.width.into_into_dart().into_dart(),
+            self.height.into_into_dart().into_dart(),
+            self.fps.into_into_dart().into_dart(),
+            self.duration_s.into_into_dart().into_dart(),
+            self.creation_time_utc_ms.into_into_dart().into_dart(),
+            self.has_gpmd.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::video::VideoInfo {}
+impl flutter_rust_bridge::IntoIntoDart<crate::video::VideoInfo> for crate::video::VideoInfo {
+    fn into_into_dart(self) -> crate::video::VideoInfo {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::video::VideoSyncMethod {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::Gpmf => 0.into_dart(),
+            Self::CreationTime => 1.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::video::VideoSyncMethod {}
+impl flutter_rust_bridge::IntoIntoDart<crate::video::VideoSyncMethod>
+    for crate::video::VideoSyncMethod
+{
+    fn into_into_dart(self) -> crate::video::VideoSyncMethod {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::video::VideoSyncOutcome {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.offset_s.into_into_dart().into_dart(),
+            self.confidence.into_into_dart().into_dart(),
+            self.method.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::video::VideoSyncOutcome
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::video::VideoSyncOutcome>
+    for crate::video::VideoSyncOutcome
+{
+    fn into_into_dart(self) -> crate::video::VideoSyncOutcome {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for FrbWrapper<crate::tracks::VisitWindow> {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
@@ -3708,6 +3983,17 @@ impl flutter_rust_bridge::IntoIntoDart<FrbWrapper<crate::fft::WelchResult>>
 }
 
 impl SseEncode for RustOpaqueMoi<SessionHandle> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        let (ptr, size) = self.sse_encode_raw();
+        <usize>::sse_encode(ptr, serializer);
+        <i32>::sse_encode(size, serializer);
+    }
+}
+
+impl SseEncode
+    for RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<SessionHandle>>
+{
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         let (ptr, size) = self.sse_encode_raw();
@@ -4642,6 +4928,70 @@ impl SseEncode for usize {
     }
 }
 
+impl SseEncode for crate::video::VideoFailure {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <crate::video::VideoFailureKind>::sse_encode(self.kind, serializer);
+        <String>::sse_encode(self.message, serializer);
+    }
+}
+
+impl SseEncode for crate::video::VideoFailureKind {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::video::VideoFailureKind::Io => 0,
+                crate::video::VideoFailureKind::Parse => 1,
+                crate::video::VideoFailureKind::NoGpmf => 2,
+                crate::video::VideoFailureKind::NoOverlap => 3,
+                crate::video::VideoFailureKind::Export => 4,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
+    }
+}
+
+impl SseEncode for crate::video::VideoInfo {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <u32>::sse_encode(self.width, serializer);
+        <u32>::sse_encode(self.height, serializer);
+        <f64>::sse_encode(self.fps, serializer);
+        <f64>::sse_encode(self.duration_s, serializer);
+        <Option<i64>>::sse_encode(self.creation_time_utc_ms, serializer);
+        <bool>::sse_encode(self.has_gpmd, serializer);
+    }
+}
+
+impl SseEncode for crate::video::VideoSyncMethod {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::video::VideoSyncMethod::Gpmf => 0,
+                crate::video::VideoSyncMethod::CreationTime => 1,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
+    }
+}
+
+impl SseEncode for crate::video::VideoSyncOutcome {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <f64>::sse_encode(self.offset_s, serializer);
+        <f64>::sse_encode(self.confidence, serializer);
+        <crate::video::VideoSyncMethod>::sse_encode(self.method, serializer);
+    }
+}
+
 impl SseEncode for crate::tracks::VisitWindow {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -4667,6 +5017,7 @@ mod io {
     // Section: imports
 
     use super::*;
+    use crate::video::*;
     use crate::*;
     use flutter_rust_bridge::for_generated::byteorder::{
         NativeEndian, ReadBytesExt, WriteBytesExt,
@@ -4691,6 +5042,20 @@ mod io {
     ) {
         MoiArc::<SessionHandle>::decrement_strong_count(ptr as _);
     }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_idl0_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSessionHandle(
+        ptr: *const std::ffi::c_void,
+    ) {
+        MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<SessionHandle>>::increment_strong_count(ptr as _);
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_idl0_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSessionHandle(
+        ptr: *const std::ffi::c_void,
+    ) {
+        MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<SessionHandle>>::decrement_strong_count(ptr as _);
+    }
 }
 #[cfg(not(target_family = "wasm"))]
 pub use io::*;
@@ -4704,6 +5069,7 @@ mod web {
     // Section: imports
 
     use super::*;
+    use crate::video::*;
     use crate::*;
     use flutter_rust_bridge::for_generated::byteorder::{
         NativeEndian, ReadBytesExt, WriteBytesExt,
@@ -4725,6 +5091,20 @@ mod web {
     #[wasm_bindgen]
     pub fn rust_arc_decrement_strong_count_RustOpaque_SessionHandle(ptr: *const std::ffi::c_void) {
         MoiArc::<SessionHandle>::decrement_strong_count(ptr as _);
+    }
+
+    #[wasm_bindgen]
+    pub fn rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSessionHandle(
+        ptr: *const std::ffi::c_void,
+    ) {
+        MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<SessionHandle>>::increment_strong_count(ptr as _);
+    }
+
+    #[wasm_bindgen]
+    pub fn rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSessionHandle(
+        ptr: *const std::ffi::c_void,
+    ) {
+        MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<SessionHandle>>::decrement_strong_count(ptr as _);
     }
 }
 #[cfg(target_family = "wasm")]
