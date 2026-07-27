@@ -151,6 +151,16 @@ enum Command {
         /// ffmpeg video encoder.
         #[arg(long, default_value = "libx264")]
         encoder: String,
+        /// Extra counter-clockwise rotation in degrees (0, 90, 180, 270) for
+        /// footage shot with the camera mounted rotated. Applied on top of any
+        /// container rotation; the overlay stays upright.
+        #[arg(long, default_value_t = 0, value_parser = parse_rotation_deg)]
+        rotate: i32,
+        /// Hardware decoder for the source video (`cuda`, `qsv`, `d3d11va`,
+        /// …). Pair with `--encoder h264_nvenc` to keep both decode and
+        /// encode off the CPU. Omitted: software decode.
+        #[arg(long)]
+        hwaccel: Option<String>,
         /// Path to the ffmpeg binary (ffprobe is resolved beside it).
         #[arg(long, default_value = "ffmpeg")]
         ffmpeg: String,
@@ -488,6 +498,8 @@ fn main() -> ExitCode {
             duration,
             output,
             encoder,
+            rotate,
+            hwaccel,
             ffmpeg,
         } => emit_bulk(
             "overlay",
@@ -502,6 +514,8 @@ fn main() -> ExitCode {
                 duration,
                 output,
                 encoder,
+                rotate,
+                hwaccel,
                 ffmpeg,
             ),
         ),
@@ -1173,6 +1187,22 @@ fn ffprobe_beside(ffmpeg: &str) -> String {
     }
 }
 
+/// Validates `--rotate`: only quarter turns are expressible as an ffmpeg
+/// transpose chain, so anything else is rejected at parse time rather than
+/// silently ignored. Negative values are accepted (`-90` = 270° CCW = 90° CW)
+/// and normalized into `[0, 360)`.
+fn parse_rotation_deg(s: &str) -> Result<i32, String> {
+    let deg: i32 = s
+        .parse()
+        .map_err(|_| format!("`{s}` is not a whole number of degrees"))?;
+    if deg % 90 != 0 {
+        return Err(format!(
+            "rotation must be a quarter turn (0, 90, 180, 270, or negative equivalents); got {deg}"
+        ));
+    }
+    Ok(deg.rem_euclid(360))
+}
+
 /// `overlay` — render a workbook overlay layout onto a video (SPEC 33.6).
 /// Bulk command: the artifact is the output video; errors envelope to stderr.
 #[allow(clippy::too_many_arguments)]
@@ -1187,6 +1217,8 @@ fn cmd_overlay(
     duration: Option<f64>,
     output: Option<PathBuf>,
     encoder: String,
+    rotate: i32,
+    hwaccel: Option<String>,
     ffmpeg: String,
 ) -> Result<(), CliError> {
     let handle = load(file)?;
@@ -1262,6 +1294,8 @@ fn cmd_overlay(
         duration_s: duration,
         encoder,
         ffmpeg_path: ffmpeg,
+        rotate_ccw_deg: rotate,
+        hwaccel,
     };
 
     // Prepared sampling context; frame i → video clock → session clock.

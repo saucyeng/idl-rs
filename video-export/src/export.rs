@@ -220,6 +220,8 @@ mod tests {
             duration_s: None,
             encoder: "libx264".into(),
             ffmpeg_path: "definitely-not-a-real-ffmpeg-binary".into(),
+            rotate_ccw_deg: 0,
+            hwaccel: None,
         };
 
         // Act
@@ -273,6 +275,8 @@ mod tests {
             duration_s: None,
             encoder: "libx264".into(),
             ffmpeg_path: "ffmpeg".into(),
+            rotate_ccw_deg: 0,
+            hwaccel: None,
         };
         let (w, h) = plan.frame_dims();
 
