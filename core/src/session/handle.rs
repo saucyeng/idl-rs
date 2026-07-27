@@ -259,23 +259,38 @@ impl SessionHandle {
             .collect()
     }
 
-    /// Samples for `channel_id`, or empty when absent.
+    /// Samples for `channel_id`, or empty when absent. Resolves derived
+    /// (math / lap-slice) channels from the store as well as parsed ones.
     pub fn channel_samples(&self, channel_id: &str) -> Vec<f64> {
-        self.session
-            .channels
-            .iter()
-            .find(|c| c.channel_id == channel_id)
-            .map(|c| c.materialize())
+        self.with_channel(channel_id, |c| c.materialize())
             .unwrap_or_default()
     }
 
-    /// Event-driven per-sample times for `channel_id`; `None` for fixed-rate or absent.
+    /// Event-driven per-sample times for `channel_id`; `None` for fixed-rate
+    /// or absent. Store-aware, like [`Self::channel_samples`].
     pub fn channel_sample_times(&self, channel_id: &str) -> Option<Vec<f64>> {
-        self.session
-            .channels
-            .iter()
-            .find(|c| c.channel_id == channel_id)
-            .and_then(|c| c.sample_times_secs.clone())
+        self.with_channel(channel_id, |c| c.sample_times_secs.clone())
+            .flatten()
+    }
+
+    /// Metadata for one channel by id, **including** derived (math /
+    /// lap-slice) channels held in the store.
+    ///
+    /// [`Self::channels`] deliberately lists only the parsed + synthesized
+    /// set the session was built from — that is the app's channel *library*.
+    /// Consumers that resolve a channel reference by name (an overlay
+    /// element bound to a math channel, say) need the store too, or every
+    /// derived binding silently reads as absent. Returns `None` when the
+    /// channel exists in neither place.
+    pub fn channel_meta(&self, channel_id: &str) -> Option<ChannelMeta> {
+        let synthesized = self.synthesized_ids.iter().any(|id| id == channel_id);
+        self.with_channel(channel_id, |c| ChannelMeta {
+            channel_id: c.channel_id.clone(),
+            sample_rate_hz: c.sample_rate_hz,
+            length: c.len() as u32,
+            is_event_driven: c.sample_rate_hz == 0.0,
+            synthesized,
+        })
     }
 
     /// Convert wall-clock epoch-ms timestamps to uniform-Time seconds for this
@@ -303,6 +318,41 @@ impl SessionHandle {
                 epochs_ms
                     .iter()
                     .map(|&e| epoch_to_time_one(&samples, c.sample_rate_hz, e))
+                    .collect()
+            }
+            None => {
+                let origin = self.session.timestamp_utc_ms as f64;
+                epochs_ms.iter().map(|&e| (e - origin) / 1000.0).collect()
+            }
+        }
+    }
+
+    /// Like [`Self::epoch_ms_to_time_secs`], but **extrapolates** linearly
+    /// beyond the `GPS_EpochMs` span instead of clamping to `0.0` /
+    /// `(len - 1) / rate`.
+    ///
+    /// Clamping is right when the epoch is known to belong to this session
+    /// (a lap crossing must not map outside it). It is wrong when the epoch
+    /// comes from *outside* the session — a video's UTC anchor — because the
+    /// saturated value is indistinguishable from a real edge match: footage
+    /// shot hours later silently maps to the session's last second. Callers
+    /// deciding whether two clocks overlap at all need the true (possibly
+    /// negative, possibly past-the-end) mapping. See SPEC §33.3.
+    ///
+    /// Returns seconds, one per input, input order preserved.
+    pub fn epoch_ms_to_time_secs_extrapolated(&self, epochs_ms: &[f64]) -> Vec<f64> {
+        let gps = self
+            .session
+            .channels
+            .iter()
+            .find(|c| c.channel_id == "GPS_EpochMs")
+            .filter(|c| c.sample_rate_hz > 0.0 && !c.is_empty());
+        match gps {
+            Some(c) => {
+                let samples = c.materialize();
+                epochs_ms
+                    .iter()
+                    .map(|&e| epoch_to_time_one_extrapolated(&samples, c.sample_rate_hz, e))
                     .collect()
             }
             None => {
@@ -721,6 +771,44 @@ fn epoch_to_time_one(samples: &[f64], rate: f64, target: f64) -> f64 {
     let span = samples[hi] - samples[lo];
     let frac = if span == 0.0 { 0.0 } else { (target - samples[lo]) / span };
     (lo as f64 + frac) / rate
+}
+
+/// Like [`epoch_to_time_one`] but extrapolates past both ends using the
+/// slope of the nearest sample interval, so an epoch outside the GPS span
+/// maps to a negative time (before the session) or one beyond its end
+/// rather than saturating at the edge.
+///
+/// Slope is seconds-of-session per ms-of-epoch: one sample interval spans
+/// `1 / rate` seconds and `samples[i+1] - samples[i]` ms. A degenerate
+/// (zero or non-finite) edge interval falls back to wall-clock 1:1
+/// (1000 ms = 1 s), which is what `GPS_EpochMs` means anyway.
+fn epoch_to_time_one_extrapolated(samples: &[f64], rate: f64, target: f64) -> f64 {
+    let last = samples.len() - 1;
+    let edge_slope = |a: f64, b: f64| {
+        let span_ms = b - a;
+        if span_ms.is_finite() && span_ms != 0.0 {
+            (1.0 / rate) / span_ms
+        } else {
+            0.001
+        }
+    };
+    if target < samples[0] {
+        let slope = if last == 0 {
+            0.001
+        } else {
+            edge_slope(samples[0], samples[1])
+        };
+        return (target - samples[0]) * slope;
+    }
+    if target > samples[last] {
+        let slope = if last == 0 {
+            0.001
+        } else {
+            edge_slope(samples[last - 1], samples[last])
+        };
+        return last as f64 / rate + (target - samples[last]) * slope;
+    }
+    epoch_to_time_one(samples, rate, target)
 }
 
 impl crate::math::eval::ChannelLookup for SessionHandle {
@@ -1331,6 +1419,68 @@ mod tests {
         // Assert
         assert!((out[0] - 3.0).abs() < 1e-9);
         assert!((out[1] - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn epoch_ms_to_time_secs_extrapolated_maps_below_span_to_negative_seconds() {
+        // Arrange — 1 Hz GPS starting at epoch 10_000 ms.
+        let meta = SessionMetaInput {
+            session_id: String::new(),
+            device_id: String::new(),
+            timestamp_utc_ms: 10_000,
+            config_checksum: String::new(),
+        };
+        let epochs: Vec<f64> = (0..5).map(|i| 10_000.0 + i as f64 * 1000.0).collect();
+        let h = SessionHandle::from_channels(meta, vec![input_channel("GPS_EpochMs", 1.0, epochs)]);
+
+        // Act — 3 s before the first fix.
+        let out = h.epoch_ms_to_time_secs_extrapolated(&[7_000.0]);
+
+        // Assert — clamping would give 0.0; the true mapping is -3 s.
+        assert!((out[0] - -3.0).abs() < 1e-9, "got {}", out[0]);
+    }
+
+    #[test]
+    fn epoch_ms_to_time_secs_extrapolated_maps_above_span_past_the_end() {
+        // Arrange — 1 Hz GPS, 5 fixes → span ends at t = 4 s.
+        let meta = SessionMetaInput {
+            session_id: String::new(),
+            device_id: String::new(),
+            timestamp_utc_ms: 10_000,
+            config_checksum: String::new(),
+        };
+        let epochs: Vec<f64> = (0..5).map(|i| 10_000.0 + i as f64 * 1000.0).collect();
+        let h = SessionHandle::from_channels(meta, vec![input_channel("GPS_EpochMs", 1.0, epochs)]);
+
+        // Act — 6 s past the last fix (last fix epoch 14_000 → t = 4).
+        let out = h.epoch_ms_to_time_secs_extrapolated(&[20_000.0]);
+
+        // Assert — clamping would give 4.0; the true mapping is 10 s.
+        assert!((out[0] - 10.0).abs() < 1e-9, "got {}", out[0]);
+    }
+
+    #[test]
+    fn epoch_ms_to_time_secs_extrapolated_matches_clamped_inside_the_span() {
+        // Arrange
+        let meta = SessionMetaInput {
+            session_id: String::new(),
+            device_id: String::new(),
+            timestamp_utc_ms: 1000,
+            config_checksum: String::new(),
+        };
+        let epochs: Vec<f64> = (0..10).map(|i| 1000.0 + i as f64 * 100.0).collect();
+        let h =
+            SessionHandle::from_channels(meta, vec![input_channel("GPS_EpochMs", 10.0, epochs)]);
+
+        // Act — in-range values must be untouched by the extrapolation path.
+        let probes = [1000.0, 1250.0, 1900.0];
+        let clamped = h.epoch_ms_to_time_secs(&probes);
+        let extrapolated = h.epoch_ms_to_time_secs_extrapolated(&probes);
+
+        // Assert
+        for (a, b) in clamped.iter().zip(extrapolated.iter()) {
+            assert!((a - b).abs() < 1e-12, "clamped {a} vs extrapolated {b}");
+        }
     }
 
     #[test]

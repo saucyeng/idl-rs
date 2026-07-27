@@ -42,6 +42,12 @@ const CONFIDENCE_CREATION_TIME: f64 = 0.3;
 /// (`telemetry`), falling back to the container `creation_time` in `info`.
 /// Errors: `Parse` when neither anchor exists; `NoOverlap` (message lists
 /// both ranges in seconds) when the mapped video span misses the session.
+///
+/// The anchor epoch is mapped through
+/// [`SessionHandle::epoch_ms_to_time_secs_extrapolated`], not the clamping
+/// variant: an anchor from outside the session must stay outside it, or
+/// footage from a different run saturates to the session edge and passes
+/// the overlap check with a fabricated offset.
 pub fn estimate_sync(
     telemetry: Option<&VideoTelemetry>,
     info: &Mp4Info,
@@ -50,12 +56,13 @@ pub fn estimate_sync(
     let (offset_s, method, confidence) =
         match telemetry.and_then(|t| t.utc_anchor) {
             Some((t_video_s, epoch_ms)) => {
-                let session_s = handle.epoch_ms_to_time_secs(&[epoch_ms as f64])[0];
+                let session_s = handle.epoch_ms_to_time_secs_extrapolated(&[epoch_ms as f64])[0];
                 (session_s - t_video_s, SyncMethod::Gpmf, CONFIDENCE_GPMF)
             }
             None => match info.creation_time_utc_ms {
                 Some(creation_ms) => {
-                    let session_s = handle.epoch_ms_to_time_secs(&[creation_ms as f64])[0];
+                    let session_s =
+                        handle.epoch_ms_to_time_secs_extrapolated(&[creation_ms as f64])[0];
                     (
                         session_s,
                         SyncMethod::CreationTime,
@@ -197,6 +204,79 @@ mod tests {
             "session range: {}",
             err.message
         );
+    }
+
+    /// Session whose clock comes from a real `GPS_EpochMs` channel (1 Hz,
+    /// one fix per second starting at `first_epoch_ms`) — the production
+    /// shape. The origin-fallback fixture above never exercises the
+    /// GPS-interpolation path, which is where out-of-span anchors land.
+    fn handle_with_gps(first_epoch_ms: i64, len_s: usize) -> SessionHandle {
+        let epochs: Vec<f64> = (0..=len_s)
+            .map(|i| (first_epoch_ms + i as i64 * 1000) as f64)
+            .collect();
+        SessionHandle::from_channels(
+            SessionMetaInput {
+                session_id: String::new(),
+                device_id: String::new(),
+                timestamp_utc_ms: first_epoch_ms,
+                config_checksum: String::new(),
+            },
+            vec![ChannelInput {
+                channel_id: "GPS_EpochMs".into(),
+                sample_rate_hz: 1.0,
+                samples: epochs,
+                sample_times_secs: None,
+            }],
+        )
+    }
+
+    #[test]
+    fn estimate_sync_gps_clock_video_starting_before_session_yields_negative_offset() {
+        // Arrange — GPS-clocked session; the camera rolled 5 s before the
+        // logger did, so the true offset is -5.0 (the first 5 s of video
+        // precede the session). Real-footage regression: the GPS mapping
+        // used to clamp below-range anchors to 0.0 and lose the lead-in.
+        let h = handle_with_gps(1_784_128_799_000, 113);
+        let inf = info(115.0, Some(1_784_128_794_000));
+
+        // Act
+        let est = estimate_sync(None, &inf, &h).unwrap();
+
+        // Assert
+        assert!(
+            (est.offset_s - -5.0).abs() < 1e-6,
+            "offset was {}",
+            est.offset_s
+        );
+    }
+
+    #[test]
+    fn estimate_sync_gps_clock_video_hours_after_session_is_no_overlap_error() {
+        // Arrange — 113 s session; video shot ~2.9 h later (a different run
+        // from the same day). Real-footage regression: the above-range clamp
+        // saturated the anchor to the session end, so this silently passed
+        // the overlap check with a fabricated offset.
+        let h = handle_with_gps(1_784_118_096_000, 129);
+        let inf = info(115.0, Some(1_784_128_794_000));
+
+        // Act
+        let err = estimate_sync(None, &inf, &h).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, VideoErrorKind::NoOverlap);
+    }
+
+    #[test]
+    fn estimate_sync_gps_clock_anchor_inside_span_is_unchanged_by_extrapolation() {
+        // Arrange — anchor 40 s into the GPS span stays exactly 40 s.
+        let h = handle_with_gps(1_000_000_000_000, 120);
+        let inf = info(30.0, Some(1_000_000_040_000));
+
+        // Act
+        let est = estimate_sync(None, &inf, &h).unwrap();
+
+        // Assert
+        assert!((est.offset_s - 40.0).abs() < 1e-6, "offset {}", est.offset_s);
     }
 
     #[test]

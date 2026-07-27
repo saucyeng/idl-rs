@@ -155,17 +155,15 @@ impl SampleContext {
         layout: &OverlayLayout,
         laps: Vec<Lap>,
     ) -> SampleContext {
-        let metas: HashMap<String, (f64, bool)> = handle
-            .channels()
-            .into_iter()
-            .map(|m| (m.channel_id.clone(), (m.sample_rate_hz, m.is_event_driven)))
-            .collect();
-
         let mut channels = HashMap::new();
         for name in layout.referenced_channels() {
-            let Some(&(rate_hz, _event)) = metas.get(&name) else {
+            // `channel_meta`, not the `channels()` library list: a layout may
+            // bind an element to a math channel, which lives in the derived
+            // store rather than the parsed set.
+            let Some(meta) = handle.channel_meta(&name) else {
                 continue;
             };
+            let rate_hz = meta.sample_rate_hz;
             let samples = handle.channel_samples(&name);
             if samples.is_empty() {
                 continue;
@@ -399,6 +397,26 @@ mod tests {
         match &s.elements[0] {
             ElementSample::Value(Some(v)) => assert!((v - 12.5).abs() < 1e-9),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_binds_an_element_to_a_math_store_channel() {
+        // Arrange — the derived channel exists only in the math store, as it
+        // does after `apply_workbook` evaluates a workbook's math channels.
+        // Real-footage regression: `prepare` used to consult the parsed
+        // channel library only, so every math-bound element rendered no-data.
+        let h = ramp_handle();
+        h.store_math("Lean_deg", 10.0, (0..=100).map(|i| i as f64 * 0.5).collect());
+
+        // Act
+        let ctx = SampleContext::prepare(&h, &gauge_layout("Lean_deg"), vec![]);
+        let s = ctx.sample(1.0);
+
+        // Assert — 10 Hz, index 10 → 10 × 0.5 = 5.0.
+        match &s.elements[0] {
+            ElementSample::Value(Some(v)) => assert!((v - 5.0).abs() < 1e-9, "got {v}"),
+            other => panic!("math channel did not reach the sampler: {other:?}"),
         }
     }
 
