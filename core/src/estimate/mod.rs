@@ -6,6 +6,7 @@
 //! (`crate::rotation`) plus the model traits and state defined here. User-facing
 //! outputs surface as derived channels (virtual sensors).
 
+pub mod attitude;
 pub mod detect;
 pub mod geometry;
 pub mod iekf;
