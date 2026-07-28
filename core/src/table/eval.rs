@@ -164,6 +164,15 @@ impl ChannelLookup for CellLookup<'_> {
         // a cell must reduce to a scalar so the rate is never surfaced.
         Some(LookupChannel { samples: std::sync::Arc::from(samples), sample_rate_hz: 0.0 })
     }
+    /// Populate the estimator's outputs into the session store via the handle,
+    /// then read the channel back through [`Self::lookup`] so a table cell
+    /// still honours its row's time window — a raw forward would hand back the
+    /// whole session regardless of the window.
+    fn estimator_channel(&self, channel_id: &str) -> Option<LookupChannel> {
+        self.handle.estimator_channel(channel_id)?;
+        self.lookup(channel_id)
+    }
+
     fn lookup_cell(&self, body: &str) -> Option<f64> {
         let addr = single_addr(self, body)?;
         self.values.get(&addr).copied()

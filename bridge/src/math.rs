@@ -103,6 +103,9 @@ impl ChannelLookup for SharedHandleLookup {
     fn best_time_base_dims(&self) -> Option<(usize, f64)> {
         self.0.best_time_base_dims()
     }
+    fn estimator_channel(&self, channel_id: &str) -> Option<LookupChannel> {
+        self.0.estimator_channel(channel_id)
+    }
 }
 
 impl MathLapCtxArg {

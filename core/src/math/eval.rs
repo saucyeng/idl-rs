@@ -112,6 +112,12 @@ impl ChannelLookup for MemoLookup<'_> {
         self.inner.best_time_base_dims()
     }
 
+    // Not memoized: the inner lookup already caches the estimator's outputs in
+    // the session's derived store, so a second call is a store read either way.
+    fn estimator_channel(&self, channel_id: &str) -> Option<LookupChannel> {
+        self.inner.estimator_channel(channel_id)
+    }
+
     fn lookup_cell(&self, name: &str) -> Option<f64> {
         self.inner.lookup_cell(name)
     }
@@ -502,6 +508,30 @@ fn require_string<'a>(v: &'a Value, ctx: &str) -> Result<&'a str, MathEvalError>
     }
 }
 
+/// Map an estimator-backed function call onto its canonical stored channel
+/// name. Errors list the accepted arguments so a typo says what to type.
+fn estimator_channel_id(name: &str, arg: &str) -> Result<&'static str, MathEvalError> {
+    let expected = match name {
+        "wheel_travel" | "wheel_velocity" => "\"front\" or \"rear\"",
+        "attitude" => "\"roll\" or \"pitch\"",
+        _ => "\"long\" or \"lat\"",
+    };
+    match (name, arg) {
+        ("wheel_travel", "front") => Ok("Front travel (mm)"),
+        ("wheel_travel", "rear") => Ok("Rear travel (mm)"),
+        ("wheel_velocity", "front") => Ok("Front velocity (mm/s)"),
+        ("wheel_velocity", "rear") => Ok("Rear velocity (mm/s)"),
+        ("attitude", "roll") => Ok("Roll (deg)"),
+        ("attitude", "pitch") => Ok("Pitch (deg)"),
+        ("body_accel", "long") => Ok("Longitudinal accel (g)"),
+        ("body_accel", "lat") => Ok("Lateral accel (g)"),
+        _ => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{name}: unknown argument \"{arg}\"; expected {expected}"),
+        )),
+    }
+}
+
 fn channel(samples: Vec<f64>, sample_rate_hz: f64) -> Value {
     Value::Channel(ChannelValue { samples: Arc::from(samples), sample_rate_hz, channel_id: None })
 }
@@ -605,6 +635,24 @@ fn call_function(
             require_arg_count(name, &args, 1)?;
             let ch = require_channel(&args[0], name)?;
             Ok(channel(crate::integration::integrate(&ch.samples, ch.sample_rate_hz), ch.sample_rate_hz))
+        }
+        // ---- Estimator-backed virtual sensors ----
+        // The offline geometry-constrained estimator (`estimate::run`) is run
+        // once per session by the lookup and cached; these are store reads.
+        "wheel_travel" | "wheel_velocity" | "attitude" | "body_accel" => {
+            require_arg_count(name, &args, 1)?;
+            let arg = require_string(&args[0], name)?;
+            let channel_id = estimator_channel_id(name, arg)?;
+            let ch = lookup.estimator_channel(channel_id).ok_or_else(|| {
+                err(
+                    MathEvalErrorKind::Runtime,
+                    format!(
+                        "{name}(\"{arg}\"): the suspension/attitude estimator could not run for \
+                         this session — it needs IMU0 accel and gyro channels"
+                    ),
+                )
+            })?;
+            Ok(channel(ch.samples.to_vec(), ch.sample_rate_hz))
         }
         "butter" => {
             require_arg_count(name, &args, 4)?;
@@ -2004,5 +2052,126 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, crate::math::MathEvalErrorKind::NoLapContext);
+    }
+
+    /// A lookup with no estimator — exercises the default trait method.
+    struct NoEstimator;
+    impl ChannelLookup for NoEstimator {
+        fn lookup(&self, _name: &str) -> Option<LookupChannel> {
+            None
+        }
+    }
+
+    /// A lookup that pretends the estimator ran, returning a 1-sample value for
+    /// any canonical estimator name so the dispatch can be tested without
+    /// running a filter.
+    struct FakeEstimator;
+    impl ChannelLookup for FakeEstimator {
+        fn lookup(&self, _name: &str) -> Option<LookupChannel> {
+            None
+        }
+        fn estimator_channel(&self, channel_id: &str) -> Option<LookupChannel> {
+            Some(LookupChannel {
+                samples: std::sync::Arc::from(vec![channel_id.len() as f64].as_slice()),
+                sample_rate_hz: 800.0,
+            })
+        }
+    }
+
+    #[test]
+    fn attitude_roll_resolves_through_the_estimator_hook() {
+        // Arrange + Act
+        let v = call_function(
+            "attitude",
+            vec![Value::Str("roll".into())],
+            &FakeEstimator,
+            &MathLapContext::empty(),
+        )
+        .unwrap();
+
+        // Assert — "Roll (deg)" is 10 chars, so the fake returns [10.0].
+        match v {
+            Value::Channel(c) => {
+                assert_eq!(c.samples.as_ref(), &[10.0]);
+                assert_eq!(c.sample_rate_hz, 800.0);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_accel_lat_resolves_through_the_estimator_hook() {
+        // Arrange + Act
+        let v = call_function(
+            "body_accel",
+            vec![Value::Str("lat".into())],
+            &FakeEstimator,
+            &MathLapContext::empty(),
+        );
+
+        // Assert
+        assert!(v.is_ok(), "{v:?}");
+    }
+
+    #[test]
+    fn wheel_travel_front_resolves_through_the_estimator_hook() {
+        // Arrange + Act
+        let v = call_function(
+            "wheel_travel",
+            vec![Value::Str("front".into())],
+            &FakeEstimator,
+            &MathLapContext::empty(),
+        );
+
+        // Assert
+        assert!(v.is_ok(), "{v:?}");
+    }
+
+    #[test]
+    fn unknown_estimator_argument_names_the_accepted_values() {
+        // Arrange + Act
+        let e = call_function(
+            "attitude",
+            vec![Value::Str("yaw".into())],
+            &FakeEstimator,
+            &MathLapContext::empty(),
+        )
+        .unwrap_err();
+
+        // Assert — yaw is deliberately not emitted, so the error must say so
+        // rather than failing obscurely.
+        assert!(e.message.contains("roll"), "{}", e.message);
+        assert!(e.message.contains("pitch"), "{}", e.message);
+    }
+
+    #[test]
+    fn estimator_function_without_an_estimator_reports_why() {
+        // Arrange + Act
+        let e = call_function(
+            "attitude",
+            vec![Value::Str("roll".into())],
+            &NoEstimator,
+            &MathLapContext::empty(),
+        )
+        .unwrap_err();
+
+        // Assert
+        assert!(e.message.contains("IMU0"), "{}", e.message);
+    }
+
+    #[test]
+    fn memo_lookup_forwards_the_estimator_hook_to_its_inner_lookup() {
+        // Arrange — MemoLookup wraps the real lookup on the production path.
+        // `estimator_channel` is a defaulted trait method, so a wrapper that
+        // forgets to forward it silently returns None and every estimator-backed
+        // channel reads as "the estimator could not run". Regression: that is
+        // exactly what happened on first contact with a real session.
+        let memo = MemoLookup::new(&FakeEstimator);
+
+        // Act
+        let got = memo.estimator_channel("Roll (deg)");
+
+        // Assert
+        assert!(got.is_some(), "MemoLookup swallowed estimator_channel");
     }
 }
