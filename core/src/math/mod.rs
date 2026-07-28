@@ -23,4 +23,6 @@ pub use resolve::resolve_dependencies;
 pub use value::{ChannelValue, Value, Vec3Value};
 
 #[cfg(test)]
+mod tests_ahrs;
+#[cfg(test)]
 mod tests_parity;
