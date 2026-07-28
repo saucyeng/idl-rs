@@ -696,6 +696,19 @@ pub fn estimate_suspension_into_store(
         channel_ids.push("Rear velocity (mm/s)".to_string());
     }
 
+    // Attitude and gravity-removed body acceleration come from the same run.
+    // Names match `SessionHandle::ESTIMATOR_CHANNELS` so the evaluator's
+    // `attitude()` / `body_accel()` functions and this call populate one set of
+    // channels rather than two.
+    handle.store_math("Roll (deg)", rate, est.roll.clone());
+    channel_ids.push("Roll (deg)".to_string());
+    handle.store_math("Pitch (deg)", rate, est.pitch.clone());
+    channel_ids.push("Pitch (deg)".to_string());
+    handle.store_math("Longitudinal accel (g)", rate, est.accel_long.clone());
+    channel_ids.push("Longitudinal accel (g)".to_string());
+    handle.store_math("Lateral accel (g)", rate, est.accel_lat.clone());
+    channel_ids.push("Lateral accel (g)".to_string());
+
     Ok(SuspensionEstimateMeta {
         channel_ids,
         length: est.len() as u32,
