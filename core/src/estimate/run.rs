@@ -330,6 +330,16 @@ pub struct StateEstimate {
     pub rear_travel: Vec<f64>,
     /// Rear wheel velocity per sample, m/s.
     pub rear_velocity: Vec<f64>,
+    /// Chassis roll per sample, degrees. Positive ⇒ leaning right.
+    pub roll: Vec<f64>,
+    /// Chassis pitch per sample, degrees. Positive ⇒ nose up.
+    pub pitch: Vec<f64>,
+    /// Gravity-removed longitudinal acceleration per sample, g. Positive ⇒
+    /// accelerating forward.
+    pub accel_long: Vec<f64>,
+    /// Gravity-removed lateral acceleration per sample, g. Positive ⇒
+    /// accelerating right.
+    pub accel_lat: Vec<f64>,
     /// Per-sample (quasi-)stationary flag (true ⇒ not riding). Lets derived ride
     /// statistics (e.g. dynamic sag) exclude parked/stopped portions.
     pub stationary: Vec<bool>,
@@ -652,12 +662,17 @@ fn run_with_trace(
     let min_airborne = ((AIRBORNE_MIN_DURATION_S / dt).round() as usize).max(1);
     let airborne = sustained_runs(&close_short_gaps(&airborne_raw, max_gap), min_airborne);
     let mut fs = init_fs.clone();
-    // Stream the four wheel outputs per sample; the full per-sample state is NOT
-    // retained (see [`StateEstimate`]), so memory stays O(outputs) on long sessions.
+    // Stream the wheel and attitude outputs per sample; the full per-sample state
+    // is NOT retained (see [`StateEstimate`]), so memory stays O(outputs) on long
+    // sessions.
     let mut front_travel = Vec::with_capacity(n);
     let mut front_velocity = Vec::with_capacity(n);
     let mut rear_travel = Vec::with_capacity(n);
     let mut rear_velocity = Vec::with_capacity(n);
+    let mut roll = Vec::with_capacity(n);
+    let mut pitch = Vec::with_capacity(n);
+    let mut accel_long = Vec::with_capacity(n);
+    let mut accel_lat = Vec::with_capacity(n);
     // The exact wheel-drive controls fed to the integrators — consumed by the RTS
     // smoothing pass below and exposed on the trace (8 B/sample each).
     let mut front_drive = vec![0.0; n];
@@ -786,6 +801,16 @@ fn run_with_trace(
         front_velocity.push(fs.x.dd_f);
         rear_travel.push(fs.x.s_r);
         rear_velocity.push(fs.x.ds_r);
+
+        // Attitude and gravity-removed body acceleration, read off the same
+        // posterior the wheel outputs come from. `accel0` is the mount-corrected
+        // chassis-frame specific force already bound above for `ImuInput`.
+        let (roll_deg, pitch_deg) = crate::estimate::attitude::roll_pitch_deg(&fs.x.r_chassis);
+        roll.push(roll_deg);
+        pitch.push(pitch_deg);
+        let (long_g, lat_g) = crate::estimate::attitude::body_accel_g(&accel0, &fs.x.r_chassis);
+        accel_long.push(long_g);
+        accel_lat.push(lat_g);
     }
 
     let ledger = ObservabilityLedger::build(&init_fs, &fs, &schema, 0.5);
@@ -846,6 +871,10 @@ fn run_with_trace(
         front_velocity,
         rear_travel,
         rear_velocity,
+        roll,
+        pitch,
+        accel_long,
+        accel_lat,
         stationary: stationary.clone(),
         final_state,
         ledger,
@@ -975,6 +1004,10 @@ mod tests {
             front_velocity: vec![0.0; 5],
             rear_travel: vec![0.0; 5],
             rear_velocity: vec![0.0; 5],
+            roll: vec![0.0; 5],
+            pitch: vec![0.0; 5],
+            accel_long: vec![0.0; 5],
+            accel_lat: vec![0.0; 5],
             stationary: vec![true, true, false, false, false],
             final_state: rest_state(),
             ledger: crate::estimate::ledger::ObservabilityLedger { components: vec![] },
@@ -996,6 +1029,10 @@ mod tests {
             front_velocity: vec![0.0, 0.0],
             rear_travel: vec![0.0, 0.0],
             rear_velocity: vec![0.0, 0.0],
+            roll: vec![0.0, 0.0],
+            pitch: vec![0.0, 0.0],
+            accel_long: vec![0.0, 0.0],
+            accel_lat: vec![0.0, 0.0],
             stationary: vec![true, true],
             final_state: rest_state(),
             ledger: crate::estimate::ledger::ObservabilityLedger { components: vec![] },
@@ -1652,5 +1689,53 @@ mod tests {
         }
         let max_travel = est.front_travel.iter().cloned().fold(0.0_f64, f64::max);
         assert!(max_travel > 0.005, "test profile produced no real travel: {max_travel}");
+    }
+
+    /// A level, stationary session: `n` samples of pure +1 g on Z and no
+    /// rotation. Physically the bike is parked on flat ground.
+    fn level_stationary_input(n: usize) -> EstimatorInput {
+        EstimatorInput {
+            dt: 1.0 / 800.0,
+            imu0: ImuSeries {
+                gyro: vec![Vector3::zeros(); n],
+                accel: vec![Vector3::new(0.0, 0.0, crate::estimate::attitude::G_MPS2); n],
+            },
+            imu1: None,
+            imu2: None,
+            gps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn run_emits_attitude_and_body_accel_for_every_sample() {
+        // Arrange
+        let input = level_stationary_input(1600);
+
+        // Act
+        let est = run(&input, &BikeGeometry::reference_bike(), &EstimatorConfig::default());
+
+        // Assert — one value per sample, matching the wheel outputs.
+        assert_eq!(est.roll.len(), est.front_travel.len());
+        assert_eq!(est.pitch.len(), est.front_travel.len());
+        assert_eq!(est.accel_long.len(), est.front_travel.len());
+        assert_eq!(est.accel_lat.len(), est.front_travel.len());
+    }
+
+    #[test]
+    fn run_on_a_level_parked_bike_reports_no_lean_and_no_acceleration() {
+        // Arrange
+        let input = level_stationary_input(1600);
+
+        // Act
+        let est = run(&input, &BikeGeometry::reference_bike(), &EstimatorConfig::default());
+
+        // Assert — sampled at the end, after the filter has settled. Tolerances
+        // are loose enough to survive init transients but tight enough that a
+        // sign error or a missing gravity subtraction fails.
+        let last = est.roll.len() - 1;
+        assert!(est.roll[last].abs() < 1.0, "roll {}", est.roll[last]);
+        assert!(est.pitch[last].abs() < 1.0, "pitch {}", est.pitch[last]);
+        assert!(est.accel_long[last].abs() < 0.05, "long {}", est.accel_long[last]);
+        assert!(est.accel_lat[last].abs() < 0.05, "lat {}", est.accel_lat[last]);
     }
 }
