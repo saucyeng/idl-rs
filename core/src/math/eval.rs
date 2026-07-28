@@ -30,6 +30,15 @@ pub trait ChannelLookup {
     /// the most samples — used to synthesize a time base when no explicit
     /// `Time` channel is in scope. Default `None` (callers fall back to an
     /// empty 10 Hz base). `SessionHandle` overrides this (Task A11).
+    /// Resolve a channel produced by the offline suspension/attitude estimator
+    /// by its canonical stored name. Implementations that can drive the
+    /// estimator run it **once** and cache every output; the rest return
+    /// `None`. Default `None` — test doubles and non-session lookups have no
+    /// estimator. `SessionHandle` overrides this.
+    fn estimator_channel(&self, _channel_id: &str) -> Option<LookupChannel> {
+        None
+    }
+
     fn best_time_base_dims(&self) -> Option<(usize, f64)> {
         None
     }

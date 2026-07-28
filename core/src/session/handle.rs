@@ -273,6 +273,58 @@ impl SessionHandle {
             .flatten()
     }
 
+    /// Canonical stored names of the estimator's outputs. The four wheel names
+    /// match what `idl-rs-bridge` already writes, so the app does not end up
+    /// with duplicate entries for the same quantity.
+    pub const ESTIMATOR_CHANNELS: [&'static str; 8] = [
+        "Front travel (mm)",
+        "Front velocity (mm/s)",
+        "Rear travel (mm)",
+        "Rear velocity (mm/s)",
+        "Roll (deg)",
+        "Pitch (deg)",
+        "Longitudinal accel (g)",
+        "Lateral accel (g)",
+    ];
+
+    /// Run the suspension/attitude estimator once and cache all of
+    /// [`Self::ESTIMATOR_CHANNELS`] into the derived store. Returns `false`
+    /// when the session cannot drive it (no IMU0).
+    ///
+    /// Idempotence is by store presence rather than a dedicated flag: a second
+    /// call sees `Roll (deg)` already resident and returns immediately. Two
+    /// threads racing the first call would both run it and upsert identical
+    /// values — wasteful but correct, and evaluation is sequential per session.
+    /// Geometry is `reference_bike()` and tuning is `EstimatorConfig::default()`
+    /// (design doc D3).
+    fn run_estimator_once(&self) -> bool {
+        if self.with_channel("Roll (deg)", |_| ()).is_some() {
+            return true;
+        }
+        let Some(input) = crate::estimate::run::EstimatorInput::from_lookup(self) else {
+            return false;
+        };
+        let est = crate::estimate::run::run(
+            &input,
+            &crate::estimate::geometry::BikeGeometry::reference_bike(),
+            &crate::estimate::run::EstimatorConfig::default(),
+        );
+        let rate_hz = if est.dt > 0.0 { 1.0 / est.dt } else { 0.0 };
+        // Travel/velocity cross the boundary in mm and mm/s, matching the
+        // bridge's existing conversion; attitude is already deg and body
+        // acceleration already g.
+        let mm = |v: &[f64]| v.iter().map(|x| x * 1000.0).collect::<Vec<f64>>();
+        self.store_math("Front travel (mm)", rate_hz, mm(&est.front_travel));
+        self.store_math("Front velocity (mm/s)", rate_hz, mm(&est.front_velocity));
+        self.store_math("Rear travel (mm)", rate_hz, mm(&est.rear_travel));
+        self.store_math("Rear velocity (mm/s)", rate_hz, mm(&est.rear_velocity));
+        self.store_math("Roll (deg)", rate_hz, est.roll);
+        self.store_math("Pitch (deg)", rate_hz, est.pitch);
+        self.store_math("Longitudinal accel (g)", rate_hz, est.accel_long);
+        self.store_math("Lateral accel (g)", rate_hz, est.accel_lat);
+        true
+    }
+
     /// Metadata for one channel by id, **including** derived (math /
     /// lap-slice) channels held in the store.
     ///
@@ -812,6 +864,16 @@ fn epoch_to_time_one_extrapolated(samples: &[f64], rate: f64, target: f64) -> f6
 }
 
 impl crate::math::eval::ChannelLookup for SessionHandle {
+    fn estimator_channel(&self, channel_id: &str) -> Option<crate::math::eval::LookupChannel> {
+        if !Self::ESTIMATOR_CHANNELS.contains(&channel_id) {
+            return None;
+        }
+        if !self.run_estimator_once() {
+            return None;
+        }
+        self.lookup(channel_id)
+    }
+
     fn lookup(&self, name: &str) -> Option<crate::math::eval::LookupChannel> {
         // Base + synthesized channels win over the math store (with_channel
         // checks session.channels first). The evaluator needs the whole array.
@@ -1800,6 +1862,71 @@ mod tests {
         assert_eq!(fixed_times, None);
         assert_eq!(absent_times, None);
     }
+
+    /// A level, stationary session in `.idl0` channel form: 2 s of IMU0 at
+    /// 800 Hz reading +1 g on Z with no rotation.
+    fn level_parked_handle() -> SessionHandle {
+        let n = 1600;
+        let g = crate::estimate::attitude::G_MPS2;
+        let zeros = vec![0.0; n];
+        SessionHandle::from_channels(
+            SessionMetaInput {
+                session_id: String::new(),
+                device_id: String::new(),
+                timestamp_utc_ms: 0,
+                config_checksum: String::new(),
+            },
+            vec![
+                input_channel("IMU0_AccelX", 800.0, zeros.clone()),
+                input_channel("IMU0_AccelY", 800.0, zeros.clone()),
+                input_channel("IMU0_AccelZ", 800.0, vec![g; n]),
+                input_channel("IMU0_GyroX", 800.0, zeros.clone()),
+                input_channel("IMU0_GyroY", 800.0, zeros.clone()),
+                input_channel("IMU0_GyroZ", 800.0, zeros),
+            ],
+        )
+    }
+
+    #[test]
+    fn estimator_channel_caches_every_output_on_first_call() {
+        // Arrange
+        use crate::math::eval::ChannelLookup;
+        let h = level_parked_handle();
+
+        // Act — ask for one channel.
+        let roll = h.estimator_channel("Roll (deg)");
+
+        // Assert — all eight are now resident, so the run happened once and
+        // populated the whole set rather than one channel at a time.
+        assert!(roll.is_some(), "roll channel missing");
+        for id in SessionHandle::ESTIMATOR_CHANNELS {
+            assert!(
+                h.channel_meta(id).is_some(),
+                "{id} not cached after the estimator ran"
+            );
+        }
+    }
+
+    #[test]
+    fn estimator_channel_returns_none_for_a_session_without_imu0() {
+        // Arrange
+        use crate::math::eval::ChannelLookup;
+        let h = handle_with(vec![input_channel("GPS_SpeedKmh", 1.0, vec![0.0; 10])]);
+
+        // Act + Assert — no IMU0 means the estimator cannot run.
+        assert!(h.estimator_channel("Roll (deg)").is_none());
+    }
+
+    #[test]
+    fn estimator_channel_ignores_names_it_does_not_own() {
+        // Arrange
+        use crate::math::eval::ChannelLookup;
+        let h = level_parked_handle();
+
+        // Act + Assert — a base channel is not an estimator output.
+        assert!(h.estimator_channel("IMU0_AccelZ").is_none());
+    }
+
 }
 
 #[cfg(test)]
