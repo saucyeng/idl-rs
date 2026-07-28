@@ -161,6 +161,12 @@ enum Command {
         /// encode off the CPU. Omitted: software decode.
         #[arg(long)]
         hwaccel: Option<String>,
+        /// Cap CPU parallelism (overlay rendering + ffmpeg encoding) at this
+        /// many threads. Default: one fewer than the machine's cores, so a
+        /// full-resolution export leaves the desktop usable. Pass `0` for no
+        /// cap.
+        #[arg(long)]
+        jobs: Option<usize>,
         /// Path to the ffmpeg binary (ffprobe is resolved beside it).
         #[arg(long, default_value = "ffmpeg")]
         ffmpeg: String,
@@ -500,6 +506,7 @@ fn main() -> ExitCode {
             encoder,
             rotate,
             hwaccel,
+            jobs,
             ffmpeg,
         } => emit_bulk(
             "overlay",
@@ -516,6 +523,7 @@ fn main() -> ExitCode {
                 encoder,
                 rotate,
                 hwaccel,
+                jobs,
                 ffmpeg,
             ),
         ),
@@ -1219,6 +1227,7 @@ fn cmd_overlay(
     encoder: String,
     rotate: i32,
     hwaccel: Option<String>,
+    jobs: Option<usize>,
     ffmpeg: String,
 ) -> Result<(), CliError> {
     let handle = load(file)?;
@@ -1296,6 +1305,18 @@ fn cmd_overlay(
         ffmpeg_path: ffmpeg,
         rotate_ccw_deg: rotate,
         hwaccel,
+        // Default to leaving one core free: a full-resolution export saturates
+        // every core otherwise, and an unusable desktop for half an hour is a
+        // worse default than a marginally slower encode. `--jobs 0` opts out.
+        threads: match jobs {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => Some(
+                std::thread::available_parallelism()
+                    .map(|n| (n.get().saturating_sub(1)).max(1))
+                    .unwrap_or(1),
+            ),
+        },
     };
 
     // Prepared sampling context; frame i → video clock → session clock.

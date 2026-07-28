@@ -119,6 +119,18 @@ where
     let mut done: u64 = 0;
     let mut failed: Option<ExportError> = None;
 
+    // A private pool when `threads` is set, so the cap bounds our rendering the
+    // same way `-threads` bounds ffmpeg's encoding. Building it locally rather
+    // than touching the global pool keeps the limit scoped to this export.
+    // A build failure is not worth aborting an export over — fall back to the
+    // global pool, which is the uncapped default behaviour.
+    let pool = plan.threads.and_then(|n| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n.max(1))
+            .build()
+            .ok()
+    });
+
     'pump: for chunk_start in (0..total).step_by(CHUNK_FRAMES) {
         if cancel.load(Ordering::Relaxed) {
             failed = Some(ExportError::new(
@@ -129,10 +141,16 @@ where
         }
         let chunk_end = (chunk_start + CHUNK_FRAMES as u64).min(total);
         // Ordered parallel render: collect preserves input order.
-        let frames: Vec<Vec<u8>> = (chunk_start..chunk_end)
-            .into_par_iter()
-            .map(&render)
-            .collect();
+        let render_chunk = || -> Vec<Vec<u8>> {
+            (chunk_start..chunk_end)
+                .into_par_iter()
+                .map(&render)
+                .collect()
+        };
+        let frames: Vec<Vec<u8>> = match &pool {
+            Some(p) => p.install(render_chunk),
+            None => render_chunk(),
+        };
         for frame in frames {
             debug_assert_eq!(frame.len(), frame_bytes, "render(i) must match frame_dims");
             if let Err(e) = stdin.write_all(&frame) {
@@ -222,6 +240,7 @@ mod tests {
             ffmpeg_path: "definitely-not-a-real-ffmpeg-binary".into(),
             rotate_ccw_deg: 0,
             hwaccel: None,
+            threads: None,
         };
 
         // Act
@@ -277,6 +296,7 @@ mod tests {
             ffmpeg_path: "ffmpeg".into(),
             rotate_ccw_deg: 0,
             hwaccel: None,
+            threads: None,
         };
         let (w, h) = plan.frame_dims();
 

@@ -38,6 +38,13 @@ pub struct ExportPlan {
     /// Pair with a hardware `encoder` (e.g. `h264_nvenc`) to move both ends
     /// off the CPU.
     pub hwaccel: Option<String>,
+    /// Cap on CPU parallelism: bounds both the overlay render pool and
+    /// ffmpeg's encoder threads. `None` uses every core.
+    ///
+    /// A full-resolution export otherwise saturates the machine — both halves
+    /// of the pipeline are embarrassingly parallel, so leaving a core or two
+    /// free is the difference between a usable desktop and a frozen one.
+    pub threads: Option<usize>,
 }
 
 impl ExportPlan {
@@ -125,6 +132,9 @@ impl ExportPlan {
         if let Some(dur) = self.duration_s {
             args.extend(["-t".into(), format!("{dur:.3}")]);
         }
+        if let Some(n) = self.threads {
+            args.extend(["-threads".into(), n.to_string()]);
+        }
         args.extend([
             "-r".into(),
             fps,
@@ -171,6 +181,7 @@ mod tests {
             ffmpeg_path: "ffmpeg".into(),
             rotate_ccw_deg: 0,
             hwaccel: None,
+            threads: None,
         }
     }
 
@@ -397,5 +408,33 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert_eq!(args, expected);
+    }
+
+    #[test]
+    fn ffmpeg_args_threads_caps_the_encoder_and_precedes_the_output() {
+        // Arrange
+        let mut p = plan(None, None, false);
+        p.threads = Some(5);
+
+        // Act
+        let args = p.ffmpeg_args(Path::new("out.mp4.part"));
+
+        // Assert — an output option, so after the inputs and before the file.
+        let t = args.iter().position(|a| a == "-threads").unwrap();
+        assert_eq!(args[t + 1], "5");
+        assert!(t > args.iter().position(|a| a == "-filter_complex").unwrap());
+        assert!(t < args.len() - 1);
+    }
+
+    #[test]
+    fn ffmpeg_args_no_thread_cap_omits_the_flag() {
+        // Arrange
+        let p = plan(None, None, false);
+
+        // Act
+        let args = p.ffmpeg_args(Path::new("out.mp4.part"));
+
+        // Assert
+        assert!(!args.contains(&"-threads".to_string()));
     }
 }
