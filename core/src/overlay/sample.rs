@@ -157,6 +157,15 @@ impl SampleContext {
     ) -> SampleContext {
         let mut channels = HashMap::new();
         for name in layout.referenced_channels() {
+            // An element may bind an estimator output (`Roll (deg)`, `Front
+            // travel (mm)`, …) by name without any math channel calling the
+            // function that produces it — the CLI's only channel definitions
+            // come from the workbook. Materialize it on demand; this is a no-op
+            // for every other name and a store read once the estimator has run.
+            if handle.channel_meta(&name).is_none() {
+                use crate::math::eval::ChannelLookup;
+                let _ = handle.estimator_channel(&name);
+            }
             // `channel_meta`, not the `channels()` library list: a layout may
             // bind an element to a math channel, which lives in the derived
             // store rather than the parsed set.
@@ -581,5 +590,42 @@ mod tests {
             &ctx.sample(1.0).elements[0],
             ElementSample::MapPos(None)
         ));
+    }
+
+    #[test]
+    fn prepare_materializes_an_estimator_channel_bound_by_name_alone() {
+        // Arrange — a layout naming an estimator output, on a session where
+        // nothing has called attitude(). The CLI hits exactly this: a workbook
+        // can carry a layout without a math channel that produces the name.
+        let n = 1600;
+        let g = crate::estimate::attitude::G_MPS2;
+        let zeros = vec![0.0; n];
+        let mk = |id: &str, s: Vec<f64>| ChannelInput {
+            channel_id: id.into(),
+            sample_rate_hz: 800.0,
+            samples: s,
+            sample_times_secs: None,
+        };
+        let h = SessionHandle::from_channels(
+            meta(),
+            vec![
+                mk("IMU0_AccelX", zeros.clone()),
+                mk("IMU0_AccelY", zeros.clone()),
+                mk("IMU0_AccelZ", vec![g; n]),
+                mk("IMU0_GyroX", zeros.clone()),
+                mk("IMU0_GyroY", zeros.clone()),
+                mk("IMU0_GyroZ", zeros),
+            ],
+        );
+
+        // Act
+        let ctx = SampleContext::prepare(&h, &gauge_layout("Roll (deg)"), vec![]);
+        let s = ctx.sample(1.0);
+
+        // Assert — a value, not the no-data placeholder.
+        match &s.elements[0] {
+            ElementSample::Value(Some(_)) => {}
+            other => panic!("estimator channel did not reach the sampler: {other:?}"),
+        }
     }
 }
