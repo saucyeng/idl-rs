@@ -38,6 +38,9 @@ pub struct ExportPlan {
     /// Pair with a hardware `encoder` (e.g. `h264_nvenc`) to move both ends
     /// off the CPU.
     pub hwaccel: Option<String>,
+    /// Constant-quality target (CRF for x264/x265, CQ for NVENC/QSV/AMF).
+    /// `None` leaves the encoder's own default. Lower is better quality.
+    pub quality: Option<u8>,
     /// Cap on CPU parallelism: bounds both the overlay render pool and
     /// ffmpeg's encoder threads. `None` uses every core.
     ///
@@ -142,6 +145,9 @@ impl ExportPlan {
             "cfr".into(),
             "-c:v".into(),
             self.encoder.clone(),
+        ]);
+        args.extend(self.quality_args());
+        args.extend([
             "-pix_fmt".into(),
             "yuv420p".into(),
             "-movflags".into(),
@@ -152,6 +158,42 @@ impl ExportPlan {
             part_path.display().to_string(),
         ]);
         args
+    }
+
+    /// Constant-quality flags for the configured encoder.
+    ///
+    /// Without these each encoder falls back to its own default, and those
+    /// defaults are wildly different: libx264 targets CRF 23 (visually fine),
+    /// while NVENC targets a fixed ~2 Mbps bitrate — at 2028p that is heavy
+    /// mush, and it made the GPU encoder look "2.6× faster" when it was really
+    /// just producing a 16× smaller file. Pinning quality on both sides makes
+    /// the encoders comparable, so choosing one is a speed decision rather
+    /// than a silent quality cut.
+    ///
+    /// x264/x265 take `-crf`; NVENC needs `-rc vbr` + `-cq` with `-b:v 0` to
+    /// leave bitrate uncapped (`-cq` alone is ignored under the default rate
+    /// control). The two scales are both 0–51 and roughly comparable for H.264.
+    /// Unrecognised encoders get nothing — their own defaults are less wrong
+    /// than a flag they may reject.
+    fn quality_args(&self) -> Vec<String> {
+        let Some(q) = self.quality else {
+            return Vec::new();
+        };
+        let e = self.encoder.as_str();
+        if e.contains("nvenc") || e.contains("qsv") || e.contains("amf") {
+            vec![
+                "-rc".into(),
+                "vbr".into(),
+                "-cq".into(),
+                q.to_string(),
+                "-b:v".into(),
+                "0".into(),
+            ]
+        } else if e.starts_with("libx26") || e.contains("libsvtav1") || e.contains("librav1e") {
+            vec!["-crf".into(), q.to_string()]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -178,6 +220,7 @@ mod tests {
             start_s: start,
             duration_s: dur,
             encoder: "libx264".into(),
+            quality: None,
             ffmpeg_path: "ffmpeg".into(),
             rotate_ccw_deg: 0,
             hwaccel: None,
@@ -408,6 +451,55 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert_eq!(args, expected);
+    }
+
+    #[test]
+    fn quality_maps_to_crf_for_x264_and_cq_for_nvenc() {
+        // Arrange — same quality target, two encoder families.
+        let mut x264 = plan(None, None, false);
+        x264.quality = Some(20);
+        let mut nvenc = plan(None, None, false);
+        nvenc.encoder = "h264_nvenc".into();
+        nvenc.quality = Some(20);
+
+        // Act
+        let a = x264.ffmpeg_args(Path::new("out.mp4.part"));
+        let b = nvenc.ffmpeg_args(Path::new("out.mp4.part"));
+
+        // Assert — x264 takes -crf; NVENC needs -rc vbr and -b:v 0 alongside
+        // -cq, or the default rate control ignores the quality target and
+        // silently caps the bitrate instead.
+        assert!(a.windows(2).any(|w| w == ["-crf", "20"]), "{a:?}");
+        assert!(!a.iter().any(|x| x == "-cq"), "x264 must not get -cq: {a:?}");
+        assert!(b.windows(2).any(|w| w == ["-cq", "20"]), "{b:?}");
+        assert!(b.windows(2).any(|w| w == ["-rc", "vbr"]), "{b:?}");
+        assert!(b.windows(2).any(|w| w == ["-b:v", "0"]), "{b:?}");
+    }
+
+    #[test]
+    fn quality_none_emits_no_rate_flags() {
+        // Arrange — quality unset leaves the encoder's own default.
+        let p = plan(None, None, false);
+
+        // Act
+        let args = p.ffmpeg_args(Path::new("out.mp4.part"));
+
+        // Assert
+        assert!(!args.iter().any(|a| a == "-crf" || a == "-cq" || a == "-b:v"), "{args:?}");
+    }
+
+    #[test]
+    fn quality_is_skipped_for_an_unrecognised_encoder() {
+        // Arrange — a codec whose rate-control flag we do not know.
+        let mut p = plan(None, None, false);
+        p.encoder = "mpeg4".into();
+        p.quality = Some(20);
+
+        // Act
+        let args = p.ffmpeg_args(Path::new("out.mp4.part"));
+
+        // Assert — emit nothing rather than a flag the encoder may reject.
+        assert!(!args.iter().any(|a| a == "-crf" || a == "-cq"), "{args:?}");
     }
 
     #[test]

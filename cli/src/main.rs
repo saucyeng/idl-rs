@@ -148,6 +148,12 @@ enum Command {
         /// Output path; default: `<video stem>_overlay.mp4` beside the video.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Constant-quality target: CRF for x264/x265, CQ for NVENC/QSV/AMF
+        /// (0-51, lower is better). Without it each encoder uses its own
+        /// default, and NVENC's is a ~2 Mbps bitrate cap that looks far worse
+        /// than libx264's CRF 23 at the same nominal settings.
+        #[arg(long, default_value_t = 20)]
+        quality: u8,
         /// ffmpeg video encoder.
         #[arg(long, default_value = "libx264")]
         encoder: String,
@@ -504,6 +510,7 @@ fn main() -> ExitCode {
             duration,
             output,
             encoder,
+            quality,
             rotate,
             hwaccel,
             jobs,
@@ -521,6 +528,7 @@ fn main() -> ExitCode {
                 duration,
                 output,
                 encoder,
+                quality,
                 rotate,
                 hwaccel,
                 jobs,
@@ -1225,6 +1233,7 @@ fn cmd_overlay(
     duration: Option<f64>,
     output: Option<PathBuf>,
     encoder: String,
+    quality: u8,
     rotate: i32,
     hwaccel: Option<String>,
     jobs: Option<usize>,
@@ -1302,6 +1311,7 @@ fn cmd_overlay(
         start_s: start,
         duration_s: duration,
         encoder,
+        quality: Some(quality),
         ffmpeg_path: ffmpeg,
         rotate_ccw_deg: rotate,
         hwaccel,

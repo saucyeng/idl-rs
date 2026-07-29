@@ -113,8 +113,15 @@ pub struct LapState {
 /// [`crate::overlay::model::OverlayElement`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ElementSample {
-    /// Gauge/Attitude value; `None` = no data at `t`.
+    /// Gauge value; `None` = no data at `t`.
     Value(Option<f64>),
+    /// Attitude: roll and (optionally bound) pitch, degrees. `roll` = `None`
+    /// is the element's no-data state; `pitch` = `None` just pins the horizon
+    /// at zero pitch, so a roll-only binding still renders.
+    Attitude {
+        roll: Option<f64>,
+        pitch: Option<f64>,
+    },
     /// TraceStrip: per channel, points normalized to the element —
     /// x = position in window [0, 1] ("now" at 1), y = value in the
     /// channel's session min/max [0, 1]. Empty inner vec = no data.
@@ -256,10 +263,20 @@ impl SampleContext {
             .elements
             .iter()
             .map(|e| match e {
-                OverlayElement::Gauge { channel, .. }
-                | OverlayElement::Attitude { channel, .. } => ElementSample::Value(
+                OverlayElement::Gauge { channel, .. } => ElementSample::Value(
                     self.channels.get(channel).and_then(|c| c.value_at(t_secs)),
                 ),
+                OverlayElement::Attitude {
+                    channel,
+                    pitch_channel,
+                    ..
+                } => ElementSample::Attitude {
+                    roll: self.channels.get(channel).and_then(|c| c.value_at(t_secs)),
+                    pitch: pitch_channel
+                        .as_ref()
+                        .and_then(|p| self.channels.get(p))
+                        .and_then(|c| c.value_at(t_secs)),
+                },
                 OverlayElement::TraceStrip {
                     channels, window_s, ..
                 } => {
@@ -483,11 +500,35 @@ mod tests {
     }
 
     #[test]
-    fn sample_attitude_element_reads_channel_like_gauge() {
-        // Arrange
+    fn sample_attitude_element_reads_roll_channel_and_leaves_pitch_unbound() {
+        // Arrange — roll bound, no pitch channel (the pre-pitch workbook shape).
         let layout = layout_of(vec![OverlayElement::Attitude {
             rect: rect(),
             channel: "Speed".into(),
+            pitch_channel: None,
+            style: AttitudeStyle::Roll,
+            range_deg: 60.0,
+        }]);
+        let ctx = SampleContext::prepare(&ramp_handle(), &layout, vec![]);
+
+        // Act + Assert — roll reads like a gauge; unbound pitch is None, which
+        // the painter renders as a level horizon rather than as no-data.
+        match &ctx.sample(2.0).elements[0] {
+            ElementSample::Attitude {
+                roll: Some(v),
+                pitch: None,
+            } => assert!((v - 20.0).abs() < 1e-9),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn sample_attitude_element_reads_a_bound_pitch_channel() {
+        // Arrange — both axes bound to the same ramp, so both must read it.
+        let layout = layout_of(vec![OverlayElement::Attitude {
+            rect: rect(),
+            channel: "Speed".into(),
+            pitch_channel: Some("Speed".into()),
             style: AttitudeStyle::Roll,
             range_deg: 60.0,
         }]);
@@ -495,7 +536,30 @@ mod tests {
 
         // Act + Assert
         match &ctx.sample(2.0).elements[0] {
-            ElementSample::Value(Some(v)) => assert!((v - 20.0).abs() < 1e-9),
+            ElementSample::Attitude {
+                roll: Some(r),
+                pitch: Some(p),
+            } => {
+                assert!((r - 20.0).abs() < 1e-9);
+                assert!((p - 20.0).abs() < 1e-9);
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn attitude_pitch_channel_is_optional_in_workbook_json() {
+        // Arrange — an element written before `pitch_channel` existed.
+        let json = r#"{ "type": "attitude", "rect": [0.0, 0.0, 0.2, 0.2],
+                        "channel": "Roll (deg)", "style": "roll",
+                        "range_deg": 60.0 }"#;
+
+        // Act
+        let e: OverlayElement = serde_json::from_str(json).unwrap();
+
+        // Assert — parses, with pitch simply unbound.
+        match e {
+            OverlayElement::Attitude { pitch_channel, .. } => assert!(pitch_channel.is_none()),
             o => panic!("{o:?}"),
         }
     }

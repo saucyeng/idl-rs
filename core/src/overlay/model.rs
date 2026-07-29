@@ -70,9 +70,18 @@ pub enum OverlayElement {
     },
     /// Signed zero-centered indicator; `range_deg` is the full-scale
     /// deflection in degrees.
+    ///
+    /// For [`AttitudeStyle::Roll`], `channel` is roll (deg, positive leaning
+    /// right) and the optional `pitch_channel` is pitch (deg, positive nose
+    /// up). With a pitch channel bound the element renders a full attitude
+    /// indicator — sky/ground, pitch ladder, bank scale; without one it still
+    /// renders, with the horizon pinned at zero pitch. Absent in workbooks
+    /// written before the field existed, hence `serde(default)`.
     Attitude {
         rect: Rect,
         channel: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pitch_channel: Option<String>,
         style: AttitudeStyle,
         range_deg: f64,
     },
@@ -125,8 +134,17 @@ impl OverlayLayout {
         };
         for e in &self.elements {
             match e {
-                OverlayElement::Gauge { channel, .. }
-                | OverlayElement::Attitude { channel, .. } => push(&mut out, channel),
+                OverlayElement::Gauge { channel, .. } => push(&mut out, channel),
+                OverlayElement::Attitude {
+                    channel,
+                    pitch_channel,
+                    ..
+                } => {
+                    push(&mut out, channel);
+                    if let Some(p) = pitch_channel {
+                        push(&mut out, p);
+                    }
+                }
                 OverlayElement::TraceStrip { channels, .. } => {
                     channels.iter().for_each(|c| push(&mut out, c))
                 }

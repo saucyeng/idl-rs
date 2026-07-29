@@ -414,6 +414,15 @@ fn draw_gauge(
     }
 }
 
+/// Degrees of pitch spanned by the ball's radius. ±30° fills the instrument,
+/// which suits a bike (a 30° nose-down is a very steep chute) while leaving the
+/// ladder legible at overlay size.
+const PITCH_SPAN_DEG: f32 = 30.0;
+/// Attitude-indicator sky, above the horizon.
+const SKY: [u8; 4] = [38, 106, 168, 210];
+/// Attitude-indicator ground, below the horizon.
+const GROUND: [u8; 4] = [122, 78, 42, 210];
+
 fn draw_attitude(
     pm: &mut Pixmap,
     b: Box2,
@@ -421,6 +430,7 @@ fn draw_attitude(
     style: AttitudeStyle,
     range_deg: f64,
     value: Option<f64>,
+    pitch: Option<f64>,
 ) {
     let Some(v) = value else {
         draw_no_data(pm, b, s);
@@ -428,41 +438,15 @@ fn draw_attitude(
     };
     let pad = 8.0 * s;
     let clamped = v.clamp(-range_deg, range_deg);
-    let readout = format!("{clamped:+.0}°");
+    let readout = match pitch {
+        Some(p) => format!("{clamped:+.0}° {:+.0}°", p.clamp(-90.0, 90.0)),
+        None => format!("{clamped:+.0}°"),
+    };
     let rpx = 0.18 * b.h;
     let rw = mono_advance(font_regular(), rpx) * readout.chars().count() as f32;
     match style {
         AttitudeStyle::Roll => {
-            // Horizon line through the panel center, rotated by -v degrees.
-            let half = 0.4 * b.w;
-            let rad = (-clamped as f32).to_radians();
-            let (dx, dy) = (half * rad.cos(), half * rad.sin());
-            let line = [(b.cx() - dx, b.cy() - dy), (b.cx() + dx, b.cy() + dy)];
-            if let Some(path) = polyline_path(&line) {
-                pm.stroke_path(
-                    &path,
-                    &paint(ACCENT),
-                    &stroke(3.0 * s),
-                    Transform::identity(),
-                    None,
-                );
-            }
-            // Fixed center marker triangle.
-            let t = 5.0 * s;
-            let mut p = PathBuilder::new();
-            p.move_to(b.cx(), b.cy() - t);
-            p.line_to(b.cx() + t, b.cy() + t);
-            p.line_to(b.cx() - t, b.cy() + t);
-            p.close();
-            if let Some(path) = p.finish() {
-                pm.fill_path(
-                    &path,
-                    &paint(TEXT),
-                    FillRule::Winding,
-                    Transform::identity(),
-                    None,
-                );
-            }
+            draw_attitude_indicator(pm, b, s, clamped, pitch.unwrap_or(0.0));
             draw_text(
                 pm,
                 font_regular(),
@@ -510,6 +494,179 @@ fn draw_attitude(
             );
         }
     }
+}
+
+/// A conventional attitude indicator: sky/ground split by a horizon that rolls
+/// and translates with pitch, a pitch ladder, a fixed aircraft symbol, and a
+/// bank scale.
+///
+/// The horizon **counter-rotates**: banking right by φ rotates the world by
+/// −φ in the instrument, so the horizon's right end rises while the aircraft
+/// symbol stays put. That is what a real AI does — the gyro-stabilised disk
+/// holds still in space while the case turns with the vehicle — and it matches
+/// what the rider sees, since the camera is bolted to the bike.
+///
+/// `roll_deg` positive ⇒ leaning right; `pitch_deg` positive ⇒ nose up (the
+/// horizon then sits *below* centre, because you are looking above it).
+fn draw_attitude_indicator(pm: &mut Pixmap, b: Box2, s: f32, roll_deg: f64, pitch_deg: f64) {
+    // Leave headroom under the ball for the readout line.
+    let r = 0.5 * b.w.min(b.h * 0.82) - 3.0 * s;
+    if r <= 4.0 * s {
+        return;
+    }
+    let (cx, cy) = (b.cx(), b.y + r + 2.0 * s);
+    let ppd = r / PITCH_SPAN_DEG; // pixels per degree of pitch
+    let y_h = cy + pitch_deg as f32 * ppd; // horizon line, before rotation
+
+    // Everything inside the ball is clipped to it, so the oversized sky/ground
+    // quads below can never bleed past the bezel at any roll angle.
+    let Some(ball) = circle_path(cx, cy, r) else {
+        return;
+    };
+    let mut mask = tiny_skia::Mask::new(pm.width(), pm.height());
+    let Some(mask) = mask.as_mut().map(|m| {
+        m.fill_path(&ball, FillRule::Winding, true, Transform::identity());
+        m
+    }) else {
+        return;
+    };
+
+    // The whole moving world rotates about the ball centre by -roll.
+    let world = Transform::from_rotate_at(-roll_deg as f32, cx, cy);
+    let big = 3.0 * r; // overscan so rotation never exposes a corner
+
+    let quad = |y0: f32, y1: f32| -> Option<tiny_skia::Path> {
+        let mut p = PathBuilder::new();
+        p.move_to(cx - big, y0);
+        p.line_to(cx + big, y0);
+        p.line_to(cx + big, y1);
+        p.line_to(cx - big, y1);
+        p.close();
+        p.finish()
+    };
+    if let Some(sky) = quad(y_h - big, y_h) {
+        pm.fill_path(&sky, &paint(SKY), FillRule::Winding, world, Some(mask));
+    }
+    if let Some(ground) = quad(y_h, y_h + big) {
+        pm.fill_path(&ground, &paint(GROUND), FillRule::Winding, world, Some(mask));
+    }
+
+    // Pitch ladder: the rung for angle k sits k degrees above the horizon.
+    // Minor rungs every 10°, drawn wider at 20° so the scale reads at a glance.
+    for k in [-30.0f32, -20.0, -10.0, 10.0, 20.0, 30.0] {
+        let y = cy + (pitch_deg as f32 - k) * ppd;
+        if (y - cy).abs() > r * 0.92 {
+            continue;
+        }
+        let half = if k.abs() as i32 % 20 == 0 { 0.30 } else { 0.18 } * r;
+        if let Some(path) = polyline_path(&[(cx - half, y), (cx + half, y)]) {
+            pm.stroke_path(&path, &paint(TEXT), &stroke(1.5 * s), world, Some(mask));
+        }
+    }
+
+    // Horizon line last, so it sits over the ladder.
+    if let Some(path) = polyline_path(&[(cx - big, y_h), (cx + big, y_h)]) {
+        pm.stroke_path(&path, &paint(TEXT), &stroke(2.5 * s), world, Some(mask));
+    }
+
+    // Bank scale: ticks fixed to the case, around the top of the bezel.
+    for k in [-60.0f32, -45.0, -30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0, 45.0, 60.0] {
+        // Screen angle: 0° at the top, positive clockwise.
+        let a = (k - 90.0).to_radians();
+        let (inner, outer) = if k == 0.0 || k.abs() == 30.0 || k.abs() == 60.0 {
+            (0.82 * r, r)
+        } else {
+            (0.90 * r, r)
+        };
+        let line = [
+            (cx + inner * a.cos(), cy + inner * a.sin()),
+            (cx + outer * a.cos(), cy + outer * a.sin()),
+        ];
+        if let Some(path) = polyline_path(&line) {
+            // Full-strength white: PANEL_BORDER's alpha 64 vanishes against
+            // the sky fill, which is what the ticks sit on top of.
+            pm.stroke_path(
+                &path,
+                &paint(TEXT),
+                &stroke(if k == 0.0 { 2.0 } else { 1.5 } * s),
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+
+    // Bank pointer: rides with the horizon, so it reads current bank against
+    // the fixed ticks above.
+    let a = (-roll_deg as f32 - 90.0).to_radians();
+    let tip = 0.80 * r;
+    let (tx, ty) = (cx + tip * a.cos(), cy + tip * a.sin());
+    let w = 0.055 * r;
+    let (nx, ny) = (-a.sin(), a.cos()); // unit normal to the pointer axis
+    let base = 0.68 * r;
+    let (bx, by) = (cx + base * a.cos(), cy + base * a.sin());
+    let mut p = PathBuilder::new();
+    p.move_to(tx, ty);
+    p.line_to(bx + w * nx, by + w * ny);
+    p.line_to(bx - w * nx, by - w * ny);
+    p.close();
+    if let Some(path) = p.finish() {
+        pm.fill_path(
+            &path,
+            &paint(ACCENT),
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+
+    // Aircraft symbol — fixed to the case: wing bars either side of a centre
+    // dot. This is the reference the horizon moves against.
+    let bar = stroke(3.5 * s);
+    for sign in [-1.0f32, 1.0] {
+        let line = [
+            (cx + sign * 0.52 * r, cy),
+            (cx + sign * 0.18 * r, cy),
+        ];
+        if let Some(path) = polyline_path(&line) {
+            pm.stroke_path(&path, &paint(ACCENT), &bar, Transform::identity(), None);
+        }
+    }
+    if let Some(dot) = circle_path(cx, cy, 0.045 * r) {
+        pm.fill_path(
+            &dot,
+            &paint(ACCENT),
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+
+    // Bezel over everything, framing the ball.
+    pm.stroke_path(
+        &ball,
+        &paint(PANEL_BORDER),
+        &stroke(1.5 * s),
+        Transform::identity(),
+        None,
+    );
+}
+
+/// A closed circle path, approximated by four cubics (the standard 0.5522847
+/// kappa). `None` when the radius is not positive.
+fn circle_path(cx: f32, cy: f32, r: f32) -> Option<tiny_skia::Path> {
+    if !(r > 0.0) {
+        return None;
+    }
+    const K: f32 = 0.552_284_75;
+    let k = K * r;
+    let mut p = PathBuilder::new();
+    p.move_to(cx, cy - r);
+    p.cubic_to(cx + k, cy - r, cx + r, cy - k, cx + r, cy);
+    p.cubic_to(cx + r, cy + k, cx + k, cy + r, cx, cy + r);
+    p.cubic_to(cx - k, cy + r, cx - r, cy + k, cx - r, cy);
+    p.cubic_to(cx - r, cy - k, cx - k, cy - r, cx, cy - r);
+    p.close();
+    p.finish()
 }
 
 fn draw_trace(pm: &mut Pixmap, b: Box2, s: f32, series: &[Vec<(f32, f32)>]) {
@@ -662,8 +819,8 @@ pub fn render_overlay_frame(
                 OverlayElement::Attitude {
                     style, range_deg, ..
                 },
-                ElementSample::Value(v),
-            ) => draw_attitude(&mut pm, b, s, *style, *range_deg, *v),
+                ElementSample::Attitude { roll, pitch },
+            ) => draw_attitude(&mut pm, b, s, *style, *range_deg, *roll, *pitch),
             (OverlayElement::TraceStrip { .. }, ElementSample::Trace(series)) => {
                 draw_trace(&mut pm, b, s, series)
             }
@@ -759,7 +916,7 @@ mod render_tests {
             { "type": "gauge", "rect": [0.02, 0.78, 0.15, 0.18], "channel": "GPS_SpeedKmh",
               "style": "numeric", "label": "km/h", "min": 0, "max": 80 },
             { "type": "attitude", "rect": [0.19, 0.78, 0.11, 0.18], "channel": "Roll_deg",
-              "style": "roll", "range_deg": 60 },
+              "pitch_channel": "Pitch_deg", "style": "roll", "range_deg": 60 },
             { "type": "trace_strip", "rect": [0.32, 0.80, 0.40, 0.16],
               "channels": ["TravelFront_mm", "TravelRear_mm"], "window_s": 8.0 },
             { "type": "track_map", "rect": [0.82, 0.04, 0.16, 0.28] },
@@ -788,7 +945,10 @@ mod render_tests {
             t_secs: 95.0,
             elements: vec![
                 ElementSample::Value(Some(42.3)),
-                ElementSample::Value(Some(-15.0)),
+                ElementSample::Attitude {
+                    roll: Some(-15.0),
+                    pitch: Some(8.0),
+                },
                 ElementSample::Trace(vec![series_a, series_b]),
                 ElementSample::MapPos(Some((0.3, 0.7))),
                 ElementSample::Laps(LapState {
@@ -806,7 +966,10 @@ mod render_tests {
             t_secs: 0.0,
             elements: vec![
                 ElementSample::Value(None),
-                ElementSample::Value(None),
+                ElementSample::Attitude {
+                    roll: None,
+                    pitch: None,
+                },
                 ElementSample::Trace(vec![vec![], vec![]]),
                 ElementSample::MapPos(None),
                 ElementSample::Laps(LapState::default()),
