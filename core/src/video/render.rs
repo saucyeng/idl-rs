@@ -414,10 +414,6 @@ fn draw_gauge(
     }
 }
 
-/// Degrees of pitch spanned by the ball's radius. ±30° fills the instrument,
-/// which suits a bike (a 30° nose-down is a very steep chute) while leaving the
-/// ladder legible at overlay size.
-const PITCH_SPAN_DEG: f32 = 30.0;
 /// Attitude-indicator sky, above the horizon.
 const SKY: [u8; 4] = [38, 106, 168, 210];
 /// Attitude-indicator ground, below the horizon.
@@ -438,24 +434,17 @@ fn draw_attitude(
     };
     let pad = 8.0 * s;
     let clamped = v.clamp(-range_deg, range_deg);
-    let readout = match pitch {
-        Some(p) => format!("{clamped:+.0}° {:+.0}°", p.clamp(-90.0, 90.0)),
-        None => format!("{clamped:+.0}°"),
-    };
+    let readout = format!("{clamped:+.0}°");
     let rpx = 0.18 * b.h;
     let rw = mono_advance(font_regular(), rpx) * readout.chars().count() as f32;
     match style {
         AttitudeStyle::Roll => {
-            draw_attitude_indicator(pm, b, s, clamped, pitch.unwrap_or(0.0));
-            draw_text(
-                pm,
-                font_regular(),
-                &readout,
-                b.cx() - rw / 2.0,
-                b.y + b.h - pad,
-                rpx,
-                TEXT,
-            );
+            // Roll is not clamped for the drawing: unlike a deflection needle,
+            // a horizon is meaningful through a full rotation. `range_deg` sets
+            // the pitch span instead (see `draw_attitude_indicator`). No text —
+            // the instrument *is* the readout, and a duplicate number beside a
+            // horizon is noise.
+            draw_attitude_indicator(pm, b, s, v, pitch.unwrap_or(0.0), range_deg as f32);
         }
         AttitudeStyle::Steer => {
             // Needle pivoting at bottom-center; 0° = straight up.
@@ -508,14 +497,26 @@ fn draw_attitude(
 ///
 /// `roll_deg` positive ⇒ leaning right; `pitch_deg` positive ⇒ nose up (the
 /// horizon then sits *below* centre, because you are looking above it).
-fn draw_attitude_indicator(pm: &mut Pixmap, b: Box2, s: f32, roll_deg: f64, pitch_deg: f64) {
-    // Leave headroom under the ball for the readout line.
-    let r = 0.5 * b.w.min(b.h * 0.82) - 3.0 * s;
+fn draw_attitude_indicator(
+    pm: &mut Pixmap,
+    b: Box2,
+    s: f32,
+    roll_deg: f64,
+    pitch_deg: f64,
+    pitch_span_deg: f32,
+) {
+    // The ball fills its box — it carries its own bezel, so there is no panel
+    // to inset from and no text band to reserve.
+    let r = 0.5 * b.w.min(b.h) - 1.5 * s;
     if r <= 4.0 * s {
         return;
     }
-    let (cx, cy) = (b.cx(), b.y + r + 2.0 * s);
-    let ppd = r / PITCH_SPAN_DEG; // pixels per degree of pitch
+    let (cx, cy) = (b.cx(), b.cy());
+    // `range_deg` is the pitch angle at the edge of the ball. A bike sees far
+    // more than an aircraft — steep chutes and near-vertical rolls — so this is
+    // configurable per layout rather than a fixed ±30°.
+    let span = if pitch_span_deg >= 5.0 { pitch_span_deg } else { 30.0 };
+    let ppd = r / span; // pixels per degree of pitch
     let y_h = cy + pitch_deg as f32 * ppd; // horizon line, before rotation
 
     // Everything inside the ball is clipped to it, so the oversized sky/ground
@@ -553,12 +554,18 @@ fn draw_attitude_indicator(pm: &mut Pixmap, b: Box2, s: f32, roll_deg: f64, pitc
 
     // Pitch ladder: the rung for angle k sits k degrees above the horizon.
     // Minor rungs every 10°, drawn wider at 20° so the scale reads at a glance.
-    for k in [-30.0f32, -20.0, -10.0, 10.0, 20.0, 30.0] {
+    let step = if span > 60.0 { 20.0f32 } else { 10.0 };
+    let rungs = (span / step) as i32;
+    for i in -rungs..=rungs {
+        let k = i as f32 * step;
+        if k == 0.0 {
+            continue; // the horizon itself
+        }
         let y = cy + (pitch_deg as f32 - k) * ppd;
         if (y - cy).abs() > r * 0.92 {
             continue;
         }
-        let half = if k.abs() as i32 % 20 == 0 { 0.30 } else { 0.18 } * r;
+        let half = if (k / step) as i32 % 2 == 0 { 0.30 } else { 0.18 } * r;
         if let Some(path) = polyline_path(&[(cx - half, y), (cx + half, y)]) {
             pm.stroke_path(&path, &paint(TEXT), &stroke(1.5 * s), world, Some(mask));
         }
@@ -803,7 +810,17 @@ pub fn render_overlay_frame(
             w: rect.w * w as f32,
             h: rect.h * h as f32,
         };
-        draw_panel(&mut pm, b, s);
+        // The attitude indicator is its own bezel — a panel behind it just
+        // boxes in a circle. Every other element wants the backing plate.
+        if !matches!(
+            elem,
+            OverlayElement::Attitude {
+                style: AttitudeStyle::Roll,
+                ..
+            }
+        ) {
+            draw_panel(&mut pm, b, s);
+        }
         match (elem, es) {
             (
                 OverlayElement::Gauge {
