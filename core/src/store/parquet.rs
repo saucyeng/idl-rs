@@ -306,7 +306,7 @@ pub fn write_session_parquet(
         .map(|(k, v)| KeyValue::new(k, v))
         .collect();
     let props = WriterProperties::builder()
-        .set_max_row_group_size(ROW_GROUP_SIZE)
+        .set_max_row_group_row_count(Some(ROW_GROUP_SIZE))
         .set_column_encoding(ColumnPath::from("t"), Encoding::DELTA_BINARY_PACKED)
         .set_column_statistics_enabled(ColumnPath::from("t"), EnabledStatistics::Chunk)
         .set_key_value_metadata(Some(all_kv))
@@ -442,10 +442,15 @@ pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
 /// Filters `col`'s non-null rows, pairing each with `t`'s value at that row
 /// (C1 §4.5's read rule) and, when present, `recorded_col`'s value at that
 /// row (`None` overall when `recorded_col` is absent — same non-IMU-source
-/// case `Channel.t_recorded_us` documents as `None`). Reconstructs the
-/// typed [`RawColumn`] from `scale`/`offset` metadata for `Int16`/`Int32`/
-/// `Float32`; `Float64` is read verbatim (bit-exact, including `-0.0`/`NaN`
-/// — no `× 1.0 + 0.0`, C1 §2's `F64` round-trip guarantee).
+/// case `Channel.t_recorded_us` documents as `None`). When `recorded_col` is
+/// present but element-wise identical to the gathered `t_us` (every
+/// non-burst-corrected source, C1 §3.3 — no correction ever applied), the
+/// reconstructed `t_recorded_us` collapses back to `None` rather than a
+/// duplicate `Some`, matching C1 §2's signed-field convention and what was
+/// originally written. Reconstructs the typed [`RawColumn`] from
+/// `scale`/`offset` metadata for `Int16`/`Int32`/`Float32`; `Float64` is
+/// read verbatim (bit-exact, including `-0.0`/`NaN` — no `× 1.0 + 0.0`,
+/// C1 §2's `F64` round-trip guarantee).
 fn read_column(
     col: &ArrayRef,
     t_col: &Int64Array,
@@ -479,7 +484,11 @@ fn read_column(
                 }
             }
             let t_recorded_us =
-                if recorded_col.is_some() && t_recorded_us.len() == t_us.len() { Some(t_recorded_us) } else { None };
+                if recorded_col.is_some() && t_recorded_us.len() == t_us.len() && t_recorded_us != t_us {
+                    Some(t_recorded_us)
+                } else {
+                    None
+                };
             (t_us, t_recorded_us, $wrap(values))
         }};
     }
@@ -568,6 +577,29 @@ mod tests {
         // Assert — C1 §7 #1.
         let imu = back.channels.iter().find(|c| c.channel_id == "IMU0_AccelX").unwrap();
         assert_eq!(imu.t_recorded_us_or_t_us(), &[0, 1250, 2500, 5000][..]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn round_trip_recorded_stamps_none_stays_none() {
+        // Arrange — `sample_session()`'s GPS channel is written with
+        // `t_recorded_us: None` (the documented common case, C1 §2/§3.3: no
+        // burst correction ever applies to GPS, so the `gps_t_recorded_us`
+        // column is present per §4.1 but element-wise identical to `t`).
+        let root = temp_root();
+        let session = sample_session();
+        assert_eq!(session.channels.iter().find(|c| c.channel_id == "GPS_EpochMs").unwrap().t_recorded_us, None);
+        let path = write_session_parquet(&root, &session, "0.1.0").unwrap();
+
+        // Act
+        let back = read_session_parquet(&path).unwrap();
+
+        // Assert — C1 §2's signed-field contract: a channel whose recorded
+        // stamps never diverged from `t` round-trips to `None`, not
+        // `Some(<duplicate of t_us>)`.
+        let gps = back.channels.iter().find(|c| c.channel_id == "GPS_EpochMs").unwrap();
+        assert_eq!(gps.t_recorded_us, None);
 
         let _ = std::fs::remove_dir_all(&root);
     }
