@@ -409,3 +409,143 @@ impl BleTransport for BtleplugBle {
         ble_config::reassemble_config_reads(move || Ok(chunks.next().unwrap()))
     }
 }
+
+/// Task 8: the composed download+config *sequencing* — BLE `send_command`
+/// entering WiFi mode, polled via `read_status`, followed by the WiFi calls
+/// L5's `download_file`/`list_device_files` Tauri commands (C3 §3.8)
+/// actually run in that order. Proved once here with a canned-response
+/// `BleTransport` stub (not real `btleplug` — Open question 9: this crate
+/// has no in-process fake GATT peripheral) plus Task 7's mock HTTP device
+/// server, so L5's own tests can focus on the IPC glue rather than
+/// re-deriving this ordering.
+#[cfg(test)]
+mod sequencing {
+    use std::sync::Mutex as StdMutex;
+
+    use super::{ble_error, BleTransport};
+    use crate::ble_control::ControlCommand;
+    use crate::ble_status::DeviceStatus;
+    use crate::device::{ConnectionInfo, DiscoveredDevice};
+    use crate::wifi_transport::integration::spawn_mock_server;
+    use crate::wifi_transport::{verify_device_identity, ReqwestWifi, WifiTransport};
+    use crate::TransportError;
+
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// Canned `BleTransport`: `send_command(WifiOn)` flips an in-memory
+    /// flag; `read_status` reports it back via `DeviceStatus::wifi_on`.
+    /// Every other method is unused by this test and returns a `Ble` error
+    /// rather than `unimplemented!()`, so an accidental call fails the test
+    /// with a normal assertion instead of panicking the whole harness.
+    struct StubBle {
+        /// `true` once `send_command(WifiOn)` has been called.
+        wifi_on: StdMutex<bool>,
+    }
+
+    impl StubBle {
+        fn new() -> Self {
+            Self { wifi_on: StdMutex::new(false) }
+        }
+    }
+
+    impl BleTransport for StubBle {
+        async fn scan(
+            &self,
+            _timeout: Duration,
+        ) -> Result<mpsc::Receiver<DiscoveredDevice>, TransportError> {
+            Err(ble_error("StubBle::scan is not exercised by this test"))
+        }
+
+        async fn connect(&mut self, _device_id: &str) -> Result<ConnectionInfo, TransportError> {
+            Err(ble_error("StubBle::connect is not exercised by this test"))
+        }
+
+        async fn disconnect(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn read_status(&self) -> Result<DeviceStatus, TransportError> {
+            let wifi_on = *self.wifi_on.lock().expect("stub mutex is never poisoned");
+            Ok(DeviceStatus { wifi_on: Some(wifi_on), ..DeviceStatus::default() })
+        }
+
+        async fn watch_status(&self) -> Result<mpsc::Receiver<DeviceStatus>, TransportError> {
+            Err(ble_error("StubBle::watch_status is not exercised by this test"))
+        }
+
+        async fn send_command(&self, cmd: ControlCommand) -> Result<(), TransportError> {
+            if cmd == ControlCommand::WifiOn {
+                *self.wifi_on.lock().expect("stub mutex is never poisoned") = true;
+            }
+            Ok(())
+        }
+
+        async fn push_config(&self, _config_json: &[u8]) -> Result<(), TransportError> {
+            Err(ble_error("StubBle::push_config is not exercised by this test"))
+        }
+
+        async fn read_config(&self) -> Result<Vec<u8>, TransportError> {
+            Err(ble_error("StubBle::read_config is not exercised by this test"))
+        }
+    }
+
+    #[tokio::test]
+    async fn wifi_on_then_status_poll_then_wifi_download_runs_in_expected_order() {
+        // Arrange
+        let ble = StubBle::new();
+        const CONTENT: &[u8] = b"session bytes";
+        let (addr, _server) = spawn_mock_server(|path, _headers| {
+            if path == "/ping" {
+                let body = br#"{"device":"IDL0-A3F2","fw":"1.4.0","proto":1,"battery":80,"sd":"OK","mode":"wifi","ble":"on"}"#.to_vec();
+                (
+                    200,
+                    "OK",
+                    vec![("Content-Type".to_string(), "application/json".to_string())],
+                    body,
+                )
+            } else if path == "/files" {
+                let body = br#"[{"name":"session_001.idl0","size":13}]"#.to_vec();
+                (
+                    200,
+                    "OK",
+                    vec![("Content-Type".to_string(), "application/json".to_string())],
+                    body,
+                )
+            } else {
+                (200, "OK", Vec::new(), CONTENT.to_vec())
+            }
+        })
+        .await;
+        let wifi = ReqwestWifi::new(format!("http://{addr}"));
+
+        // Act — the exact sequence L5's download-file command runs: BLE
+        // WifiOn, poll status until wifi_on flips true, then the WiFi calls.
+        ble.send_command(ControlCommand::WifiOn).await.unwrap();
+
+        let mut wifi_on = false;
+        for _ in 0..10 {
+            let status = ble.read_status().await.unwrap();
+            if status.wifi_on == Some(true) {
+                wifi_on = true;
+                break;
+            }
+        }
+        assert!(wifi_on, "wifi_on never observed via read_status polling");
+
+        let ping = wifi.ping().await.unwrap();
+        verify_device_identity(&ping, "IDL0-A3F2").unwrap();
+        let files = wifi.list_files().await.unwrap();
+
+        let mut sink = Vec::new();
+        let mut on_progress = |_: u64, _: Option<u64>| {};
+        let bytes_written =
+            wifi.download(0, 0, &mut sink, &mut on_progress).await.unwrap();
+
+        // Assert
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "session_001.idl0");
+        assert_eq!(bytes_written, CONTENT.len() as u64);
+        assert_eq!(sink, CONTENT);
+    }
+}

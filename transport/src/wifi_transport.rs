@@ -399,8 +399,12 @@ mod tests {
 /// Integration-shaped tests: `ReqwestWifi` against a hand-rolled HTTP/1.1
 /// mock device server (Task 7 Step 2/3), rather than a real IDL0 device —
 /// that half of the proof is Task 9's manual step.
+///
+/// `pub(crate)` (not private): Task 8's composed sequencing test
+/// (`ble_transport.rs`, `mod sequencing`) reuses `spawn_mock_server` for its
+/// WiFi half, rather than re-deriving a second hand-rolled HTTP server.
 #[cfg(test)]
-mod integration {
+pub(crate) mod integration {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -413,7 +417,7 @@ mod integration {
     /// One canned HTTP response: status code, reason phrase, extra headers
     /// (beyond `Content-Length`/`Connection`, which this server always
     /// sets itself), and body bytes.
-    type MockResponse = (u16, &'static str, Vec<(String, String)>, Vec<u8>);
+    pub(crate) type MockResponse = (u16, &'static str, Vec<(String, String)>, Vec<u8>);
 
     /// Spins up a `TcpListener` on an OS-assigned free port and answers
     /// every request with whatever `route(path, headers)` returns. No HTTP
@@ -422,7 +426,7 @@ mod integration {
     /// handful of lines (Task 7 Step 2's own guidance) — this keeps the
     /// crate's dependency list to what SPEC actually requires. One request
     /// per accepted connection; `route` runs once per request.
-    async fn spawn_mock_server<F>(route: F) -> (SocketAddr, JoinHandle<()>)
+    pub(crate) async fn spawn_mock_server<F>(route: F) -> (SocketAddr, JoinHandle<()>)
     where
         F: Fn(&str, &[(String, String)]) -> MockResponse + Send + Sync + 'static,
     {
