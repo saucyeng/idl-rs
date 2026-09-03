@@ -1752,6 +1752,8 @@ dependencies = [
  "sha2",
  "tauri",
  "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
