@@ -179,8 +179,15 @@ pub fn write_derived_parquet(
         arrays.push(Arc::new(Float64Array::from(o.values.clone())));
     }
 
+    // C1 §5: the `inputs` metadata value must be "in the same canonical
+    // order used to compute the file hash" — channel_id ascending, the same
+    // sort `derived_file_hash` applies to its own internal copy — so a
+    // consumer can verify/re-derive without re-hashing every input in
+    // whatever order the caller happened to pass them.
     let inputs_json = {
-        let entries: Vec<String> = inputs
+        let mut sorted_inputs = inputs.to_vec();
+        sorted_inputs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let entries: Vec<String> = sorted_inputs
             .iter()
             .map(|(id, h)| format!(r#"{{"channel_id":{},"column_hash":"{}"}}"#, serde_json::to_string(id).unwrap(), hex(h)))
             .collect();
@@ -191,17 +198,24 @@ pub fn write_derived_parquet(
     let batch = RecordBatch::try_new(schema.clone(), arrays)
         .map_err(|e| DerivedStoreError::new(DerivedStoreErrorKind::Schema, format!("RecordBatch::try_new: {e}")))?;
 
-    let mut props_builder = WriterProperties::builder();
-    for (k, v) in [
-        ("derived_kind".to_string(), derived_kind.to_string()),
-        ("inputs".to_string(), inputs_json),
-        ("config_json".to_string(), String::from_utf8_lossy(&config_json_bytes).into_owned()),
-        ("engine_version".to_string(), crate::VERSION.to_string()),
-        ("computed_at_utc_ms".to_string(), computed_at_utc_ms.to_string()),
-    ] {
-        props_builder = props_builder.set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(k, v)]));
-    }
-    let props = props_builder.build();
+    // `WriterPropertiesBuilder::set_key_value_metadata` *replaces* rather
+    // than accumulates (verified against the pinned 59.3.0 source,
+    // `parquet::file::properties::WriterPropertiesBuilder::set_key_value_metadata`
+    // — `self.key_value_metadata = value`; same fact already documented at
+    // `core/src/store/parquet.rs`'s file-metadata write site), so every
+    // file-metadata pair is collected into one `Vec<KeyValue>` and set in a
+    // single call.
+    let all_kv: Vec<parquet::file::metadata::KeyValue> = vec![
+        parquet::file::metadata::KeyValue::new("derived_kind".to_string(), derived_kind.to_string()),
+        parquet::file::metadata::KeyValue::new("inputs".to_string(), inputs_json),
+        parquet::file::metadata::KeyValue::new(
+            "config_json".to_string(),
+            String::from_utf8_lossy(&config_json_bytes).into_owned(),
+        ),
+        parquet::file::metadata::KeyValue::new("engine_version".to_string(), crate::VERSION.to_string()),
+        parquet::file::metadata::KeyValue::new("computed_at_utc_ms".to_string(), computed_at_utc_ms.to_string()),
+    ];
+    let props = WriterProperties::builder().set_key_value_metadata(Some(all_kv)).build();
 
     let mut buf: Vec<u8> = Vec::new();
     {
@@ -219,7 +233,25 @@ pub fn write_derived_parquet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use uuid::Uuid;
+
+    /// Reads back a written derived parquet file's file-level key-value
+    /// metadata (not its columns) as a plain map, for asserting against C1
+    /// §5's file-metadata table in tests.
+    fn read_file_metadata(path: &Path) -> std::collections::HashMap<String, String> {
+        let file = std::fs::File::open(path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        builder
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|kv| kv.value.map(|v| (kv.key, v)))
+            .collect()
+    }
 
     fn temp_root() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("idl-rs-test-{}", Uuid::new_v4()));
@@ -298,6 +330,74 @@ mod tests {
         // second call (mtime unchanged) even though computed_at_utc_ms differs.
         assert_eq!(p1, p2);
         assert_eq!(mtime1, mtime2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_derived_parquet_writes_all_five_file_metadata_keys() {
+        // Arrange
+        let root = temp_root();
+        let outputs = vec![DerivedOutput {
+            channel_id: "Roll (deg)".to_string(),
+            t_us: vec![0, 1000],
+            values: vec![0.5, 0.6],
+            nominal_rate_hz: 800.0,
+            unit: "deg".to_string(),
+        }];
+        let config = serde_json::json!({"gain": 1.5});
+        let ih = derived_input_hash("IMU0_AccelX", &[0, 1000], &[1.0, 2.0]);
+        let inputs = vec![("IMU0_AccelX".to_string(), ih)];
+
+        // Act
+        let path =
+            write_derived_parquet(&root, "s1", "iekf_suspension_attitude", &inputs, &config, &outputs, 1234).unwrap();
+        let kv = read_file_metadata(&path);
+
+        // Assert — all five keys C1 §5 requires "Always" survive the write,
+        // not just the last one set (the bug: a per-key
+        // `set_key_value_metadata` loop replaces rather than merges).
+        assert_eq!(kv.get("derived_kind").map(String::as_str), Some("iekf_suspension_attitude"));
+        let expected_inputs = format!(r#"[{{"channel_id":"IMU0_AccelX","column_hash":"{}"}}]"#, hex(&ih));
+        assert_eq!(kv.get("inputs"), Some(&expected_inputs));
+        assert_eq!(kv.get("config_json").map(String::as_str), Some(r#"{"gain":1.5}"#));
+        assert_eq!(kv.get("engine_version").map(String::as_str), Some(crate::VERSION));
+        assert_eq!(kv.get("computed_at_utc_ms").map(String::as_str), Some("1234"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_derived_parquet_inputs_metadata_is_sorted_by_channel_id_regardless_of_call_order() {
+        // Arrange — pass inputs deliberately out of channel_id order.
+        let root = temp_root();
+        let outputs = vec![DerivedOutput {
+            channel_id: "Roll (deg)".to_string(),
+            t_us: vec![0],
+            values: vec![0.5],
+            nominal_rate_hz: 800.0,
+            unit: "deg".to_string(),
+        }];
+        let config = serde_json::json!({});
+        let hb = derived_input_hash("IMU0_GyroY", &[0], &[2.0]);
+        let ha = derived_input_hash("IMU0_AccelX", &[0], &[1.0]);
+        // Out-of-order: "IMU0_GyroY" > "IMU0_AccelX", but passed first.
+        let inputs = vec![("IMU0_GyroY".to_string(), hb), ("IMU0_AccelX".to_string(), ha)];
+
+        // Act
+        let path = write_derived_parquet(&root, "s2", "iekf_suspension_attitude", &inputs, &config, &outputs, 0).unwrap();
+        let kv = read_file_metadata(&path);
+        let written_inputs = kv.get("inputs").cloned().unwrap();
+
+        // Assert — the written `inputs` field lists channel_id-ascending
+        // order (matching derived_file_hash's own internal sort), not the
+        // caller's original argument order.
+        let expected = format!(
+            r#"[{{"channel_id":"IMU0_AccelX","column_hash":"{}"}},{{"channel_id":"IMU0_GyroY","column_hash":"{}"}}]"#,
+            hex(&ha),
+            hex(&hb)
+        );
+        assert_eq!(written_inputs, expected);
 
         let _ = std::fs::remove_dir_all(&root);
     }
