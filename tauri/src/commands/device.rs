@@ -171,13 +171,21 @@ async fn list_files_via(ble: &impl BleTransport, wifi: &impl WifiTransport) -> R
 /// resolves `file_name` to the device's `file_index` (WiFi's `/download`
 /// endpoint is index-addressed, not name-addressed — SPEC §6.1), streams
 /// into a temp file under `<data>/tmp/`, then moves it into the
-/// content-addressed blob store at `<data>/blobs/sha256/<hash>` (C4 §3: blob
-/// hash = SHA-256 of the raw bytes; C4 §4: "a second write to the same hash
-/// is a verified no-op, skip rather than overwrite"). This is the write-once
-/// blob case, simpler than C4 §4's full atomic-write sequence for mutable
-/// files (no optimistic-concurrency re-read needed — a blob never changes
-/// once written), which stays L1's to build generally for
+/// content-addressed blob store at `<data>/blobs/sha256/<2 hex>/<62 hex>`
+/// (C4 §2's fixed sharded path convention — the first 2 lowercase hex chars
+/// of the digest as a subdirectory, the remaining 62 as the filename, *not*
+/// a flat `blobs/sha256/<64 hex>`; C4 §3: blob hash = SHA-256 of the raw
+/// bytes; C4 §4: "a second write to the same hash is a verified no-op, skip
+/// rather than overwrite"). This is the write-once blob case, simpler than
+/// C4 §4's full atomic-write sequence for mutable files (no
+/// optimistic-concurrency re-read needed — a blob never changes once
+/// written), which stays L1's to build generally for
 /// `session.json`/`data.parquet`/workbooks.
+// TODO(idl0): this duplicates the sharded blob-path formula L1's
+// `idl_rs::store::blob` module already implements correctly (not yet merged
+// to `main` as of this task) — once L1 lands, replace this hand-rolled
+// `data_dir.join(...)` split with a real call into that module's writer
+// instead of reimplementing C4 §2's path convention here.
 async fn download_via(
     ble: &impl BleTransport,
     wifi: &impl WifiTransport,
@@ -216,10 +224,12 @@ async fn download_via(
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading back {}: {e}", tmp_path.display())))?;
     let sha256 = sha256_hex(&bytes);
 
-    let blob_dir = data_dir.join("blobs/sha256");
+    // C4 §2's fixed sharded convention: first 2 hex chars as a
+    // subdirectory, remaining 62 as the filename.
+    let blob_dir = data_dir.join("blobs/sha256").join(&sha256[..2]);
     std::fs::create_dir_all(&blob_dir)
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("creating {}: {e}", blob_dir.display())))?;
-    let blob_path = blob_dir.join(&sha256);
+    let blob_path = blob_dir.join(&sha256[2..]);
     if blob_path.exists() {
         let _ = std::fs::remove_file(&tmp_path); // already have this content — verified no-op (C4 §4)
     } else {
@@ -624,10 +634,44 @@ mod tests {
         let expected_hash = sha256_hex(&content);
         assert_eq!(result.sha256, expected_hash);
         assert_eq!(result.size_bytes, content.len() as u64);
-        let blob_path = data_dir.path().join("blobs/sha256").join(&expected_hash);
+        // C4 §2's fixed sharded convention: first 2 hex chars as a
+        // subdirectory, remaining 62 as the filename — not a flat
+        // `blobs/sha256/<64-hex>` path.
+        let blob_path = data_dir.path().join("blobs/sha256").join(&expected_hash[..2]).join(&expected_hash[2..]);
         assert_eq!(result.path, blob_path.display().to_string());
         assert_eq!(std::fs::read(&blob_path).unwrap(), content);
+        assert!(
+            !data_dir.path().join("blobs/sha256").join(&expected_hash).exists(),
+            "must not also land at the flat (unsharded) path"
+        );
         assert_eq!(progress_calls, vec![(content.len() as u64, Some(content.len() as u64))]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_via_shards_the_blob_path_by_the_first_two_hex_chars_of_the_digest() {
+        // Arrange: content chosen so its SHA-256 digest starts with "ab",
+        // matching C4 §2's example convention directly (found by brute-force
+        // search over a counter suffix, not hand-picked to hide a bug).
+        let content = (0u32..)
+            .map(|n| format!("shard-fixture-{n}").into_bytes())
+            .find(|candidate| sha256_hex(candidate).starts_with("ab"))
+            .expect("some counter value hashes to a digest starting with ab");
+        let expected_hash = sha256_hex(&content);
+        assert!(expected_hash.starts_with("ab"));
+        let data_dir = tempfile::tempdir().unwrap();
+        let ble = StubBle { wifi_on_reads: StdMutex::new(VecDeque::from([Some(true)])), ..Default::default() };
+        let wifi = StubWifi {
+            list_files_result: Ok(vec![idl_transport::DeviceFile { name: "shard.idl0".to_string(), size_bytes: content.len() as u64, session_id: None }]),
+            download_bytes: Ok(content.clone()),
+        };
+
+        // Act
+        let result = download_via(&ble, &wifi, "shard.idl0", data_dir.path(), |_, _| {}).await.unwrap();
+
+        // Assert: lands at blobs/sha256/ab/<remaining 62 hex>, not blobs/sha256/<64 hex>.
+        let expected_path = data_dir.path().join("blobs/sha256").join("ab").join(&expected_hash[2..]);
+        assert_eq!(result.path, expected_path.display().to_string());
+        assert_eq!(std::fs::read(&expected_path).unwrap(), content);
     }
 
     #[tokio::test(start_paused = true)]
