@@ -1735,6 +1735,7 @@ name = "idl-transport"
 version = "0.1.0"
 dependencies = [
  "btleplug",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

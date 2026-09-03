@@ -10,10 +10,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 btleplug = "0.13.0"
 tokio = { version = "1.53.1", features = ["sync", "time", "macros"] }
-# TODO(idl0): reqwest has no pin in docs/superpowers/specs/2026-09-02-idl1-m0-ecosystem.md —
-# do not guess a version (CLAUDE.md §1). Get the exact pin from the lead (Open question 1)
-# before uncommenting; until then WiFi-transport code (Task 6+) does not compile.
-# reqwest = { version = "<PIN>", default-features = false, features = ["stream"] }
+# Pinned 2026-09-03, lead ruling R7 (docs/superpowers/specs/2026-09-02-idl1-m0-ecosystem.md).
+# default-tls dropped: every WiFi endpoint (SPEC §6) is plain HTTP against
+# 192.168.4.1 — no TLS stack needed, smaller build.
+reqwest = { version = "0.13.4", default-features = false, features = ["stream"] }
 
 [dev-dependencies]
 serde_json = "1"
