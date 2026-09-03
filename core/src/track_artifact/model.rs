@@ -24,6 +24,12 @@ pub struct Track {
     pub sector_gates: Vec<SectorGate>,
     pub neutral_zones: Vec<NeutralZone>,
     pub reference_polyline: Vec<GpsFix>,
+    /// Track creation time, milliseconds since the Unix epoch (wire field,
+    /// C4 §5's `tracks.created_at_ms`).
+    pub created_at_ms: i64,
+    /// Track last-update time, milliseconds since the Unix epoch (wire
+    /// field, C4 §5's `tracks.updated_at_ms`).
+    pub updated_at_ms: i64,
 }
 
 impl Track {
@@ -65,6 +71,10 @@ struct TrackDto {
     neutral_zones: Vec<NeutralZoneDto>,
     #[serde(default)]
     reference_polyline: Vec<GpsFixDto>,
+    #[serde(default)]
+    created_at_ms: i64,
+    #[serde(default)]
+    updated_at_ms: i64,
 }
 
 #[derive(Deserialize)]
@@ -162,6 +172,8 @@ impl From<TrackArtifact> for Track {
             sector_gates: t.sector_gates.into_iter().map(SectorGateDto::into_core).collect(),
             neutral_zones: t.neutral_zones.into_iter().map(NeutralZoneDto::into_core).collect(),
             reference_polyline: t.reference_polyline.into_iter().map(GpsFixDto::into_core).collect(),
+            created_at_ms: t.created_at_ms,
+            updated_at_ms: t.updated_at_ms,
         }
     }
 }

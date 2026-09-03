@@ -54,6 +54,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_track_wire_created_and_updated_at_ms_are_carried_into_domain_track() {
+        // Arrange — a track_id whose created_at_ms/updated_at_ms differ, so a
+        // field swap or a dropped value would be caught.
+        let json = r#"{"track_artifact_version":1,"track":{"track_id":"t","name":"n",
+            "created_at_ms":1000,"updated_at_ms":2000}}"#;
+
+        // Act
+        let t = parse_track(json.as_bytes()).unwrap();
+
+        // Assert
+        assert_eq!(t.created_at_ms, 1000);
+        assert_eq!(t.updated_at_ms, 2000);
+    }
+
+    #[test]
     fn parses_point_to_point_timing() {
         // Arrange
         let json = r#"{"track_artifact_version":1,"track":{"track_id":"t","name":"n",
