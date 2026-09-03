@@ -6,3 +6,4 @@
 //! no network (CLAUDE.md §2).
 
 pub mod atomic;
+pub mod blob;
