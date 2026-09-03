@@ -154,4 +154,31 @@ mod tests {
         // Assert
         assert!(rx.recv_timeout(Duration::from_millis(500)).is_err(), "callback must not fire for a self-write");
     }
+
+    #[test]
+    fn self_write_followed_by_a_different_external_edit_within_the_ttl_window_still_fires_callback() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel::<PathBuf>();
+        let hashes = Arc::new(ExpectedHashSet::new());
+        let target = dir.path().join("dummy.idl1wb");
+        let self_content = b"---\nid: test\n---\n# Dummy\n";
+        let external_content = b"---\nid: test\n---\n# Edited elsewhere\n";
+        hashes.expect(target.clone(), sha256_hex(self_content)); // registered before our write, per C4 §4 step 3
+        let _watcher = WorkbookWatcher::new(dir.path(), Arc::clone(&hashes), move |p| { let _ = tx.send(p.to_path_buf()); }).unwrap();
+
+        // Act — our own write first (suppressed), then a genuinely different
+        // write to the same path shortly after, while the expected-hash entry
+        // is still live (well within EXPECTED_HASH_TTL). The matched entry
+        // lingering until TTL must not suppress this: check_and_consume gates
+        // on exact hash equality, and external_content's hash differs from
+        // the registered one, so this is a real edit, not a duplicate delivery
+        // of our own write.
+        std::fs::write(&target, self_content).unwrap();
+        std::fs::write(&target, external_content).unwrap();
+
+        // Assert
+        let seen = rx.recv_timeout(Duration::from_millis(1000)).expect("callback fired for the external edit");
+        assert_eq!(seen, target);
+    }
 }
