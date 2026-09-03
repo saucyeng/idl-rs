@@ -10,6 +10,8 @@
 
 pub mod commands;
 pub mod error;
+pub mod paths;
+pub mod state;
 pub use error::{IpcError, IpcErrorKind};
 
 /// The invoke handler covering every command in this crate. The app crate
