@@ -1,8 +1,8 @@
 //! idl-rs — pure data-acquisition engine for IDL0 (.idl0) files.
 //!
-//! Parsing, data model, DSP, and analysis. No Flutter, no flutter_rust_bridge,
-//! no clap, no I/O beyond std::fs. Consumed by the Flutter app (via
-//! idl-rs-bridge), the idl-rs CLI, and future Python/WASM bindings.
+//! Parsing, data model, DSP, and analysis. No Tauri, no async runtime,
+//! no clap, no I/O beyond std::fs. Consumed by the idl1 app (via
+//! idl-rs-tauri) and the idl-rs CLI, and future Python/WASM bindings.
 
 pub mod calibration;
 pub mod chart_decimation;
