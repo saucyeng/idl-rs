@@ -1,0 +1,14 @@
+[package]
+name = "idl-rs-tauri"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Tauri command glue over idl-rs and idl-transport. The only crate the idl1 frontend sees."
+
+[dependencies]
+idl-rs = { path = "../core" }
+idl-transport = { path = "../transport" }
+tauri = "2.11.5"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]

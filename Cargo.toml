@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "cli", "transport"]
+members = ["core", "cli", "transport", "tauri"]
 
 # Dev builds (tauri dev) use the cargo dev profile.
 # The engine must still run at release-grade speed — parse/DSP at opt-level 0
