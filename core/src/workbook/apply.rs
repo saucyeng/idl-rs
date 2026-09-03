@@ -117,7 +117,6 @@ mod tests {
                 .collect(),
             workbook_version: 1,
             worksheets: Vec::new(),
-            overlay_layouts: Vec::new(),
         }
     }
 

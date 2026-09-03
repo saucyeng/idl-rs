@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["core", "bridge", "cli", "video-export"]
+members = ["core", "cli", "transport"]
 
-# Dev (flutter run) builds: cargokit maps Flutter debug → cargo dev profile.
+# Dev builds (tauri dev) use the cargo dev profile.
 # The engine must still run at release-grade speed — parse/DSP at opt-level 0
 # is 10-50x slower and reads as "the app is slow". The "*" wildcard covers
 # dependencies (sci-rs, nalgebra, rustfft); workspace members need explicit
@@ -11,7 +11,7 @@ members = ["core", "bridge", "cli", "video-export"]
 # `debug = "line-tables-only"` trims the heavy variable/type debuginfo (full by
 # default) to just the line tables — much lighter to emit and link on every
 # incremental build, while keeping panic backtraces' file:line. Zero runtime
-# cost. The cdylib Flutter loads needs no Rust symbol info.
+# cost. The library the app loads needs no Rust symbol info.
 [profile.dev]
 debug = "line-tables-only"
 
@@ -19,10 +19,4 @@ debug = "line-tables-only"
 opt-level = 3
 
 [profile.dev.package.idl-rs]
-opt-level = 3
-
-[profile.dev.package.idl_rs_bridge]
-opt-level = 3
-
-[profile.dev.package.idl-rs-video-export]
 opt-level = 3

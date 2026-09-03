@@ -17,7 +17,6 @@ pub mod histogram;
 pub mod integration;
 pub mod laps;
 pub mod math;
-pub mod overlay;
 pub mod parse;
 pub mod rotation;
 pub mod scatter;
@@ -29,5 +28,8 @@ pub mod track_artifact;
 pub mod track_projection;
 pub mod tracks;
 pub mod variance;
-pub mod video;
 pub mod workbook;
+
+/// The engine's crate version, stamped into derived-file hashes and reported
+/// over IPC so every device can prove it computes with the same engine.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

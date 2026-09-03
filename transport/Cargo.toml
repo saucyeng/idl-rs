@@ -1,11 +1,12 @@
 [package]
-name = "idl-rs-video-export"
+name = "idl-transport"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-description = "Sidecar-ffmpeg export driver for idl-rs video overlays (the only process-spawning component)."
+description = "Device transport (BLE, WiFi transfer, config push) and LAN sync for idl1. I/O only; no DSP."
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
 serde_json = "1"
-rayon = "1.10"
