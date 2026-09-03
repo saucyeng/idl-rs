@@ -9,3 +9,4 @@ pub mod atomic;
 pub mod blob;
 pub mod derived;
 pub mod parquet;
+pub mod session_json;
