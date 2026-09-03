@@ -6,8 +6,16 @@
 //! the app talks to 192.168.4.1 directly and the user joins the AP in
 //! system settings") — desktop always talks to the fixed AP IP directly.
 
+use futures::StreamExt;
+use tokio::io::AsyncWriteExt;
+
 use crate::device::DeviceFile;
 use crate::{TransportError, TransportErrorKind};
+
+/// Builds a `TransportErrorKind::Wifi` error with `message`.
+fn wifi_error(message: impl Into<String>) -> TransportError {
+    TransportError::new(TransportErrorKind::Wifi, message)
+}
 
 /// The device's fixed WiFi-mode IP (SPEC §6, AP mode, no router).
 pub const DEVICE_BASE_URL: &str = "http://192.168.4.1";
@@ -146,49 +154,157 @@ impl ReqwestWifi {
 }
 
 impl WifiTransport for ReqwestWifi {
-    // Task 7 implementer fills in each method body against `reqwest`
-    // 0.13.4's actual `Client`/`RequestBuilder`/`Response` API. No
-    // real-server unit tests here (Task 7 adds the mock HTTP server and
-    // integration-shaped tests); every body below is `unimplemented!()`
-    // only so the crate compiles now — they panic if called, and nothing
-    // calls them until Task 7.
-
     async fn ping(&self) -> Result<PingResponse, TransportError> {
-        unimplemented!("Task 7 implementer: GET {{base_url}}/ping, .json::<PingResponse>().await, map non-2xx/decode failures to TransportErrorKind::Wifi")
+        let response = self
+            .client
+            .get(format!("{}/ping", self.base_url))
+            .send()
+            .await
+            .map_err(|e| wifi_error(format!("GET /ping failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| wifi_error(format!("GET /ping returned an error status: {e}")))?;
+        response
+            .json::<PingResponse>()
+            .await
+            .map_err(|e| wifi_error(format!("GET /ping returned malformed JSON: {e}")))
     }
 
     async fn handoff(&self) -> Result<(), TransportError> {
-        unimplemented!("Task 7 implementer: POST {{base_url}}/handoff, map non-2xx to TransportErrorKind::Wifi")
+        self.client
+            .post(format!("{}/handoff", self.base_url))
+            .send()
+            .await
+            .map_err(|e| wifi_error(format!("POST /handoff failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| wifi_error(format!("POST /handoff returned an error status: {e}")))?;
+        Ok(())
     }
 
     async fn wifi_off(&self) -> Result<(), TransportError> {
-        unimplemented!("Task 7 implementer: POST {{base_url}}/wifi_off, map non-2xx to TransportErrorKind::Wifi")
+        self.client
+            .post(format!("{}/wifi_off", self.base_url))
+            .send()
+            .await
+            .map_err(|e| wifi_error(format!("POST /wifi_off failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| wifi_error(format!("POST /wifi_off returned an error status: {e}")))?;
+        Ok(())
     }
 
     async fn list_files(&self) -> Result<Vec<DeviceFile>, TransportError> {
-        unimplemented!("Task 7 implementer: GET {{base_url}}/files, .json::<Vec<DeviceFile>>().await (resolve Open question 3's #[serde(rename = \"size\")] on DeviceFile::size_bytes)")
+        let response = self
+            .client
+            .get(format!("{}/files", self.base_url))
+            .send()
+            .await
+            .map_err(|e| wifi_error(format!("GET /files failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| wifi_error(format!("GET /files returned an error status: {e}")))?;
+        response
+            .json::<Vec<DeviceFile>>()
+            .await
+            .map_err(|e| wifi_error(format!("GET /files returned malformed JSON: {e}")))
     }
 
+    /// SPEC §6.1 `/download`, resumable via `Range`/`Content-Range`. Sends
+    /// the `Range` header only when resuming (`resume_from_bytes > 0`) —
+    /// asking for `bytes=0-` on a fresh download is unnecessary and some
+    /// HTTP servers respond `206` instead of `200` to any `Range` header,
+    /// which would make the fresh-download and resumed-download code paths
+    /// harder to tell apart than they need to be.
     async fn download(
         &self,
-        _file_index: u32,
-        _resume_from_bytes: u64,
-        _sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-        _on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+        file_index: u32,
+        resume_from_bytes: u64,
+        sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+        on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
     ) -> Result<u64, TransportError> {
-        unimplemented!("Task 7 implementer: GET {{base_url}}/download?file=N with a Range header from range_header(resume_from_bytes) when resume_from_bytes > 0, stream .bytes_stream() into sink via tokio::io::AsyncWriteExt::write_all, call on_progress per chunk, cross-check a 206 response's Content-Range via parse_content_range against the requested offset")
+        let url = format!("{}/download?file={file_index}", self.base_url);
+        let mut request = self.client.get(&url);
+        if resume_from_bytes > 0 {
+            request = request.header(reqwest::header::RANGE, range_header(resume_from_bytes));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| wifi_error(format!("GET /download failed: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(wifi_error(format!("GET /download returned status {status}")));
+        }
+
+        // A 206 echoes exactly what range the server actually served — the
+        // trait's own contract (`WifiTransport::download`'s doc comment)
+        // says to error rather than silently trust a mismatch.
+        let total_bytes = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            let content_range = response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| wifi_error("206 response is missing a Content-Range header"))?
+                .to_string();
+            let (start_byte, _end_byte, total_bytes) = parse_content_range(&content_range)
+                .ok_or_else(|| {
+                    wifi_error(format!("malformed Content-Range header: {content_range}"))
+                })?;
+            if start_byte != resume_from_bytes {
+                return Err(wifi_error(format!(
+                    "server resumed at byte {start_byte}, but {resume_from_bytes} was requested"
+                )));
+            }
+            total_bytes
+        } else {
+            None
+        };
+
+        let mut stream = response.bytes_stream();
+        let mut done_bytes: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| wifi_error(format!("download stream error: {e}")))?;
+            sink.write_all(&chunk)
+                .await
+                .map_err(|e| wifi_error(format!("writing downloaded bytes failed: {e}")))?;
+            done_bytes += chunk.len() as u64;
+            on_progress(done_bytes, total_bytes);
+        }
+        Ok(done_bytes)
     }
 
-    async fn delete(&self, _file_index: u32) -> Result<(), TransportError> {
-        unimplemented!("Task 7 implementer: GET {{base_url}}/delete?file=N, map non-2xx to TransportErrorKind::Wifi")
+    async fn delete(&self, file_index: u32) -> Result<(), TransportError> {
+        self.client
+            .get(format!("{}/delete?file={file_index}", self.base_url))
+            .send()
+            .await
+            .map_err(|e| wifi_error(format!("GET /delete failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| wifi_error(format!("GET /delete returned an error status: {e}")))?;
+        Ok(())
     }
 
-    async fn push_config(&self, _config_json: &[u8]) -> Result<(), TransportError> {
-        unimplemented!("Task 7 implementer: POST {{base_url}}/config with config_json as the body, map non-2xx to TransportErrorKind::Wifi")
+    async fn push_config(&self, config_json: &[u8]) -> Result<(), TransportError> {
+        self.client
+            .post(format!("{}/config", self.base_url))
+            .body(config_json.to_vec())
+            .send()
+            .await
+            .map_err(|e| wifi_error(format!("POST /config failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| wifi_error(format!("POST /config returned an error status: {e}")))?;
+        Ok(())
     }
 
-    async fn push_ota(&self, _firmware_image: &[u8]) -> Result<(), TransportError> {
-        unimplemented!("Task 7 implementer: POST {{base_url}}/ota, Content-Type: application/octet-stream, Content-Length set, map non-2xx to TransportErrorKind::Wifi")
+    async fn push_ota(&self, firmware_image: &[u8]) -> Result<(), TransportError> {
+        self.client
+            .post(format!("{}/ota", self.base_url))
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(firmware_image.to_vec())
+            .send()
+            .await
+            .map_err(|e| wifi_error(format!("POST /ota failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| wifi_error(format!("POST /ota returned an error status: {e}")))?;
+        Ok(())
     }
 }
 
@@ -277,5 +393,213 @@ mod tests {
         assert!(matching.is_ok());
         let err = mismatched.unwrap_err();
         assert_eq!(err.kind, TransportErrorKind::Wifi);
+    }
+}
+
+/// Integration-shaped tests: `ReqwestWifi` against a hand-rolled HTTP/1.1
+/// mock device server (Task 7 Step 2/3), rather than a real IDL0 device —
+/// that half of the proof is Task 9's manual step.
+#[cfg(test)]
+mod integration {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+
+    use super::*;
+
+    /// One canned HTTP response: status code, reason phrase, extra headers
+    /// (beyond `Content-Length`/`Connection`, which this server always
+    /// sets itself), and body bytes.
+    type MockResponse = (u16, &'static str, Vec<(String, String)>, Vec<u8>);
+
+    /// Spins up a `TcpListener` on an OS-assigned free port and answers
+    /// every request with whatever `route(path, headers)` returns. No HTTP
+    /// framework: SPEC §6 needs only a handful of fixed GET/POST endpoints
+    /// with no persistent connections, and a hand-rolled response is a
+    /// handful of lines (Task 7 Step 2's own guidance) — this keeps the
+    /// crate's dependency list to what SPEC actually requires. One request
+    /// per accepted connection; `route` runs once per request.
+    async fn spawn_mock_server<F>(route: F) -> (SocketAddr, JoinHandle<()>)
+    where
+        F: Fn(&str, &[(String, String)]) -> MockResponse + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server local addr");
+        let route = Arc::new(route);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { break };
+                let route = Arc::clone(&route);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let mut total = 0;
+                    loop {
+                        let n = socket.read(&mut buf[total..]).await.unwrap_or(0);
+                        if n == 0 {
+                            return; // connection closed before a full request arrived
+                        }
+                        total += n;
+                        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break; // end of headers — every request here has no body
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf[..total]);
+                    let mut lines = text.lines();
+                    let request_line = lines.next().unwrap_or("");
+                    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+                    let headers: Vec<(String, String)> = lines
+                        .take_while(|line| !line.is_empty())
+                        .filter_map(|line| line.split_once(':'))
+                        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                        .collect();
+
+                    let (status, reason, extra_headers, body) = route(path, &headers);
+                    let mut response = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                        body.len()
+                    );
+                    for (key, value) in extra_headers {
+                        response.push_str(&format!("{key}: {value}\r\n"));
+                    }
+                    response.push_str("\r\n");
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn ping_then_verify_device_identity_matching_ok_mismatched_wifi_error() {
+        // Arrange
+        let (addr, _server) = spawn_mock_server(|path, _headers| {
+            assert_eq!(path, "/ping");
+            let body = br#"{"device":"IDL0-A3F2","fw":"1.4.0","proto":1,"battery":87,"sd":"OK","mode":"wifi","ble":"on"}"#.to_vec();
+            (
+                200,
+                "OK",
+                vec![("Content-Type".to_string(), "application/json".to_string())],
+                body,
+            )
+        })
+        .await;
+        let wifi = ReqwestWifi::new(format!("http://{addr}"));
+
+        // Act
+        let ping = wifi.ping().await.unwrap();
+        let matching = verify_device_identity(&ping, "IDL0-A3F2");
+        let mismatched = verify_device_identity(&ping, "IDL0-OTHER");
+
+        // Assert
+        assert_eq!(ping.device, "IDL0-A3F2");
+        assert!(matching.is_ok());
+        assert_eq!(mismatched.unwrap_err().kind, TransportErrorKind::Wifi);
+    }
+
+    #[tokio::test]
+    async fn list_files_two_entries_one_missing_session_id_deserialises_both() {
+        // Arrange
+        let (addr, _server) = spawn_mock_server(|path, _headers| {
+            assert_eq!(path, "/files");
+            let body = br#"[
+                {"name":"session_001.idl0","size":12345,"session_id":"0123456789abcdef0123456789abcdef"},
+                {"name":"session_002.idl0","size":999}
+            ]"#
+            .to_vec();
+            (
+                200,
+                "OK",
+                vec![("Content-Type".to_string(), "application/json".to_string())],
+                body,
+            )
+        })
+        .await;
+        let wifi = ReqwestWifi::new(format!("http://{addr}"));
+
+        // Act
+        let files = wifi.list_files().await.unwrap();
+
+        // Assert
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, "session_001.idl0");
+        assert_eq!(files[0].size_bytes, 12345);
+        assert_eq!(
+            files[0].session_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(files[1].size_bytes, 999);
+        assert_eq!(files[1].session_id, None);
+    }
+
+    #[tokio::test]
+    async fn download_full_then_resumed_from_midpoint_concatenates_to_original_bytes() {
+        // Arrange
+        const CONTENT: &[u8] = b"0123456789ABCDEFGHIJ"; // 20 bytes
+
+        let (addr, _server) = spawn_mock_server(|path, headers| {
+            assert!(path.starts_with("/download?file="));
+            let range_value = headers
+                .iter()
+                .find(|(key, _)| key == "range")
+                .map(|(_, value)| value.clone());
+            match range_value {
+                None => (200, "OK", Vec::new(), CONTENT.to_vec()),
+                Some(range_value) => {
+                    let start: usize = range_value
+                        .trim_start_matches("bytes=")
+                        .trim_end_matches('-')
+                        .parse()
+                        .expect("test-only Range header is well-formed");
+                    let body = CONTENT[start..].to_vec();
+                    let content_range =
+                        format!("bytes {start}-{}/{}", CONTENT.len() - 1, CONTENT.len());
+                    (
+                        206,
+                        "Partial Content",
+                        vec![("Content-Range".to_string(), content_range)],
+                        body,
+                    )
+                }
+            }
+        })
+        .await;
+        let wifi = ReqwestWifi::new(format!("http://{addr}"));
+
+        // Act — fresh download, no resume
+        let mut full_sink = Vec::new();
+        let mut full_progress = Vec::new();
+        let mut on_full_progress =
+            |done_bytes: u64, total_bytes: Option<u64>| full_progress.push((done_bytes, total_bytes));
+        let full_bytes_written = wifi
+            .download(0, 0, &mut full_sink, &mut on_full_progress)
+            .await
+            .unwrap();
+
+        // Act — resumed from the midpoint, simulating an interrupted download
+        let mut resumed_sink = Vec::new();
+        let mut on_resumed_progress = |_: u64, _: Option<u64>| {};
+        let resumed_bytes_written = wifi
+            .download(0, 10, &mut resumed_sink, &mut on_resumed_progress)
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(full_bytes_written, CONTENT.len() as u64);
+        assert_eq!(full_sink, CONTENT);
+        assert!(!full_progress.is_empty());
+        assert!(full_progress.windows(2).all(|w| w[0].0 <= w[1].0));
+
+        assert_eq!(resumed_bytes_written, (CONTENT.len() - 10) as u64);
+        assert_eq!(resumed_sink, &CONTENT[10..]);
+
+        let mut concatenated = full_sink[..10].to_vec();
+        concatenated.extend_from_slice(&resumed_sink);
+        assert_eq!(concatenated, CONTENT);
     }
 }

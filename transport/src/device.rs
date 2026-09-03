@@ -28,7 +28,13 @@ pub struct ConnectionInfo {
 /// One entry from `GET /files` (SPEC §6.1).
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct DeviceFile {
+    /// File name on the device's SD card.
     pub name: String,
+    /// File size, bytes. Open question 3: SPEC §6.1's wire key is the bare
+    /// `size`; renamed here to this crate's unit-suffixed convention so C3
+    /// §3.8's already-signed `DeviceFile.size_bytes: u64` matches without a
+    /// second rename at the Tauri layer.
+    #[serde(rename = "size")]
     pub size_bytes: u64,
     /// 32 lowercase hex chars, or `None` if the file's header was unreadable
     /// (SPEC §6.1: "omitted only if the header is unreadable").

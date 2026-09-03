@@ -9,11 +9,40 @@ description = "Device transport (BLE, WiFi transfer, config push) and LAN sync f
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 btleplug = "0.13.0"
-tokio = { version = "1.53.1", features = ["sync", "time", "macros"] }
+# Task 7 judgment call (Open questions 6/8): "rt" and "io-util" were not in
+# Task 1's original feature list ("this crate ... never spawns its own
+# runtime"). Both are still needed once the trait bodies are real: "rt" for
+# `tokio::spawn`, used only to feed the `mpsc::Receiver` returned by
+# `scan`/`watch_status` from a task on whichever runtime is already driving
+# the call (never a runtime this crate creates itself — Task 1's actual
+# constraint, preserved); "io-util" for `AsyncWriteExt::write_all`, needed to
+# write into `WifiTransport::download`'s generic `sink` (fixed by Task 6's
+# trait signature). See ble_transport.rs::scan for the full reasoning.
+tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "io-util"] }
+# Task 7: needed to construct/parse GATT characteristic UUIDs against
+# btleplug's `Uuid`-typed `Characteristic::uuid` field (already resolved in
+# the workspace lockfile via btleplug's own dependency on uuid 1.26.0 — this
+# just names it directly rather than relying on a transitive re-export).
+uuid = "1"
+# Task 7: needed for `StreamExt::next` to drain btleplug's `CentralEvent`/
+# `ValueNotification` streams and reqwest's `bytes_stream()` — already
+# resolved in the workspace lockfile (both btleplug and reqwest depend on
+# futures 0.3.34/futures-util 0.3.34 transitively); this just names the
+# extension trait directly. `default-features = false` + `"std"` keeps out
+# futures' executor/compat/io-compat/thread-pool extras this crate never uses.
+futures = { version = "0.3", default-features = false, features = ["std"] }
 # Pinned 2026-09-03, lead ruling R7 (docs/superpowers/specs/2026-09-02-idl1-m0-ecosystem.md).
 # default-tls dropped: every WiFi endpoint (SPEC §6) is plain HTTP against
-# 192.168.4.1 — no TLS stack needed, smaller build.
-reqwest = { version = "0.13.4", default-features = false, features = ["stream"] }
+# 192.168.4.1 — no TLS stack needed, smaller build. Task 7 adds "json":
+# `/ping` and `/files` (SPEC §6.1) are both JSON bodies this trait
+# deserialises directly (`PingResponse`, `Vec<DeviceFile>>`); not in Task 6's
+# original feature list because Task 6 only wrote the trait, not its body.
+reqwest = { version = "0.13.4", default-features = false, features = ["stream", "json"] }
 
 [dev-dependencies]
 serde_json = "1"
+# Task 7: the mock HTTP device server (wifi_transport.rs integration tests)
+# hand-rolls HTTP/1.1 over a raw `tokio::net::TcpListener` rather than adding
+# a server framework — "net" is dev-only (test builds), so it never reaches
+# consumers of this library the way the main [dependencies] tokio entry does.
+tokio = { version = "1.53.1", features = ["net", "rt", "macros", "io-util"] }
