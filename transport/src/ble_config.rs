@@ -31,15 +31,15 @@ pub fn validate_config_size(json: &[u8]) -> Result<(), TransportError> {
     Ok(())
 }
 
-/// Splits `json` into `chunk_size`-byte pieces (the last shorter) for
-/// sequential Write-with-Response calls to Config RX (FF05). `chunk_size`
+/// Splits `json` into `chunk_size_bytes`-byte pieces (the last shorter) for
+/// sequential Write-with-Response calls to Config RX (FF05). `chunk_size_bytes`
 /// comes from the connection's negotiated MTU minus ATT overhead (Task 5 —
 /// see Open question 6 on why the exact value isn't fixed here).
-pub fn chunk_config(json: &[u8], chunk_size: usize) -> Vec<&[u8]> {
-    if chunk_size == 0 || json.is_empty() {
+pub fn chunk_config(json: &[u8], chunk_size_bytes: usize) -> Vec<&[u8]> {
+    if chunk_size_bytes == 0 || json.is_empty() {
         return Vec::new();
     }
-    json.chunks(chunk_size).collect()
+    json.chunks(chunk_size_bytes).collect()
 }
 
 /// Reassembles the Config TX (FF06) read loop: calls `read_chunk` repeatedly
