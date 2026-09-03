@@ -87,15 +87,24 @@ mod tests {
     fn handle_with(channels: Vec<ChannelInput>) -> SessionHandle {
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         SessionHandle::from_channels(meta, channels)
     }
 
     fn base(id: &str, samples: Vec<f64>) -> ChannelInput {
-        ChannelInput { channel_id: id.to_string(), sample_rate_hz: 10.0, samples, sample_times_secs: None }
+        let t_us = (0..samples.len())
+            .map(|i| (i as f64 * 1_000_000.0 / 10.0).round() as i64)
+            .collect();
+        ChannelInput {
+            channel_id: id.to_string(),
+            sample_rate_hz: 10.0,
+            samples,
+            t_us,
+            source_kind: id.to_lowercase(),
+        }
     }
 
     fn defs(pairs: &[(&str, &str)]) -> HashMap<String, MathChannelDef> {

@@ -541,19 +541,36 @@ mod tests {
     fn handle_with(channels: Vec<ChannelInput>) -> SessionHandle {
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 1_700_000_000_000, // arbitrary recent unix ms
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         SessionHandle::from_channels(meta, channels)
     }
 
+    /// 1 Hz channel with synthetic uniform `t_us` (`i * 1_000_000`).
     fn fixed(id: &str, samples: Vec<f64>) -> ChannelInput {
-        ChannelInput { channel_id: id.to_string(), sample_rate_hz: 1.0, samples, sample_times_secs: None }
+        let t_us = (0..samples.len() as i64).map(|i| i * 1_000_000).collect();
+        ChannelInput {
+            channel_id: id.to_string(),
+            sample_rate_hz: 1.0,
+            samples,
+            t_us,
+            source_kind: id.to_lowercase(),
+        }
     }
 
+    /// Event-driven channel with explicit per-sample `times` (seconds),
+    /// converted to `t_us`.
     fn event(id: &str, samples: Vec<f64>, times: Vec<f64>) -> ChannelInput {
-        ChannelInput { channel_id: id.to_string(), sample_rate_hz: 0.0, samples, sample_times_secs: Some(times) }
+        let t_us = times.iter().map(|&t| (t * 1e6).round() as i64).collect();
+        ChannelInput {
+            channel_id: id.to_string(),
+            sample_rate_hz: 0.0,
+            samples,
+            t_us,
+            source_kind: id.to_lowercase(),
+        }
     }
 
     #[test]

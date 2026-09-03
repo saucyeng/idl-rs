@@ -48,15 +48,22 @@ mod tests {
     fn handle_with(channels: Vec<ChannelInput>) -> SessionHandle {
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         SessionHandle::from_channels(meta, channels)
     }
 
     fn ch(id: &str, samples: Vec<f64>) -> ChannelInput {
-        ChannelInput { channel_id: id.to_string(), sample_rate_hz: 1.0, samples, sample_times_secs: None }
+        let t_us = (0..samples.len() as i64).map(|i| i * 1_000_000).collect();
+        ChannelInput {
+            channel_id: id.to_string(),
+            sample_rate_hz: 1.0,
+            samples,
+            t_us,
+            source_kind: id.to_lowercase(),
+        }
     }
 
     #[test]

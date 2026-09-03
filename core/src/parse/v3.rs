@@ -58,6 +58,12 @@ impl ImuRouting {
 
 /// Parses a v3 `.idl0` buffer. Returns the parsed session plus an optional
 /// truncation warning (the buffer ended mid-record).
+///
+/// `session.blob_sha256` is left empty — this function only sees the decoded
+/// record stream, not the file's raw bytes, so it cannot compute the hash
+/// itself. The caller with file access (`SessionHandle::from_path`/
+/// `from_bytes`) computes `sha256(bytes)` over the same buffer and fills it
+/// in after `parse()` returns.
 pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     let mut reader = ByteReader::new(bytes);
 
@@ -101,7 +107,7 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
 
     let mut acc = ChannelAccumulator::new();
     let mut routing = HotRouting::new(&registry_by_name);
-    let mut event_ts_us: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut channel_ts_us: HashMap<String, Vec<i64>> = HashMap::new();
     let mut origin = TimeOrigin::default();
     let mut first: [Option<i64>; 3] = [None; 3];
     let mut last: [Option<i64>; 3] = [None; 3];
@@ -115,6 +121,13 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     // sample. Placement anchors to absolute time so per-IMU drop/backstep history
     // never accumulates cross-IMU drift (§15.2).
     let mut last_abs_slot: [i64; 3] = [0; 3];
+    // Every kept IMU record's own device timestamp, per IMU — the raw recorded
+    // time Task 6's burst-seam correction reconciles against. Unused for
+    // `t_us` in this task (Task 4 interim: grid-slot time — see below).
+    let mut imu_recorded_ts: [Vec<i64>; 3] = Default::default();
+    // Per-fix GPS device timestamp — every GPS channel shares this as its
+    // `t_us` source (C1 §2; no burst structure to reconcile for GPS).
+    let mut gps_ts: Vec<i64> = Vec::new();
     let mut gps_anchor = GpsAnchor::default();
     let mut truncation: Option<ParseError> = None;
 
@@ -125,7 +138,7 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
             &registry,
             &mut routing,
             &mut acc,
-            &mut event_ts_us,
+            &mut channel_ts_us,
             &mut origin,
             &mut first,
             &mut last,
@@ -133,6 +146,8 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
             period_us,
             &mut imu_gaps,
             &mut last_abs_slot,
+            &mut imu_recorded_ts,
+            &mut gps_ts,
             &mut gps_anchor,
         ) {
             Ok(true) => {}
@@ -150,22 +165,42 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     // rebuilt onto that grid (drops linear-filled, edges held), so cross-IMU
     // element-wise math no longer sees mismatched rates/lengths.
     let plan = ImuGridPlan::build(&first, &count, imu_gaps, period_us);
+    let t0_us = origin.min_us.unwrap_or(0);
     let mut channels = Vec::new();
     for (name, column) in acc.into_entries() {
         let rate = resolve_rate(&name, gps_sample_rate_hz, &registry, plan.nominal_rate);
-        let sample_times_secs = match event_ts_us.get(&name) {
-            Some(ts) if !ts.is_empty() => {
-                let o = origin.min_us.unwrap_or(ts[0]);
-                Some(ts.iter().map(|&t| (t - o) as f64 / 1e6).collect())
-            }
-            _ => None,
-        };
         let (column, gaps) = plan.reconcile(&name, column);
+        let (t_us, source_kind) = if let Some(imu_idx) = imu_index_of(&name) {
+            // Task 4 interim: grid-slot time, matching the pre-idl1 implicit
+            // i/rate formula exactly (no burst correction yet — Task 6).
+            // t_recorded_us stays None: defined identical to t_us until Task 6
+            // actually diverges them.
+            let local_t0 = first[imu_idx].unwrap_or(t0_us);
+            let t = (0..column.len())
+                .map(|slot| (local_t0 - t0_us) + (slot as i64) * period_us)
+                .collect();
+            (t, format!("imu{imu_idx}"))
+        } else if name.starts_with("GPS") {
+            let t = gps_ts.iter().map(|&ts| ts - t0_us).collect();
+            (t, "gps".to_string())
+        } else if let Some(ts) = channel_ts_us.get(&name) {
+            let t = ts.iter().map(|&ts| ts - t0_us).collect();
+            (t, generic_source_kind(&name))
+        } else {
+            // No recorded timestamp captured for this name (should not happen
+            // for a real registry channel) — empty t_us degrades gracefully
+            // rather than panicking (CLAUDE.md §5); surfaced by the round-trip
+            // test in Task 9 if it ever fires.
+            (Vec::new(), generic_source_kind(&name))
+        };
         channels.push(Channel {
-            channel_id: name,
-            sample_rate_hz: rate,
+            channel_id: name.clone(),
+            t_us,
+            t_recorded_us: None,
+            nominal_rate_hz: rate,
             column,
-            sample_times_secs,
+            source_kind,
+            unit: unit_for(&name, &registry_by_name),
             gaps,
         });
     }
@@ -190,13 +225,66 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     Ok(ParseResult {
         session: Session {
             session_id,
-            device_id,
+            device_id: Some(device_id),
             timestamp_utc_ms: effective_start_ms,
-            config_checksum: format!("{config_crc:08x}"),
+            config_checksum: Some(format!("{config_crc:08x}")),
+            source_format: crate::session::SourceFormat::Idl0,
+            // Filled by the caller, not here — `parse_v3` only sees the
+            // decoded record stream, not the raw file bytes it came from.
+            // `SessionHandle::from_bytes` computes `sha256(bytes)` (the
+            // `sha2` dependency, Task 1) and overwrites this field after
+            // `parse()` returns, before synthesis runs (see store::blob,
+            // Task 8).
+            blob_sha256: String::new(),
             channels,
         },
         truncation_warning: truncation,
     })
+}
+
+/// Resolves a channel's physical unit string (contract C1 §4.1). IMU axes and
+/// GPS channels get a small hardcoded table (the registry doesn't self-describe
+/// a useful unit for them today); every other registry channel falls back to
+/// `ChannelRegistryEntry.units` verbatim (SPEC §5.2); unknown names get an
+/// empty string.
+fn unit_for(channel_id: &str, registry_by_name: &HashMap<String, ChannelRegistryEntry>) -> String {
+    if let Some(u) = imu_axis_unit(channel_id) {
+        return u.to_string();
+    }
+    if let Some(u) = gps_channel_unit(channel_id) {
+        return u.to_string();
+    }
+    registry_by_name.get(channel_id).map(|e| e.units.clone()).unwrap_or_default()
+}
+
+/// IMU axis unit (`g` for accel, `dps` for gyro), or `None` for a non-IMU
+/// channel name.
+fn imu_axis_unit(channel_id: &str) -> Option<&'static str> {
+    if imu_index_of(channel_id).is_none() {
+        return None;
+    }
+    if channel_id.contains("Accel") {
+        Some("g")
+    } else if channel_id.contains("Gyro") {
+        Some("dps")
+    } else {
+        None
+    }
+}
+
+/// GPS channel unit, per contract C1 §4.1's table verbatim, or `None` for a
+/// non-GPS channel name.
+fn gps_channel_unit(channel_id: &str) -> Option<&'static str> {
+    match channel_id {
+        "GPS_SpeedKmh" => Some("km/h"),
+        "GPS_EpochMs" => Some("ms_raw"),
+        "GPS_Latitude" | "GPS_Longitude" => Some("deg_e7"),
+        "GPS_Altitude" => Some("m_e1"),
+        "GPS_Heading" => Some("deg_e2"),
+        "GPS_FixQuality" => Some("enum_raw"),
+        "GPS_Satellites" => Some("count"),
+        _ => None,
+    }
 }
 
 /// Reads one record. Returns `Ok(true)` to continue, `Ok(false)` on SESSION_END.
@@ -207,7 +295,7 @@ fn read_record(
     registry: &HashMap<u8, ChannelRegistryEntry>,
     routing: &mut HotRouting,
     acc: &mut ChannelAccumulator,
-    event_ts_us: &mut HashMap<String, Vec<i64>>,
+    channel_ts_us: &mut HashMap<String, Vec<i64>>,
     origin: &mut TimeOrigin,
     first: &mut [Option<i64>; 3],
     last: &mut [Option<i64>; 3],
@@ -215,6 +303,8 @@ fn read_record(
     period_us: i64,
     imu_gaps: &mut [Vec<(usize, usize)>; 3],
     last_abs_slot: &mut [i64; 3],
+    imu_recorded_ts: &mut [Vec<i64>; 3],
+    gps_ts: &mut Vec<i64>,
     gps_anchor: &mut GpsAnchor,
 ) -> Result<bool, ParseError> {
     let type_ = reader.u8("record type")?;
@@ -224,16 +314,16 @@ fn read_record(
         0x01 => {
             parse_imu(
                 reader, payload_len, imu_mask, &mut routing.imu, acc, first, last, count, period_us,
-                imu_gaps, last_abs_slot, origin,
+                imu_gaps, last_abs_slot, imu_recorded_ts, origin,
             )?;
             Ok(true)
         }
         0x02 => {
-            parse_gps_record(reader, payload_len, acc, Some(gps_anchor), Some(origin))?;
+            parse_gps_record(reader, payload_len, acc, Some(gps_anchor), Some(origin), gps_ts)?;
             Ok(true)
         }
         0x03 => {
-            parse_channel(reader, payload_len, registry, &mut routing.channel_slot, acc, event_ts_us, origin)?;
+            parse_channel(reader, payload_len, registry, &mut routing.channel_slot, acc, channel_ts_us, origin)?;
             Ok(true)
         }
         _ => {
@@ -256,6 +346,7 @@ fn parse_imu(
     period_us: i64,
     imu_gaps: &mut [Vec<(usize, usize)>; 3],
     last_abs_slot: &mut [i64; 3],
+    imu_recorded_ts: &mut [Vec<i64>; 3],
     origin: &mut TimeOrigin,
 ) -> Result<(), ParseError> {
     let payload_start = reader.position();
@@ -303,6 +394,9 @@ fn parse_imu(
     }
 
     if !drop_sample && idx < IMU_CHANNEL_NAMES.len() {
+        // One push per kept record (not per axis) — the raw recorded
+        // timestamp Task 6's burst-seam correction reconciles against.
+        imu_recorded_ts[idx].push(ts_us);
         let names = IMU_CHANNEL_NAMES[idx];
         for axis in 0..6u32 {
             let mask_bit = imu_index as u32 * 6 + axis;
@@ -349,7 +443,7 @@ fn parse_channel(
     registry: &HashMap<u8, ChannelRegistryEntry>,
     channel_slot: &mut [Option<usize>; 256],
     acc: &mut ChannelAccumulator,
-    event_ts_us: &mut HashMap<String, Vec<i64>>,
+    channel_ts_us: &mut HashMap<String, Vec<i64>>,
     origin: &mut TimeOrigin,
 ) -> Result<(), ParseError> {
     let payload_start = reader.position();
@@ -395,11 +489,10 @@ fn parse_channel(
                 read_typed_value(reader, entry.data_type)? * entry.scale + entry.offset,
             ),
         }
-        if entry.sample_rate_hz == 0 {
-            // Event-driven channel (low-rate): record the per-sample timestamp.
-            // The name is only cloned here, never on the high-rate path.
-            event_ts_us.entry(entry.name.clone()).or_default().push(ts_us);
-        }
+        // Every CHANNEL_SAMPLE record's own timestamp, regardless of the
+        // registry's declared rate — contract C1 §2 makes per-sample time
+        // mandatory on every channel, not just event-driven ones.
+        channel_ts_us.entry(entry.name.clone()).or_default().push(ts_us);
     }
 
     let consumed = reader.position() - payload_start;
@@ -474,9 +567,9 @@ mod tests {
         // Assert — metadata
         assert!(r.is_complete());
         assert_eq!(r.session.session_id, "0102030405060708090a0b0c0d0e0f10");
-        assert_eq!(r.session.device_id, "b0b1b2b3b4b5");
+        assert_eq!(r.session.device_id.as_deref(), Some("b0b1b2b3b4b5"));
         assert_eq!(r.session.timestamp_utc_ms, RMC_UTC_MS);
-        assert_eq!(r.session.config_checksum, "cafebabe");
+        assert_eq!(r.session.config_checksum.as_deref(), Some("cafebabe"));
 
         // IMU scaled
         assert_relative_eq!(find(&r, "IMU0_AccelX").materialize()[0], 16.0, epsilon = 1e-6);
@@ -651,7 +744,7 @@ mod tests {
         let ch = find(&r, "IMU0_AccelX");
         assert_eq!(ch.len(), 6);
         assert!(ch.gaps.is_empty());
-        assert_relative_eq!(ch.sample_rate_hz, 1e6 / 600.0, epsilon = 1e-6);
+        assert_relative_eq!(ch.nominal_rate_hz, 1e6 / 600.0, epsilon = 1e-6);
     }
 
     #[test]
@@ -678,7 +771,7 @@ mod tests {
         assert_eq!(ch.len(), 4);
         assert!(ch.gaps.is_empty());
         assert_eq!(ch.materialize(), vec![10.0, 20.0, 30.0, 40.0]);
-        assert_relative_eq!(ch.sample_rate_hz, 1000.0, epsilon = 1e-9);
+        assert_relative_eq!(ch.nominal_rate_hz, 1000.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -744,7 +837,7 @@ mod tests {
         // Assert — equal length, equal nominal rate, spike on the same slot, and
         // the two reconciled columns are identical (so the difference is all 0).
         assert_eq!(a.len(), b.len());
-        assert_eq!(a.sample_rate_hz, b.sample_rate_hz);
+        assert_eq!(a.nominal_rate_hz, b.nominal_rate_hz);
         assert_eq!(a.materialize()[4], 1000.0);
         assert_eq!(b.materialize()[4], 1000.0);
         assert_eq!(a.materialize(), b.materialize());
@@ -782,8 +875,8 @@ mod tests {
         let r = parse_v3(&buf).unwrap();
 
         // Assert
-        let r0 = find(&r, "IMU0_AccelX").sample_rate_hz;
-        let r1 = find(&r, "IMU1_AccelX").sample_rate_hz;
+        let r0 = find(&r, "IMU0_AccelX").nominal_rate_hz;
+        let r1 = find(&r, "IMU1_AccelX").nominal_rate_hz;
         assert_eq!(r0, r1);
         assert_relative_eq!(r0, 1000.0, epsilon = 1e-9);
     }
@@ -894,8 +987,10 @@ mod tests {
         assert_relative_eq!(brake.materialize()[0], 100.0 * 0.5 + 1.0, epsilon = 1e-6);
         assert_relative_eq!(brake.materialize()[1], 200.0 * 0.5 + 1.0, epsilon = 1e-6);
         assert_relative_eq!(brake.materialize()[2], 300.0 * 0.5 + 1.0, epsilon = 1e-6);
-        // Fixed-rate channel → no per-sample event timestamps.
-        assert!(brake.sample_times_secs.is_none());
+        // Every channel carries real, strictly increasing t_us now (C1 §2/§3.5
+        // invariant 1) — fixed-rate channels are no longer distinguished by a
+        // "times present/absent" signal.
+        assert!(brake.t_us.windows(2).all(|w| w[1] > w[0]));
     }
 
     #[test]
@@ -978,18 +1073,21 @@ mod tests {
         ]);
         let r = parse_v3(&buf).unwrap();
         let rr = find(&r, "HR_RR");
-        assert_eq!(rr.sample_rate_hz, 0.0);
-        let times = rr.sample_times_secs.as_ref().unwrap();
-        assert_eq!(times.len(), 3);
-        assert_relative_eq!(times[0], 0.5, epsilon = 1e-9);
-        assert_relative_eq!(times[1], 1.0, epsilon = 1e-9);
-        assert_relative_eq!(times[2], 1.3, epsilon = 1e-9);
+        assert_eq!(rr.nominal_rate_hz, 0.0);
+        // Tightened to exact µs checks on t_us directly — the old
+        // sample_times_secs-presence signal ("this channel carries real
+        // per-sample time") is now true of every channel by construction.
+        assert_eq!(rr.t_us, vec![500_000, 1_000_000, 1_300_000]);
         assert_relative_eq!(rr.materialize()[0], 1000.0, epsilon = 1e-6);
-        assert!(find(&r, "IMU0_AccelX").sample_times_secs.is_none());
     }
 
     #[test]
-    fn event_channel_duration_reflects_last_timestamp() {
+    fn event_channel_duration_spans_its_own_first_to_last_sample() {
+        // duration_ms is (t_us.last() - t_us.first()) / 1000 (session::Channel
+        // doc comment) — the channel's own data span, not "time since the
+        // session origin to the last sample". HR_RR's own samples run from
+        // 500_000 µs to 1_300_000 µs (session-relative, origin = the IMU
+        // record at 1_000_000), an 800 ms span.
         let rr_scale: f32 = 1000.0 / 1024.0;
         let registry = vec![
             v3_registry_entry(0, 4, 800, ACCEL_SCALE, 0.0, "IMU0_AccelX", "g"),
@@ -1004,7 +1102,7 @@ mod tests {
             session_end(),
         ]);
         let r = parse_v3(&buf).unwrap();
-        assert_eq!(find(&r, "HR_RR").duration_ms(), 1300);
+        assert_eq!(find(&r, "HR_RR").duration_ms(), 800);
     }
 
     #[test]
@@ -1018,8 +1116,7 @@ mod tests {
             session_end(),
         ]);
         let r = parse_v3(&buf).unwrap();
-        let times = find(&r, "HR_RR").sample_times_secs.as_ref().unwrap();
-        assert_relative_eq!(times[0], 0.0, epsilon = 1e-9);
-        assert_relative_eq!(times[1], 0.4, epsilon = 1e-9);
+        let t_us = &find(&r, "HR_RR").t_us;
+        assert_eq!(t_us, &vec![0, 400_000]);
     }
 }

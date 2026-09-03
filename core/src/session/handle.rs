@@ -48,22 +48,40 @@ pub struct ChannelMeta {
     pub synthesized: bool,
 }
 
-/// Header fields for [`SessionHandle::from_channels`] (GPX path).
+/// Header fields for [`SessionHandle::from_channels`] (GPX path). Mirrors
+/// [`Session`]'s own field set (minus `channels`/`source_format`/
+/// `blob_sha256`, which `from_channels` fills — GPX is this constructor's
+/// only caller today, so `source_format` is fixed to
+/// [`crate::session::SourceFormat::Gpx`]; `blob_sha256` is left empty for the
+/// same reason `parse_v3` leaves it empty — the raw source bytes aren't in
+/// scope here, only the caller that read the file has them).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionMetaInput {
+    /// See [`Session::session_id`].
     pub session_id: String,
-    pub device_id: String,
+    /// See [`Session::device_id`]. `None` for GPX — there is no device.
+    pub device_id: Option<String>,
+    /// See [`Session::timestamp_utc_ms`].
     pub timestamp_utc_ms: i64,
-    pub config_checksum: String,
+    /// See [`Session::config_checksum`]. `None` for GPX — there is no device config.
+    pub config_checksum: Option<String>,
 }
 
-/// One channel of caller-parsed data (GPX path).
+/// One channel of caller-parsed data (GPX path). Mirrors [`Channel`]'s field
+/// set (minus `t_recorded_us`, which `from_channels` sets `None` — GPX has no
+/// burst structure to reconcile — and `unit`, left empty).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChannelInput {
+    /// See [`Channel::channel_id`].
     pub channel_id: String,
+    /// See [`Channel::nominal_rate_hz`].
     pub sample_rate_hz: f64,
+    /// Physical sample values.
     pub samples: Vec<f64>,
-    pub sample_times_secs: Option<Vec<f64>>,
+    /// See [`Channel::t_us`]. `t_us.len()` must equal `samples.len()`.
+    pub t_us: Vec<i64>,
+    /// See [`Channel::source_kind`].
+    pub source_kind: String,
 }
 
 /// Owned parsed session. Synthesis runs in every constructor. The `derived`
@@ -183,6 +201,16 @@ impl SessionHandle {
     /// truncation is recoverable and surfaced via [`SessionMeta::truncation_warning`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
         let ParseResult { mut session, truncation_warning } = parse(bytes)?;
+        // `parse_v3` cannot see the raw file bytes it was decoded from (it
+        // only receives the already-borrowed slice's contents as a record
+        // stream) — computing the content hash here, over the exact same
+        // buffer, is this constructor's job (contract C1 §2/§4.3).
+        session.blob_sha256 = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            crate::parse::records::to_hex(hasher.finalize().as_slice())
+        };
         let synthesized_ids = synthesize_base_channels(&mut session);
         Ok(Self {
             session,
@@ -205,13 +233,23 @@ impl SessionHandle {
             device_id: meta.device_id,
             timestamp_utc_ms: meta.timestamp_utc_ms,
             config_checksum: meta.config_checksum,
+            // GPX is this constructor's only caller today (see
+            // `SessionMetaInput`'s doc comment).
+            source_format: crate::session::SourceFormat::Gpx,
+            // Not this constructor's to compute — the caller holding the
+            // raw `.gpx` bytes fills it in, same division of labour as
+            // `parse_v3`/`SessionHandle::from_bytes`.
+            blob_sha256: String::new(),
             channels: channels
                 .into_iter()
                 .map(|c| Channel {
                     channel_id: c.channel_id,
-                    sample_rate_hz: c.sample_rate_hz,
+                    t_us: c.t_us,
+                    t_recorded_us: None,
+                    nominal_rate_hz: c.sample_rate_hz,
                     column: RawColumn::F64(c.samples),
-                    sample_times_secs: c.sample_times_secs,
+                    source_kind: c.source_kind,
+                    unit: String::new(),
                     gaps: Vec::new(),
                 })
                 .collect(),
@@ -229,9 +267,13 @@ impl SessionHandle {
     pub fn metadata(&self) -> SessionMeta {
         SessionMeta {
             session_id: self.session.session_id.clone(),
-            device_id: self.session.device_id.clone(),
+            // `SessionMeta`'s FFI-facing shape predates C1's `Option<String>`
+            // widening (contract C1 §1 — only the parser's *output* model
+            // changed) — `None` (FIT/GPX/CSV, no device) still reads as the
+            // empty-string "no device" convention this summary already used.
+            device_id: self.session.device_id.clone().unwrap_or_default(),
             timestamp_utc_ms: self.session.timestamp_utc_ms,
-            config_checksum: self.session.config_checksum.clone(),
+            config_checksum: self.session.config_checksum.clone().unwrap_or_default(),
             channel_count: self.session.channels.len() as u32,
             duration_ms: self
                 .session
@@ -251,9 +293,9 @@ impl SessionHandle {
             .iter()
             .map(|c| ChannelMeta {
                 channel_id: c.channel_id.clone(),
-                sample_rate_hz: c.sample_rate_hz,
+                sample_rate_hz: c.nominal_rate_hz,
                 length: c.len() as u32,
-                is_event_driven: c.sample_rate_hz == 0.0,
+                is_event_driven: c.nominal_rate_hz == 0.0,
                 synthesized: self.synthesized_ids.iter().any(|id| id == &c.channel_id),
             })
             .collect()
@@ -266,11 +308,22 @@ impl SessionHandle {
             .unwrap_or_default()
     }
 
-    /// Event-driven per-sample times for `channel_id`; `None` for fixed-rate
-    /// or absent. Store-aware, like [`Self::channel_samples`].
+    /// Event-driven per-sample times for `channel_id`, in seconds; `None` for
+    /// fixed-rate or absent. Store-aware, like [`Self::channel_samples`].
+    /// Derives the seconds vector from `t_us` (contract C1's mandatory-time
+    /// field) rather than a retired dedicated field — the
+    /// [`crate::math::eval::ChannelLookup::sample_times`] contract this
+    /// backs is otherwise unchanged (event-driven only, seconds, not
+    /// touched by C1).
     pub fn channel_sample_times(&self, channel_id: &str) -> Option<Vec<f64>> {
-        self.with_channel(channel_id, |c| c.sample_times_secs.clone())
-            .flatten()
+        self.with_channel(channel_id, |c| {
+            if c.nominal_rate_hz == 0.0 {
+                Some(c.t_us.iter().map(|&t| t as f64 / 1e6).collect())
+            } else {
+                None
+            }
+        })
+        .flatten()
     }
 
     /// Canonical stored names of the estimator's outputs. The four wheel names
@@ -338,9 +391,9 @@ impl SessionHandle {
         let synthesized = self.synthesized_ids.iter().any(|id| id == channel_id);
         self.with_channel(channel_id, |c| ChannelMeta {
             channel_id: c.channel_id.clone(),
-            sample_rate_hz: c.sample_rate_hz,
+            sample_rate_hz: c.nominal_rate_hz,
             length: c.len() as u32,
-            is_event_driven: c.sample_rate_hz == 0.0,
+            is_event_driven: c.nominal_rate_hz == 0.0,
             synthesized,
         })
     }
@@ -363,13 +416,13 @@ impl SessionHandle {
             .channels
             .iter()
             .find(|c| c.channel_id == "GPS_EpochMs")
-            .filter(|c| c.sample_rate_hz > 0.0 && !c.is_empty());
+            .filter(|c| c.nominal_rate_hz > 0.0 && !c.is_empty());
         match gps {
             Some(c) => {
                 let samples = c.materialize();
                 epochs_ms
                     .iter()
-                    .map(|&e| epoch_to_time_one(&samples, c.sample_rate_hz, e))
+                    .map(|&e| epoch_to_time_one(&samples, c.nominal_rate_hz, e))
                     .collect()
             }
             None => {
@@ -398,13 +451,13 @@ impl SessionHandle {
             .channels
             .iter()
             .find(|c| c.channel_id == "GPS_EpochMs")
-            .filter(|c| c.sample_rate_hz > 0.0 && !c.is_empty());
+            .filter(|c| c.nominal_rate_hz > 0.0 && !c.is_empty());
         match gps {
             Some(c) => {
                 let samples = c.materialize();
                 epochs_ms
                     .iter()
-                    .map(|&e| epoch_to_time_one_extrapolated(&samples, c.sample_rate_hz, e))
+                    .map(|&e| epoch_to_time_one_extrapolated(&samples, c.nominal_rate_hz, e))
                     .collect()
             }
             None => {
@@ -441,18 +494,12 @@ impl SessionHandle {
             if samples.is_empty() {
                 return vec![f64::NAN; times.len()];
             }
-            match &c.sample_times_secs {
-                // Event-driven: nearest entry in the per-sample time array.
-                Some(st) => times
-                    .iter()
-                    .map(|&t| nearest_by_times(&samples, st, t))
-                    .collect(),
-                // Fixed-rate: sample i is at i / sample_rate_hz.
-                None => times
-                    .iter()
-                    .map(|&t| nearest_by_rate(&samples, c.sample_rate_hz, t))
-                    .collect(),
-            }
+            // Every channel has real `t_us` now (C1 §2) — the old
+            // event-driven/fixed-rate branch collapses into one lookup.
+            times
+                .iter()
+                .map(|&t| nearest_by_t_us(&samples, &c.t_us, t))
+                .collect()
         })
         .unwrap_or_else(|| vec![f64::NAN; times.len()])
     }
@@ -472,7 +519,7 @@ impl SessionHandle {
                 RawColumn::Ramp { .. } => 0,
                 RawColumn::Interp { base, .. } => base.len() * 8,
             };
-            let times = c.sample_times_secs.as_ref().map_or(0, |t| t.len() * 8);
+            let times = c.t_us.len() * 8 + c.t_recorded_us.as_ref().map_or(0, |t| t.len() * 8);
             (col + times) as u64
         }
         let cols: u64 = self.session.channels.iter().map(channel_bytes).sum();
@@ -496,7 +543,7 @@ impl SessionHandle {
     /// dependency channels between `eval_math` calls (spec §6). Fixed-rate
     /// (no per-sample times); `sample_rate_hz` 0.0 denotes a scalar-as-channel.
     pub fn store_math(&self, channel_id: &str, sample_rate_hz: f64, samples: Vec<f64>) {
-        let ch = Channel::from_f64(channel_id, sample_rate_hz, samples, None);
+        let ch = Channel::from_f64(channel_id, sample_rate_hz, samples);
         self.derived
             .write()
             .unwrap()
@@ -601,12 +648,12 @@ impl SessionHandle {
         // the derived-store READ lock when the source lives there, and the insert
         // below takes the WRITE lock — nesting them deadlocks.
         let sliced = self.with_channel(channel_id, |c| {
-            (slice_channel_by_time(c, t0_secs, t1_secs), c.sample_rate_hz)
+            (slice_channel_by_time(c, t0_secs, t1_secs), c.nominal_rate_hz)
         });
         match sliced {
             Some((slice, rate)) if !slice.is_empty() => {
                 let n = slice.len();
-                let ch = Channel::from_f64(&token, rate, slice, None);
+                let ch = Channel::from_f64(&token, rate, slice);
                 self.derived.write().unwrap().insert(key, ch);
                 (token, n)
             }
@@ -653,7 +700,7 @@ impl SessionHandle {
         averaging: crate::fft::Averaging,
         scaling: crate::fft::Scaling,
     ) -> crate::fft::WelchResult {
-        match self.with_channel(channel_id, |c| (c.materialize(), c.sample_rate_hz)) {
+        match self.with_channel(channel_id, |c| (c.materialize(), c.nominal_rate_hz)) {
             Some((samples, rate)) => crate::fft::welch(
                 samples, rate, window, nperseg, noverlap, detrend, averaging, scaling,
             ),
@@ -680,7 +727,7 @@ impl SessionHandle {
         averaging: crate::fft::Averaging,
         scaling: crate::fft::Scaling,
     ) -> crate::fft::WelchResult {
-        match self.with_channel(channel_id, |c| (slice_channel_by_time(c, t0_secs, t1_secs), c.sample_rate_hz)) {
+        match self.with_channel(channel_id, |c| (slice_channel_by_time(c, t0_secs, t1_secs), c.nominal_rate_hz)) {
             Some((slice, rate)) if !slice.is_empty() => {
                 crate::fft::welch(slice, rate, window, nperseg, noverlap, detrend, averaging, scaling)
             }
@@ -706,7 +753,7 @@ impl SessionHandle {
         detrend: crate::fft::Detrend,
         scaling: crate::fft::Scaling,
     ) -> crate::spectrogram::SpectrogramResult {
-        match self.with_channel(channel_id, |c| (slice_channel_by_time(c, t0_secs, t1_secs), c.sample_rate_hz)) {
+        match self.with_channel(channel_id, |c| (slice_channel_by_time(c, t0_secs, t1_secs), c.nominal_rate_hz)) {
             Some((slice, rate)) if !slice.is_empty() => {
                 let mut s = crate::spectrogram::spectrogram(slice, rate, window, nperseg, noverlap, detrend, scaling);
                 for t in s.times_secs.iter_mut() {
@@ -746,58 +793,25 @@ impl SessionHandle {
 
 /// Slices a channel to the inclusive time window `[t0, t1]` (seconds).
 ///
-/// Fixed-rate (`rate > 0`): sample `i` is at `i / rate`; returns the contiguous
-/// run `ceil(t0·rate)..=floor(t1·rate)` widened from the raw column via
+/// Operates on `c.t_us` directly (every channel has real per-sample time —
+/// contract C1 §2/§3.5 invariant 1): converts `t0`/`t1` to whole microseconds
+/// and binary-searches (`partition_point`, `t_us` is strictly increasing) for
+/// the inclusive `[t0, t1]` index window, then widens only that window via
 /// [`RawColumn::materialize_range`] — the full channel is never materialized.
-/// Event-driven (`rate == 0` with per-sample times): returns samples whose
-/// time is in `[t0, t1]` (sparse by design, so the transient materialize is
-/// small). Empty when the window is inverted, the data is empty, or no sample
-/// falls inside.
+/// Empty when the window is inverted, the data is empty, or no sample falls
+/// inside.
 fn slice_channel_by_time(c: &Channel, t0: f64, t1: f64) -> Vec<f64> {
     if c.is_empty() || t1 < t0 {
         return Vec::new();
     }
-    if c.sample_rate_hz > 0.0 {
-        return match fixed_rate_slice_range(c.len(), c.sample_rate_hz, t0, t1) {
-            Some((lo, hi)) => c.column.materialize_range(lo, hi + 1),
-            None => Vec::new(),
-        };
+    let t0_us = (t0 * 1e6).round() as i64;
+    let t1_us = (t1 * 1e6).round() as i64;
+    let lo = c.t_us.partition_point(|&t| t < t0_us);
+    let hi = c.t_us.partition_point(|&t| t <= t1_us);
+    if lo >= hi {
+        return Vec::new();
     }
-    match c.sample_times_secs.as_deref() {
-        Some(ts) => {
-            let samples = c.materialize();
-            samples
-                .iter()
-                .zip(ts.iter())
-                .filter(|(_, &t)| t >= t0 && t <= t1)
-                .map(|(&s, _)| s)
-                .collect()
-        }
-        None => Vec::new(),
-    }
-}
-
-/// Inclusive-window index range for a fixed-rate channel: `ceil(t0·rate) ..=
-/// floor(t1·rate)`, clamped; `None` when no sample falls inside. The 1e-9
-/// epsilon absorbs float boundary error so an exact grid point isn't dropped
-/// (same arithmetic as the previous whole-channel slice — outputs are
-/// bit-identical).
-fn fixed_rate_slice_range(len: usize, rate: f64, t0: f64, t1: f64) -> Option<(usize, usize)> {
-    if len == 0 || t1 < t0 {
-        return None;
-    }
-    const EPS: f64 = 1e-9;
-    let lo_f = (t0 * rate - EPS).ceil();
-    let hi_f = (t1 * rate + EPS).floor();
-    if hi_f < 0.0 {
-        return None;
-    }
-    let lo = lo_f.max(0.0) as usize;
-    let hi = (hi_f as usize).min(len - 1);
-    if lo > hi || lo >= len {
-        return None;
-    }
-    Some((lo, hi))
+    c.column.materialize_range(lo, hi)
 }
 
 /// Maps one epoch-ms `target` to uniform-Time seconds via a bracketing binary
@@ -879,14 +893,14 @@ impl crate::math::eval::ChannelLookup for SessionHandle {
         // checks session.channels first). The evaluator needs the whole array.
         self.with_channel(name, |c| crate::math::eval::LookupChannel {
             samples: Arc::from(c.materialize()),
-            sample_rate_hz: c.sample_rate_hz,
+            sample_rate_hz: c.nominal_rate_hz,
         })
     }
 
     fn channel_dims(&self, name: &str) -> Option<(usize, f64)> {
         // (len, rate) without materializing — the closed-form time base reads
         // this so the zero-storage `Time` ramp is never widened.
-        self.with_channel(name, |c| (c.len(), c.sample_rate_hz))
+        self.with_channel(name, |c| (c.len(), c.nominal_rate_hz))
     }
 
     fn best_time_base_dims(&self) -> Option<(usize, f64)> {
@@ -899,10 +913,10 @@ impl crate::math::eval::ChannelLookup for SessionHandle {
             }
         };
         for c in &self.session.channels {
-            consider(c.len(), c.sample_rate_hz);
+            consider(c.len(), c.nominal_rate_hz);
         }
         for c in self.derived.read().unwrap().values() {
-            consider(c.len(), c.sample_rate_hz);
+            consider(c.len(), c.nominal_rate_hz);
         }
         best
     }
@@ -912,32 +926,24 @@ impl crate::math::eval::ChannelLookup for SessionHandle {
     }
 }
 
-/// Value of a fixed-rate channel at recording-time `t_secs` — the nearest
-/// sample (sample `i` is at `i / rate_hz`). `NaN` for a non-positive rate,
-/// negative time, or an index past the last sample.
-fn nearest_by_rate(samples: &[f64], rate_hz: f64, t_secs: f64) -> f64 {
-    if rate_hz <= 0.0 || t_secs < 0.0 {
-        return f64::NAN;
-    }
-    let idx = (t_secs * rate_hz).round();
-    if idx < 0.0 || idx as usize >= samples.len() {
-        return f64::NAN;
-    }
-    samples[idx as usize]
-}
-
-/// Value of an event-driven channel at recording-time `t_secs` — the sample
-/// whose `times` entry (assumed ascending) is closest. `NaN` when the arrays
-/// are empty. Times beyond the ends clamp to the first / last sample.
-fn nearest_by_times(samples: &[f64], times: &[f64], t_secs: f64) -> f64 {
-    let n = samples.len().min(times.len());
+/// Value of a channel at recording-time `t_secs` — the sample whose `t_us`
+/// entry (assumed ascending, contract C1 §3.5 invariant 1) is closest.
+/// Mirrors the previous event-driven `nearest_by_times`'s partition-point
+/// logic exactly, reading `t_us` (µs, `i64`) instead of a seconds `f64`
+/// array — every channel has real `t_us` now (C1 §2), so this one function
+/// replaces both the old fixed-rate (`i / rate`) and event-driven paths.
+/// `NaN` when the arrays are empty. Times beyond the ends clamp to the
+/// first / last sample.
+fn nearest_by_t_us(samples: &[f64], t_us: &[i64], t_secs: f64) -> f64 {
+    let n = samples.len().min(t_us.len());
     if n == 0 {
         return f64::NAN;
     }
-    let pos = times[..n].partition_point(|&x| x < t_secs);
+    let target_us = (t_secs * 1e6).round() as i64;
+    let pos = t_us[..n].partition_point(|&x| x < target_us);
     let hi = pos.min(n - 1);
     let lo = pos.saturating_sub(1);
-    let pick = if (times[lo] - t_secs).abs() <= (times[hi] - t_secs).abs() {
+    let pick = if (t_us[lo] - target_us).abs() <= (t_us[hi] - target_us).abs() {
         lo
     } else {
         hi
@@ -949,16 +955,27 @@ fn nearest_by_times(samples: &[f64], times: &[f64], t_secs: f64) -> f64 {
 mod tests {
     use super::*;
 
+    /// Synthetic-uniform `t_us` (matches [`Channel::from_f64`]'s formula) —
+    /// every caller here is a fixed-rate fixture.
     fn input_channel(id: &str, rate: f64, samples: Vec<f64>) -> ChannelInput {
-        ChannelInput { channel_id: id.to_string(), sample_rate_hz: rate, samples, sample_times_secs: None }
+        let t_us = (0..samples.len())
+            .map(|i| (i as f64 * 1_000_000.0 / rate).round() as i64)
+            .collect();
+        ChannelInput {
+            channel_id: id.to_string(),
+            sample_rate_hz: rate,
+            samples,
+            t_us,
+            source_kind: id.to_lowercase(),
+        }
     }
 
     fn test_meta() -> SessionMetaInput {
         SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         }
     }
 
@@ -1000,12 +1017,16 @@ mod tests {
 
     #[test]
     fn from_channels_runs_synthesis_and_reports_metadata() {
-        // Arrange — one 10 Hz channel of 20 samples (= 2000 ms).
+        // Arrange — one 10 Hz channel of 20 samples: t_us spans sample 0 to
+        // sample 19 (0 to 1_900_000 µs) — duration_ms is that real span
+        // (contract C1 §3.1/session::Channel::duration_ms), not
+        // `len / rate × 1000` (2000 ms — the old fixed-rate formula, which
+        // assumed a 20th, unrecorded sample at exactly the 20/rate mark).
         let meta = SessionMetaInput {
             session_id: "abc".to_string(),
-            device_id: "dev".to_string(),
+            device_id: Some("dev".to_string()),
             timestamp_utc_ms: 1700,
-            config_checksum: "crc".to_string(),
+            config_checksum: Some("crc".to_string()),
         };
 
         // Act
@@ -1014,7 +1035,7 @@ mod tests {
 
         // Assert — Time was synthesized; duration is the max span; no truncation.
         assert_eq!(m.session_id, "abc");
-        assert_eq!(m.duration_ms, 2000);
+        assert_eq!(m.duration_ms, 1900);
         assert_eq!(m.truncation_warning, None);
         assert!(h.channels().iter().any(|c| c.channel_id == "Time" && c.synthesized));
         assert_eq!(m.channel_count, h.channels().len() as u32);
@@ -1025,9 +1046,9 @@ mod tests {
         // Arrange
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(meta, vec![input_channel("X", 1.0, vec![1.0, 2.0, 3.0])]);
 
@@ -1038,13 +1059,15 @@ mod tests {
 
     #[test]
     fn resident_bytes_counts_columns_times_and_math_store() {
-        // Arrange — one event-driven F64 channel (10 samples + 10 times) plus
-        // a 5-sample math entry. Event-only session → no Time/Distance.
+        // Arrange — one event-driven F64 channel (10 samples + 10 t_us) plus
+        // a 5-sample math entry, which also carries its own synthetic t_us
+        // now (contract C1 §2 — every channel has real per-sample time, not
+        // just event-driven ones). Event-only session → no Time/Distance.
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(
             meta,
@@ -1052,28 +1075,35 @@ mod tests {
                 channel_id: "E".to_string(),
                 sample_rate_hz: 0.0,
                 samples: vec![1.0; 10],
-                sample_times_secs: Some(vec![0.5; 10]),
+                t_us: vec![500_000; 10],
+                source_kind: "e".to_string(),
             }],
         );
         h.store_math("M", 1.0, vec![2.0; 5]);
 
-        // Act + Assert — 10×8 (samples) + 10×8 (times) + 5×8 (math) = 200.
-        assert_eq!(h.resident_bytes(), 200);
+        // Act + Assert — E: 10×8 (samples) + 10×8 (t_us) = 160.
+        // M: 5×8 (samples) + 5×8 (its own synthetic t_us) = 80. Total 240.
+        assert_eq!(h.resident_bytes(), 240);
     }
 
     #[test]
-    fn resident_bytes_lazy_columns_count_base_storage_only() {
-        // Arrange — fixed-rate channel synthesizes Time (Ramp → 0 bytes).
+    fn resident_bytes_counts_t_us_alongside_every_column() {
+        // Arrange — fixed-rate channel synthesizes Time. Under idl1, Time is a
+        // real `RawColumn::F64` (not the old zero-storage `Ramp` — session
+        // ::synthesis's doc comment) and every channel, base or synthesized,
+        // carries a real `t_us` array (contract C1 §2) that now counts as
+        // resident cost too.
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(meta, vec![input_channel("X", 10.0, vec![0.0; 8])]);
 
-        // Act + Assert — X = 8×8 = 64; synthesized Time ramp adds nothing.
-        assert_eq!(h.resident_bytes(), 64);
+        // Act + Assert — X: 8 samples × 8 B column + 8 × 8 B t_us = 128.
+        // Time: same length, same shape (F64 column + t_us) = 128. Total 256.
+        assert_eq!(h.resident_bytes(), 256);
     }
 
     #[test]
@@ -1082,16 +1112,19 @@ mod tests {
         // computed from the index window, never a whole-channel widen.
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let mut h = SessionHandle::from_channels(meta, vec![]);
         h.session.channels.push(Channel {
             channel_id: "C".to_string(),
-            sample_rate_hz: 10.0,
+            t_us: (0..100i64).map(|i| i * 100_000).collect(),
+            t_recorded_us: None,
+            nominal_rate_hz: 10.0,
             column: RawColumn::I16 { data: (0..100).collect(), scale: 0.5, offset: 0.0 },
-            sample_times_secs: None,
+            source_kind: "c".to_string(),
+            unit: String::new(),
             gaps: Vec::new(),
         });
 
@@ -1197,17 +1230,20 @@ mod tests {
         // are both exercised.
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let mut h = SessionHandle::from_channels(meta, vec![]);
         let raws: Vec<i16> = (0..5000).map(|i| ((i * 37) % 1000) as i16 - 500).collect();
         h.session.channels.push(Channel {
             channel_id: "C".to_string(),
-            sample_rate_hz: 100.0,
+            t_us: (0..5000i64).map(|i| i * 10_000).collect(),
+            t_recorded_us: None,
+            nominal_rate_hz: 100.0,
             column: RawColumn::I16 { data: raws, scale: 0.5, offset: 1.0 },
-            sample_times_secs: None,
+            source_kind: "c".to_string(),
+            unit: String::new(),
             gaps: Vec::new(),
         });
 
@@ -1243,9 +1279,9 @@ mod tests {
         // Arrange — one fixed-rate channel; synthesis adds "Time".
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(meta, vec![input_channel("X", 10.0, vec![1.0, 2.0])]);
 
@@ -1264,9 +1300,9 @@ mod tests {
         // Arrange
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(meta, vec![input_channel("X", 10.0, vec![1.0, 2.0])]);
 
@@ -1285,9 +1321,9 @@ mod tests {
         // Arrange
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(meta, vec![input_channel("X", 1.0, vec![0.0])]);
 
@@ -1305,9 +1341,9 @@ mod tests {
         // Arrange — a base channel "X" and (illegally) a same-named math entry.
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(meta, vec![input_channel("X", 1.0, vec![1.0, 1.0])]);
         h.store_math("X", 1.0, vec![9.0, 9.0]);
@@ -1322,9 +1358,9 @@ mod tests {
         // Arrange — two channels; the longer one wins the time base.
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(
             meta,
@@ -1347,9 +1383,9 @@ mod tests {
         // Arrange — base channel "X" = 0..16.
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let samples: Vec<f64> = (0..16).map(|i| i as f64).collect();
         let h = SessionHandle::from_channels(meta, vec![input_channel("X", 10.0, samples)]);
@@ -1369,9 +1405,9 @@ mod tests {
         // Arrange — a math channel written via store_math (not a base channel).
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(meta, vec![input_channel("X", 10.0, vec![0.0; 4])]);
         h.store_math("M", 10.0, (0..16).map(|i| i as f64).collect());
@@ -1391,9 +1427,9 @@ mod tests {
         // Arrange
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(meta, vec![input_channel("X", 10.0, vec![1.0])]);
 
@@ -1410,9 +1446,9 @@ mod tests {
         // Arrange
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(meta, vec![input_channel("X", 10.0, vec![1.0, 2.0])]);
 
@@ -1429,9 +1465,9 @@ mod tests {
         // Arrange — GPS_EpochMs at 10 Hz: epoch 1000,1100,1200,... ms.
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 1000,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let epochs: Vec<f64> = (0..10).map(|i| 1000.0 + i as f64 * 100.0).collect();
         let h = SessionHandle::from_channels(meta, vec![input_channel("GPS_EpochMs", 10.0, epochs)]);
@@ -1450,9 +1486,9 @@ mod tests {
         // Arrange
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(
             meta,
@@ -1469,9 +1505,9 @@ mod tests {
         // Arrange — no GPS_EpochMs; origin = timestamp_utc_ms = 2000.
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 2000,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(meta, vec![input_channel("X", 10.0, vec![0.0; 4])]);
 
@@ -1488,9 +1524,9 @@ mod tests {
         // Arrange — 1 Hz GPS starting at epoch 10_000 ms.
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 10_000,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let epochs: Vec<f64> = (0..5).map(|i| 10_000.0 + i as f64 * 1000.0).collect();
         let h = SessionHandle::from_channels(meta, vec![input_channel("GPS_EpochMs", 1.0, epochs)]);
@@ -1507,9 +1543,9 @@ mod tests {
         // Arrange — 1 Hz GPS, 5 fixes → span ends at t = 4 s.
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 10_000,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let epochs: Vec<f64> = (0..5).map(|i| 10_000.0 + i as f64 * 1000.0).collect();
         let h = SessionHandle::from_channels(meta, vec![input_channel("GPS_EpochMs", 1.0, epochs)]);
@@ -1526,9 +1562,9 @@ mod tests {
         // Arrange
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 1000,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let epochs: Vec<f64> = (0..10).map(|i| 1000.0 + i as f64 * 100.0).collect();
         let h =
@@ -1549,9 +1585,9 @@ mod tests {
     fn epoch_ms_to_time_secs_empty_input_is_empty() {
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(meta, vec![input_channel("X", 1.0, vec![0.0])]);
         assert!(h.epoch_ms_to_time_secs(&[]).is_empty());
@@ -1562,9 +1598,9 @@ mod tests {
     fn handle_with(channels: Vec<ChannelInput>) -> SessionHandle {
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         SessionHandle::from_channels(meta, channels)
     }
@@ -1699,7 +1735,8 @@ mod tests {
             channel_id: "E".to_string(),
             sample_rate_hz: 0.0,
             samples: vec![10.0, 20.0, 30.0, 40.0, 50.0],
-            sample_times_secs: Some(vec![0.0, 0.5, 1.0, 1.5, 2.0]),
+            t_us: vec![0, 500_000, 1_000_000, 1_500_000, 2_000_000],
+            source_kind: "e".to_string(),
         };
         let h = handle_with(vec![ch]);
 
@@ -1841,13 +1878,15 @@ mod tests {
             channel_id: "GPS_Latitude".to_string(),
             sample_rate_hz: 0.0,
             samples: vec![51.5, 51.6, 51.7],
-            sample_times_secs: Some(vec![0.0, 1.5, 3.2]),
+            t_us: vec![0, 1_500_000, 3_200_000],
+            source_kind: "gps".to_string(),
         };
         let fixed_ch = ChannelInput {
             channel_id: "IMU0_AccelX".to_string(),
             sample_rate_hz: 200.0,
             samples: vec![0.1, 0.2, 0.3],
-            sample_times_secs: None,
+            t_us: vec![0, 5_000, 10_000],
+            source_kind: "imu0".to_string(),
         };
         let h = SessionHandle::from_channels(test_meta(), vec![event_ch, fixed_ch]);
 
@@ -1872,9 +1911,9 @@ mod tests {
         SessionHandle::from_channels(
             SessionMetaInput {
                 session_id: String::new(),
-                device_id: String::new(),
+                device_id: None,
                 timestamp_utc_ms: 0,
-                config_checksum: String::new(),
+                config_checksum: None,
             },
             vec![
                 input_channel("IMU0_AccelX", 800.0, zeros.clone()),
@@ -1937,20 +1976,24 @@ mod gps_channel_values_tests {
         SessionHandle::from_channels(
             SessionMetaInput {
                 session_id: String::new(),
-                device_id: String::new(),
+                device_id: None,
                 timestamp_utc_ms: 0,
-                config_checksum: String::new(),
+                config_checksum: None,
             },
             channels,
         )
     }
 
     fn ch(id: &str, rate: f64, samples: Vec<f64>) -> ChannelInput {
+        let t_us = (0..samples.len())
+            .map(|i| (i as f64 * 1_000_000.0 / rate).round() as i64)
+            .collect();
         ChannelInput {
             channel_id: id.to_string(),
             sample_rate_hz: rate,
             samples,
-            sample_times_secs: None,
+            t_us,
+            source_kind: id.to_lowercase(),
         }
     }
 
@@ -1992,9 +2035,12 @@ mod gps_channel_values_tests {
     }
 
     #[test]
-    fn gps_channel_values_nan_past_channel_span() {
+    fn gps_channel_values_clamps_to_nearest_past_channel_span() {
         // Arrange — fixes at secs 0,1,2 but target channel only spans sec 0
-        // (1 Hz, length 1). Fix 0 → sample 0; fixes 1,2 → out of span → NaN.
+        // (1 Hz, length 1). `nearest_by_t_us` (contract C1 — every channel
+        // has real `t_us` now) clamps beyond the last sample rather than
+        // returning NaN, matching the pre-idl1 event-driven "nearest"
+        // semantics — that behavior now applies uniformly.
         let h = handle_with(vec![
             ch("GPS_Latitude", 1.0, vec![10.0, 11.0, 12.0]),
             ch("GPS_Longitude", 1.0, vec![5.0, 6.0, 7.0]),
@@ -2005,10 +2051,8 @@ mod gps_channel_values_tests {
         // Act
         let v = h.gps_channel_values("Short");
 
-        // Assert
-        assert_eq!(v.len(), 3);
-        assert_eq!(v[0], 42.0);
-        assert!(v[1].is_nan() && v[2].is_nan());
+        // Assert — every fix clamps to the channel's single sample.
+        assert_eq!(v, vec![42.0, 42.0, 42.0]);
     }
 
     #[test]

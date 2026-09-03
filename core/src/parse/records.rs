@@ -267,13 +267,16 @@ pub fn read_registry_entry_v3(reader: &mut ByteReader) -> Result<ChannelRegistry
 ///
 /// Emits the eight raw GPS channels (no scale/offset). Optionally seeds the
 /// `anchor` from the first non-zero `gps_epoch_ms` (for §5.6 back-fill) and
-/// folds `device_timestamp_us` into `origin` (the event-time zero).
+/// folds `device_timestamp_us` into `origin` (the event-time zero). Pushes
+/// this fix's own `device_ts_us` into `gps_ts` unconditionally — every GPS
+/// channel shares this one per-fix timestamp as its `t_us` source (C1 §2).
 pub fn parse_gps_record(
     reader: &mut ByteReader,
     payload_len: usize,
     out: &mut ChannelAccumulator,
     anchor: Option<&mut GpsAnchor>,
     origin: Option<&mut TimeOrigin>,
+    gps_ts: &mut Vec<i64>,
 ) -> Result<(), ParseError> {
     let payload_start = reader.position();
     let gps_epoch_ms = reader.i64("gps_epoch_ms")?;
@@ -281,6 +284,7 @@ pub fn parse_gps_record(
     if let Some(o) = origin {
         o.observe(device_ts_us);
     }
+    gps_ts.push(device_ts_us);
     if let Some(a) = anchor {
         if a.gps_epoch_ms.is_none() && gps_epoch_ms > 0 {
             a.gps_epoch_ms = Some(gps_epoch_ms);
@@ -361,6 +365,24 @@ pub fn imu_period_us(odr_hz: u16) -> i64 {
 /// artifact this replaces — design §4.1).
 pub fn imu_nominal_rate(period_us: i64) -> f64 {
     1e6 / period_us as f64
+}
+
+/// Maps a generic registry channel name to its `source_kind` token (contract
+/// C1 §4.2). Falls back to the lower-cased channel name for any future
+/// sensor the registry adds without a schema change (SPEC §5.2's
+/// forward-compatibility philosophy, carried into C1 §4.2's `source_kind`
+/// definition verbatim).
+pub fn generic_source_kind(channel_id: &str) -> String {
+    match channel_id {
+        "WheelFront" => "wheel_front",
+        "WheelRear" => "wheel_rear",
+        "PressureFront" => "pressure_front",
+        "PressureRear" => "pressure_rear",
+        "HR_BPM" => "hr_bpm",
+        "HR_RR" => "hr_rr",
+        other => return other.to_lowercase(),
+    }
+    .to_string()
 }
 
 /// IMU index `0..=2` parsed from an `IMU{n}_` channel name, else `None`.

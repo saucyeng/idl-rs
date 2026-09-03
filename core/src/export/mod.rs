@@ -82,18 +82,11 @@ pub(crate) fn select_channels<'a>(
     Ok(out)
 }
 
-/// Time in seconds of sample `i`: per-sample time for event-driven channels
-/// (`sample_rate_hz == 0`), else `i / sample_rate_hz`.
+/// Time in seconds of sample `i`: `t_us[i] / 1e6` — every channel has real
+/// per-sample time now (contract C1 §2), so this no longer branches on
+/// event-driven vs. fixed-rate. `0.0` for an out-of-range index.
 pub(crate) fn sample_time_secs(ch: &Channel, i: usize) -> f64 {
-    if ch.sample_rate_hz == 0.0 {
-        ch.sample_times_secs
-            .as_ref()
-            .and_then(|t| t.get(i))
-            .copied()
-            .unwrap_or(0.0)
-    } else {
-        i as f64 / ch.sample_rate_hz
-    }
+    ch.t_us.get(i).map(|&t| t as f64 / 1e6).unwrap_or(0.0)
 }
 
 /// CSV-escape a field: quote and double internal quotes only when the field
@@ -185,19 +178,37 @@ mod tests {
     fn handle_with(channels: Vec<ChannelInput>) -> SessionHandle {
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         SessionHandle::from_channels(meta, channels)
     }
 
+    /// Fixed-rate channel with synthetic-uniform `t_us` (matches `Channel::from_f64`).
     fn fixed(id: &str, rate: f64, samples: Vec<f64>) -> ChannelInput {
-        ChannelInput { channel_id: id.to_string(), sample_rate_hz: rate, samples, sample_times_secs: None }
+        let t_us = (0..samples.len())
+            .map(|i| (i as f64 * 1_000_000.0 / rate).round() as i64)
+            .collect();
+        ChannelInput {
+            channel_id: id.to_string(),
+            sample_rate_hz: rate,
+            samples,
+            t_us,
+            source_kind: id.to_lowercase(),
+        }
     }
 
+    /// Event-driven channel with explicit per-sample `times` (seconds).
     fn event(id: &str, samples: Vec<f64>, times: Vec<f64>) -> ChannelInput {
-        ChannelInput { channel_id: id.to_string(), sample_rate_hz: 0.0, samples, sample_times_secs: Some(times) }
+        let t_us = times.iter().map(|&t| (t * 1e6).round() as i64).collect();
+        ChannelInput {
+            channel_id: id.to_string(),
+            sample_rate_hz: 0.0,
+            samples,
+            t_us,
+            source_kind: id.to_lowercase(),
+        }
     }
 
     #[test]
@@ -320,7 +331,7 @@ mod tests {
             duration_ms: 0,
             truncation_warning: None,
         };
-        let derived = vec![Channel::from_f64("ForkVelocity", 10.0, vec![1.5, 2.5], None)];
+        let derived = vec![Channel::from_f64("ForkVelocity", 10.0, vec![1.5, 2.5])];
         let mut buf: Vec<u8> = Vec::new();
 
         // Act

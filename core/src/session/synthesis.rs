@@ -11,27 +11,43 @@ use crate::session::{Channel, RawColumn, Session};
 /// (`["Time"]`, `["Time", "Distance"]`, or `[]`).
 ///
 /// `Time`: built at the highest fixed-rate channel's rate, length = the longest
-/// sample count at that rate, `samples[i] = i / rate`. Omitted (returns `[]`)
-/// when the session has no fixed-rate channel.
+/// sample count at that rate; `samples[i] = t_us[i] / 1e6`, where `t_us` is
+/// **that winning channel's own real `t_us`** — not `i / rate` (contract C1
+/// §3.5 invariant 4 forbids deriving `Time`'s values from the nominal rate).
+/// This is a **deliberate, documented departure from the pre-idl1
+/// zero-storage `Ramp` representation**: `Ramp`'s `value(i) = i / rate`
+/// formula is exactly the derivation invariant 4 forbids once a channel's
+/// `t_us` is not perfectly uniform (true after Task 6's burst correction, or
+/// for any channel with drops), so `Time` costs 8 B/sample again under idl1
+/// (`RawColumn::F64`, not `Ramp`). Omitted (returns `[]`) when the session
+/// has no fixed-rate channel.
 ///
 /// `Distance` (metres): trapezoidal-integrate `GPS_SpeedKmh / 3.6` (km/h → m/s)
 /// at the GPS rate, then linear-interpolate onto the `Time` grid, clamped at
-/// both ends. Omitted when `GPS_SpeedKmh` is absent/empty.
+/// both ends; presented on `Time`'s own `t_us` (they share one time axis by
+/// construction). Omitted when `GPS_SpeedKmh` is absent/empty.
 pub fn synthesize_base_channels(session: &mut Session) -> Vec<String> {
-    // Highest fixed-rate channel; longest sample count at that rate.
+    // Highest fixed-rate channel; longest sample count at that rate; the
+    // winning channel's own index, so its real t_us can be carried forward.
     let mut max_rate = 0.0_f64;
     let mut max_rate_len = 0usize;
-    for c in &session.channels {
-        if c.sample_rate_hz <= 0.0 {
+    let mut time_source_idx: Option<usize> = None;
+    for (i, c) in session.channels.iter().enumerate() {
+        if c.nominal_rate_hz <= 0.0 {
             continue;
         }
-        if c.sample_rate_hz > max_rate {
-            max_rate = c.sample_rate_hz;
+        if c.nominal_rate_hz > max_rate {
+            max_rate = c.nominal_rate_hz;
             max_rate_len = c.len();
-        } else if c.sample_rate_hz == max_rate && c.len() > max_rate_len {
+            time_source_idx = Some(i);
+        } else if c.nominal_rate_hz == max_rate && c.len() > max_rate_len {
             max_rate_len = c.len();
+            time_source_idx = Some(i);
         }
     }
+    let Some(time_source_idx) = time_source_idx else {
+        return Vec::new();
+    };
     if max_rate <= 0.0 || max_rate_len == 0 {
         return Vec::new();
     }
@@ -41,13 +57,20 @@ pub fn synthesize_base_channels(session: &mut Session) -> Vec<String> {
     // Distance base from GPS_SpeedKmh, if present and usable.
     let distance = synthesize_distance_base(&session.channels);
 
-    // Time is a pure function of (len, rate) — RawColumn::Ramp stores no
-    // samples (the eager 8 B/sample ramp cost ~800 MB at 100M samples).
+    // The winning channel's own real t_us — cloned once, out from under the
+    // borrow of session.channels, so it can feed both the Time push below
+    // and (if present) Distance's push.
+    let time_t_us = session.channels[time_source_idx].t_us.clone();
+    let time_values: Vec<f64> = time_t_us.iter().map(|&t| t as f64 / 1_000_000.0).collect();
+
     session.channels.push(Channel {
         channel_id: "Time".to_string(),
-        sample_rate_hz: max_rate,
-        column: RawColumn::Ramp { len: max_rate_len, rate: max_rate },
-        sample_times_secs: None,
+        t_us: time_t_us.clone(),
+        t_recorded_us: None,
+        nominal_rate_hz: max_rate,
+        column: RawColumn::F64(time_values),
+        source_kind: "synthesized".to_string(),
+        unit: "s".to_string(),
         gaps: Vec::new(),
     });
     if let Some((base, base_rate)) = distance {
@@ -56,14 +79,17 @@ pub fn synthesize_base_channels(session: &mut Session) -> Vec<String> {
         // clamp-lerp bit-for-bit).
         session.channels.push(Channel {
             channel_id: "Distance".to_string(),
-            sample_rate_hz: max_rate,
+            t_us: time_t_us,
+            t_recorded_us: None,
+            nominal_rate_hz: max_rate,
             column: RawColumn::Interp {
                 base,
                 base_rate,
                 out_rate: max_rate,
                 len: max_rate_len,
             },
-            sample_times_secs: None,
+            source_kind: "synthesized".to_string(),
+            unit: "m".to_string(),
             gaps: Vec::new(),
         });
         added.push("Distance".to_string());
@@ -77,10 +103,10 @@ pub fn synthesize_base_channels(session: &mut Session) -> Vec<String> {
 /// ([`RawColumn::Interp`]). Mirrors Dart `_synthesiseDistance` step 1.
 fn synthesize_distance_base(channels: &[Channel]) -> Option<(Vec<f64>, f64)> {
     let speed = channels.iter().find(|c| {
-        c.channel_id == "GPS_SpeedKmh" && c.sample_rate_hz > 0.0 && !c.is_empty()
+        c.channel_id == "GPS_SpeedKmh" && c.nominal_rate_hz > 0.0 && !c.is_empty()
     })?;
     let ms: Vec<f64> = speed.materialize().into_iter().map(|s| s / 3.6).collect();
-    Some((integrate(&ms, speed.sample_rate_hz), speed.sample_rate_hz))
+    Some((integrate(&ms, speed.nominal_rate_hz), speed.nominal_rate_hz))
 }
 
 #[cfg(test)]
@@ -89,14 +115,16 @@ mod tests {
     use approx::assert_relative_eq;
 
     fn ch(id: &str, rate: f64, samples: Vec<f64>) -> Channel {
-        Channel::from_f64(id, rate, samples, None)
+        Channel::from_f64(id, rate, samples)
     }
     fn session(channels: Vec<Channel>) -> Session {
         Session {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
+            source_format: crate::session::SourceFormat::Idl0,
+            blob_sha256: String::new(),
             channels,
         }
     }
@@ -112,8 +140,14 @@ mod tests {
         // Assert
         assert_eq!(added, vec!["Time".to_string()]);
         let time = s.channels.iter().find(|c| c.channel_id == "Time").unwrap();
-        assert_eq!(time.sample_rate_hz, 200.0);
+        assert_eq!(time.nominal_rate_hz, 200.0);
         assert_eq!(time.len(), 5);
+        // `ch`/`from_f64` builds its channels with synthetic-uniform t_us
+        // (t_us[i] = round(i * 1e6 / rate)), so these values numerically
+        // coincide with i/rate for this fixture — but Time's real formula is
+        // "the winning channel's own t_us / 1e6", not "i/rate" (C1 §3.5
+        // invariant 4); the two only agree because the *source* channel here
+        // happens to be perfectly uniform.
         assert_relative_eq!(time.materialize()[0], 0.0, epsilon = 1e-9);
         assert_relative_eq!(time.materialize()[4], 4.0 / 200.0, epsilon = 1e-9);
     }
@@ -121,11 +155,12 @@ mod tests {
     #[test]
     fn no_fixed_rate_channel_synthesizes_nothing() {
         // Arrange — only an event-driven channel (rate 0).
-        let mut s = session(vec![Channel::from_f64(
+        let mut s = session(vec![Channel::from_f64_with_times(
             "HR_RR",
             0.0,
             vec![1.0, 2.0],
-            Some(vec![0.5, 1.0]),
+            vec![500_000, 1_000_000],
+            "hr_rr",
         )]);
 
         // Act
@@ -151,7 +186,7 @@ mod tests {
         // Assert
         assert_eq!(added, vec!["Time".to_string(), "Distance".to_string()]);
         let dist = s.channels.iter().find(|c| c.channel_id == "Distance").unwrap();
-        assert_eq!(dist.sample_rate_hz, 2.0);
+        assert_eq!(dist.nominal_rate_hz, 2.0);
         assert_eq!(dist.len(), 4);
         // distAtGps = [0,1,2] m; interp to t=0,0.5,1,1.5 → 0,0.5,1,1.5
         assert_relative_eq!(dist.materialize()[0], 0.0, epsilon = 1e-9);

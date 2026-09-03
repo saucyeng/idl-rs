@@ -196,18 +196,22 @@ mod tests {
     fn meta() -> SessionMetaInput {
         SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         }
     }
 
     fn ch(id: &str, rate: f64, samples: Vec<f64>) -> ChannelInput {
+        let t_us = (0..samples.len())
+            .map(|i| (i as f64 * 1_000_000.0 / rate).round() as i64)
+            .collect();
         ChannelInput {
             channel_id: id.to_string(),
             sample_rate_hz: rate,
             samples,
-            sample_times_secs: None,
+            t_us,
+            source_kind: id.to_lowercase(),
         }
     }
 
