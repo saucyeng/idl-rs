@@ -8,6 +8,7 @@
 
 pub mod column;
 pub mod handle;
+pub mod seam_correction;
 pub mod synthesis;
 
 pub use column::RawColumn;
