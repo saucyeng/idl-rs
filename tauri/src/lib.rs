@@ -9,6 +9,8 @@
 //! ```
 
 pub mod commands;
+pub mod error;
+pub use error::{IpcError, IpcErrorKind};
 
 /// The invoke handler covering every command in this crate. The app crate
 /// passes it to `tauri::Builder::invoke_handler` so new commands never touch
