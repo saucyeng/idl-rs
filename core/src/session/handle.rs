@@ -31,6 +31,12 @@ pub struct SessionMeta {
     pub duration_ms: i64,
     /// `Some` when the file was truncated mid-record (recoverable).
     pub truncation_warning: Option<String>,
+    /// Non-fatal import-time anomalies (contract C1 §3.3 burst-seam
+    /// correction fallbacks, today the only source) — see
+    /// [`crate::session::ParseResult::import_warnings`]. Empty for a clean
+    /// parse, and always empty for the GPX path ([`SessionHandle::from_channels`],
+    /// which has no burst structure to correct).
+    pub import_warnings: Vec<String>,
 }
 
 /// Per-channel metadata; no samples cross with this.
@@ -96,6 +102,7 @@ pub struct SessionHandle {
     session: Session,
     synthesized_ids: Vec<String>,
     truncation_warning: Option<String>,
+    import_warnings: Vec<String>,
     derived: RwLock<HashMap<DerivedKey, Channel>>,
 }
 
@@ -105,6 +112,7 @@ impl Clone for SessionHandle {
             session: self.session.clone(),
             synthesized_ids: self.synthesized_ids.clone(),
             truncation_warning: self.truncation_warning.clone(),
+            import_warnings: self.import_warnings.clone(),
             derived: RwLock::new(self.derived.read().unwrap().clone()),
         }
     }
@@ -200,7 +208,7 @@ impl SessionHandle {
     /// Hard failures (`InvalidMagicBytes`/`UnsupportedSchemaVersion`) → `Err`;
     /// truncation is recoverable and surfaced via [`SessionMeta::truncation_warning`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
-        let ParseResult { mut session, truncation_warning } = parse(bytes)?;
+        let ParseResult { mut session, truncation_warning, import_warnings } = parse(bytes)?;
         // `parse_v3` cannot see the raw file bytes it was decoded from (it
         // only receives the already-borrowed slice's contents as a record
         // stream) — computing the content hash here, over the exact same
@@ -216,6 +224,11 @@ impl SessionHandle {
             session,
             synthesized_ids,
             truncation_warning: truncation_warning.map(|e| e.to_string()),
+            // Never silently dropped (CLAUDE.md §5) — carried forward as the
+            // human-readable `message` (the `kind` discriminant is for a
+            // caller wanting to filter/group programmatically; today's only
+            // reader is `SessionMeta::import_warnings`, text-only).
+            import_warnings: import_warnings.into_iter().map(|w| w.message).collect(),
             derived: RwLock::new(HashMap::new()),
         })
     }
@@ -259,6 +272,9 @@ impl SessionHandle {
             session,
             synthesized_ids,
             truncation_warning: None,
+            // GPX has no burst structure to correct (see `time_map`'s doc) —
+            // always empty on this path.
+            import_warnings: Vec::new(),
             derived: RwLock::new(HashMap::new()),
         }
     }
@@ -283,6 +299,7 @@ impl SessionHandle {
                 .max()
                 .unwrap_or(0),
             truncation_warning: self.truncation_warning.clone(),
+            import_warnings: self.import_warnings.clone(),
         }
     }
 

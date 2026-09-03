@@ -10,8 +10,10 @@ pub mod column;
 pub mod handle;
 pub mod seam_correction;
 pub mod synthesis;
+pub mod time_map;
 
 pub use column::RawColumn;
+pub use seam_correction::{ImportWarning, ImportWarningKind};
 
 use std::fmt;
 
@@ -371,6 +373,15 @@ pub struct ParseResult {
     /// `Some` when the file ended mid-record. Surface as
     /// "Log incomplete — showing data to <timestamp>".
     pub truncation_warning: Option<ParseError>,
+    /// Non-fatal import-time anomalies collected during parsing — today,
+    /// exclusively burst-seam correction's fallback cases (contract C1
+    /// §3.3; [`crate::session::seam_correction::correct_burst_seams`]).
+    /// Empty for a clean parse. Never silently dropped (CLAUDE.md §5) — a
+    /// caller that discards `ParseResult` without reading this is the one
+    /// place a warning could still go unseen; every constructor of a
+    /// [`SessionHandle`](crate::session::handle::SessionHandle) threads it
+    /// through instead.
+    pub import_warnings: Vec<ImportWarning>,
 }
 
 impl ParseResult {
@@ -434,11 +445,16 @@ mod tests {
         };
 
         // Act + Assert
-        let clean = ParseResult { session: session.clone(), truncation_warning: None };
+        let clean = ParseResult {
+            session: session.clone(),
+            truncation_warning: None,
+            import_warnings: Vec::new(),
+        };
         assert!(clean.is_complete());
         let partial = ParseResult {
             session,
             truncation_warning: Some(ParseError::TruncatedRecord("eof".to_string())),
+            import_warnings: Vec::new(),
         };
         assert!(!partial.is_complete());
     }

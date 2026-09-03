@@ -113,17 +113,13 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     let mut last: [Option<i64>; 3] = [None; 3];
     let mut count: [usize; 3] = [0; 3];
     // Nominal IMU grid period (firmware back-counts each FIFO drain at this step,
-    // SPEC §5.5). The hot loop records a drop only when a timestamp jump deviates
-    // from it — a clean log never touches `imu_gaps`.
+    // SPEC §5.5) — the fallback period for an IMU with too few samples to run
+    // burst-seam correction, and `correct_burst_seams`'s own burst-detection
+    // tolerance window.
     let period_us = imu_period_us(imu_sample_rate_hz);
-    let mut imu_gaps: [Vec<(usize, usize)>; 3] = Default::default();
-    // Absolute grid slot (relative to each IMU's first sample) of the last *kept*
-    // sample. Placement anchors to absolute time so per-IMU drop/backstep history
-    // never accumulates cross-IMU drift (§15.2).
-    let mut last_abs_slot: [i64; 3] = [0; 3];
     // Every kept IMU record's own device timestamp, per IMU — the raw recorded
-    // time Task 6's burst-seam correction reconciles against. Unused for
-    // `t_us` in this task (Task 4 interim: grid-slot time — see below).
+    // time burst-seam correction reconciles against (contract C1 §3.3), once
+    // per parse, after the whole stream is read.
     let mut imu_recorded_ts: [Vec<i64>; 3] = Default::default();
     // Per-fix GPS device timestamp — every GPS channel shares this as its
     // `t_us` source (C1 §2; no burst structure to reconcile for GPS).
@@ -143,9 +139,6 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
             &mut first,
             &mut last,
             &mut count,
-            period_us,
-            &mut imu_gaps,
-            &mut last_abs_slot,
             &mut imu_recorded_ts,
             &mut gps_ts,
             &mut gps_anchor,
@@ -160,27 +153,66 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
         }
     }
 
-    // Drop reconciliation (SPEC §15): all IMU channels share one nominal rate and
-    // a single grid anchored at the earliest IMU first-sample; each IMU column is
-    // rebuilt onto that grid (drops linear-filled, edges held), so cross-IMU
-    // element-wise math no longer sees mismatched rates/lengths.
-    let plan = ImuGridPlan::build(&first, &count, imu_gaps, period_us);
+    // Burst-seam correction (contract C1 §3.3): recover each IMU's true
+    // (possibly off-nominal) sample cadence from its recorded read-instant
+    // stamps and re-space every burst to a monotonic, uniform corrected
+    // axis, before gap detection ever runs — C1 §3.3's "ruled" ordering
+    // (§8 item 1). An IMU with fewer than 2 samples has no burst structure
+    // to correct; its (possibly empty) raw stamps pass through verbatim at
+    // the nominal period.
+    let mut corrected: [Vec<i64>; 3] = Default::default();
+    let mut effective_period_us = [period_us; 3];
+    let mut import_warnings: Vec<crate::session::seam_correction::ImportWarning> = Vec::new();
+    for i in 0..3 {
+        if imu_recorded_ts[i].len() >= 2 {
+            let seam = crate::session::seam_correction::correct_burst_seams(&imu_recorded_ts[i], period_us);
+            effective_period_us[i] = seam.effective_period_us;
+            corrected[i] = seam.corrected_us;
+            // Never silently drop a non-fatal anomaly (CLAUDE.md §5) — tag
+            // each with its source IMU so a caller reading the flattened
+            // list can tell which stream it came from.
+            import_warnings.extend(seam.warnings.into_iter().map(|w| {
+                crate::session::seam_correction::ImportWarning {
+                    kind: w.kind,
+                    message: format!("IMU{i}: {}", w.message),
+                }
+            }));
+        } else {
+            corrected[i] = imu_recorded_ts[i].clone();
+        }
+    }
+
+    // Drop reconciliation (contract C1 §3.3): gap detection runs once, here,
+    // against each IMU's own corrected stamps and effective period — never
+    // the nominal period, and never inline in the hot loop (that was the
+    // phantom-drop mechanism C1's worked example demonstrates).
+    let plan = ImuGridPlan::build_from_corrected(corrected, effective_period_us, period_us);
     let t0_us = origin.min_us.unwrap_or(0);
     let mut channels = Vec::new();
     for (name, column) in acc.into_entries() {
-        let rate = resolve_rate(&name, gps_sample_rate_hz, &registry, plan.nominal_rate);
-        let (column, gaps) = plan.reconcile(&name, column);
-        let (t_us, source_kind) = if let Some(imu_idx) = imu_index_of(&name) {
-            // Task 4 interim: grid-slot time, matching the pre-idl1 implicit
-            // i/rate formula exactly (no burst correction yet — Task 6).
-            // t_recorded_us stays None: defined identical to t_us until Task 6
-            // actually diverges them.
-            let local_t0 = first[imu_idx].unwrap_or(t0_us);
-            let t = (0..column.len())
-                .map(|slot| (local_t0 - t0_us) + (slot as i64) * period_us)
-                .collect();
-            (t, format!("imu{imu_idx}"))
-        } else if name.starts_with("GPS") {
+        if let Some(imu_idx) = imu_index_of(&name) {
+            let (rebuilt_column, t_us_abs, t_recorded_us_abs, gaps) = plan.reconcile(&name, column);
+            let t_us = t_us_abs.iter().map(|&t| t - t0_us).collect();
+            let t_recorded_us = if t_recorded_us_abs.is_empty() {
+                None
+            } else {
+                Some(t_recorded_us_abs.iter().map(|&t| t - t0_us).collect())
+            };
+            channels.push(Channel {
+                channel_id: name.clone(),
+                t_us,
+                t_recorded_us,
+                nominal_rate_hz: plan_nominal_rate_for(imu_idx, &effective_period_us),
+                column: rebuilt_column,
+                source_kind: format!("imu{imu_idx}"),
+                unit: unit_for(&name, &registry_by_name),
+                gaps,
+            });
+            continue;
+        }
+        let rate = resolve_rate(&name, gps_sample_rate_hz, &registry, 0.0);
+        let (column, _t_us, _t_recorded_us, _gaps) = plan.reconcile(&name, column);
+        let (t_us, source_kind) = if name.starts_with("GPS") {
             let t = gps_ts.iter().map(|&ts| ts - t0_us).collect();
             (t, "gps".to_string())
         } else if let Some(ts) = channel_ts_us.get(&name) {
@@ -201,7 +233,7 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
             column,
             source_kind,
             unit: unit_for(&name, &registry_by_name),
-            gaps,
+            gaps: Vec::new(),
         });
     }
 
@@ -239,7 +271,19 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
             channels,
         },
         truncation_warning: truncation,
+        import_warnings,
     })
+}
+
+/// Per-IMU nominal rate (Hz) after burst-seam correction: `1e6 /
+/// effective_period_us[imu_idx]`. Replaces the old single session-wide
+/// `ImuGridPlan::nominal_rate` — each IMU can now have its own corrected
+/// period, so its `nominal_rate_hz` metadata must be its own (contract C1
+/// §4.2 already treats `nominal_rate_hz` as per-channel; see this plan's
+/// Open questions for the widening this represents from the pre-idl1
+/// single-shared-rate model).
+fn plan_nominal_rate_for(imu_idx: usize, effective_period_us: &[i64; 3]) -> f64 {
+    1e6 / effective_period_us[imu_idx] as f64
 }
 
 /// Resolves a channel's physical unit string (contract C1 §4.1). IMU axes and
@@ -300,9 +344,6 @@ fn read_record(
     first: &mut [Option<i64>; 3],
     last: &mut [Option<i64>; 3],
     count: &mut [usize; 3],
-    period_us: i64,
-    imu_gaps: &mut [Vec<(usize, usize)>; 3],
-    last_abs_slot: &mut [i64; 3],
     imu_recorded_ts: &mut [Vec<i64>; 3],
     gps_ts: &mut Vec<i64>,
     gps_anchor: &mut GpsAnchor,
@@ -313,8 +354,8 @@ fn read_record(
         0xFF => Ok(false),
         0x01 => {
             parse_imu(
-                reader, payload_len, imu_mask, &mut routing.imu, acc, first, last, count, period_us,
-                imu_gaps, last_abs_slot, imu_recorded_ts, origin,
+                reader, payload_len, imu_mask, &mut routing.imu, acc, first, last, count,
+                imu_recorded_ts, origin,
             )?;
             Ok(true)
         }
@@ -343,9 +384,6 @@ fn parse_imu(
     first: &mut [Option<i64>; 3],
     last: &mut [Option<i64>; 3],
     count: &mut [usize; 3],
-    period_us: i64,
-    imu_gaps: &mut [Vec<(usize, usize)>; 3],
-    last_abs_slot: &mut [i64; 3],
     imu_recorded_ts: &mut [Vec<i64>; 3],
     origin: &mut TimeOrigin,
 ) -> Result<(), ParseError> {
@@ -354,40 +392,24 @@ fn parse_imu(
     let ts_us = reader.i64("timestamp_us")?;
     origin.observe(ts_us);
     let idx = imu_index as usize;
-    // Absolute-grid placement (§15.2): each sample lands on slot
-    // `round((ts - first) / period)`, so co-temporal events across IMUs share a
-    // slot regardless of differing drop histories — no per-step drift. Fast path
-    // (exact nominal Δ, the ~99% case) is one i64 compare + increment, no divide.
-    // A sample whose slot does not advance past the last kept one (a backward
-    // step / duplicate at a FIFO drain boundary) is dropped: not counted, its
-    // axes not stored. A forward jump records the missing run for the rebuild.
+    // A raw wire timestamp that does not advance is a genuine duplicate/
+    // backstep read at a FIFO drain boundary (SPEC §5.5) — safe to drop
+    // unconditionally: within-burst deltas are always exact at the
+    // *nominal* cadence regardless of true ODR (C1 §3.3), so this
+    // comparison needs no period knowledge and cannot itself manufacture a
+    // phantom drop. Gap detection against the *corrected* period happens
+    // once, after the whole stream is read (ImuGridPlan::build_from_corrected).
     let mut drop_sample = false;
     if idx < 3 {
-        match (first[idx], last[idx]) {
-            (Some(f), Some(prev)) => {
-                let delta = ts_us - prev;
-                let abs_slot = if delta == period_us {
-                    last_abs_slot[idx] + 1
-                } else {
-                    ((ts_us - f) as f64 / period_us as f64).round() as i64
-                };
-                if abs_slot <= last_abs_slot[idx] {
-                    drop_sample = true;
-                } else {
-                    let missing = (abs_slot - last_abs_slot[idx] - 1) as usize;
-                    if missing >= 1 {
-                        imu_gaps[idx].push((count[idx], missing));
-                    }
-                    last_abs_slot[idx] = abs_slot;
-                    last[idx] = Some(ts_us);
-                    count[idx] += 1;
-                }
+        match last[idx] {
+            Some(prev) if ts_us <= prev => {
+                drop_sample = true;
             }
             _ => {
-                // First sample of this IMU anchors relative slot 0.
-                first[idx] = Some(ts_us);
+                if first[idx].is_none() {
+                    first[idx] = Some(ts_us);
+                }
                 last[idx] = Some(ts_us);
-                last_abs_slot[idx] = 0;
                 count[idx] += 1;
             }
         }
@@ -777,7 +799,16 @@ mod tests {
     #[test]
     fn single_imu_drop_is_linearly_filled_and_recorded() {
         // Arrange — IMU0 at 1000 Hz; the 3rd sample arrives 2 periods after the
-        // 2nd (one sample dropped between received indices 1 and 2).
+        // 2nd (one sample dropped between received indices 1 and 2), followed by
+        // 9 more single-sample "bursts" of ordinary ±2 µs read-instant jitter (5
+        // at 998 µs, 4 at 1002 µs) — realistic surrounding burst context so the
+        // drop's own skewed 1500 µs burst-to-burst estimate is one of 10 total
+        // estimates, not the only one. C1 §3.3's median-not-mean robustness
+        // guarantee only holds with enough other estimates for the skewed one to
+        // be an outlier the median ignores (R12):
+        // median(998, 998, 998, 998, 998, 1002, 1002, 1002, 1002, 1500) = 1000 µs,
+        // exactly nominal, so the drop is still detected as a genuine gap rather
+        // than reinterpreted as an off-nominal true ODR.
         let registry = vec![v3_registry_entry(0, 4, 1000, 1.0, 0.0, "IMU0_AccelX", "raw")];
         let buf = cat(&[
             Header { schema_version: 3, imu_mask: 0x01, imu_sample_rate_hz: 1000, ..Default::default() }
@@ -786,25 +817,48 @@ mod tests {
             frame(0x01, &imu_payload(0, 1_001_000, &[10])),
             frame(0x01, &imu_payload(0, 1_003_000, &[30])), // 2000 µs jump → 1 missing
             frame(0x01, &imu_payload(0, 1_004_000, &[40])),
+            // Ordinary jittery burst context appended after the drop (no
+            // further drops) — 5 seams at nominal-2 µs, 4 at nominal+2 µs.
+            frame(0x01, &imu_payload(0, 1_004_998, &[50])),
+            frame(0x01, &imu_payload(0, 1_005_996, &[60])),
+            frame(0x01, &imu_payload(0, 1_006_994, &[70])),
+            frame(0x01, &imu_payload(0, 1_007_992, &[80])),
+            frame(0x01, &imu_payload(0, 1_008_990, &[90])),
+            frame(0x01, &imu_payload(0, 1_009_992, &[100])),
+            frame(0x01, &imu_payload(0, 1_010_994, &[110])),
+            frame(0x01, &imu_payload(0, 1_011_996, &[120])),
+            frame(0x01, &imu_payload(0, 1_012_998, &[130])),
             session_end(),
         ]);
 
         // Act
         let r = parse_v3(&buf).unwrap();
 
-        // Assert — one linear fill (20) between 10 and 30; length 5; one GapSpan.
+        // Assert — one linear fill (20) between 10 and 30, the rest verbatim;
+        // one GapSpan at the drop's own location, unaffected by the extra
+        // context appended after it.
         let ch = find(&r, "IMU0_AccelX");
-        assert_eq!(ch.materialize(), vec![0.0, 10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(
+            ch.materialize(),
+            vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0]
+        );
         assert_eq!(ch.gaps, vec![GapSpan { start: 2, len: 1 }]);
-        assert_eq!(ch.len(), 5);
+        assert_eq!(ch.len(), 14);
     }
 
     #[test]
     fn two_imus_with_different_drops_align_a_shared_spike_to_the_same_slot() {
         // Arrange — IMU0 and IMU1 at 1000 Hz on one clock. Both record a spike
         // (1000) at the same timestamp (1_004_000), but IMU0 drops a sample
-        // before it while IMU1 does not. Reconciliation must make them
-        // equal-length and land the spike on the same slot so `[A] - [B]` works.
+        // before it while IMU1 does not. Both streams then carry 9 more samples
+        // of realistic surrounding burst context: IMU0 as ordinary jittery
+        // single-sample "bursts" (±2 µs seams, no further drops), IMU1 as plain
+        // nominal continuation — so IMU0's median has enough burst-to-burst
+        // estimates for its drop's skewed one to be an ignorable outlier (R12):
+        // median(1333.33, 998×5, 1002×4) = 1000 µs, matching IMU1's trivial
+        // (single-burst, no-estimate) nominal fallback exactly. Reconciliation
+        // must make them equal-length and land the spike on the same slot so
+        // `[A] - [B]` works.
         let registry = vec![
             v3_registry_entry(0, 4, 1000, 1.0, 0.0, "IMU0_AccelX", "raw"),
             v3_registry_entry(6, 4, 1000, 1.0, 0.0, "IMU1_AccelX", "raw"),
@@ -813,19 +867,38 @@ mod tests {
         let buf = cat(&[
             Header { schema_version: 3, imu_mask: 0x41, imu_count: 2, imu_sample_rate_hz: 1000, ..Default::default() }
                 .build(&registry),
-            // IMU0 — drops one sample between 1_001_000 and 1_003_000.
+            // IMU0 — drops one sample between 1_001_000 and 1_003_000, then 9
+            // ordinary jittery bursts (no further drops).
             frame(0x01, &imu_payload(0, 1_000_000, &[0])),
             frame(0x01, &imu_payload(0, 1_001_000, &[0])),
             frame(0x01, &imu_payload(0, 1_003_000, &[0])),
             frame(0x01, &imu_payload(0, 1_004_000, &[1000])), // spike
             frame(0x01, &imu_payload(0, 1_005_000, &[0])),
-            // IMU1 — no drops.
+            frame(0x01, &imu_payload(0, 1_005_998, &[0])),
+            frame(0x01, &imu_payload(0, 1_006_996, &[0])),
+            frame(0x01, &imu_payload(0, 1_007_994, &[0])),
+            frame(0x01, &imu_payload(0, 1_008_992, &[0])),
+            frame(0x01, &imu_payload(0, 1_009_990, &[0])),
+            frame(0x01, &imu_payload(0, 1_010_992, &[0])),
+            frame(0x01, &imu_payload(0, 1_011_994, &[0])),
+            frame(0x01, &imu_payload(0, 1_012_996, &[0])),
+            frame(0x01, &imu_payload(0, 1_013_998, &[0])),
+            // IMU1 — no drops, plain nominal continuation.
             frame(0x01, &imu_payload(1, 1_000_000, &[0])),
             frame(0x01, &imu_payload(1, 1_001_000, &[0])),
             frame(0x01, &imu_payload(1, 1_002_000, &[0])),
             frame(0x01, &imu_payload(1, 1_003_000, &[0])),
             frame(0x01, &imu_payload(1, 1_004_000, &[1000])), // spike, same timestamp
             frame(0x01, &imu_payload(1, 1_005_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_006_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_007_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_008_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_009_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_010_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_011_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_012_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_013_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_014_000, &[0])),
             session_end(),
         ]);
 
@@ -848,8 +921,14 @@ mod tests {
 
     #[test]
     fn all_imu_channels_report_the_single_nominal_rate_despite_different_drops() {
-        // Arrange — same two-IMU stream; IMU0 drops one, IMU1 drops none. The old
-        // (n-1)/span formula gave 800 vs 1000 Hz; the nominal rate is identical.
+        // Arrange — same two-IMU stream as the shared-spike test above (minus
+        // the spike itself): IMU0 drops one, IMU1 drops none, each carrying 9
+        // more samples of realistic surrounding burst context (IMU0 jittery
+        // single-sample "bursts", IMU1 plain nominal continuation) so IMU0's
+        // median has enough burst-to-burst estimates for its drop's skewed one
+        // to be an ignorable outlier (R12) rather than the only estimate. The
+        // old (n-1)/span formula gave 800 vs 1000 Hz; the nominal rate is
+        // identical.
         let registry = vec![
             v3_registry_entry(0, 4, 1000, 1.0, 0.0, "IMU0_AccelX", "raw"),
             v3_registry_entry(6, 4, 1000, 1.0, 0.0, "IMU1_AccelX", "raw"),
@@ -862,12 +941,30 @@ mod tests {
             frame(0x01, &imu_payload(0, 1_003_000, &[0])),
             frame(0x01, &imu_payload(0, 1_004_000, &[0])),
             frame(0x01, &imu_payload(0, 1_005_000, &[0])),
+            frame(0x01, &imu_payload(0, 1_005_998, &[0])),
+            frame(0x01, &imu_payload(0, 1_006_996, &[0])),
+            frame(0x01, &imu_payload(0, 1_007_994, &[0])),
+            frame(0x01, &imu_payload(0, 1_008_992, &[0])),
+            frame(0x01, &imu_payload(0, 1_009_990, &[0])),
+            frame(0x01, &imu_payload(0, 1_010_992, &[0])),
+            frame(0x01, &imu_payload(0, 1_011_994, &[0])),
+            frame(0x01, &imu_payload(0, 1_012_996, &[0])),
+            frame(0x01, &imu_payload(0, 1_013_998, &[0])),
             frame(0x01, &imu_payload(1, 1_000_000, &[0])),
             frame(0x01, &imu_payload(1, 1_001_000, &[0])),
             frame(0x01, &imu_payload(1, 1_002_000, &[0])),
             frame(0x01, &imu_payload(1, 1_003_000, &[0])),
             frame(0x01, &imu_payload(1, 1_004_000, &[0])),
             frame(0x01, &imu_payload(1, 1_005_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_006_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_007_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_008_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_009_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_010_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_011_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_012_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_013_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_014_000, &[0])),
             session_end(),
         ]);
 
@@ -1118,5 +1215,52 @@ mod tests {
         let r = parse_v3(&buf).unwrap();
         let t_us = &find(&r, "HR_RR").t_us;
         assert_eq!(t_us, &vec![0, 400_000]);
+    }
+
+    #[test]
+    fn imu_burst_off_nominal_odr_reports_the_corrected_rate_and_spacing() {
+        // Arrange — contract C1 §3.3's worked example's *raw* stamps
+        // verbatim: nominal 1250 µs (800 Hz configured), true period
+        // 1200 µs (≈833.3 Hz), 4 bursts of N=4. IMU0, single axis.
+        let raw_stamps: [i64; 16] = [
+            96250, 97500, 98750, 100000, // burst 0
+            101050, 102300, 103550, 104800, // burst 1
+            105850, 107100, 108350, 109600, // burst 2
+            110650, 111900, 113150, 114400, // burst 3
+        ];
+        let registry = vec![v3_registry_entry(0, 4, 800, 1.0, 0.0, "IMU0_AccelX", "raw")];
+        let mut parts = vec![Header {
+            schema_version: 3,
+            imu_mask: 0x01,
+            imu_sample_rate_hz: 800, // imu_period_us(800) == 1250, the nominal period.
+            ..Default::default()
+        }
+        .build(&registry)];
+        for &ts in raw_stamps.iter() {
+            parts.push(frame(0x01, &imu_payload(0, ts, &[10])));
+        }
+        parts.push(session_end());
+
+        // Act
+        let r = parse_v3(&cat(&parts)).unwrap();
+
+        // Assert — nominal_rate_hz reflects the *corrected* 1200 µs period,
+        // not the configured-ODR 1250 µs one; every sample lands cleanly on
+        // the corrected grid (no drops, since the worked example's corrected
+        // stamps are exactly evenly spaced), so t_us advances by exactly
+        // 1200 µs at every step.
+        let ch = find(&r, "IMU0_AccelX");
+        assert_eq!(ch.len(), 16);
+        assert!(ch.gaps.is_empty());
+        assert_relative_eq!(ch.nominal_rate_hz, 1e6 / 1200.0, epsilon = 1e-6);
+        assert!(ch.t_us.windows(2).all(|w| w[1] - w[0] == 1200));
+
+        // t_recorded_us is present (correction actually diverged it from the
+        // nominal-grid formula the pre-Task-6 parser used) and, since this
+        // IMU has no drops, advances at the same 1200 µs corrected spacing
+        // as t_us.
+        let t_recorded = ch.t_recorded_us.as_ref().expect("burst correction should set t_recorded_us");
+        assert_eq!(t_recorded.len(), 16);
+        assert!(t_recorded.windows(2).all(|w| w[1] - w[0] == 1200));
     }
 }

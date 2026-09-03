@@ -330,6 +330,7 @@ mod tests {
             channel_count: 1,
             duration_ms: 0,
             truncation_warning: None,
+            import_warnings: Vec::new(),
         };
         let derived = vec![Channel::from_f64("ForkVelocity", 10.0, vec![1.5, 2.5])];
         let mut buf: Vec<u8> = Vec::new();
