@@ -7,3 +7,4 @@
 
 pub mod atomic;
 pub mod blob;
+pub mod parquet;
