@@ -9,11 +9,17 @@
 /// field set.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeviceStatus {
+    /// `true` when the WiFi radio is on (`WiFi: ON` line), `false` for `OFF`.
     pub wifi_on: Option<bool>,
+    /// `true` while a recording session is active (`Logging: RUNNING` line).
     pub logging: Option<bool>,
+    /// Main battery charge, percent (`Battery: NN%` line).
     pub battery_pct: Option<u8>,
+    /// SD card state (`SD:` line).
     pub sd: Option<SdState>,
+    /// GPS fix state (`GPS:` line).
     pub gps: Option<GpsState>,
+    /// IMU health state (`IMU:` line).
     pub imu: Option<ImuState>,
     /// Running image's `esp_app_desc_t.version`, e.g. `"1.5.0"`.
     pub firmware: Option<String>,
@@ -22,17 +28,46 @@ pub struct DeviceStatus {
     /// Raw HR line value (`ABSENT`, `SEARCHING`, `"CONNECTED 132"`, …) — kept
     /// as a string pending a typed enum decision, see Open question 4.
     pub hr: Option<String>,
+    /// Heart-rate strap battery, percent (`HR_Battery: NN%` line).
     pub hr_battery_pct: Option<u8>,
 }
 
+/// SD card state, decoded from the status block's `SD:` line (SPEC §7.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SdState { Ok, Full, Error, Absent }
+pub enum SdState {
+    /// Card present and writable.
+    Ok,
+    /// Card present but has no free space left.
+    Full,
+    /// Card present but unreadable/unwritable.
+    Error,
+    /// No card inserted.
+    Absent,
+}
 
+/// GPS fix state, decoded from the status block's `GPS:` line (SPEC §7.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GpsState { Fix, NoFix, Absent }
+pub enum GpsState {
+    /// GPS module has a valid position fix.
+    Fix,
+    /// GPS module is powered but has not yet acquired a fix.
+    NoFix,
+    /// No GPS module detected.
+    Absent,
+}
 
+/// IMU health state, decoded from the status block's `IMU:` line (SPEC §7.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImuState { Ok, Partial, Error, Absent }
+pub enum ImuState {
+    /// All configured IMU sensors are reporting.
+    Ok,
+    /// Some but not all configured IMU sensors are reporting.
+    Partial,
+    /// IMU present but reporting a fault.
+    Error,
+    /// No IMU detected.
+    Absent,
+}
 
 /// Parses a §7.3-shaped status block. Unknown lines are ignored; a
 /// malformed value for a known key (e.g. `Battery: NN%` with non-numeric

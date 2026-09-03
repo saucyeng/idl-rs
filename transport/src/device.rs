@@ -16,9 +16,12 @@ pub struct DiscoveredDevice {
 /// Result of a successful BLE connect + GATT setup (SPEC §7.4 steps 2–4).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConnectionInfo {
+    /// Same identifier as the `DiscoveredDevice` passed to `connect`.
     pub device_id: String,
     /// From the first status read/notification's `Firmware:` line (SPEC §7.3).
     pub firmware_version: String,
+    /// `true` once GATT setup (service/characteristic discovery, Status
+    /// notifications enabled) completed successfully (SPEC §7.4 steps 2–4).
     pub connected: bool,
 }
 
