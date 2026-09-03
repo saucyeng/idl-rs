@@ -268,8 +268,11 @@ pub fn read_registry_entry_v3(reader: &mut ByteReader) -> Result<ChannelRegistry
 /// Emits the eight raw GPS channels (no scale/offset). Optionally seeds the
 /// `anchor` from the first non-zero `gps_epoch_ms` (for §5.6 back-fill) and
 /// folds `device_timestamp_us` into `origin` (the event-time zero). Pushes
-/// this fix's own `device_ts_us` into `gps_ts` unconditionally — every GPS
-/// channel shares this one per-fix timestamp as its `t_us` source (C1 §2).
+/// this fix's own `device_ts_us` into `gps_ts` only once every fallible field
+/// read below has succeeded — every GPS channel shares this one per-fix
+/// timestamp as its `t_us` source, and a mid-record truncation must not leave
+/// `gps_ts` ahead of the `GPS_*` columns (C1 §2's mandatory
+/// `t_us.len() == column.len()`).
 pub fn parse_gps_record(
     reader: &mut ByteReader,
     payload_len: usize,
@@ -284,7 +287,6 @@ pub fn parse_gps_record(
     if let Some(o) = origin {
         o.observe(device_ts_us);
     }
-    gps_ts.push(device_ts_us);
     if let Some(a) = anchor {
         if a.gps_epoch_ms.is_none() && gps_epoch_ms > 0 {
             a.gps_epoch_ms = Some(gps_epoch_ms);
@@ -298,6 +300,12 @@ pub fn parse_gps_record(
     let heading = reader.u16("heading")?;
     let fix_quality = reader.u8("fix_quality")?;
     let satellites = reader.u8("satellites")?;
+
+    // Pushed only once every fallible field above has succeeded, mirroring
+    // `parse_channel`'s `channel_ts_us` ordering (v3.rs) — a `.idl0` buffer
+    // truncated mid-GPS-record must not leave `gps_ts` one entry ahead of the
+    // `GPS_*` columns below (C1 §2's mandatory `t_us.len() == column.len()`).
+    gps_ts.push(device_ts_us);
 
     out.push("GPS_EpochMs", gps_epoch_ms as f64);
     out.push("GPS_Latitude", latitude as f64);
@@ -812,5 +820,42 @@ mod tests {
         // Assert — column unchanged, no gaps.
         assert_eq!(col.materialize(), vec![42.0]);
         assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn parse_gps_record_truncated_mid_record_keeps_gps_ts_in_sync_with_columns() {
+        // Arrange — a full first GPS fix, followed by a second fix whose
+        // buffer physically ends after `device_timestamp_us` but before the
+        // remaining five fallible fields (`latitude`..`satellites`) can be
+        // read — the real "buffer ended mid-record" recovery path `parse_v3`
+        // already documents.
+        use crate::parse::test_buffers::gps_payload;
+
+        let full = gps_payload(1_704_110_400_000, 1_000, 10, 20, 30, 40, 50, 1, 8);
+        let mut second = gps_payload(0, 2_000, 0, 0, 0, 0, 0, 0, 0);
+        second.truncate(18); // gps_epoch_ms(8) + device_ts_us(8) + 2 of latitude's 4 bytes
+        let mut buf = full.clone();
+        buf.extend_from_slice(&second);
+        let mut reader = ByteReader::new(&buf);
+        let mut acc = ChannelAccumulator::new();
+        let mut gps_ts: Vec<i64> = Vec::new();
+
+        // Act
+        parse_gps_record(&mut reader, full.len(), &mut acc, None, None, &mut gps_ts).unwrap();
+        let err = parse_gps_record(&mut reader, full.len(), &mut acc, None, None, &mut gps_ts);
+
+        // Assert — the second call reports the truncation and every GPS_*
+        // column still has exactly as many samples as `gps_ts` (C1 §2).
+        assert!(matches!(err, Err(ParseError::TruncatedRecord(_))));
+        assert_eq!(gps_ts.len(), 1);
+        let entries = acc.into_entries();
+        assert_eq!(entries.len(), 8);
+        for (name, col) in &entries {
+            assert_eq!(
+                col.materialize().len(),
+                gps_ts.len(),
+                "{name}: t_us/column length mismatch"
+            );
+        }
     }
 }
