@@ -322,9 +322,9 @@ fn gps_channel_unit(channel_id: &str) -> Option<&'static str> {
     match channel_id {
         "GPS_SpeedKmh" => Some("km/h"),
         "GPS_EpochMs" => Some("ms_raw"),
-        "GPS_Latitude" | "GPS_Longitude" => Some("deg_e7"),
-        "GPS_Altitude" => Some("m_e1"),
-        "GPS_Heading" => Some("deg_e2"),
+        "GPS_Latitude" | "GPS_Longitude" => Some("deg"),
+        "GPS_Altitude" => Some("m"),
+        "GPS_Heading" => Some("deg"),
         "GPS_FixQuality" => Some("enum_raw"),
         "GPS_Satellites" => Some("count"),
         _ => None,
@@ -598,10 +598,19 @@ mod tests {
         assert_relative_eq!(find(&r, "IMU0_AccelY").materialize()[0], -8192.0 * ACCEL_SCALE as f64, epsilon = 1e-6);
         assert_relative_eq!(find(&r, "IMU0_GyroX").materialize()[0], 1000.0 * GYRO_SCALE as f64, epsilon = 1e-3);
 
-        // GPS raw (lat/lon/epoch/sats are verbatim wire integers)
+        // GPS: epoch/sats are verbatim wire integers; lat/lon are baked to
+        // physical decimal degrees at parse time (ruling R27): raw ×1e-7.
         assert_eq!(find(&r, "GPS_EpochMs").materialize()[0], RMC_UTC_MS as f64);
-        assert_eq!(find(&r, "GPS_Latitude").materialize()[0], 515_250_000.0);
-        assert_eq!(find(&r, "GPS_Longitude").materialize()[0], -1_234_567.0);
+        assert_relative_eq!(
+            find(&r, "GPS_Latitude").materialize()[0],
+            51.525,
+            epsilon = 1e-9
+        );
+        assert_relative_eq!(
+            find(&r, "GPS_Longitude").materialize()[0],
+            -0.1234567,
+            epsilon = 1e-9
+        );
         assert_eq!(find(&r, "GPS_Satellites").materialize()[0], 8.0);
         // GPS_SpeedKmh is engine-scaled to physical km/h: raw 1000 (km/h × 100)
         // → 10.0 km/h via the 0.01 column scale (§5.7).

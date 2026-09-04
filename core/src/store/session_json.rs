@@ -101,10 +101,11 @@ impl VersionedConfig for SessionJson {
 }
 
 /// A single lap-start/finish gate, decimal degrees (C1 §6, settled by ruling
-/// R8: `session.json` is a human-legible file, not an internal struct
-/// compared against raw ×1e7 device bytes, so it keeps decimal degrees;
-/// `crate::laps::model::Gate`/`crate::gps::GpsFix`'s own ×1e7 wire scale
-/// converts to this convention exactly once, at this JSON boundary).
+/// R8: `session.json` is a human-legible file, not an internal struct, so it
+/// keeps decimal degrees. Ruling R27 moved `crate::laps::model::Gate`/
+/// `crate::gps::GpsFix` to the same physical decimal-degree scale, so the
+/// conversion this JSON boundary once did is gone — it is now a plain field
+/// copy).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LapGateJson {
     /// First gate endpoint latitude, decimal degrees.

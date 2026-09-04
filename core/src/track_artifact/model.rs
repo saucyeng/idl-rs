@@ -81,9 +81,12 @@ struct TrackDto {
 
 #[derive(Serialize, Deserialize)]
 struct LapGateDto {
-    // Despite the `_deg` name, these carry degrees x1e7 (matching `Gate`'s
-    // own scale), unchanged from idl0 (SPEC §16.3) — see this module's own
-    // Gate/GpsFix conversions, which copy verbatim without rescaling.
+    // Despite the `_deg` name, these carry degrees x1e7, unchanged from idl0
+    // (SPEC §17b.1) — an external file-format contract independent of the
+    // engine's internal `Gate` scale. Ruling R27 moved `Gate` to physical
+    // decimal degrees, so this module's Gate/GpsFix conversions now rescale
+    // explicitly at this wire boundary (they used to copy verbatim, back
+    // when both sides were x1e7).
     lat1_deg: f64,
     lon1_deg: f64,
     lat2_deg: f64,
@@ -127,8 +130,8 @@ struct NeutralZoneDto {
 struct GpsFixDto {
     #[serde(default)]
     timestamp_ms: i64,
-    // Despite the `_deg` name, these carry degrees x1e7 (matching
-    // `GpsFix`'s own scale), unchanged from idl0 (SPEC §16.3).
+    // Despite the `_deg` name, these carry degrees x1e7, unchanged from idl0
+    // (SPEC §17b.1) — see `LapGateDto`'s doc comment.
     latitude_deg: f64,
     longitude_deg: f64,
 }
@@ -137,7 +140,17 @@ struct GpsFixDto {
 
 impl LapGateDto {
     fn into_gate(self) -> Gate {
-        Gate { lat1: self.lat1_deg, lon1: self.lon1_deg, lat2: self.lat2_deg, lon2: self.lon2_deg }
+        // `/ 1e7`, not `* 1e-7`: 1e7 is exactly representable in binary
+        // floating point and division is correctly rounded, so this exactly
+        // undoes `From<&Gate>`'s `(deg * 1e7).round()` below for any value
+        // that started as a real decimal-degree measurement — multiplying
+        // by the inexact constant `1e-7` would not round-trip bit-exact.
+        Gate {
+            lat1: self.lat1_deg / 1e7,
+            lon1: self.lon1_deg / 1e7,
+            lat2: self.lat2_deg / 1e7,
+            lon2: self.lon2_deg / 1e7,
+        }
     }
 }
 impl LapTimingDto {
@@ -164,7 +177,8 @@ impl NeutralZoneDto {
 }
 impl GpsFixDto {
     fn into_core(self) -> GpsFix {
-        GpsFix { timestamp_ms: self.timestamp_ms, lat: self.latitude_deg, lon: self.longitude_deg }
+        // See `LapGateDto::into_gate` on why `/ 1e7`, not `* 1e-7`.
+        GpsFix { timestamp_ms: self.timestamp_ms, lat: self.latitude_deg / 1e7, lon: self.longitude_deg / 1e7 }
     }
 }
 
@@ -189,7 +203,13 @@ impl From<TrackArtifact> for Track {
 
 impl From<&Gate> for LapGateDto {
     fn from(g: &Gate) -> Self {
-        LapGateDto { lat1_deg: g.lat1, lon1_deg: g.lon1, lat2_deg: g.lat2, lon2_deg: g.lon2, name: String::new() }
+        LapGateDto {
+            lat1_deg: (g.lat1 * 1e7).round(),
+            lon1_deg: (g.lon1 * 1e7).round(),
+            lat2_deg: (g.lat2 * 1e7).round(),
+            lon2_deg: (g.lon2 * 1e7).round(),
+            name: String::new(),
+        }
     }
 }
 impl From<&LapTiming> for LapTimingDto {
@@ -216,7 +236,11 @@ impl From<&NeutralZone> for NeutralZoneDto {
 }
 impl From<&GpsFix> for GpsFixDto {
     fn from(f: &GpsFix) -> Self {
-        GpsFixDto { timestamp_ms: f.timestamp_ms, latitude_deg: f.lat, longitude_deg: f.lon }
+        GpsFixDto {
+            timestamp_ms: f.timestamp_ms,
+            latitude_deg: (f.lat * 1e7).round(),
+            longitude_deg: (f.lon * 1e7).round(),
+        }
     }
 }
 impl From<&Track> for TrackArtifact {
@@ -234,6 +258,101 @@ impl From<&Track> for TrackArtifact {
                 created_at_ms: t.created_at_ms,
                 updated_at_ms: t.updated_at_ms,
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A spread of physical decimal-degree values chosen to catch a
+    /// regression from `/ 1e7` to `* 1e-7` on the `.idl0t` wire boundary
+    /// (`LapGateDto`/`GpsFixDto`'s doc comments explain why the two are not
+    /// interchangeable). At least `50.1163`, `-122.9574`, `89.9999999`, and
+    /// `-89.9999999` are known — verified independently, not just asserted
+    /// here — to land on a different `f64` than they started from if `*
+    /// 1e-7` is used instead of `/ 1e7`; the rest (zero, unit values, exact
+    /// ±90/±180 boundaries, an arbitrary 7-decimal-digit mid-range value)
+    /// round-trip under either operator and are included for coverage, not
+    /// as regression bait.
+    const CASES: &[f64] = &[
+        0.0,
+        0.0000001,
+        -0.0000001,
+        1.0,
+        -1.0,
+        50.1163,       // fails under `* 1e-7`
+        -122.9574,     // fails under `* 1e-7`
+        89.9999999,    // fails under `* 1e-7`
+        -89.9999999,   // fails under `* 1e-7`
+        90.0,
+        -90.0,
+        179.9999999,
+        -179.9999999,
+        180.0,
+        -180.0,
+        45.1234567,
+        -45.1234567,
+    ];
+
+    #[test]
+    fn gate_wire_round_trip_is_bit_exact_across_a_spread_of_coordinates() {
+        for &deg in CASES {
+            // Arrange — the wire i32 grid point this degree value encodes to.
+            let gate = Gate { lat1: deg, lon1: -deg, lat2: deg, lon2: -deg };
+            let expected_lat_raw = (deg * 1e7).round() as i32;
+            let expected_lon_raw = (-deg * 1e7).round() as i32;
+
+            // Act — write, then read back.
+            let wire1 = LapGateDto::from(&gate);
+            let (wire1_lat, wire1_lon) = (wire1.lat1_deg, wire1.lon1_deg);
+            let gate2 = wire1.into_gate();
+
+            // Assert (1) — the wire value itself is the exact i32 grid point.
+            assert_eq!(wire1_lat as i32, expected_lat_raw, "deg={deg}: encode");
+            assert_eq!(wire1_lon as i32, expected_lon_raw, "deg={deg}: encode");
+
+            // Assert (2) — the decoded *domain* value is bit-exact against
+            // ground truth (`raw / 1e7`, computed independently here, not
+            // via `into_gate`). This is the assertion that actually
+            // distinguishes `/ 1e7` from `* 1e-7`: a regression to `*
+            // 1e-7` decodes to a different `f64` for `deg` values like
+            // `50.1163`/`-122.9574`/`89.9999999` above, by up to a few
+            // ULPs — an error too small for a *second* `.round()` on
+            // re-encoding to ever catch (verified: re-encoding either
+            // decoded value recovers the same wire i32 either way, which is
+            // why a write→read→write test that only compares the
+            // *re-encoded* wire value cannot catch this regression; the
+            // domain value itself must be checked).
+            assert_eq!(gate2.lat1, wire1_lat / 1e7, "deg={deg}: decode not bit-exact");
+            assert_eq!(gate2.lon1, wire1_lon / 1e7, "deg={deg}: decode not bit-exact");
+        }
+    }
+
+    #[test]
+    fn gps_fix_wire_round_trip_is_bit_exact_across_a_spread_of_coordinates() {
+        for &deg in CASES {
+            // Arrange
+            let fix = GpsFix { timestamp_ms: 0, lat: deg, lon: -deg };
+            let expected_lat_raw = (deg * 1e7).round() as i32;
+            let expected_lon_raw = (-deg * 1e7).round() as i32;
+
+            // Act — write, then read back.
+            let wire1 = GpsFixDto::from(&fix);
+            let (wire1_lat, wire1_lon) = (wire1.latitude_deg, wire1.longitude_deg);
+            let fix2 = wire1.into_core();
+
+            // Assert (1) — wire value is the exact i32 grid point.
+            assert_eq!(wire1_lat as i32, expected_lat_raw, "deg={deg}: encode");
+            assert_eq!(wire1_lon as i32, expected_lon_raw, "deg={deg}: encode");
+
+            // Assert (2) — decoded domain value is bit-exact against ground
+            // truth. See `gate_wire_round_trip_...`'s comment: this is the
+            // assertion that actually catches a `/ 1e7` → `* 1e-7`
+            // regression; comparing a re-encoded wire value would not.
+            assert_eq!(fix2.lat, wire1_lat / 1e7, "deg={deg}: decode not bit-exact");
+            assert_eq!(fix2.lon, wire1_lon / 1e7, "deg={deg}: decode not bit-exact");
         }
     }
 }

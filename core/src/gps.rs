@@ -1,11 +1,11 @@
 //! General GPS utilities: assemble a fix list from the session handle's GPS
 //! channels. Shared by `laps` (gate crossings) and `tracks` (visit detection).
-//! Coordinates are copied at the raw channel-sample scale (degrees × 1e7); no
-//! rescaling happens here.
+//! Coordinates are copied at the channel-sample scale — physical decimal
+//! degrees, ruling R27; no rescaling happens here.
 
 use crate::session::handle::SessionHandle;
 
-/// A GPS position with timestamp. `lat`/`lon` are the raw channel-sample scale.
+/// A GPS position with timestamp. `lat`/`lon` are physical decimal degrees.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GpsFix {
     pub timestamp_ms: i64,

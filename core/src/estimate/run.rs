@@ -96,7 +96,7 @@ fn course_to_nav(heading_deg: f64) -> Vector3<f64> {
 }
 
 /// Pulls the GPS velocity fixes from a lookup: `GPS_SpeedKmh` (km/h, physical) ×
-/// `GPS_Heading` (raw centidegrees, ÷100 → degrees clockwise from north), stamped
+/// `GPS_Heading` (physical degrees clockwise from north, ruling R27), stamped
 /// with the speed channel's event times (`sample_times`, seconds on the recording
 /// timeline; falls back to `index / rate` for a fixed-rate GPS channel). Fixes with
 /// `GPS_FixQuality` = 0 (no fix) are dropped when that channel is present. Returns
@@ -123,7 +123,7 @@ fn gps_samples_from_lookup(lookup: &dyn ChannelLookup) -> Vec<GpsSample> {
             }
         }
         let speed_mps = speed.samples[i] / 3.6; // km/h → m/s
-        let heading_deg = heading.samples[i] / 100.0; // centidegrees → degrees
+        let heading_deg = heading.samples[i]; // already physical degrees (ruling R27)
         out.push(GpsSample { time_s: times[i], velocity: speed_mps * course_to_nav(heading_deg) });
     }
     out
@@ -1520,11 +1520,11 @@ mod tests {
     #[test]
     fn gps_samples_from_lookup_builds_nav_velocity_at_event_times() {
         // Arrange — two fixes: 3.6 km/h due east (course 90°) at t = 1.25 s, then
-        // 7.2 km/h due north (course 0°) at t = 2.5 s. Heading is wire-format
-        // centidegrees; both have fix quality 1.
+        // 7.2 km/h due north (course 0°) at t = 2.5 s. Heading is already
+        // physical degrees (ruling R27); both have fix quality 1.
         let mut channels = HashMap::new();
         channels.insert("GPS_SpeedKmh".to_string(), (vec![3.6, 7.2], 0.0));
-        channels.insert("GPS_Heading".to_string(), (vec![9000.0, 0.0], 0.0));
+        channels.insert("GPS_Heading".to_string(), (vec![90.0, 0.0], 0.0));
         channels.insert("GPS_FixQuality".to_string(), (vec![1.0, 1.0], 0.0));
         let mut times = HashMap::new();
         times.insert("GPS_SpeedKmh".to_string(), vec![1.25, 2.5]);
@@ -1548,7 +1548,7 @@ mod tests {
         // and must be dropped; the second (quality 2) survives.
         let mut channels = HashMap::new();
         channels.insert("GPS_SpeedKmh".to_string(), (vec![99.9, 7.2], 0.0));
-        channels.insert("GPS_Heading".to_string(), (vec![12345.0, 0.0], 0.0));
+        channels.insert("GPS_Heading".to_string(), (vec![123.45, 0.0], 0.0));
         channels.insert("GPS_FixQuality".to_string(), (vec![0.0, 2.0], 0.0));
         let mut times = HashMap::new();
         times.insert("GPS_SpeedKmh".to_string(), vec![0.5, 1.0]);
