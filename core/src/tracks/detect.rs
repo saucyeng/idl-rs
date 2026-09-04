@@ -27,7 +27,8 @@ impl Default for VisitParams {
 }
 
 /// One reference track to match against. `polyline` is the track's stored
-/// reference polyline (lat/lon at the channel-sample scale, degrees × 1e7).
+/// reference polyline (lat/lon at the channel-sample scale — physical
+/// decimal degrees, ruling R27).
 #[derive(Debug, Clone)]
 pub struct TrackRef {
     pub track_id: String,
@@ -57,13 +58,12 @@ pub fn detect_visits(handle: &SessionHandle, tracks: &[TrackRef], params: VisitP
         return Vec::new();
     }
 
-    // Local-metre conversion. Coords are deg × 1e7, so the divide-by-1e7 cancels
-    // into the metres-per-deg constant. Latitude scale is fixed; longitude
-    // shrinks by cos(lat) at the session centroid.
+    // Local-metre conversion. Latitude scale is fixed; longitude shrinks by
+    // cos(lat) at the session centroid.
     let sess_box = Bbox::of(&session_gps);
-    let centroid_lat_deg = (sess_box.min_lat + sess_box.max_lat) / 2.0 / 1e7;
-    const M_PER_DEG_UNITS: f64 = 111_320.0 / 1e7;
-    let lon_scale = M_PER_DEG_UNITS * (centroid_lat_deg * std::f64::consts::PI / 180.0).cos().abs();
+    let centroid_lat_deg = (sess_box.min_lat + sess_box.max_lat) / 2.0;
+    const M_PER_DEG: f64 = 111_320.0;
+    let lon_scale = M_PER_DEG * (centroid_lat_deg * std::f64::consts::PI / 180.0).cos().abs();
 
     // Step 1: bounding-box pre-filter + pre-projection.
     let mut candidates: Vec<TrackProj> = Vec::new();
@@ -77,7 +77,7 @@ pub fn detect_visits(handle: &SessionHandle, tracks: &[TrackRef], params: VisitP
         }
         candidates.push(TrackProj {
             track_id: t.track_id.clone(),
-            ref_lat_m: t.polyline.iter().map(|f| f.lat * M_PER_DEG_UNITS).collect(),
+            ref_lat_m: t.polyline.iter().map(|f| f.lat * M_PER_DEG).collect(),
             ref_lon_m: t.polyline.iter().map(|f| f.lon * lon_scale).collect(),
         });
     }
@@ -90,7 +90,7 @@ pub fn detect_visits(handle: &SessionHandle, tracks: &[TrackRef], params: VisitP
     // Step 2: per-sample nearest-track assignment.
     let mut assignment: Vec<Option<&str>> = Vec::with_capacity(session_gps.len());
     for fix in &session_gps {
-        let px_m = fix.lat * M_PER_DEG_UNITS;
+        let px_m = fix.lat * M_PER_DEG;
         let py_m = fix.lon * lon_scale;
         let mut best_id: Option<&str> = None;
         let mut best_dist_sq = threshold_sq;
@@ -190,7 +190,7 @@ mod tests {
             .collect()
     }
 
-    // A reference track polyline (lat/lon only matter); coords at deg × 1e7.
+    // A reference track polyline (lat/lon only matter); coords are decimal degrees.
     fn track(id: &str, fixes: Vec<GpsFix>) -> TrackRef {
         TrackRef { track_id: id.to_string(), polyline: fixes }
     }
@@ -198,8 +198,8 @@ mod tests {
     #[test]
     fn detect_visits_single_track_one_window() {
         // Arrange — 40 fixes (≈40 s) hugging a track polyline within threshold.
-        let poly = line(0, 40, 1_000_000.0, 1_000_000.0, 100.0, 0.0);
-        let session = handle_from_fixes(&line(0, 40, 1_000_000.0, 1_000_000.0, 100.0, 0.0));
+        let poly = line(0, 40, 0.1, 0.1, 0.00001, 0.0);
+        let session = handle_from_fixes(&line(0, 40, 0.1, 0.1, 0.00001, 0.0));
         let tracks = vec![track("A", poly)];
 
         // Act
@@ -215,10 +215,10 @@ mod tests {
     #[test]
     fn detect_visits_two_tracks_in_sequence_yield_two_ordered_windows() {
         // Arrange — 40 s on track A, then 40 s on a far-away track B.
-        let a_poly = line(0, 40, 1_000_000.0, 1_000_000.0, 100.0, 0.0);
-        let b_poly = line(0, 40, 9_000_000.0, 9_000_000.0, 100.0, 0.0);
-        let mut fixes = line(0, 40, 1_000_000.0, 1_000_000.0, 100.0, 0.0);
-        fixes.extend(line(40_000, 40, 9_000_000.0, 9_000_000.0, 100.0, 0.0));
+        let a_poly = line(0, 40, 0.1, 0.1, 0.00001, 0.0);
+        let b_poly = line(0, 40, 0.9, 0.9, 0.00001, 0.0);
+        let mut fixes = line(0, 40, 0.1, 0.1, 0.00001, 0.0);
+        fixes.extend(line(40_000, 40, 0.9, 0.9, 0.00001, 0.0));
         let session = handle_from_fixes(&fixes);
         let tracks = vec![track("A", a_poly), track("B", b_poly)];
 
@@ -235,8 +235,8 @@ mod tests {
     #[test]
     fn detect_visits_short_window_discarded() {
         // Arrange — only 10 s on track (< 30 s min_visit).
-        let poly = line(0, 40, 1_000_000.0, 1_000_000.0, 100.0, 0.0);
-        let session = handle_from_fixes(&line(0, 10, 1_000_000.0, 1_000_000.0, 100.0, 0.0));
+        let poly = line(0, 40, 0.1, 0.1, 0.00001, 0.0);
+        let session = handle_from_fixes(&line(0, 10, 0.1, 0.1, 0.00001, 0.0));
         let tracks = vec![track("A", poly)];
 
         // Act
@@ -250,16 +250,16 @@ mod tests {
     fn detect_visits_gap_within_tolerance_keeps_one_window() {
         // Arrange — 20 s on track, a single 3 s off-track blip (within 5 s
         // tolerance), then 20 s back on track. lon jumps far away during the blip.
-        let poly = line(0, 60, 1_000_000.0, 1_000_000.0, 100.0, 0.0);
-        let mut fixes = line(0, 20, 1_000_000.0, 1_000_000.0, 100.0, 0.0);
+        let poly = line(0, 60, 0.1, 0.1, 0.00001, 0.0);
+        let mut fixes = line(0, 20, 0.1, 0.1, 0.00001, 0.0);
         // One off-track fix 3 s after the last on-track fix (gap = 3 s ≤ 5 s).
-        fixes.push(GpsFix { timestamp_ms: 22_000, lat: 5_000_000.0, lon: 5_000_000.0 });
+        fixes.push(GpsFix { timestamp_ms: 22_000, lat: 0.5, lon: 0.5 });
         // Resume on track; continue the polyline coordinates from index 20.
         fixes.extend(
             (20..40).map(|i| GpsFix {
                 timestamp_ms: 23_000 + (i - 20) as i64 * 1000,
-                lat: 1_000_000.0 + i as f64 * 100.0,
-                lon: 1_000_000.0,
+                lat: 0.1 + i as f64 * 0.00001,
+                lon: 0.1,
             }),
         );
         let session = handle_from_fixes(&fixes);
@@ -278,16 +278,16 @@ mod tests {
         // Arrange — 40 s on track, a 10 s off-track gap (> 5 s tolerance), then
         // 40 s back on track. Each on-track run is long enough to survive
         // min_visit, so the over-tolerance gap yields two windows.
-        let poly = line(0, 200, 1_000_000.0, 1_000_000.0, 100.0, 0.0);
-        let mut fixes = line(0, 40, 1_000_000.0, 1_000_000.0, 100.0, 0.0);
+        let poly = line(0, 200, 0.1, 0.1, 0.00001, 0.0);
+        let mut fixes = line(0, 40, 0.1, 0.1, 0.00001, 0.0);
         // 10 s off-track gap: jump far away for one fix at t = 50 s.
-        fixes.push(GpsFix { timestamp_ms: 50_000, lat: 5_000_000.0, lon: 5_000_000.0 });
+        fixes.push(GpsFix { timestamp_ms: 50_000, lat: 0.5, lon: 0.5 });
         // Resume on the polyline from t = 60 s for another 40 s.
         fixes.extend(
             (60..100).map(|i| GpsFix {
                 timestamp_ms: 60_000 + (i - 60) as i64 * 1000,
-                lat: 1_000_000.0 + i as f64 * 100.0,
-                lon: 1_000_000.0,
+                lat: 0.1 + i as f64 * 0.00001,
+                lon: 0.1,
             }),
         );
         let session = handle_from_fixes(&fixes);
@@ -309,8 +309,8 @@ mod tests {
         // perpendicular to a (1,1) diagonal (within the default 30 m, but
         // outside a 0.1 m threshold). The bboxes overlap, so this exercises the
         // per-sample distance gate, not the bbox pre-filter.
-        let poly = line(0, 40, 1_000_000.0, 1_000_000.0, 100.0, 100.0);
-        let session = handle_from_fixes(&line(0, 40, 1_000_050.0, 999_950.0, 100.0, 100.0));
+        let poly = line(0, 40, 0.1, 0.1, 0.00001, 0.00001);
+        let session = handle_from_fixes(&line(0, 40, 0.100005, 0.099995, 0.00001, 0.00001));
         let tracks = vec![track("A", poly)];
 
         // Act — default threshold matches; a 0.1 m threshold rejects every sample.
@@ -326,8 +326,8 @@ mod tests {
     #[test]
     fn detect_visits_bbox_non_overlap_rejects_track() {
         // Arrange — session near origin; only candidate is far away.
-        let far = line(0, 40, 9_000_000.0, 9_000_000.0, 100.0, 0.0);
-        let session = handle_from_fixes(&line(0, 40, 1_000_000.0, 1_000_000.0, 100.0, 0.0));
+        let far = line(0, 40, 0.9, 0.9, 0.00001, 0.0);
+        let session = handle_from_fixes(&line(0, 40, 0.1, 0.1, 0.00001, 0.0));
         let tracks = vec![track("Far", far)];
 
         // Act
@@ -340,9 +340,9 @@ mod tests {
     #[test]
     fn detect_visits_empty_when_too_few_fixes_or_no_tracks() {
         // Arrange
-        let poly = line(0, 40, 1_000_000.0, 1_000_000.0, 100.0, 0.0);
-        let one_fix = handle_from_fixes(&line(0, 1, 1_000_000.0, 1_000_000.0, 100.0, 0.0));
-        let many = handle_from_fixes(&line(0, 40, 1_000_000.0, 1_000_000.0, 100.0, 0.0));
+        let poly = line(0, 40, 0.1, 0.1, 0.00001, 0.0);
+        let one_fix = handle_from_fixes(&line(0, 1, 0.1, 0.1, 0.00001, 0.0));
+        let many = handle_from_fixes(&line(0, 40, 0.1, 0.1, 0.00001, 0.0));
 
         // Act + Assert — < 2 fixes → []; empty track list → [].
         assert!(detect_visits(&one_fix, &[track("A", poly.clone())], VisitParams::default()).is_empty());

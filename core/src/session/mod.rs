@@ -166,7 +166,7 @@ pub struct Channel {
     /// to avoid; see C1 §2's `RawColumn` round-trip table).
     pub source_kind: String,
     /// Physical unit string (contract C1 §4.1's per-channel `unit` values,
-    /// e.g. `g`, `dps`, `km/h`, `deg_e7`, `pulse`, `bar`, `bpm`). **Not
+    /// e.g. `g`, `dps`, `km/h`, `deg`, `pulse`, `bar`, `bpm`). **Not
     /// explicit in C1 §2's struct listing** — C1 §4.2 mandates a `unit`
     /// column-metadata value on every `data.parquet` channel column
     /// *always*, and the only place that value already exists today is the

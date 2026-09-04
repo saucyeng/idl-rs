@@ -265,7 +265,8 @@ pub fn read_registry_entry_v3(reader: &mut ByteReader) -> Result<ChannelRegistry
 
 /// Parses a GPS_FIX (0x02) record — identical wire format in v2 and v3.
 ///
-/// Emits the eight raw GPS channels (no scale/offset). Optionally seeds the
+/// Emits the eight GPS channels, with lat/lon/alt/heading baked to physical
+/// units at parse time (ruling R27) and no metadata scale/offset. Optionally seeds the
 /// `anchor` from the first non-zero `gps_epoch_ms` (for §5.6 back-fill) and
 /// folds `device_timestamp_us` into `origin` (the event-time zero). Pushes
 /// this fix's own `device_ts_us` into `gps_ts` only once every fallible field
@@ -308,18 +309,21 @@ pub fn parse_gps_record(
     gps_ts.push(device_ts_us);
 
     out.push("GPS_EpochMs", gps_epoch_ms as f64);
-    out.push("GPS_Latitude", latitude as f64);
-    out.push("GPS_Longitude", longitude as f64);
-    out.push("GPS_Altitude", altitude as f64);
-    // GPS_SpeedKmh is the one GPS-fix channel returned in physical units. The
+    // GPS_Latitude/Longitude/Altitude/Heading are baked to physical units at
+    // parse time (ruling R27), the same convention already used by
+    // `WheelFront`/`HR_RR`: no metadata `scale`/`offset` key, the division
+    // happens once here instead of in every consumer.
+    out.push("GPS_Latitude", latitude as f64 * 1e-7);
+    out.push("GPS_Longitude", longitude as f64 * 1e-7);
+    out.push("GPS_Altitude", altitude as f64 * 0.1);
+    // GPS_SpeedKmh is the one GPS-fix channel returned via metadata scale. The
     // firmware logs km/h × 100 (§5.6); a 0.01 scale on a compact i32 column makes
     // `materialize()` yield km/h, so Distance synthesis, math expressions, and the
     // colour-by-channel scale all get physical speed without each consumer
-    // dividing (§5.7). Lat/lon/alt/heading stay raw — their consumers apply the
-    // documented ÷1e7 / ÷10 / ÷100.
+    // dividing (§5.7).
     let speed_slot = out.slot_for_i32("GPS_SpeedKmh", 0.01, 0.0);
     out.push_i32_at(speed_slot, speed as i32);
-    out.push("GPS_Heading", heading as f64);
+    out.push("GPS_Heading", heading as f64 * 0.01);
     out.push("GPS_FixQuality", fix_quality as f64);
     out.push("GPS_Satellites", satellites as f64);
 

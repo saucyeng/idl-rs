@@ -47,7 +47,7 @@ mod tests {
         assert_eq!(t.sector_gates.len(), 1);
         assert_eq!(t.sector_gates[0].name, "S1");
         assert_eq!(t.reference_polyline.len(), 1);
-        assert_eq!(t.reference_polyline[0].lat, 501163000.0);
+        assert_eq!(t.reference_polyline[0].lat, 501163000.0 / 1e7);
         // track_ref carries id + polyline.
         assert_eq!(t.track_ref().track_id, "t-1");
         assert_eq!(t.track_ref().polyline.len(), 1);

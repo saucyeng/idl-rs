@@ -1,25 +1,23 @@
 //! Per-sample lap-distance normalisation onto a canonical polyline (port of
 //! `lap_distance_accumulator.dart`), confidence-anchor redistribution.
 //!
-//! **Unit correction vs idl0 (ruling R17):** `lap_distance_accumulator.dart`
-//! (lines 79-80, 88-89) feeds ×1e7-scale latitude straight into
-//! `cos(meanLat · π/180)` and multiplies ×1e7 coordinate deltas by the raw
-//! `111_320` m/deg constant — its "metres" are ~1e7× too large, so the
-//! documented 5 m confidence-anchor residual threshold can never fire and
-//! the projection's longitude scale is the cosine of a meaningless angle.
-//! This port fixes both: `M_PER_UNIT = 111_320.0 / 1e7` converts a raw
-//! (`crate::gps::GpsFix`) ×1e7-scale coordinate delta directly to metres,
-//! and the mean-latitude angle is divided by `1e7` before `cos()`. The
-//! algorithm's structure (projection, residual, tangent agreement, anchor
-//! selection, arc-fraction redistribution) is otherwise a verbatim port.
+//! **Unit correction vs idl0 (ruling R17, and see R27):** `lap_distance_accumulator.dart`
+//! (lines 79-80, 88-89) fed ×1e7-scale latitude straight into
+//! `cos(meanLat · π/180)` and multiplied ×1e7 coordinate deltas by the raw
+//! `111_320` m/deg constant — its "metres" were ~1e7× too large, so the
+//! documented 5 m confidence-anchor residual threshold could never fire and
+//! the projection's longitude scale was the cosine of a meaningless angle.
+//! This port fixed both. Ruling R27 later moved `crate::gps::GpsFix`'s
+//! lat/lon from ×1e7 integers to physical decimal degrees, so the `/ 1e7`
+//! this module once needed on both `M_PER_UNIT` and the mean-latitude angle
+//! is gone — the algorithm's structure (projection, residual, tangent
+//! agreement, anchor selection, arc-fraction redistribution) is otherwise
+//! unchanged.
 
 use crate::gps::GpsFix;
 
-/// Metres per raw GPS-fix coordinate unit (`crate::gps::GpsFix`'s degrees ×
-/// 1e7 scale): `111_320.0` m/deg (WGS-84 mean) ÷ `1e7` units/deg. See this
-/// module's doc comment — this is the constant idl0's Dart port omits the
-/// `/ 1e7` from.
-const M_PER_UNIT: f64 = 111_320.0 / 1e7;
+/// Metres per degree of latitude (WGS-84 mean): `111_320.0` m/deg.
+const M_PER_UNIT: f64 = 111_320.0;
 
 /// Maximum perpendicular residual (metres) for a sample to qualify as a
 /// confidence anchor.
@@ -82,8 +80,8 @@ impl LapDistanceAccumulator {
     /// `finish_gate_distance` are metres along `polyline`, defaulting to
     /// `0.0`/`polyline_length` when `None`.
     ///
-    /// `samples` and `polyline` are `crate::gps::GpsFix`'s native ×1e7
-    /// scale (see this module's doc comment).
+    /// `samples` and `polyline` are `crate::gps::GpsFix`'s native physical
+    /// decimal-degree scale (see this module's doc comment).
     ///
     /// Returns [`LapDistanceErrorKind::LengthMismatch`] when
     /// `speed_kmh.len() != samples.len()`, or
@@ -122,8 +120,8 @@ impl LapDistanceAccumulator {
             });
         }
 
-        let mean_lat_e7 = polyline.iter().map(|f| f.lat).sum::<f64>() / polyline.len() as f64;
-        let mean_lat_rad = (mean_lat_e7 / 1e7) * std::f64::consts::PI / 180.0;
+        let mean_lat_deg = polyline.iter().map(|f| f.lat).sum::<f64>() / polyline.len() as f64;
+        let mean_lat_rad = mean_lat_deg * std::f64::consts::PI / 180.0;
         let lon_scale = M_PER_UNIT * mean_lat_rad.cos();
 
         let mut polyline_cum = vec![0.0f64; polyline.len()];
@@ -239,7 +237,7 @@ mod tests {
     #[test]
     fn empty_samples_or_short_polyline_returns_all_zero() {
         // Arrange / Act
-        let a = LapDistanceAccumulator::compute(&[], &[fix(0.0, 0.0), fix(10_000_000.0, 10_000_000.0)], &[], None, None, &[]).unwrap();
+        let a = LapDistanceAccumulator::compute(&[], &[fix(0.0, 0.0), fix(1.0, 1.0)], &[], None, None, &[]).unwrap();
         let b = LapDistanceAccumulator::compute(&[fix(0.0, 0.0)], &[fix(0.0, 0.0)], &[10.0], None, None, &[]).unwrap();
 
         // Assert
@@ -249,10 +247,10 @@ mod tests {
 
     #[test]
     fn straight_line_polyline_normalised_distance_increases_monotonically() {
-        // Arrange -- samples exactly on a straight-line polyline (raw x1e7
-        // scale, ~1_000-unit == ~11 m steps), moving fast enough to qualify
-        // as confidence anchors throughout.
-        let polyline: Vec<GpsFix> = (0..10).map(|i| fix(i as f64 * 1_000.0, 0.0)).collect();
+        // Arrange -- samples exactly on a straight-line polyline (physical
+        // decimal degrees, ~0.0001-deg == ~11 m steps), moving fast enough
+        // to qualify as confidence anchors throughout.
+        let polyline: Vec<GpsFix> = (0..10).map(|i| fix(i as f64 * 0.0001, 0.0)).collect();
         let samples = polyline.clone();
         let speed = vec![30.0; samples.len()];
 
@@ -267,7 +265,7 @@ mod tests {
     #[test]
     fn gate_crossing_pins_an_exact_known_distance_at_its_sample_index() {
         // Arrange
-        let polyline: Vec<GpsFix> = (0..10).map(|i| fix(i as f64 * 1_000.0, 0.0)).collect();
+        let polyline: Vec<GpsFix> = (0..10).map(|i| fix(i as f64 * 0.0001, 0.0)).collect();
         let samples = polyline.clone();
         let speed = vec![1.0; samples.len()]; // below anchor threshold -- only the gate crossing anchors
 
@@ -283,20 +281,17 @@ mod tests {
 
     #[test]
     fn projected_residual_reflects_real_metres_not_e7_scaled_metres() {
-        // Arrange -- a due-north polyline at ~50 deg N (raw x1e7 GPS-fix
-        // scale); one sample offset exactly 3 m due east of the polyline's
-        // midpoint (offset computed with the same M_PER_UNIT/cos(lat)
-        // formula the implementation uses). Only a correct x1e7->metres
-        // conversion recovers a ~3 m residual -- the idl0-bug-faithful math
-        // (feeding raw x1e7 into cos()/* 111_320 without the /1e7) is off
-        // by a factor of ~1e7 and would not come remotely close.
-        let polyline: Vec<GpsFix> = (0..=10).map(|i| fix(500_000_000.0 + i as f64 * 1_000.0, 100_000_000.0)).collect();
-        let mean_lat_e7 = polyline.iter().map(|f| f.lat).sum::<f64>() / polyline.len() as f64;
-        let mean_lat_rad = (mean_lat_e7 / 1e7) * std::f64::consts::PI / 180.0;
+        // Arrange -- a due-north polyline at ~50 deg N (physical decimal
+        // degrees); one sample offset exactly 3 m due east of the
+        // polyline's midpoint (offset computed with the same
+        // M_PER_UNIT/cos(lat) formula the implementation uses).
+        let polyline: Vec<GpsFix> = (0..=10).map(|i| fix(50.0 + i as f64 * 0.0001, 10.0)).collect();
+        let mean_lat_deg = polyline.iter().map(|f| f.lat).sum::<f64>() / polyline.len() as f64;
+        let mean_lat_rad = mean_lat_deg * std::f64::consts::PI / 180.0;
         let lon_scale = M_PER_UNIT * mean_lat_rad.cos();
-        let delta_lon_e7 = 3.0 / lon_scale;
-        assert!((delta_lon_e7 - 419.0).abs() < 5.0, "sanity check on the computed offset: {delta_lon_e7}");
-        let sample = fix(mean_lat_e7, 100_000_000.0 + delta_lon_e7);
+        let delta_lon_deg = 3.0 / lon_scale;
+        assert!((delta_lon_deg - 0.0000419).abs() < 0.0000005, "sanity check on the computed offset: {delta_lon_deg}");
+        let sample = fix(mean_lat_deg, 10.0 + delta_lon_deg);
         let speed = vec![30.0];
 
         // Act
@@ -312,7 +307,7 @@ mod tests {
         // moving fast (30 km/h) so every interior sample qualifies as a
         // confidence anchor (residual ~= 0, tangent_agreement ~= 1, speed
         // above the anchor threshold).
-        let polyline: Vec<GpsFix> = (0..=10).map(|i| fix(500_000_000.0 + i as f64 * 1_000.0, 100_000_000.0)).collect();
+        let polyline: Vec<GpsFix> = (0..=10).map(|i| fix(50.0 + i as f64 * 0.0001, 10.0)).collect();
         let samples = polyline.clone();
         let speed = vec![30.0; samples.len()];
 
@@ -321,9 +316,9 @@ mod tests {
 
         // Assert -- sample 5's tangent agrees almost exactly with the
         // polyline's own tangent, and its normalised distance matches its
-        // arc length: 5 steps x (1_000 units x 111_320/1e7 m/unit).
+        // arc length: 5 steps x (0.0001 deg x 111_320 m/deg).
         assert!(acc.tangent_agreement[5] > 0.999, "tangent_agreement = {}", acc.tangent_agreement[5]);
-        let expected = 5.0 * 1_000.0 * M_PER_UNIT;
+        let expected = 5.0 * 0.0001 * M_PER_UNIT;
         assert!((acc.normalised_distance[5] - expected).abs() < 0.1, "normalised_distance = {}", acc.normalised_distance[5]);
     }
 

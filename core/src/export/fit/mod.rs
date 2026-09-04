@@ -102,17 +102,15 @@ fn fit_timestamp(epoch_ms: i64) -> u32 {
     secs.max(0) as u32
 }
 
-/// Convert a raw `GPS_Latitude`/`GPS_Longitude` sample (degrees × 1e7) to FIT
-/// semicircles: `degrees × 2^31 / 180`.
-fn to_semicircles(raw_deg_e7: f64) -> i32 {
-    let degrees = raw_deg_e7 / 1e7;
+/// Convert a physical `GPS_Latitude`/`GPS_Longitude` sample (decimal degrees,
+/// ruling R27) to FIT semicircles: `degrees × 2^31 / 180`.
+fn to_semicircles(degrees: f64) -> i32 {
     (degrees * (2f64.powi(31) / 180.0)).round() as i32
 }
 
-/// Convert a raw `GPS_Altitude` sample (metres × 10) to the FIT record
-/// altitude field: `(metres + 500) × 5`, clamped to the uint16 range.
-fn altitude_stored(raw_m_x10: f64) -> u16 {
-    let metres = raw_m_x10 / 10.0;
+/// Convert a physical `GPS_Altitude` sample (metres, ruling R27) to the FIT
+/// record altitude field: `(metres + 500) × 5`, clamped to the uint16 range.
+fn altitude_stored(metres: f64) -> u16 {
     let v = ((metres + 500.0) * 5.0).round();
     v.clamp(0.0, u16::MAX as f64) as u16
 }
@@ -125,12 +123,13 @@ fn speed_stored(kmh: f64) -> u16 {
     (mps * 1000.0).round().clamp(0.0, u16::MAX as f64) as u16
 }
 
-/// Great-circle distance in metres between two raw (deg × 1e7) coordinates.
-fn haversine_m(lat1_e7: f64, lon1_e7: f64, lat2_e7: f64, lon2_e7: f64) -> f64 {
+/// Great-circle distance in metres between two physical decimal-degree
+/// coordinates.
+fn haversine_m(lat1_deg: f64, lon1_deg: f64, lat2_deg: f64, lon2_deg: f64) -> f64 {
     const R: f64 = 6_371_000.0; // Earth radius, metres
-    let to_rad = |deg_e7: f64| (deg_e7 / 1e7).to_radians();
+    let to_rad = |deg: f64| deg.to_radians();
     let (la1, lo1, la2, lo2) =
-        (to_rad(lat1_e7), to_rad(lon1_e7), to_rad(lat2_e7), to_rad(lon2_e7));
+        (to_rad(lat1_deg), to_rad(lon1_deg), to_rad(lat2_deg), to_rad(lon2_deg));
     let dlat = la2 - la1;
     let dlon = lo2 - lo1;
     let a = (dlat / 2.0).sin().powi(2) + la1.cos() * la2.cos() * (dlon / 2.0).sin().powi(2);
@@ -146,15 +145,15 @@ fn speed_mps_stored(mps: Option<f64>) -> u16 {
     }
 }
 
-/// A single GPS fix prepared for FIT export. Coordinates stay at the raw
-/// channel scale (deg × 1e7); altitude is the raw channel sample (m × 10).
-/// `speed_kmh` is the engine-scaled physical speed in km/h (§5.7). Each optional
-/// field is `None` when its source channel is absent.
+/// A single GPS fix prepared for FIT export. Coordinates and altitude are the
+/// physical channel scale (decimal degrees / metres, ruling R27). `speed_kmh`
+/// is the engine-scaled physical speed in km/h (§5.7). Each optional field is
+/// `None` when its source channel is absent.
 struct Fix {
     epoch_ms: i64,
-    lat_e7: f64,
-    lon_e7: f64,
-    alt_m_x10: Option<f64>,
+    lat_deg: f64,
+    lon_deg: f64,
+    alt_m: Option<f64>,
     speed_kmh: Option<f64>,
 }
 
@@ -202,9 +201,9 @@ fn collect_fixes(handle: &SessionHandle) -> Vec<Fix> {
         }
         fixes.push(Fix {
             epoch_ms: epoch[i] as i64,
-            lat_e7: lat[i],
-            lon_e7: lon[i],
-            alt_m_x10: if has_alt { alt.get(i).copied() } else { None },
+            lat_deg: lat[i],
+            lon_deg: lon[i],
+            alt_m: if has_alt { alt.get(i).copied() } else { None },
             speed_kmh: if has_speed { speed.get(i).copied() } else { None },
         });
     }
@@ -275,7 +274,7 @@ pub fn write_fit(
     let session_start_ms = handle.metadata().timestamp_utc_ms;
     let hr = collect_hr(handle, session_start_ms);
 
-    let has_alt = fixes.iter().any(|f| f.alt_m_x10.is_some());
+    let has_alt = fixes.iter().any(|f| f.alt_m.is_some());
     let has_speed = fixes.iter().any(|f| f.speed_kmh.is_some());
     let has_hr = !hr.wall_ms.is_empty();
 
@@ -311,15 +310,15 @@ pub fn write_fit(
     let mut hr_values: Vec<u8> = Vec::new();
     for fix in &fixes {
         if let Some(p) = prev {
-            cumulative_m += haversine_m(p.lat_e7, p.lon_e7, fix.lat_e7, fix.lon_e7);
+            cumulative_m += haversine_m(p.lat_deg, p.lon_deg, fix.lat_deg, fix.lon_deg);
         }
         fw.data_header(0);
         fw.push_u32(fit_timestamp(fix.epoch_ms));
-        fw.push_i32(to_semicircles(fix.lat_e7));
-        fw.push_i32(to_semicircles(fix.lon_e7));
+        fw.push_i32(to_semicircles(fix.lat_deg));
+        fw.push_i32(to_semicircles(fix.lon_deg));
         fw.push_u32((cumulative_m * 100.0).round().clamp(0.0, u32::MAX as f64) as u32);
         if has_alt {
-            fw.push_u16(fix.alt_m_x10.map(altitude_stored).unwrap_or(U16_INVALID));
+            fw.push_u16(fix.alt_m.map(altitude_stored).unwrap_or(U16_INVALID));
         }
         if has_speed {
             fw.push_u16(fix.speed_kmh.map(speed_stored).unwrap_or(U16_INVALID));
@@ -583,16 +582,16 @@ mod tests {
 
     #[test]
     fn semicircles_round_trip_known_value() {
-        // Arrange — 45.0 degrees stored as 45.0e7.
+        // Arrange — 45.0 physical decimal degrees.
         // 45 deg × 2^31/180 = 536870912.
-        assert_eq!(to_semicircles(45.0 * 1e7), 536_870_912);
+        assert_eq!(to_semicircles(45.0), 536_870_912);
         assert_eq!(to_semicircles(0.0), 0);
     }
 
     #[test]
     fn altitude_applies_fit_scale_and_offset() {
-        // Arrange — 100.0 m stored as 1000 (m × 10). (100 + 500) × 5 = 3000.
-        assert_eq!(altitude_stored(1000.0), 3000);
+        // Arrange — 100.0 physical metres. (100 + 500) × 5 = 3000.
+        assert_eq!(altitude_stored(100.0), 3000);
     }
 
     #[test]
@@ -604,7 +603,7 @@ mod tests {
     #[test]
     fn haversine_one_degree_latitude_is_about_111km() {
         // Act
-        let d = haversine_m(0.0, 0.0, 1.0 * 1e7, 0.0);
+        let d = haversine_m(0.0, 0.0, 1.0, 0.0);
 
         // Assert — ~111.19 km within 1 km.
         assert!((d - 111_195.0).abs() < 1000.0, "got {d}");
@@ -614,8 +613,8 @@ mod tests {
     fn collect_fixes_drops_zero_sentinels_and_zips_to_shortest() {
         // Arrange — 3 lat/lon (index 0 = (0,0) sentinel), 2 epochs.
         let h = handle_with(vec![
-            fixed("GPS_Latitude", vec![0.0, 45.0e7, 46.0e7]),
-            fixed("GPS_Longitude", vec![0.0, -1.0e7, -2.0e7]),
+            fixed("GPS_Latitude", vec![0.0, 45.0, 46.0]),
+            fixed("GPS_Longitude", vec![0.0, -1.0, -2.0]),
             fixed("GPS_EpochMs", vec![1000.0, 2000.0]),
         ]);
 
@@ -625,8 +624,8 @@ mod tests {
         // Assert — sentinel dropped; zipped to the 2 epochs; index 1 survives.
         assert_eq!(fixes.len(), 1);
         assert_eq!(fixes[0].epoch_ms, 2000);
-        assert_eq!(fixes[0].lat_e7, 45.0e7);
-        assert!(fixes[0].alt_m_x10.is_none());
+        assert_eq!(fixes[0].lat_deg, 45.0);
+        assert!(fixes[0].alt_m.is_none());
         assert!(fixes[0].speed_kmh.is_none());
     }
 
@@ -634,10 +633,10 @@ mod tests {
     fn collect_fixes_carries_altitude_and_speed_when_present() {
         // Arrange
         let h = handle_with(vec![
-            fixed("GPS_Latitude", vec![45.0e7]),
-            fixed("GPS_Longitude", vec![-1.0e7]),
+            fixed("GPS_Latitude", vec![45.0]),
+            fixed("GPS_Longitude", vec![-1.0]),
             fixed("GPS_EpochMs", vec![5000.0]),
-            fixed("GPS_Altitude", vec![1000.0]),
+            fixed("GPS_Altitude", vec![100.0]),
             fixed("GPS_SpeedKmh", vec![36.0]),
         ]);
 
@@ -646,7 +645,7 @@ mod tests {
 
         // Assert
         assert_eq!(fixes.len(), 1);
-        assert_eq!(fixes[0].alt_m_x10, Some(1000.0));
+        assert_eq!(fixes[0].alt_m, Some(100.0));
         assert_eq!(fixes[0].speed_kmh, Some(36.0));
     }
 
@@ -684,8 +683,8 @@ mod tests {
     fn write_fit_produces_a_valid_fit_file() {
         // Arrange — two GPS fixes + two HR beats.
         let h = handle_with(vec![
-            fixed("GPS_Latitude", vec![45.0e7, 45.001e7]),
-            fixed("GPS_Longitude", vec![-1.0e7, -1.001e7]),
+            fixed("GPS_Latitude", vec![45.0, 45.001]),
+            fixed("GPS_Longitude", vec![-1.0, -1.001]),
             fixed("GPS_EpochMs", vec![1_700_000_001_000.0, 1_700_000_002_000.0]),
             fixed("GPS_Altitude", vec![1000.0, 1010.0]),
             fixed("GPS_SpeedKmh", vec![36.0, 36.0]),
@@ -710,8 +709,8 @@ mod tests {
     fn fit_output_parses_back_with_fitparser() {
         // Arrange — two fixes, two HR beats, cycling.
         let h = handle_with(vec![
-            fixed("GPS_Latitude", vec![45.0e7, 45.001e7]),
-            fixed("GPS_Longitude", vec![-1.0e7, -1.001e7]),
+            fixed("GPS_Latitude", vec![45.0, 45.001]),
+            fixed("GPS_Longitude", vec![-1.0, -1.001]),
             fixed("GPS_EpochMs", vec![1_700_000_001_000.0, 1_700_000_002_000.0]),
             fixed("GPS_Altitude", vec![1000.0, 1010.0]),
             fixed("GPS_SpeedKmh", vec![36.0, 36.0]),
@@ -749,8 +748,8 @@ mod tests {
         // registers channel 22), with no per-sample event times. Regression:
         // HR was silently dropped from the FIT for this (real-world) shape.
         let h = handle_with(vec![
-            fixed("GPS_Latitude", vec![45.0e7, 45.001e7]),
-            fixed("GPS_Longitude", vec![-1.0e7, -1.001e7]),
+            fixed("GPS_Latitude", vec![45.0, 45.001]),
+            fixed("GPS_Longitude", vec![-1.0, -1.001]),
             fixed("GPS_EpochMs", vec![1_700_000_001_000.0, 1_700_000_002_000.0]),
             fixed("HR_BPM", vec![140.0, 150.0]),
         ]);
@@ -773,8 +772,8 @@ mod tests {
     fn fit_output_omits_heart_rate_when_absent() {
         // Arrange — GPS only, no HR.
         let h = handle_with(vec![
-            fixed("GPS_Latitude", vec![45.0e7, 45.001e7]),
-            fixed("GPS_Longitude", vec![-1.0e7, -1.001e7]),
+            fixed("GPS_Latitude", vec![45.0, 45.001]),
+            fixed("GPS_Longitude", vec![-1.0, -1.001]),
             fixed("GPS_EpochMs", vec![1_700_000_001_000.0, 1_700_000_002_000.0]),
         ]);
         let mut buf: Vec<u8> = Vec::new();
@@ -796,8 +795,8 @@ mod tests {
     fn fit_output_writes_one_lap_message_per_fit_lap() {
         // Arrange — two GPS fixes spanning 4 s, and two explicit laps.
         let h = handle_with(vec![
-            fixed("GPS_Latitude", vec![45.0e7, 45.001e7]),
-            fixed("GPS_Longitude", vec![-1.0e7, -1.001e7]),
+            fixed("GPS_Latitude", vec![45.0, 45.001]),
+            fixed("GPS_Longitude", vec![-1.0, -1.001]),
             fixed("GPS_EpochMs", vec![1_700_000_001_000.0, 1_700_000_005_000.0]),
         ]);
         let laps = vec![

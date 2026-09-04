@@ -1,12 +1,12 @@
 //! Lap-detection types. Inputs (gates / timing config) mirror the Dart Track
 //! config; outputs (laps / sectors / neutral-zone visits) mirror the Dart
-//! result models. Coordinates are the raw GPS-channel scale (degrees × 1e7) —
-//! the crossing geometry (see `geometry`) is scale-invariant, so nothing is
-//! rescaled.
+//! result models. Coordinates are the GPS-channel scale — physical decimal
+//! degrees (ruling R27) — the crossing geometry (see `geometry`) is
+//! scale-invariant, so nothing is rescaled.
 
 use serde::Serialize;
 
-/// A gate line segment, two GPS posts (raw degrees × 1e7).
+/// A gate line segment, two GPS posts (physical decimal degrees).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Gate {
     pub lat1: f64,

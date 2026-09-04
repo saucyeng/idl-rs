@@ -81,9 +81,12 @@ struct TrackDto {
 
 #[derive(Serialize, Deserialize)]
 struct LapGateDto {
-    // Despite the `_deg` name, these carry degrees x1e7 (matching `Gate`'s
-    // own scale), unchanged from idl0 (SPEC §16.3) — see this module's own
-    // Gate/GpsFix conversions, which copy verbatim without rescaling.
+    // Despite the `_deg` name, these carry degrees x1e7, unchanged from idl0
+    // (SPEC §17b.1) — an external file-format contract independent of the
+    // engine's internal `Gate` scale. Ruling R27 moved `Gate` to physical
+    // decimal degrees, so this module's Gate/GpsFix conversions now rescale
+    // explicitly at this wire boundary (they used to copy verbatim, back
+    // when both sides were x1e7).
     lat1_deg: f64,
     lon1_deg: f64,
     lat2_deg: f64,
@@ -127,8 +130,8 @@ struct NeutralZoneDto {
 struct GpsFixDto {
     #[serde(default)]
     timestamp_ms: i64,
-    // Despite the `_deg` name, these carry degrees x1e7 (matching
-    // `GpsFix`'s own scale), unchanged from idl0 (SPEC §16.3).
+    // Despite the `_deg` name, these carry degrees x1e7, unchanged from idl0
+    // (SPEC §17b.1) — see `LapGateDto`'s doc comment.
     latitude_deg: f64,
     longitude_deg: f64,
 }
@@ -137,7 +140,17 @@ struct GpsFixDto {
 
 impl LapGateDto {
     fn into_gate(self) -> Gate {
-        Gate { lat1: self.lat1_deg, lon1: self.lon1_deg, lat2: self.lat2_deg, lon2: self.lon2_deg }
+        // `/ 1e7`, not `* 1e-7`: 1e7 is exactly representable in binary
+        // floating point and division is correctly rounded, so this exactly
+        // undoes `From<&Gate>`'s `(deg * 1e7).round()` below for any value
+        // that started as a real decimal-degree measurement — multiplying
+        // by the inexact constant `1e-7` would not round-trip bit-exact.
+        Gate {
+            lat1: self.lat1_deg / 1e7,
+            lon1: self.lon1_deg / 1e7,
+            lat2: self.lat2_deg / 1e7,
+            lon2: self.lon2_deg / 1e7,
+        }
     }
 }
 impl LapTimingDto {
@@ -164,7 +177,8 @@ impl NeutralZoneDto {
 }
 impl GpsFixDto {
     fn into_core(self) -> GpsFix {
-        GpsFix { timestamp_ms: self.timestamp_ms, lat: self.latitude_deg, lon: self.longitude_deg }
+        // See `LapGateDto::into_gate` on why `/ 1e7`, not `* 1e-7`.
+        GpsFix { timestamp_ms: self.timestamp_ms, lat: self.latitude_deg / 1e7, lon: self.longitude_deg / 1e7 }
     }
 }
 
@@ -189,7 +203,13 @@ impl From<TrackArtifact> for Track {
 
 impl From<&Gate> for LapGateDto {
     fn from(g: &Gate) -> Self {
-        LapGateDto { lat1_deg: g.lat1, lon1_deg: g.lon1, lat2_deg: g.lat2, lon2_deg: g.lon2, name: String::new() }
+        LapGateDto {
+            lat1_deg: (g.lat1 * 1e7).round(),
+            lon1_deg: (g.lon1 * 1e7).round(),
+            lat2_deg: (g.lat2 * 1e7).round(),
+            lon2_deg: (g.lon2 * 1e7).round(),
+            name: String::new(),
+        }
     }
 }
 impl From<&LapTiming> for LapTimingDto {
@@ -216,7 +236,11 @@ impl From<&NeutralZone> for NeutralZoneDto {
 }
 impl From<&GpsFix> for GpsFixDto {
     fn from(f: &GpsFix) -> Self {
-        GpsFixDto { timestamp_ms: f.timestamp_ms, latitude_deg: f.lat, longitude_deg: f.lon }
+        GpsFixDto {
+            timestamp_ms: f.timestamp_ms,
+            latitude_deg: (f.lat * 1e7).round(),
+            longitude_deg: (f.lon * 1e7).round(),
+        }
     }
 }
 impl From<&Track> for TrackArtifact {

@@ -88,7 +88,7 @@ mod tests {
                 enter: Gate { lat1: 9.0, lon1: 10.0, lat2: 11.0, lon2: 12.0 },
                 exit: Gate { lat1: 13.0, lon1: 14.0, lat2: 15.0, lon2: 16.0 },
             }],
-            reference_polyline: vec![GpsFix { timestamp_ms: 1000, lat: 501163000.0, lon: -1229574000.0 }],
+            reference_polyline: vec![GpsFix { timestamp_ms: 1000, lat: 50.1163, lon: -122.9574 }],
             created_at_ms: 111,
             updated_at_ms: 222,
         }

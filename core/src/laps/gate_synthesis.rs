@@ -2,13 +2,11 @@
 //! `gate_geometry.dart`). Used by GPX-as-Track import: the user gets two
 //! reasonable default gates at the start and finish, re-placeable later.
 //!
-//! **Unit convention (settled, ruling R8):** every input here —
-//! [`GpsFix`] and the internal geometry — is at the raw GPS-fix scale
-//! (degrees × 1e7, `crate::gps::GpsFix`'s own doc). [`LapGateJson`] is
-//! decimal degrees (C1 §6). The geometric-mean/perpendicular-vector math
-//! below is scale-invariant, so it runs entirely at the × 1e7 scale and
-//! converts to decimal degrees exactly once, at the very end, in
-//! [`to_lap_gate_json`].
+//! **Unit convention (settled, ruling R8; updated by R27):** every input
+//! here — [`GpsFix`] and the internal geometry — is at the same physical
+//! decimal-degree scale as [`LapGateJson`] (C1 §6), so no conversion
+//! happens at the boundary [`to_lap_gate_json`] used to sit at; it is now a
+//! plain field copy.
 
 use crate::gps::GpsFix;
 use crate::store::session_json::LapGateJson;
@@ -93,16 +91,17 @@ pub fn perpendicular_gate_at(
 }
 
 /// Index of the polyline fix whose Euclidean lat/lon distance to
-/// `(lat_e7, lon_e7)` (same degrees-× 1e7 scale as `polyline`) is smallest.
-pub fn snap_to_nearest_fix(polyline: &[GpsFix], lat_e7: f64, lon_e7: f64) -> Result<usize, GateSynthesisError> {
+/// `(lat_deg, lon_deg)` (same physical decimal-degree scale as `polyline`)
+/// is smallest.
+pub fn snap_to_nearest_fix(polyline: &[GpsFix], lat_deg: f64, lon_deg: f64) -> Result<usize, GateSynthesisError> {
     if polyline.is_empty() {
         return Err(GateSynthesisError { kind: GateSynthesisErrorKind::Empty, message: "polyline must not be empty".to_string() });
     }
     let mut best_idx = 0;
     let mut best_dist_sq = f64::INFINITY;
     for (i, f) in polyline.iter().enumerate() {
-        let d_lat = f.lat - lat_e7;
-        let d_lon = f.lon - lon_e7;
+        let d_lat = f.lat - lat_deg;
+        let d_lon = f.lon - lon_deg;
         let dist_sq = d_lat * d_lat + d_lon * d_lon;
         if dist_sq < best_dist_sq {
             best_dist_sq = dist_sq;
@@ -114,17 +113,17 @@ pub fn snap_to_nearest_fix(polyline: &[GpsFix], lat_e7: f64, lon_e7: f64) -> Res
 
 /// Builds a gate of total length `width_meters` centred on `at_index`,
 /// perpendicular to the segment from `at_index` toward `towards`. Coords
-/// stay at the × 1e7 scale until [`to_lap_gate_json`] converts once at the end.
+/// stay in physical decimal degrees throughout — [`to_lap_gate_json`] is a
+/// plain field copy.
 fn perpendicular_gate(at_index: &GpsFix, towards: &GpsFix, width_meters: f64, name: &str) -> LapGateJson {
     // Local-metre conversion factors. Lat: 1 deg ~= 111,320 m. Lon: shrinks
-    // by cos(lat). Coordinates are at x1e7, so the constants fold the
-    // factor in directly (x1e7 deg -> metres).
-    const M_PER_DEG_UNITS: f64 = 111_320.0 / 1e7;
-    let lat_deg = at_index.lat / 1e7;
-    let lon_scale = M_PER_DEG_UNITS * (lat_deg * std::f64::consts::PI / 180.0).cos().abs();
+    // by cos(lat).
+    const M_PER_DEG: f64 = 111_320.0;
+    let lat_deg = at_index.lat;
+    let lon_scale = M_PER_DEG * (lat_deg * std::f64::consts::PI / 180.0).cos().abs();
 
     // Direction vector along the track in metric units.
-    let dx_m = (towards.lat - at_index.lat) * M_PER_DEG_UNITS;
+    let dx_m = (towards.lat - at_index.lat) * M_PER_DEG;
     let dy_m = (towards.lon - at_index.lon) * lon_scale;
     let length = (dx_m * dx_m + dy_m * dy_m).sqrt();
 
@@ -139,31 +138,25 @@ fn perpendicular_gate(at_index: &GpsFix, towards: &GpsFix, width_meters: f64, na
     let perp_dx_m = -dy_m / length;
     let perp_dy_m = dx_m / length;
 
-    // Half-width offsets, converted back to x1e7 deg.
+    // Half-width offsets, converted back to decimal degrees.
     let half_width = width_meters / 2.0;
-    let d_lat_units = (perp_dx_m * half_width) / M_PER_DEG_UNITS;
-    let d_lon_units = (perp_dy_m * half_width) / lon_scale;
+    let d_lat_deg = (perp_dx_m * half_width) / M_PER_DEG;
+    let d_lon_deg = (perp_dy_m * half_width) / lon_scale;
 
     to_lap_gate_json(
-        at_index.lat + d_lat_units,
-        at_index.lon + d_lon_units,
-        at_index.lat - d_lat_units,
-        at_index.lon - d_lon_units,
+        at_index.lat + d_lat_deg,
+        at_index.lon + d_lon_deg,
+        at_index.lat - d_lat_deg,
+        at_index.lon - d_lon_deg,
         name,
     )
 }
 
-/// Converts × 1e7-scale coordinates to `LapGateJson`'s decimal-degrees
-/// convention (C1 §6, settled by ruling R8 — see this module's doc
-/// comment).
-fn to_lap_gate_json(lat1_e7: f64, lon1_e7: f64, lat2_e7: f64, lon2_e7: f64, name: &str) -> LapGateJson {
-    LapGateJson {
-        lat1_deg: lat1_e7 / 1e7,
-        lon1_deg: lon1_e7 / 1e7,
-        lat2_deg: lat2_e7 / 1e7,
-        lon2_deg: lon2_e7 / 1e7,
-        name: name.to_string(),
-    }
+/// Copies physical decimal-degree coordinates into `LapGateJson`'s own
+/// decimal-degrees convention (C1 §6, settled by ruling R8; no conversion
+/// since ruling R27 — see this module's doc comment).
+fn to_lap_gate_json(lat1_deg: f64, lon1_deg: f64, lat2_deg: f64, lon2_deg: f64, name: &str) -> LapGateJson {
+    LapGateJson { lat1_deg, lon1_deg, lat2_deg, lon2_deg, name: name.to_string() }
 }
 
 #[cfg(test)]
@@ -185,9 +178,9 @@ mod tests {
     fn endpoint_gates_produces_start_and_finish_perpendicular_to_travel() {
         // Arrange -- a straight line due north (lat increasing, lon constant).
         let polyline = vec![
-            fix(0, 501_163_000.0, -1_229_574_000.0),
-            fix(1000, 501_164_000.0, -1_229_574_000.0),
-            fix(2000, 501_165_000.0, -1_229_574_000.0),
+            fix(0, 50.1163, -122.9574),
+            fix(1000, 50.1164, -122.9574),
+            fix(2000, 50.1165, -122.9574),
         ];
 
         // Act
