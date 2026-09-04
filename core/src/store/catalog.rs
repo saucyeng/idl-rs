@@ -507,9 +507,8 @@ fn read_data_parquet_session_fields(path: &Path) -> Result<DataParquetSessionFie
 /// [`crate::session::Channel::duration_ms`] exactly, so this is a real
 /// elapsed-time value, never an epoch-scale timestamp. Reads only the `t`
 /// column via [`ProjectionMask`] (no other column is materialized), and
-/// only its first/last value per row group — `t` is sorted ascending (C1
-/// §3.5), so those are each row group's min/max. `None` when the file has
-/// fewer than 2 rows.
+/// only the first and last row it reads (batches stream in `t`-ascending
+/// order, C1 §3.5). `None` when the file has fewer than 2 rows.
 fn read_data_parquet_duration_ms(path: &Path) -> Result<Option<i64>, CatalogError> {
     let file = std::fs::File::open(path).map_err(io_err)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
