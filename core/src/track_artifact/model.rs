@@ -81,6 +81,9 @@ struct TrackDto {
 
 #[derive(Serialize, Deserialize)]
 struct LapGateDto {
+    // Despite the `_deg` name, these carry degrees x1e7 (matching `Gate`'s
+    // own scale), unchanged from idl0 (SPEC §16.3) — see this module's own
+    // Gate/GpsFix conversions, which copy verbatim without rescaling.
     lat1_deg: f64,
     lon1_deg: f64,
     lat2_deg: f64,
@@ -124,6 +127,8 @@ struct NeutralZoneDto {
 struct GpsFixDto {
     #[serde(default)]
     timestamp_ms: i64,
+    // Despite the `_deg` name, these carry degrees x1e7 (matching
+    // `GpsFix`'s own scale), unchanged from idl0 (SPEC §16.3).
     latitude_deg: f64,
     longitude_deg: f64,
 }

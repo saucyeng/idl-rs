@@ -7,6 +7,7 @@
 //! are out of scope for the engine's parse output (roadmap Phase 5).
 
 pub mod column;
+pub mod filename;
 pub mod handle;
 pub mod seam_correction;
 pub mod synthesis;
