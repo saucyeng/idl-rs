@@ -10,4 +10,7 @@ pub mod blob;
 pub mod catalog;
 pub mod derived;
 pub mod parquet;
+pub mod profile;
 pub mod session_json;
+pub mod settings;
+pub mod verify;

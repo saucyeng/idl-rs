@@ -452,9 +452,15 @@ fn index_lap_summary(
 }
 
 /// The `sessions` DDL columns that live in `data.parquet`'s own file-level
-/// key-value metadata (C1 §4.3), read once per session.
-struct DataParquetSessionFields {
-    blob_sha256: String,
+/// key-value metadata (C1 §4.3), read once per session. `pub(crate)` (not
+/// private): `store::verify`'s checks #3 (missing blob) and #4 (session_id
+/// identity) reuse this same read rather than a second, parallel parse of
+/// the same file-level metadata (decisions.md R15 item 4).
+pub(crate) struct DataParquetSessionFields {
+    /// `data.parquet`'s own `session_id` metadata key — compared against
+    /// the containing directory's name by `store::verify` check #4.
+    pub(crate) session_id: String,
+    pub(crate) blob_sha256: String,
     /// One of `"idl0"`/`"fit"`/`"gpx"`/`"csv"` (the `sessions.source_format`
     /// `CHECK` constraint's exact allowed set, C4 §5).
     source_format: String,
@@ -472,7 +478,7 @@ struct DataParquetSessionFields {
 /// requires. `Sql`-kind [`CatalogError`] when the file doesn't parse as
 /// Parquet or a required key is missing/malformed (this session's row is
 /// then reported as a skip, not inserted with fabricated values).
-fn read_data_parquet_session_fields(path: &Path) -> Result<DataParquetSessionFields, CatalogError> {
+pub(crate) fn read_data_parquet_session_fields(path: &Path) -> Result<DataParquetSessionFields, CatalogError> {
     let bad = |msg: String| CatalogError { kind: CatalogErrorKind::Sql, message: msg };
     let file = std::fs::File::open(path).map_err(io_err)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| bad(e.to_string()))?;
@@ -491,6 +497,7 @@ fn read_data_parquet_session_fields(path: &Path) -> Result<DataParquetSessionFie
     let timestamp_utc_ms: i64 =
         get("timestamp_utc_ms")?.parse().map_err(|_| bad(format!("{}: timestamp_utc_ms did not parse as i64", path.display())))?;
     Ok(DataParquetSessionFields {
+        session_id: get("session_id")?,
         blob_sha256: get("blob_sha256")?,
         source_format: get("source_format")?,
         device_id: opt("device_id"),
