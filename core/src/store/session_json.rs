@@ -100,10 +100,11 @@ impl VersionedConfig for SessionJson {
     }
 }
 
-/// A single lap-start/finish gate, decimal degrees (C1 §6's stated default —
-/// flagged pending Isaac's confirmation against `lap_detector.dart`'s actual
-/// runtime convention, C1 §8 item 4; this plan's Open questions carries the
-/// flag forward).
+/// A single lap-start/finish gate, decimal degrees (C1 §6, settled by ruling
+/// R8: `session.json` is a human-legible file, not an internal struct
+/// compared against raw ×1e7 device bytes, so it keeps decimal degrees;
+/// `crate::laps::model::Gate`/`crate::gps::GpsFix`'s own ×1e7 wire scale
+/// converts to this convention exactly once, at this JSON boundary).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LapGateJson {
     /// First gate endpoint latitude, decimal degrees.

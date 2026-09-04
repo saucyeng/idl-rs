@@ -11,11 +11,13 @@
 use crate::store::session_json::{LapJson, TrackVisitJson};
 
 /// One session-wide-renumbered lap, its originating visit's `track_id`, and
-/// whether it's in `ignored_lap_numbers`.
+/// whether it's in `ignored_lap_numbers`. `track_id` is always populated —
+/// [`TrackVisitJson::track_id`] is itself non-optional, so every lap
+/// collected from `track_visits` has one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenumberedLap {
     pub lap: LapJson,
-    pub track_id: Option<String>,
+    pub track_id: String,
     pub is_ignored: bool,
 }
 
@@ -37,7 +39,7 @@ pub fn renumber_session_laps(track_visits: &[TrackVisitJson], ignored_lap_number
             let lap_number = (i + 1) as u32;
             RenumberedLap {
                 lap: LapJson { lap_number, ..src },
-                track_id: Some(track_id),
+                track_id,
                 is_ignored: ignored_lap_numbers.contains(&lap_number),
             }
         })
@@ -87,9 +89,9 @@ mod tests {
         // Assert
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].lap.lap_number, 1);
-        assert_eq!(out[0].track_id.as_deref(), Some("track-B"));
+        assert_eq!(out[0].track_id, "track-B");
         assert_eq!(out[1].lap.lap_number, 2);
-        assert_eq!(out[1].track_id.as_deref(), Some("track-A"));
+        assert_eq!(out[1].track_id, "track-A");
         assert_eq!(out[2].lap.lap_number, 3);
     }
 
@@ -129,7 +131,7 @@ mod tests {
         let out = renumber_session_laps(&visits, &[]);
 
         // Assert
-        assert_eq!(out[0].track_id.as_deref(), Some("track-A"));
-        assert_eq!(out[1].track_id.as_deref(), Some("track-B"));
+        assert_eq!(out[0].track_id, "track-A");
+        assert_eq!(out[1].track_id, "track-B");
     }
 }
