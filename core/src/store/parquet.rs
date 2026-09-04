@@ -326,13 +326,29 @@ pub fn write_session_parquet(
     Ok(target)
 }
 
-/// Reads `data.parquet` back into a [`Session`] (contract C1 §4.5's read
-/// rule: for each channel column, filter to non-null rows, take `t` at
-/// those rows as `t_us`, the values as the compact `RawColumn`).
-/// Synthesized `Time`/`Distance` are **not** reconstructed here — they are
-/// re-derived by `crate::session::synthesis::synthesize_base_channels`
-/// after this function returns, exactly as it already runs after parsing.
-pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
+/// `data.parquet`'s file-level key-value metadata (C1 §4.3) — the nine keys
+/// every `data.parquet` file carries. Returned by [`read_session_metadata`],
+/// which reads only the file footer, no row-group/column data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionParquetMetadata {
+    pub session_id: String,
+    pub timestamp_utc_ms: i64,
+    pub device_id: Option<String>,
+    pub config_checksum: Option<String>,
+    pub blob_sha256: String,
+    /// One of `"idl0"`/`"fit"`/`"gpx"`/`"csv"` (the raw wire token, not the
+    /// parsed [`SourceFormat`] — [`read_session_parquet`] parses it further).
+    pub source_format: String,
+    pub importer_version: String,
+    pub engine_version: String,
+    pub seam_correction_version: String,
+}
+
+/// Reads `data.parquet`'s file-level key-value metadata (C1 §4.3) only — no
+/// row-group or column materialization, just the Parquet footer. The single
+/// parser for these nine keys; [`read_session_parquet`] calls this rather
+/// than duplicating the parsing logic.
+pub fn read_session_metadata(path: &Path) -> Result<SessionParquetMetadata, ParquetStoreError> {
     let file = std::fs::File::open(path)
         .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Io, format!("open {}: {e}", path.display())))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -347,6 +363,41 @@ pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
         .into_iter()
         .filter_map(|kv| kv.value.map(|v| (kv.key, v)))
         .collect();
+
+    let get = |k: &str| -> Result<String, ParquetStoreError> {
+        file_kv.get(k).cloned().ok_or_else(|| {
+            ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("missing required file metadata key {k}"))
+        })
+    };
+    let timestamp_utc_ms: i64 = get("timestamp_utc_ms")?.parse().map_err(|_| {
+        ParquetStoreError::new(ParquetStoreErrorKind::Schema, "timestamp_utc_ms did not parse as i64".to_string())
+    })?;
+    Ok(SessionParquetMetadata {
+        session_id: get("session_id")?,
+        timestamp_utc_ms,
+        device_id: file_kv.get("device_id").cloned(),
+        config_checksum: file_kv.get("config_checksum").cloned(),
+        blob_sha256: get("blob_sha256")?,
+        source_format: get("source_format")?,
+        importer_version: get("importer_version")?,
+        engine_version: get("engine_version")?,
+        seam_correction_version: get("seam_correction_version")?,
+    })
+}
+
+/// Reads `data.parquet` back into a [`Session`] (contract C1 §4.5's read
+/// rule: for each channel column, filter to non-null rows, take `t` at
+/// those rows as `t_us`, the values as the compact `RawColumn`).
+/// Synthesized `Time`/`Distance` are **not** reconstructed here — they are
+/// re-derived by `crate::session::synthesis::synthesize_base_channels`
+/// after this function returns, exactly as it already runs after parsing.
+pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
+    let meta = read_session_metadata(path)?;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Io, format!("open {}: {e}", path.display())))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("{}: {e}", path.display())))?;
     let schema = builder.schema().clone();
 
     let reader = builder
@@ -362,17 +413,10 @@ pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
     let batch = arrow::compute::concat_batches(&schema, &batches)
         .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Io, format!("concat_batches: {e}")))?;
 
-    let get = |k: &str| -> Result<String, ParquetStoreError> {
-        file_kv.get(k).cloned().ok_or_else(|| {
-            ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("missing required file metadata key {k}"))
-        })
-    };
-    let session_id = get("session_id")?;
-    let timestamp_utc_ms: i64 = get("timestamp_utc_ms")?.parse().map_err(|_| {
-        ParquetStoreError::new(ParquetStoreErrorKind::Schema, "timestamp_utc_ms did not parse as i64".to_string())
-    })?;
-    let blob_sha256 = get("blob_sha256")?;
-    let source_format = match get("source_format")?.as_str() {
+    let session_id = meta.session_id;
+    let timestamp_utc_ms = meta.timestamp_utc_ms;
+    let blob_sha256 = meta.blob_sha256;
+    let source_format = match meta.source_format.as_str() {
         "idl0" => SourceFormat::Idl0,
         "fit" => SourceFormat::Fit,
         "gpx" => SourceFormat::Gpx,
@@ -381,8 +425,8 @@ pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
             return Err(ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("unknown source_format {other}")))
         }
     };
-    let device_id = file_kv.get("device_id").cloned();
-    let config_checksum = file_kv.get("config_checksum").cloned();
+    let device_id = meta.device_id;
+    let config_checksum = meta.config_checksum;
 
     let t_col = batch
         .column_by_name("t")

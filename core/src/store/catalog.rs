@@ -494,6 +494,7 @@ pub(crate) struct DataParquetSessionFields {
     timestamp_utc_ms: i64,
 }
 
+// TODO(idl0): delegate to store::parquet::read_session_metadata (R18 item 3)
 /// Reads `data.parquet`'s file-level key-value metadata (C1 §4.3) — no
 /// row-group/column materialization — into the fields the `sessions` DDL
 /// requires. `Sql`-kind [`CatalogError`] when the file doesn't parse as

@@ -9,6 +9,7 @@ pub mod atomic;
 pub mod blob;
 pub mod catalog;
 pub mod derived;
+pub mod import;
 pub mod parquet;
 pub mod profile;
 pub mod session_json;
