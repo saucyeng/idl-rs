@@ -43,8 +43,10 @@ pub(crate) fn channel_refs(expr: &str) -> Vec<String> {
 /// Resolve the transitive math-channel dependencies referenced by `expression`
 /// into `handle`'s math store. For each `[Name]` reference that names a math
 /// channel in `defs`, evaluate it deps-first via [`crate::math::evaluate`] and
-/// write the result with [`SessionHandle::store_math`], so the outer
-/// evaluation reads it Rust-side without marshalling samples.
+/// write the result with [`SessionHandle::store_math_with_times`] (not
+/// [`SessionHandle::store_math`] — a dependency channel keeps its source's
+/// real per-sample time, C1 §8 item 5), so the outer evaluation reads it
+/// Rust-side without marshalling samples.
 ///
 /// A `[Name]` not in `defs` is left alone — it is either a base/synthesized
 /// channel (which `evaluate` looks up directly) or genuinely unknown (which
@@ -72,7 +74,10 @@ pub fn resolve_dependencies(
         visited.insert(name.clone());
         resolve_dependencies(handle, &def.expression, defs, lap_ctx, visited);
         if let Ok(out) = evaluate(&def.expression, handle, lap_ctx) {
-            handle.store_math(&name, out.sample_rate_hz, out.samples);
+            // store_math_with_times, not store_math: a dependency channel
+            // keeps its source's real per-sample time (C1 §8 item 5, L3-R11)
+            // rather than a synthesized i/rate ramp.
+            handle.store_math_with_times(&name, out.sample_rate_hz, out.samples, out.t_us);
         }
         visited.remove(&name);
     }

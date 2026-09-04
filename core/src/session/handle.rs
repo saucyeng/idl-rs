@@ -331,7 +331,8 @@ impl SessionHandle {
     /// field) rather than a retired dedicated field — the
     /// [`crate::math::eval::ChannelLookup::sample_times`] contract this
     /// backs is otherwise unchanged (event-driven only, seconds, not
-    /// touched by C1).
+    /// touched by C1). A seconds view kept for the estimator (L3-R15); new
+    /// code reads [`crate::math::eval::LookupChannel::t_us`] instead.
     pub fn channel_sample_times(&self, channel_id: &str) -> Option<Vec<f64>> {
         self.with_channel(channel_id, |c| {
             if c.nominal_rate_hz == 0.0 {
@@ -487,8 +488,14 @@ impl SessionHandle {
     /// One value per GPS fix, in the exact order [`crate::gps::build_gps_track`]
     /// returns fixes: `channel_id` resampled (nearest-sample, no interpolation)
     /// to each fix's recording-time instant. `NaN` where the fix falls outside
-    /// the channel's sample span or the channel is absent. Empty when the
-    /// session has no GPS fixes.
+    /// the channel's own recorded `[first, last]` span (R39, extending R31's
+    /// `cursor_readout` rule here — a channel that ends early stops
+    /// colouring the trace rather than freezing at its last value), the
+    /// channel has no samples, or the channel is absent. Empty when the
+    /// session has no GPS fixes. As elsewhere in this module, `NaN` doubles
+    /// as both "no value" and a legitimately-recorded `NaN` sample; this
+    /// function does not distinguish the two, matching its pre-existing
+    /// contract for the absent/empty-channel cases.
     ///
     /// The resampled vector is small (one f64 per fix; GPS ≈ 10 Hz) and is the
     /// only thing that crosses FFI — the channel's full sample column stays in
@@ -508,14 +515,30 @@ impl SessionHandle {
 
         self.with_channel(channel_id, |c| {
             let samples = c.materialize();
-            if samples.is_empty() {
+            let n = samples.len().min(c.t_us.len());
+            if n == 0 {
                 return vec![f64::NAN; times.len()];
             }
             // Every channel has real `t_us` now (C1 §2) — the old
             // event-driven/fixed-rate branch collapses into one lookup.
+            // R39: a fix time outside this channel's own recorded
+            // `[first, last]` span reads `NaN` (uncoloured), the same span
+            // check `cursor_readout` (R31) performs at its call site —
+            // `nearest_by_t_us`/`nearest_at_t_us` keep clamping and stay
+            // the shared primitive; the check lives here, not in them.
             times
                 .iter()
-                .map(|&t| nearest_by_t_us(&samples, &c.t_us, t))
+                .map(|&t| {
+                    // Same µs rounding `nearest_by_t_us` applies internally —
+                    // computed here only to test the span, not to look up
+                    // the value (that stays `nearest_by_t_us`'s job).
+                    let target_us = (t * 1e6).round() as i64;
+                    if target_us < c.t_us[0] || target_us > c.t_us[n - 1] {
+                        f64::NAN
+                    } else {
+                        nearest_by_t_us(&samples, &c.t_us, t)
+                    }
+                })
                 .collect()
         })
         .unwrap_or_else(|| vec![f64::NAN; times.len()])
@@ -567,6 +590,31 @@ impl SessionHandle {
             .insert(DerivedKey::Math(channel_id.to_string()), ch);
     }
 
+    /// Insert or replace a math-channel result by name (upsert), like
+    /// [`Self::store_math`], but with the caller's own `t_us` (µs since the
+    /// session's first sample) rather than a synthesized `i / rate` ramp — so
+    /// a derived math channel keeps its source's real per-sample time (C1 §8
+    /// item 5, L3-R11). `source_kind` is always `"synthesized"` in practice
+    /// (the only caller is [`crate::math::resolve::resolve_dependencies`]);
+    /// taking it as a parameter rather than hardcoding it, unlike
+    /// [`Channel::from_f64`], is deliberate — `crate::store::parquet`'s
+    /// `source_kind == "synthesized"` exclusion is exactly how a derived
+    /// channel avoids leaking into `data.parquet`, so an accidental wrong
+    /// value here is a real bug, not a style choice.
+    pub fn store_math_with_times(
+        &self,
+        channel_id: &str,
+        sample_rate_hz: f64,
+        samples: Vec<f64>,
+        t_us: Vec<i64>,
+    ) {
+        let ch = Channel::from_f64_with_times(channel_id, sample_rate_hz, samples, t_us, "synthesized");
+        self.derived
+            .write()
+            .unwrap()
+            .insert(DerivedKey::Math(channel_id.to_string()), ch);
+    }
+
     /// Run `f` against the [`Channel`] for `channel_id`, wherever it lives —
     /// parsed/synthesized `session.channels` or the interior-mutable math store.
     /// The math-store read lock is held only for the closure's duration. `None`
@@ -583,15 +631,22 @@ impl SessionHandle {
     }
 
     /// Decimate the chart tile at (`tier`, `tile_index`) for `channel_id`.
-    /// All-NaN when the channel is absent. Folds min/max per bucket directly
-    /// over the raw column ([`RawColumn::min_max_range`]) — no f64 window is
-    /// ever materialized, so the cost is one pass over the tile's raw samples
-    /// at any tier (master design §4 seam). NaN semantics match
+    /// All-NaN when the channel is absent, or when `tier` exceeds
+    /// [`crate::chart_decimation::MAX_TIER`] (checked before any bucket
+    /// folds data, at every `tile_index` including `0` — C3 §3.5 has L5
+    /// reject an out-of-range `tier` first, but core does not depend on that
+    /// for this guarantee). Folds min/max per bucket directly over the raw
+    /// column ([`RawColumn::min_max_range`]) — no f64 window is ever
+    /// materialized, so the cost is one pass over the tile's raw samples at
+    /// any tier (master design §4 seam). NaN semantics match
     /// [`crate::chart_decimation::decimate_tile_pure`]: past-end and all-NaN
     /// buckets emit `[NaN, NaN]`; mixed buckets fold finite samples only.
     pub fn decimate_tile(&self, channel_id: &str, tier: u32, tile_index: u32) -> Vec<f64> {
+        if tier > crate::chart_decimation::MAX_TIER {
+            return crate::chart_decimation::empty_tile();
+        }
         self.with_channel(channel_id, |c| {
-            let bucket = crate::chart_decimation::TIER_BASE.pow(tier) as usize;
+            let bucket = crate::chart_decimation::TIER_BASE.checked_pow(tier).unwrap_or(u32::MAX) as usize;
             let n_buckets = crate::chart_decimation::TILE_SIZE_BUCKETS as usize;
             let tile_start = (tile_index as usize).saturating_mul(n_buckets).saturating_mul(bucket);
             let mut out = Vec::with_capacity(n_buckets * 2);
@@ -908,9 +963,12 @@ impl crate::math::eval::ChannelLookup for SessionHandle {
     fn lookup(&self, name: &str) -> Option<crate::math::eval::LookupChannel> {
         // Base + synthesized channels win over the math store (with_channel
         // checks session.channels first). The evaluator needs the whole array.
+        // t_us is the channel's own real recorded time (C1 §8 item 5) —
+        // never re-derived from the rate.
         self.with_channel(name, |c| crate::math::eval::LookupChannel {
             samples: Arc::from(c.materialize()),
             sample_rate_hz: c.nominal_rate_hz,
+            t_us: Arc::from(c.t_us.as_slice()),
         })
     }
 
@@ -952,11 +1010,28 @@ impl crate::math::eval::ChannelLookup for SessionHandle {
 /// `NaN` when the arrays are empty. Times beyond the ends clamp to the
 /// first / last sample.
 fn nearest_by_t_us(samples: &[f64], t_us: &[i64], t_secs: f64) -> f64 {
+    let target_us = (t_secs * 1e6).round() as i64;
+    nearest_at_t_us(samples, t_us, target_us).unwrap_or(f64::NAN)
+}
+
+/// Value of a channel at recording-time `target_us` (µs) — the sample whose
+/// `t_us` entry (assumed ascending, contract C1 §3.5 invariant 1) is
+/// closest, ties resolving to the earlier sample. Clamped: a `target_us`
+/// before the first or after the last recorded sample returns that edge
+/// sample, not an error — callers that instead want `null` past a
+/// channel's recorded span (C3 §3.7, R31) check `t_us[0]`/`t_us[last]`
+/// themselves before calling this.
+///
+/// `None` iff there is no sample to return, i.e.
+/// `samples.len().min(t_us.len()) == 0` — never derived from `is_nan()`,
+/// since `NaN` is a legitimate *sample* value elsewhere in this crate
+/// (`decimate_tile_pure`'s NaN contract). A `NaN` sample nearest the
+/// target is `Some(f64::NAN)`.
+pub(crate) fn nearest_at_t_us(samples: &[f64], t_us: &[i64], target_us: i64) -> Option<f64> {
     let n = samples.len().min(t_us.len());
     if n == 0 {
-        return f64::NAN;
+        return None;
     }
-    let target_us = (t_secs * 1e6).round() as i64;
     let pos = t_us[..n].partition_point(|&x| x < target_us);
     let hi = pos.min(n - 1);
     let lo = pos.saturating_sub(1);
@@ -965,12 +1040,57 @@ fn nearest_by_t_us(samples: &[f64], t_us: &[i64], t_secs: f64) -> f64 {
     } else {
         hi
     };
-    samples[pick]
+    Some(samples[pick])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearest_at_t_us_target_matches_a_sample_exactly() {
+        // Arrange
+        let samples = [1.0, 2.0, 3.0];
+        let t_us = [0_i64, 1_000_000, 2_000_000];
+
+        // Act
+        let v = nearest_at_t_us(&samples, &t_us, 1_000_000);
+
+        // Assert
+        assert_eq!(v, Some(2.0));
+    }
+
+    #[test]
+    fn nearest_at_t_us_target_between_samples_tie_goes_to_earlier() {
+        // Arrange — target is exactly halfway between the two samples.
+        let samples = [1.0, 2.0];
+        let t_us = [0_i64, 1_000_000];
+
+        // Act
+        let v = nearest_at_t_us(&samples, &t_us, 500_000);
+
+        // Assert — `<=` in the tie comparison picks the earlier sample.
+        assert_eq!(v, Some(1.0));
+    }
+
+    #[test]
+    fn nearest_at_t_us_target_past_the_ends_clamps() {
+        // Arrange
+        let samples = [1.0, 2.0, 3.0];
+        let t_us = [0_i64, 1_000_000, 2_000_000];
+
+        // Act + Assert
+        assert_eq!(nearest_at_t_us(&samples, &t_us, -500_000), Some(1.0));
+        assert_eq!(nearest_at_t_us(&samples, &t_us, 5_000_000), Some(3.0));
+    }
+
+    #[test]
+    fn nearest_at_t_us_empty_arrays_none_not_nan() {
+        // Arrange — empty samples, empty t_us.
+
+        // Act + Assert
+        assert_eq!(nearest_at_t_us(&[], &[], 0), None);
+    }
 
     /// Synthetic-uniform `t_us` (matches [`Channel::from_f64`]'s formula) —
     /// every caller here is a fixed-rate fixture.
@@ -1283,6 +1403,84 @@ mod tests {
     }
 
     #[test]
+    fn decimate_tile_tier_above_max_tier_at_tile_index_zero_returns_all_nan_tile_no_panic() {
+        // Arrange — the case that used to leak real data: at tile_index 0
+        // the saturating start offset was 0, so bucket 0 folded the whole
+        // channel as genuine (non-NaN) min/max before the early-return fix.
+        let h = SessionHandle::from_channels(test_meta(), vec![input_channel("C", 10.0, vec![1.0; 20])]);
+
+        // Act
+        let out = h.decimate_tile("C", crate::chart_decimation::MAX_TIER + 1, 0);
+
+        // Assert
+        assert_eq!(out.len(), (crate::chart_decimation::TILE_SIZE_BUCKETS as usize) * 2);
+        assert!(out.iter().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn decimate_tile_tier_above_max_tier_at_tile_index_one_returns_all_nan_tile_no_panic() {
+        // Arrange
+        let h = SessionHandle::from_channels(test_meta(), vec![input_channel("C", 10.0, vec![1.0; 20])]);
+
+        // Act
+        let out = h.decimate_tile("C", crate::chart_decimation::MAX_TIER + 1, 1);
+
+        // Assert
+        assert_eq!(out.len(), (crate::chart_decimation::TILE_SIZE_BUCKETS as usize) * 2);
+        assert!(out.iter().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn build_tile_bytes_sample_region_matches_decimate_tile_over_materialized_samples() {
+        // Arrange — same compact i16 fixture as
+        // decimate_tile_matches_pure_fold_over_materialized_samples, proving
+        // tile::build_tile_bytes itself (not just decimate_channel) agrees
+        // with the non-materializing SessionHandle::decimate_tile path.
+        let meta = SessionMetaInput {
+            session_id: String::new(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            config_checksum: None,
+        };
+        let mut h = SessionHandle::from_channels(meta, vec![]);
+        let raws: Vec<i16> = (0..5000).map(|i| ((i * 37) % 1000) as i16 - 500).collect();
+        let t_us: Vec<i64> = (0..5000i64).map(|i| i * 10_000).collect();
+        h.session.channels.push(Channel {
+            channel_id: "C".to_string(),
+            t_us: t_us.clone(),
+            t_recorded_us: None,
+            nominal_rate_hz: 100.0,
+            column: RawColumn::I16 { data: raws, scale: 0.5, offset: 1.0 },
+            source_kind: "c".to_string(),
+            unit: String::new(),
+            gaps: Vec::new(),
+        });
+
+        // Act + Assert
+        let samples = h.channel_samples("C");
+        for tier in 0..=6u32 {
+            for tile in 0..2u32 {
+                let want = h.decimate_tile("C", tier, tile);
+                let bytes = crate::tile::build_tile_bytes(&samples, &t_us, tier, tile, 0);
+                let sample_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+                let mut got = Vec::with_capacity(sample_count * 2);
+                for i in 0..sample_count {
+                    let base = 32 + i * 8;
+                    got.push(f32::from_le_bytes(bytes[base..base + 4].try_into().unwrap()) as f64);
+                    got.push(f32::from_le_bytes(bytes[base + 4..base + 8].try_into().unwrap()) as f64);
+                }
+                assert_eq!(got.len(), want.len(), "tier {tier} tile {tile}");
+                for (g, w) in got.iter().zip(want.iter()) {
+                    assert!(
+                        (g.is_nan() && w.is_nan()) || g == w,
+                        "tier {tier} tile {tile}: got {g}, want {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn from_path_missing_file_is_io_error() {
         // Act
         let r = SessionHandle::from_path("definitely/not/a/real/file.idl0");
@@ -1330,6 +1528,35 @@ mod tests {
         // Assert
         assert_eq!(got.samples, vec![7.0, 8.0].into());
         assert_eq!(got.sample_rate_hz, 10.0);
+    }
+
+    #[test]
+    fn store_math_with_times_round_trips_the_real_axis_not_a_synthesized_ramp() {
+        use crate::math::eval::ChannelLookup;
+        // Arrange — irregular t_us a synthesized `i/rate` ramp could never
+        // produce at 10 Hz (a uniform ramp would be [0, 100_000]).
+        let meta = SessionMetaInput {
+            session_id: String::new(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            config_checksum: None,
+        };
+        let h = SessionHandle::from_channels(meta, vec![input_channel("X", 10.0, vec![1.0, 2.0])]);
+        let real_t_us = vec![0i64, 103_412];
+
+        // Act — G5.2's round-trip fix: store_math_with_times, not store_math
+        // + Channel::from_f64 (which would discard this axis).
+        h.store_math_with_times("Derived", 10.0, vec![7.0, 8.0], real_t_us.clone());
+        let got = h.lookup("Derived").unwrap();
+
+        // Assert — the given axis survives verbatim, not a synthesized ramp.
+        assert_eq!(got.t_us.as_ref(), real_t_us.as_slice());
+        assert_ne!(got.t_us.as_ref(), [0i64, 100_000].as_slice());
+        // And the stored channel is marked "synthesized" so store/parquet.rs
+        // excludes it from data.parquet (C1 §4.1) — not optional.
+        let store = h.derived.read().unwrap();
+        let stored = store.get(&DerivedKey::Math("Derived".to_string())).unwrap();
+        assert_eq!(stored.source_kind, "synthesized");
     }
 
     #[test]
@@ -2052,12 +2279,16 @@ mod gps_channel_values_tests {
     }
 
     #[test]
-    fn gps_channel_values_clamps_to_nearest_past_channel_span() {
-        // Arrange — fixes at secs 0,1,2 but target channel only spans sec 0
-        // (1 Hz, length 1). `nearest_by_t_us` (contract C1 — every channel
-        // has real `t_us` now) clamps beyond the last sample rather than
-        // returning NaN, matching the pre-idl1 event-driven "nearest"
-        // semantics — that behavior now applies uniformly.
+    fn gps_channel_values_nan_past_channel_span() {
+        // Arrange — R39: this asserts the reversal of the previous
+        // behaviour (`gps_channel_values_clamps_to_nearest_past_channel_span`,
+        // now renamed/inverted), a deliberate landed-behaviour change, not a
+        // fix to a broken test. Fixes at secs 0,1,2 but target channel only
+        // spans sec 0 (1 Hz, length 1): a fix time outside a channel's own
+        // recorded `[first, last]` span must now read `NaN` (uncoloured),
+        // the same rule `cursor_readout` (R31) applies — a channel that ends
+        // early stops painting the trace instead of freezing at its last
+        // value.
         let h = handle_with(vec![
             ch("GPS_Latitude", 1.0, vec![10.0, 11.0, 12.0]),
             ch("GPS_Longitude", 1.0, vec![5.0, 6.0, 7.0]),
@@ -2068,8 +2299,33 @@ mod gps_channel_values_tests {
         // Act
         let v = h.gps_channel_values("Short");
 
-        // Assert — every fix clamps to the channel's single sample.
-        assert_eq!(v, vec![42.0, 42.0, 42.0]);
+        // Assert — only the fix inside the channel's span (sec 0) gets a
+        // value; the rest read NaN, not the clamped last sample.
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0], 42.0);
+        assert!(v[1].is_nan());
+        assert!(v[2].is_nan());
+    }
+
+    #[test]
+    fn gps_channel_values_at_span_boundary_returns_value() {
+        // Arrange — fixes exactly at the channel's first and last recorded
+        // `t_us`; both ends of the span must still resolve to a value, not
+        // NaN (an off-by-one here would silently blank every trace's ends).
+        let h = handle_with(vec![
+            ch("GPS_Latitude", 1.0, vec![10.0, 11.0, 12.0]),
+            ch("GPS_Longitude", 1.0, vec![5.0, 6.0, 7.0]),
+            ch("GPS_EpochMs", 1.0, vec![0.0, 1000.0, 2000.0]),
+            ch("Fork", 1.0, vec![7.0, 8.0, 9.0]),
+        ]);
+
+        // Act — fixes at secs 0, 1, 2; "Fork" spans exactly the same range.
+        let v = h.gps_channel_values("Fork");
+
+        // Assert — first and last fixes sit exactly on the channel's
+        // recorded span edges and both return a value, not NaN.
+        assert_eq!(v, vec![7.0, 8.0, 9.0]);
+        assert!(v.iter().all(|x| !x.is_nan()));
     }
 
     #[test]

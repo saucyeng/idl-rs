@@ -161,8 +161,14 @@ impl ChannelLookup for CellLookup<'_> {
             return None;
         }
         // Rate is whatever the source channel reports; aggregates ignore it, and
-        // a cell must reduce to a scalar so the rate is never surfaced.
-        Some(LookupChannel { samples: std::sync::Arc::from(samples), sample_rate_hz: 0.0 })
+        // a cell must reduce to a scalar so the rate is never surfaced. Rate-0
+        // presentation — t_us is the "no time axis" marker (L3-R12), never a
+        // synthetic ramp.
+        Some(LookupChannel {
+            samples: std::sync::Arc::from(samples),
+            sample_rate_hz: 0.0,
+            t_us: std::sync::Arc::from(&[] as &[i64]),
+        })
     }
     /// Populate the estimator's outputs into the session store via the handle,
     /// then read the channel back through [`Self::lookup`] so a table cell
