@@ -13,8 +13,9 @@ pub const TILE_SIZE_BUCKETS: u32 = 1024;
 /// configured tier range (C3 §3.5, ledger R25). `fetch_tile`'s L5 wrapper
 /// rejects `tier > MAX_TIER` with `invalid_argument` before any bytes are
 /// produced; [`decimate_channel`] and `SessionHandle::decimate_tile` still
-/// degrade a too-large tier to an all-NaN tile via `checked_pow`, as defense
-/// in depth rather than a panic.
+/// return an explicit all-NaN tile for `tier > MAX_TIER`, checked before any
+/// bucket folds data (at every `tile_index`, including `0`), as defense in
+/// depth rather than relying on the caller.
 pub const MAX_TIER: u32 = 10;
 
 /// Decimates `samples[start..start+span]` into `2 * TILE_SIZE_BUCKETS` floats,
@@ -70,8 +71,14 @@ pub fn decimate_tile_pure(
 /// `tier` 0 = raw (bucket size 1), k = `TIER_BASE.pow(k)`. Returns
 /// `2 * TILE_SIZE_BUCKETS` interleaved `[min, max, …]` floats; past-end buckets
 /// are NaN-padded. Wraps the tier→bucket-size and tile→start arithmetic around
-/// [`decimate_tile_pure`].
+/// [`decimate_tile_pure`]. `tier > MAX_TIER` returns [`empty_tile`] directly,
+/// before any bucket folds data — true at every `tile_index`, including `0`
+/// (where the saturating start offset would otherwise be `0` and bucket `0`
+/// would fold real, non-NaN data from `samples`).
 pub fn decimate_channel(samples: &[f64], tier: u32, tile_index: u32) -> Vec<f64> {
+    if tier > MAX_TIER {
+        return empty_tile();
+    }
     let bucket_size = TIER_BASE.checked_pow(tier).unwrap_or(u32::MAX);
     let start = tile_index
         .saturating_mul(TILE_SIZE_BUCKETS)
@@ -90,14 +97,19 @@ pub fn empty_tile() -> Vec<f64> {
 /// into `column_count` equal-width slices (C3 §3.5, ledger R30). Shared by
 /// [`column_stats`] and [`column_times_us`] so their bucket boundaries can
 /// never diverge. `u64` throughout — `bucket_size` alone can reach
-/// `u32::MAX` under [`MAX_TIER`], so `tile_span`/`tile_start` overflow `u32`.
+/// `u32::MAX` under [`MAX_TIER`], so `tile_span`/`tile_start` can still
+/// overflow `u64` for a large enough `tile_index`/`column_count`; every
+/// multiplication here is `saturating_mul`, matching [`decimate_channel`]
+/// and `SessionHandle::decimate_tile` — an out-of-range result saturates to
+/// `u64::MAX` (clamped to `samples.len()`/`t_us.len()` by the caller) rather
+/// than panicking or wrapping (CLAUDE.md §5, "never a crash on bad data").
 fn column_sample_range(tier: u32, tile_index: u32, column_count: u32, j: u32) -> (u64, u64) {
     let bucket_size = TIER_BASE.checked_pow(tier).unwrap_or(u32::MAX) as u64;
-    let tile_span = TILE_SIZE_BUCKETS as u64 * bucket_size;
-    let tile_start = tile_index as u64 * tile_span;
+    let tile_span = (TILE_SIZE_BUCKETS as u64).saturating_mul(bucket_size);
+    let tile_start = (tile_index as u64).saturating_mul(tile_span);
     let cc = column_count as u64;
-    let lo = tile_start + (j as u64 * tile_span) / cc;
-    let hi = tile_start + ((j as u64 + 1) * tile_span) / cc;
+    let lo = tile_start.saturating_add((j as u64).saturating_mul(tile_span) / cc);
+    let hi = tile_start.saturating_add((j as u64 + 1).saturating_mul(tile_span) / cc);
     (lo, hi)
 }
 
@@ -328,16 +340,30 @@ mod tests {
     }
 
     #[test]
-    fn decimate_channel_tier_above_max_tier_returns_all_nan_tile_no_panic() {
-        // Arrange — MAX_TIER + 1 overflows TIER_BASE.pow in u32; tile_index 1
-        // (not 0) so the saturating start offset lands past samples.len(),
-        // making every bucket NaN rather than just the ones past bucket 0.
+    fn decimate_channel_tier_above_max_tier_at_tile_index_zero_returns_all_nan_tile_no_panic() {
+        // Arrange — the case that used to leak real data: at tile_index 0
+        // the saturating start offset was 0, so bucket 0 folded the entire
+        // sample array as genuine (non-NaN) min/max before this fix. The
+        // early `tier > MAX_TIER` return makes the guarantee true here too.
+        let samples: Vec<f64> = (0..16).map(|i| i as f64).collect();
+
+        // Act
+        let out = decimate_channel(&samples, MAX_TIER + 1, 0);
+
+        // Assert
+        assert_eq!(out.len(), (TILE_SIZE_BUCKETS as usize) * 2);
+        assert!(out.iter().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn decimate_channel_tier_above_max_tier_at_tile_index_one_returns_all_nan_tile_no_panic() {
+        // Arrange
         let samples: Vec<f64> = (0..16).map(|i| i as f64).collect();
 
         // Act
         let out = decimate_channel(&samples, MAX_TIER + 1, 1);
 
-        // Assert — checked_pow degrades to an all-NaN tile, not a panic.
+        // Assert
         assert_eq!(out.len(), (TILE_SIZE_BUCKETS as usize) * 2);
         assert!(out.iter().all(|v| v.is_nan()));
     }
@@ -484,5 +510,29 @@ mod tests {
 
         // Assert
         assert_eq!(out[0], 12345);
+    }
+
+    #[test]
+    fn column_sample_range_large_tile_index_and_column_count_saturates_no_panic() {
+        // Arrange — tier above MAX_TIER (bucket_size saturates to u32::MAX)
+        // combined with a tile_index/column_count near and past the ~4.19M
+        // boundary where plain u64 multiplication in column_sample_range
+        // would overflow (panic in debug, wrap in release) before this fix.
+        let samples = vec![1.0, 2.0, 3.0];
+        let t_us = vec![0i64, 1000, 2000];
+        let tier = MAX_TIER + 1;
+        let tile_index = 5_000_000u32;
+        let column_count = 5_000_000u32;
+
+        // Act — must not panic.
+        let stats = column_stats(&samples, tier, tile_index, column_count);
+        let times = column_times_us(&t_us, tier, tile_index, column_count);
+
+        // Assert — saturated ranges land far past samples.len()/t_us.len(),
+        // so every column is the past-end case.
+        assert_eq!(stats.len(), column_count as usize);
+        assert_eq!(times.len(), column_count as usize);
+        assert!(stats.iter().all(|c| c.0.is_nan() && c.1.is_nan() && c.2.is_nan()));
+        assert!(times.iter().all(|&t| t == i64::MIN));
     }
 }

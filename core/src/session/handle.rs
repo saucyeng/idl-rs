@@ -609,13 +609,20 @@ impl SessionHandle {
     }
 
     /// Decimate the chart tile at (`tier`, `tile_index`) for `channel_id`.
-    /// All-NaN when the channel is absent. Folds min/max per bucket directly
-    /// over the raw column ([`RawColumn::min_max_range`]) — no f64 window is
-    /// ever materialized, so the cost is one pass over the tile's raw samples
-    /// at any tier (master design §4 seam). NaN semantics match
+    /// All-NaN when the channel is absent, or when `tier` exceeds
+    /// [`crate::chart_decimation::MAX_TIER`] (checked before any bucket
+    /// folds data, at every `tile_index` including `0` — C3 §3.5 has L5
+    /// reject an out-of-range `tier` first, but core does not depend on that
+    /// for this guarantee). Folds min/max per bucket directly over the raw
+    /// column ([`RawColumn::min_max_range`]) — no f64 window is ever
+    /// materialized, so the cost is one pass over the tile's raw samples at
+    /// any tier (master design §4 seam). NaN semantics match
     /// [`crate::chart_decimation::decimate_tile_pure`]: past-end and all-NaN
     /// buckets emit `[NaN, NaN]`; mixed buckets fold finite samples only.
     pub fn decimate_tile(&self, channel_id: &str, tier: u32, tile_index: u32) -> Vec<f64> {
+        if tier > crate::chart_decimation::MAX_TIER {
+            return crate::chart_decimation::empty_tile();
+        }
         self.with_channel(channel_id, |c| {
             let bucket = crate::chart_decimation::TIER_BASE.checked_pow(tier).unwrap_or(u32::MAX) as usize;
             let n_buckets = crate::chart_decimation::TILE_SIZE_BUCKETS as usize;
@@ -1312,15 +1319,29 @@ mod tests {
     }
 
     #[test]
-    fn decimate_tile_tier_above_max_tier_returns_all_nan_tile_no_panic() {
-        // Arrange — tile_index 1 (not 0) so the saturating start offset
-        // lands past the channel's length, making every bucket NaN.
+    fn decimate_tile_tier_above_max_tier_at_tile_index_zero_returns_all_nan_tile_no_panic() {
+        // Arrange — the case that used to leak real data: at tile_index 0
+        // the saturating start offset was 0, so bucket 0 folded the whole
+        // channel as genuine (non-NaN) min/max before the early-return fix.
+        let h = SessionHandle::from_channels(test_meta(), vec![input_channel("C", 10.0, vec![1.0; 20])]);
+
+        // Act
+        let out = h.decimate_tile("C", crate::chart_decimation::MAX_TIER + 1, 0);
+
+        // Assert
+        assert_eq!(out.len(), (crate::chart_decimation::TILE_SIZE_BUCKETS as usize) * 2);
+        assert!(out.iter().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn decimate_tile_tier_above_max_tier_at_tile_index_one_returns_all_nan_tile_no_panic() {
+        // Arrange
         let h = SessionHandle::from_channels(test_meta(), vec![input_channel("C", 10.0, vec![1.0; 20])]);
 
         // Act
         let out = h.decimate_tile("C", crate::chart_decimation::MAX_TIER + 1, 1);
 
-        // Assert — checked_pow degrades to an all-NaN tile, not a panic.
+        // Assert
         assert_eq!(out.len(), (crate::chart_decimation::TILE_SIZE_BUCKETS as usize) * 2);
         assert!(out.iter().all(|v| v.is_nan()));
     }
