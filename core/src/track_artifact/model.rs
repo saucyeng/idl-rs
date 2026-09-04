@@ -261,3 +261,98 @@ impl From<&Track> for TrackArtifact {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A spread of physical decimal-degree values chosen to catch a
+    /// regression from `/ 1e7` to `* 1e-7` on the `.idl0t` wire boundary
+    /// (`LapGateDto`/`GpsFixDto`'s doc comments explain why the two are not
+    /// interchangeable). At least `50.1163`, `-122.9574`, `89.9999999`, and
+    /// `-89.9999999` are known — verified independently, not just asserted
+    /// here — to land on a different `f64` than they started from if `*
+    /// 1e-7` is used instead of `/ 1e7`; the rest (zero, unit values, exact
+    /// ±90/±180 boundaries, an arbitrary 7-decimal-digit mid-range value)
+    /// round-trip under either operator and are included for coverage, not
+    /// as regression bait.
+    const CASES: &[f64] = &[
+        0.0,
+        0.0000001,
+        -0.0000001,
+        1.0,
+        -1.0,
+        50.1163,       // fails under `* 1e-7`
+        -122.9574,     // fails under `* 1e-7`
+        89.9999999,    // fails under `* 1e-7`
+        -89.9999999,   // fails under `* 1e-7`
+        90.0,
+        -90.0,
+        179.9999999,
+        -179.9999999,
+        180.0,
+        -180.0,
+        45.1234567,
+        -45.1234567,
+    ];
+
+    #[test]
+    fn gate_wire_round_trip_is_bit_exact_across_a_spread_of_coordinates() {
+        for &deg in CASES {
+            // Arrange — the wire i32 grid point this degree value encodes to.
+            let gate = Gate { lat1: deg, lon1: -deg, lat2: deg, lon2: -deg };
+            let expected_lat_raw = (deg * 1e7).round() as i32;
+            let expected_lon_raw = (-deg * 1e7).round() as i32;
+
+            // Act — write, then read back.
+            let wire1 = LapGateDto::from(&gate);
+            let (wire1_lat, wire1_lon) = (wire1.lat1_deg, wire1.lon1_deg);
+            let gate2 = wire1.into_gate();
+
+            // Assert (1) — the wire value itself is the exact i32 grid point.
+            assert_eq!(wire1_lat as i32, expected_lat_raw, "deg={deg}: encode");
+            assert_eq!(wire1_lon as i32, expected_lon_raw, "deg={deg}: encode");
+
+            // Assert (2) — the decoded *domain* value is bit-exact against
+            // ground truth (`raw / 1e7`, computed independently here, not
+            // via `into_gate`). This is the assertion that actually
+            // distinguishes `/ 1e7` from `* 1e-7`: a regression to `*
+            // 1e-7` decodes to a different `f64` for `deg` values like
+            // `50.1163`/`-122.9574`/`89.9999999` above, by up to a few
+            // ULPs — an error too small for a *second* `.round()` on
+            // re-encoding to ever catch (verified: re-encoding either
+            // decoded value recovers the same wire i32 either way, which is
+            // why a write→read→write test that only compares the
+            // *re-encoded* wire value cannot catch this regression; the
+            // domain value itself must be checked).
+            assert_eq!(gate2.lat1, wire1_lat / 1e7, "deg={deg}: decode not bit-exact");
+            assert_eq!(gate2.lon1, wire1_lon / 1e7, "deg={deg}: decode not bit-exact");
+        }
+    }
+
+    #[test]
+    fn gps_fix_wire_round_trip_is_bit_exact_across_a_spread_of_coordinates() {
+        for &deg in CASES {
+            // Arrange
+            let fix = GpsFix { timestamp_ms: 0, lat: deg, lon: -deg };
+            let expected_lat_raw = (deg * 1e7).round() as i32;
+            let expected_lon_raw = (-deg * 1e7).round() as i32;
+
+            // Act — write, then read back.
+            let wire1 = GpsFixDto::from(&fix);
+            let (wire1_lat, wire1_lon) = (wire1.latitude_deg, wire1.longitude_deg);
+            let fix2 = wire1.into_core();
+
+            // Assert (1) — wire value is the exact i32 grid point.
+            assert_eq!(wire1_lat as i32, expected_lat_raw, "deg={deg}: encode");
+            assert_eq!(wire1_lon as i32, expected_lon_raw, "deg={deg}: encode");
+
+            // Assert (2) — decoded domain value is bit-exact against ground
+            // truth. See `gate_wire_round_trip_...`'s comment: this is the
+            // assertion that actually catches a `/ 1e7` → `* 1e-7`
+            // regression; comparing a re-encoded wire value would not.
+            assert_eq!(fix2.lat, wire1_lat / 1e7, "deg={deg}: decode not bit-exact");
+            assert_eq!(fix2.lon, wire1_lon / 1e7, "deg={deg}: decode not bit-exact");
+        }
+    }
+}
