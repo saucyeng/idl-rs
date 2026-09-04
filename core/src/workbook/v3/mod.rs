@@ -8,11 +8,13 @@
 use std::collections::{HashMap, HashSet};
 
 pub mod cell;
+pub mod constants;
 pub mod error;
 pub mod front_matter;
 pub mod math_cell;
 
 pub use cell::{CellDoc, CellKindToken};
+pub use constants::merge_constants;
 pub use error::{WorkbookError, WorkbookErrorKind};
 pub use front_matter::{ConstantRaw, FrontMatter, UnitsPref};
 pub use math_cell::{parse_math_cell_body, MathCellLine};

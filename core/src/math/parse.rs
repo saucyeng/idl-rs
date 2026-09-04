@@ -6,6 +6,8 @@
 //! Operator semantics (elementwise application, division-by-zero, truthiness)
 //! are NOT here — they live in `eval.rs`. This module only shapes the tree.
 
+use std::collections::HashMap;
+
 use crate::math::token::{tokenize, Token, TokenKind};
 use crate::math::{MathEvalError, MathEvalErrorKind};
 
@@ -68,9 +70,30 @@ fn constant_value(name: &str) -> Option<f64> {
 }
 
 /// Tokenizes and parses `src` into an [`Ast`]. Rejects trailing tokens.
+/// Equivalent to `parse_with_constants(src, &HashMap::new())` — no
+/// workbook-level constants table in scope, matching every existing v2
+/// caller's behaviour unchanged.
 pub fn parse(src: &str) -> Result<Ast, MathEvalError> {
+    parse_with_constants(src, &HashMap::new())
+}
+
+/// Tokenizes and parses `src` into an [`Ast`], additionally resolving a bare
+/// identifier against `constants` (`name → f64`, C2 §3.1's flat workbook
+/// constants namespace — front matter + `const` lines, already merged by
+/// `workbook::v3::constants::merge_constants`) when it is neither a call nor
+/// one of the four universal constants (`pi`/`tau`/`e`/`g`, [`constant_value`]
+/// — checked first, so they always take precedence and can never be
+/// shadowed by `constants`).
+///
+/// **Precondition, not enforced here:** this function has no opinion on C2
+/// §3.5.A's `ReservedName` rule — it trusts its caller (`merge_constants`)
+/// already excluded the universal four (and every other reserved name) from
+/// `constants` before calling. A `constants` entry that does share a
+/// universal-four name is simply shadowed by the built-in at parse time
+/// (`constant_value` wins), never treated as an error by this function.
+pub fn parse_with_constants(src: &str, constants: &HashMap<String, f64>) -> Result<Ast, MathEvalError> {
     let tokens = tokenize(src)?;
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser { tokens, pos: 0, constants };
     let ast = p.parse_or()?;
     if p.cur().kind != TokenKind::Eof {
         return Err(parse_err(format!(
@@ -81,12 +104,13 @@ pub fn parse(src: &str) -> Result<Ast, MathEvalError> {
     Ok(ast)
 }
 
-struct Parser {
+struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
+    constants: &'a HashMap<String, f64>,
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     fn cur(&self) -> &Token {
         &self.tokens[self.pos]
     }
@@ -247,9 +271,14 @@ impl Parser {
                 return Ok(Ast::Call { name, args });
             }
             // A bare identifier that is a universal constant (pi / tau / e / g)
-            // resolves to a literal; anything else is a missing-bracket error.
+            // resolves to a literal; failing that, a threaded workbook
+            // constants-table lookup (C2 §3.1); anything else is a
+            // missing-bracket error.
             if let Some(value) = constant_value(&name) {
                 return Ok(Ast::Number(value));
+            }
+            if let Some(value) = self.constants.get(&name) {
+                return Ok(Ast::Number(*value));
             }
             return Err(parse_err(format!(
                 "Unexpected identifier \"{name}\" — did you mean [{name}] for a channel reference?"
@@ -405,5 +434,61 @@ mod tests {
             }
             other => panic!("unexpected root: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_with_constants_bare_identifier_k_evaluates_as_literal_9_81() {
+        // Arrange
+        let constants = HashMap::from([("k".to_string(), 9.81)]);
+
+        // Act
+        let a = parse_with_constants("k * 2", &constants).unwrap();
+
+        // Assert — Binary(Mul, Number(9.81), Number(2)).
+        match a {
+            Ast::Binary { op: BinOp::Mul, left, right } => {
+                assert!(matches!(*left, Ast::Number(n) if (n - 9.81).abs() < 1e-12));
+                assert!(matches!(*right, Ast::Number(n) if n == 2.0));
+            }
+            other => panic!("unexpected root: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_with_constants_pi_in_table_still_resolves_to_the_builtin_pi() {
+        // Arrange — parse_with_constants trusts its caller (merge_constants)
+        // already excluded the universal four from the table; this call
+        // succeeds using the parser's own built-in `pi`, not the table's
+        // `1.0` entry, since constant_value is checked first.
+        let constants = HashMap::from([("pi".to_string(), 1.0)]);
+
+        // Act
+        let a = parse_with_constants("pi * 2", &constants).unwrap();
+
+        // Assert
+        match a {
+            Ast::Binary { op: BinOp::Mul, left, right } => {
+                assert!(matches!(*left, Ast::Number(n) if (n - std::f64::consts::PI).abs() < 1e-12));
+                assert!(matches!(*right, Ast::Number(n) if n == 2.0));
+            }
+            other => panic!("unexpected root: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_with_constants_unknown_identifier_is_parse_error() {
+        // Act
+        let err = parse_with_constants("nope * 2", &HashMap::new()).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::Parse);
+        assert!(err.message.contains("Unexpected identifier \"nope\""));
+    }
+
+    #[test]
+    fn parse_with_empty_constants_table_equals_parse() {
+        // Act / Assert — parse() is a zero-constants call into the same
+        // underlying function; HashMap::new() does not allocate.
+        assert_eq!(parse("1 + [X] * g"), parse_with_constants("1 + [X] * g", &HashMap::new()));
     }
 }
