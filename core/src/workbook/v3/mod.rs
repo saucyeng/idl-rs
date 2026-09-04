@@ -5,15 +5,40 @@
 //! (C2 §5) and evaluation are later tasks; the fence bodies here are stored
 //! raw and unparsed (`CellDoc::raw_fence_body`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub mod cell;
 pub mod error;
 pub mod front_matter;
+pub mod math_cell;
 
 pub use cell::{CellDoc, CellKindToken};
 pub use error::{WorkbookError, WorkbookErrorKind};
 pub use front_matter::{ConstantRaw, FrontMatter, UnitsPref};
+pub use math_cell::{parse_math_cell_body, MathCellLine};
+
+/// One `const` line collected from any `math` cell (C2 §3.1), flattened
+/// across the whole document. Workbook-scoped like a front-matter constant
+/// (C2 §3.1: "not scoped to their own cell") — `cell_id` records only where
+/// it was *declared*, for error messages. Handed to Task 4's
+/// `merge_constants`, this lane's single `DuplicateConstant`/`ReservedName`
+/// enforcement point for constants (this module raises neither for `Const`
+/// lines — see [`parse_workbook`]'s doc comment).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstLine {
+    /// The `math` cell this `const` line was declared in.
+    pub cell_id: String,
+    /// The `const` line's identifier (C2 §3.1) — already validated against
+    /// `identifier`/[`error::RESERVED_NAMES`] by [`parse_math_cell_body`].
+    pub name: String,
+    /// The constant's scalar value — unitless (a `const` line's
+    /// right-hand side is always a bare `number`, C2 §3.1).
+    pub value: f64,
+    /// Always `None` — a `const` line has no unit-suffix syntax (C2 §3.1);
+    /// kept for shape symmetry with
+    /// [`front_matter::ConstantRaw::WithUnit`].
+    pub unit_display: Option<String>,
+}
 
 /// A parsed `.idl1wb` document (C2 §1–§2): front-matter identity plus the
 /// cells and prose the body contains, in document order.
@@ -38,6 +63,10 @@ pub struct WorkbookDoc {
     /// `None` whenever there is at least one cell (trailing text then lives
     /// on that last cell's [`CellDoc::prose_after`] instead).
     pub trailing_prose: Option<String>,
+    /// Every `const` line from every `math` cell, flattened document-wide
+    /// (C2 §2.4, §3.1) — Task 4's `merge_constants` input; see
+    /// [`ConstLine`].
+    pub const_lines: Vec<ConstLine>,
 }
 
 /// Parses a `.idl1wb` document's front matter, cell fences and prose spans
@@ -55,6 +84,15 @@ pub struct WorkbookDoc {
 /// stated here so Task 2 and Task 9 build on one consistent rule:
 /// **front-matter identity/version is fatal; everything else is
 /// collected.**
+///
+/// Every `math` cell's fence body is parsed here too (C2 §3.1) and its
+/// `Def` lines flattened into one document-wide namespace (C2 §2.4): a
+/// repeated name raises [`WorkbookErrorKind::DuplicateDefinition`]. `Const`
+/// lines are only *collected*, into [`WorkbookDoc::const_lines`] — this
+/// function does not raise `DuplicateConstant` for them (G3.6): Task 4's
+/// `merge_constants` is this lane's single enforcement point for that kind,
+/// the same "single enforcement point" shape already used for
+/// `ReservedName`.
 pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>), Vec<WorkbookError>> {
     let (front_matter, body) = front_matter::parse_front_matter(markdown).map_err(|e| vec![e])?;
 
@@ -62,7 +100,30 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
         return Err(vec![error::unsupported_workbook_version(front_matter.version)]);
     }
 
-    let (cells, trailing_prose, errors) = cell::scan_cells(body);
+    let (cells, trailing_prose, mut errors) = cell::scan_cells(body);
+
+    let mut const_lines = Vec::new();
+    let mut def_names = HashSet::new();
+    for cell in &cells {
+        if cell.kind_token != CellKindToken::Math {
+            continue;
+        }
+        let (lines, cell_errors) = math_cell::parse_math_cell_body(&cell.id, &cell.raw_fence_body);
+        errors.extend(cell_errors);
+        for line in lines {
+            match line {
+                MathCellLine::Def { name, .. } => {
+                    if !def_names.insert(name.clone()) {
+                        errors.push(error::duplicate_definition(&cell.id, &name));
+                    }
+                }
+                MathCellLine::Const { name, value, unit_display } => {
+                    const_lines.push(ConstLine { cell_id: cell.id.clone(), name, value, unit_display });
+                }
+                MathCellLine::Blank | MathCellLine::Comment => {}
+            }
+        }
+    }
 
     let doc = WorkbookDoc {
         id: front_matter.id,
@@ -72,6 +133,7 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
         version: front_matter.version,
         cells,
         trailing_prose,
+        const_lines,
     };
 
     Ok((doc, errors))
@@ -101,5 +163,20 @@ mod tests {
         assert!(doc.cells[0].raw_fence_body.contains("fork_bottom_out = [fork_travel] > 195"));
         assert_eq!(doc.cells[1].id, "e5f6a7b8");
         assert_eq!(doc.cells[1].kind_token, CellKindToken::Js);
+    }
+
+    #[test]
+    fn same_identifier_defined_in_two_different_math_cells_duplicate_definition_both_cells_still_parse() {
+        // Arrange
+        let markdown = "---\nid: 9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d\nname: Test\n---\n\n```math id=aaaaaaaa\nroll_deg = [Roll]\n```\n\n```math id=bbbbbbbb\nroll_deg = [Roll2]\n```\n";
+
+        // Act
+        let (doc, errors) = parse_workbook(markdown).unwrap();
+
+        // Assert
+        assert_eq!(doc.cells.len(), 2);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind, WorkbookErrorKind::DuplicateDefinition);
+        assert_eq!(errors[0].cell_id, "bbbbbbbb");
     }
 }
