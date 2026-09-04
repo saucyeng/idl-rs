@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Deserializer};
 
-use super::error::{WorkbookError, WorkbookErrorKind};
+use super::error::{self, WorkbookError};
 
 /// Workbook-level unit-system *preference* (C2 §1). Consumed only by the
 /// editor UI (L6) for axis-label/number-format suggestions — has no effect
@@ -170,12 +170,7 @@ pub struct FrontMatter {
 /// for it. `version` validation is deliberately *not* done here — see
 /// [`super::parse_workbook`].
 pub fn parse_front_matter(markdown: &str) -> Result<(FrontMatter, &str), WorkbookError> {
-    let missing_id = || {
-        WorkbookError::front_matter(
-            WorkbookErrorKind::MissingFrontMatterId,
-            "Workbook front matter is missing a valid 'id'",
-        )
-    };
+    let missing_id = error::missing_front_matter_id;
 
     let rest = markdown.strip_prefix("---\n").ok_or_else(missing_id)?;
     let (yaml_block, body) = rest.split_once("\n---\n").ok_or_else(missing_id)?;
@@ -195,6 +190,7 @@ pub fn parse_front_matter(markdown: &str) -> Result<(FrontMatter, &str), Workboo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::error::WorkbookErrorKind;
 
     const VALID_ID: &str = "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d";
 
