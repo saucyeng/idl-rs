@@ -210,7 +210,7 @@ mod tests {
 
     /// C2 §2.5's worked example, restated literally (copied verbatim from
     /// the spec — already the contract's own checked example).
-    const WORKED_EXAMPLE: &str = "---\nid: 9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d\nname: Fork tuning\nconstants: { g: 9.80665, rider_mass_kg: 82 }\n---\n# Fork tuning \u{2014} Whistler, 2026-08-30\n\n```math id=a1b2c3d4\nfork_velocity = differentiate([fork_travel])\nfork_bottom_out = [fork_travel] > 195\n```\n\n```js id=e5f6a7b8\nPlot.plot({ marks: [Plot.lineY(channel(\"fork_velocity\"), { x: \"t\", y: \"v\" })] })\n```\n\nBottom-outs this lap: ${fork_bottom_out.v.filter(Boolean).length}\n";
+    const WORKED_EXAMPLE: &str = "---\nid: 9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d\nname: Fork tuning\nconstants: { rider_mass_kg: 82 }\n---\n# Fork tuning \u{2014} Whistler, 2026-08-30\n\n```math id=a1b2c3d4\nfork_velocity = differentiate([fork_travel])\nfork_bottom_out = [fork_travel] > 195\n```\n\n```js id=e5f6a7b8\nPlot.plot({ marks: [Plot.lineY(channel(\"fork_velocity\"), { x: \"t\", y: \"v\" })] })\n```\n\nBottom-outs this lap: ${fork_bottom_out.v.filter(Boolean).length}\n";
 
     #[test]
     fn parse_workbook_c2_5_worked_example_parses_id_version_and_both_cells() {
