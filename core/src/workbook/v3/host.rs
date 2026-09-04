@@ -73,6 +73,15 @@ pub fn to_host_channel(t_us: &[i64], v: &[f64]) -> HostChannel {
 /// between them (an overlay/compare feature scopes to one session at a
 /// time, not a merge).
 ///
+/// **The `(id, lookup)` pairing is trusted, not verified here** (ledger
+/// R35, `runs/2026-09-03/decisions.md`): `id` itself is never read by this
+/// function, only `other_lookup` is — so a caller that wires session A's id
+/// to session B's lookup gets session B's data back under session A's
+/// label, silently. The caller that resolves `other_session` from a
+/// session id string is the one place that pairing can be checked, and it
+/// must guarantee the lookup it hands in really does belong to the id it
+/// hands in alongside it.
+///
 /// # Errors
 /// [`MathEvalErrorKind::UnknownChannel`] when `name` is not resolvable in
 /// the applicable lookup (this is also the outcome when a session-scoped
@@ -81,7 +90,14 @@ pub fn to_host_channel(t_us: &[i64], v: &[f64]) -> HostChannel {
 /// signature carries no separate expected-id to compare against a
 /// mismatch). [`MathEvalErrorKind::NoLapContext`] when `lap` is given but
 /// `lap_ctx.main_lap_bounds` has no matching lap (empty, or `lap` out of
-/// range — both mean "no lap context available for that lap").
+/// range — both mean "no lap context available for that lap"; the
+/// message names how many laps this session actually has (L3-R34b), so
+/// "lap 7 of a 3-lap session" does not read as a "no laps at all" lie).
+// TODO(idl0): land the `(id, lookup)` pairing check with the wave-2 caller
+// (L6) that first threads a real `Session`/session map in here —
+// `ChannelLookup` has no way to report its own session id today, so the
+// caller must compare ids it already holds itself rather than asking the
+// trait to confirm (R35).
 pub fn channel(
     lookup: &dyn ChannelLookup,
     name: &str,
@@ -103,9 +119,16 @@ pub fn channel(
 
     let window = (lap_number as usize).checked_sub(1).and_then(|i| lap_ctx.main_lap_bounds.get(i));
     let &(start_s, end_s) = window.ok_or_else(|| {
+        // L3-R34b: name the recorded lap count so "lap 7 of a 3-lap
+        // session" reads differently from "no laps recorded at all".
+        let lap_count = lap_ctx.main_lap_bounds.len();
+        let laps_recorded =
+            if lap_count == 0 { "no laps recorded".to_string() } else { format!("{lap_count} laps recorded") };
         MathEvalError::new(
             MathEvalErrorKind::NoLapContext,
-            format!("channel(\"{name}\", lap: {lap_number}): no lap {lap_number} in this session's lap table"),
+            format!(
+                "channel(\"{name}\", lap: {lap_number}): no lap {lap_number} in this session's lap table ({laps_recorded})"
+            ),
         )
     })?;
 
@@ -308,8 +331,9 @@ mod tests {
     }
 
     #[test]
-    fn channel_lap_requested_with_empty_main_lap_bounds_no_lap_context() {
-        // Arrange
+    fn channel_lap_requested_with_empty_main_lap_bounds_no_lap_context_message_says_no_laps_recorded() {
+        // Arrange — L3-R34b: an empty lap table names itself as such, not
+        // as "0 laps recorded".
         let lookup = MapLookup(HashMap::from([("X", (vec![1.0, 2.0], 10.0, vec![0, 100_000]))]));
 
         // Act
@@ -317,6 +341,30 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, MathEvalErrorKind::NoLapContext);
+        assert_eq!(
+            err.message,
+            "channel(\"X\", lap: 1): no lap 1 in this session's lap table (no laps recorded)"
+        );
+    }
+
+    #[test]
+    fn channel_lap_out_of_range_of_a_non_empty_lap_table_no_lap_context_message_names_the_recorded_lap_count() {
+        // Arrange — L3-R34b: 3 laps recorded, lap 7 requested.
+        let lookup = MapLookup(HashMap::from([("X", (vec![1.0, 2.0], 10.0, vec![0, 100_000]))]));
+        let lap_ctx = MathLapContext {
+            main_lap_bounds: vec![(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)],
+            ..MathLapContext::empty()
+        };
+
+        // Act
+        let err = channel(&lookup, "X", Some(7), &lap_ctx, None).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::NoLapContext);
+        assert_eq!(
+            err.message,
+            "channel(\"X\", lap: 7): no lap 7 in this session's lap table (3 laps recorded)"
+        );
     }
 
     #[test]
