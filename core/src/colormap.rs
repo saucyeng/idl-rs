@@ -62,6 +62,8 @@ pub(crate) fn finite_bounds(values: &[f64]) -> (f64, f64) {
     }
 }
 
+// TODO(idl0): linear min-max only — log/percentile scaling for heavily-skewed
+// density counts (G11.8) is a deferred L6 display decision, not implemented here.
 /// Linearly normalises `values` to Turbo RGBA8 colours.
 ///
 /// Non-finite values (NaN, ±∞) map to `turbo_rgba8`'s transparent `[0,0,0,0]`
