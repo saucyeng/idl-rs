@@ -19,6 +19,15 @@ pub mod test_buffers;
 
 use crate::session::{ParseError, ParseResult};
 
+/// This module's own version (C1 §4.3), SemVer 2.0.0 — bumped whenever the
+/// `.idl0` parser's output or its timing-derivation logic changes. Stamped
+/// into every `data.parquet` this crate writes for an `.idl0` source
+/// ([`crate::store::parquet::write_session_parquet`]'s `importer_version`
+/// argument); a mismatch against the currently-running build's value is one
+/// of the two triggers for C1 §4.3's regeneration rule (the other being
+/// [`crate::session::seam_correction::SEAM_CORRECTION_VERSION`]).
+pub const IDL0_IMPORTER_VERSION: &str = "0.1.0";
+
 /// Validates the magic bytes (and schema byte) and dispatches to the v3 parser.
 ///
 /// - `IDL0` + schema 3 → [`v3::parse_v3`]

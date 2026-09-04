@@ -23,6 +23,7 @@ pub mod scatter;
 pub mod session;
 pub mod spectrogram;
 pub mod statistics;
+pub mod store;
 pub mod table;
 pub mod track_artifact;
 pub mod track_projection;

@@ -32,9 +32,9 @@ mod tests {
     fn handle_with(channels: Vec<ChannelInput>) -> SessionHandle {
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         SessionHandle::from_channels(meta, channels)
     }
@@ -50,7 +50,8 @@ mod tests {
             channel_id: "IMU0_AccelX".to_string(),
             sample_rate_hz: 1000.0,
             samples: vec![0.121, 0.13, 0.142],
-            sample_times_secs: None,
+            t_us: vec![0, 1_000, 2_000],
+            source_kind: "imu0".to_string(),
         }]);
 
         // Act
@@ -73,7 +74,8 @@ mod tests {
             channel_id: "HR_RR".to_string(),
             sample_rate_hz: 0.0,
             samples: vec![1000.0, 900.0],
-            sample_times_secs: Some(vec![0.5, 1.25]),
+            t_us: vec![500_000, 1_250_000],
+            source_kind: "hr_rr".to_string(),
         }]);
 
         // Act
@@ -95,7 +97,8 @@ mod tests {
             channel_id: "a,b".to_string(),
             sample_rate_hz: 1.0,
             samples: vec![7.0],
-            sample_times_secs: None,
+            t_us: vec![0],
+            source_kind: "a_b".to_string(),
         }]);
 
         // Act
@@ -112,7 +115,8 @@ mod tests {
             channel_id: "X".to_string(),
             sample_rate_hz: 10.0,
             samples: vec![0.0, 0.0],
-            sample_times_secs: None,
+            t_us: vec![0, 100_000],
+            source_kind: "x".to_string(),
         }]);
 
         // Act

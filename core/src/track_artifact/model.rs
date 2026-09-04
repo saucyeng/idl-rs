@@ -1,8 +1,10 @@
 //! Portable Track artifact (`.idl0t`) model. Private serde DTOs mirror the Dart
 //! `Track.toJson` wire format; they convert once at the read boundary into the
-//! public domain [`Track`], which holds the Phase-4 analysis types directly.
+//! public domain [`Track`], and back again (`track_artifact::write`) via the
+//! same DTOs — this module is the single authority on the wire shape in
+//! both directions.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::VersionedConfig;
 use crate::gps::GpsFix;
@@ -24,6 +26,12 @@ pub struct Track {
     pub sector_gates: Vec<SectorGate>,
     pub neutral_zones: Vec<NeutralZone>,
     pub reference_polyline: Vec<GpsFix>,
+    /// Track creation time, milliseconds since the Unix epoch (wire field,
+    /// C4 §5's `tracks.created_at_ms`).
+    pub created_at_ms: i64,
+    /// Track last-update time, milliseconds since the Unix epoch (wire
+    /// field, C4 §5's `tracks.updated_at_ms`).
+    pub updated_at_ms: i64,
 }
 
 impl Track {
@@ -36,7 +44,7 @@ impl Track {
 
 // ---- private wire DTOs (the `.idl0t` JSON shape == Dart Track.toJson) ----
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub(crate) struct TrackArtifact {
     track_artifact_version: u32,
     track: TrackDto,
@@ -50,7 +58,7 @@ impl VersionedConfig for TrackArtifact {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct TrackDto {
     #[serde(default)]
     track_id: String,
@@ -65,26 +73,33 @@ struct TrackDto {
     neutral_zones: Vec<NeutralZoneDto>,
     #[serde(default)]
     reference_polyline: Vec<GpsFixDto>,
+    #[serde(default)]
+    created_at_ms: i64,
+    #[serde(default)]
+    updated_at_ms: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct LapGateDto {
+    // Despite the `_deg` name, these carry degrees x1e7 (matching `Gate`'s
+    // own scale), unchanged from idl0 (SPEC §16.3) — see this module's own
+    // Gate/GpsFix conversions, which copy verbatim without rescaling.
     lat1_deg: f64,
     lon1_deg: f64,
     lat2_deg: f64,
     lon2_deg: f64,
-    // Present in the wire format; the engine `Gate` has no name, so it is dropped.
+    // Present in the wire format; the engine `Gate` has no name, so it is
+    // dropped on read (`into_gate`) and written back as `""` on encode
+    // (`From<&Gate>`, below) — the engine never round-trips a gate name.
     #[serde(default)]
-    #[allow(dead_code)]
     name: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum LapTimingDto {
     Circuit {
         #[serde(default)]
-        #[allow(dead_code)]
         name: String,
         start_finish: LapGateDto,
     },
@@ -94,13 +109,13 @@ enum LapTimingDto {
     },
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct SectorGateDto {
     name: String,
     gate: LapGateDto,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct NeutralZoneDto {
     #[serde(default)]
     name: String,
@@ -108,10 +123,12 @@ struct NeutralZoneDto {
     exit: LapGateDto,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct GpsFixDto {
     #[serde(default)]
     timestamp_ms: i64,
+    // Despite the `_deg` name, these carry degrees x1e7 (matching
+    // `GpsFix`'s own scale), unchanged from idl0 (SPEC §16.3).
     latitude_deg: f64,
     longitude_deg: f64,
 }
@@ -162,6 +179,61 @@ impl From<TrackArtifact> for Track {
             sector_gates: t.sector_gates.into_iter().map(SectorGateDto::into_core).collect(),
             neutral_zones: t.neutral_zones.into_iter().map(NeutralZoneDto::into_core).collect(),
             reference_polyline: t.reference_polyline.into_iter().map(GpsFixDto::into_core).collect(),
+            created_at_ms: t.created_at_ms,
+            updated_at_ms: t.updated_at_ms,
+        }
+    }
+}
+
+// ---- domain → wire conversions (private; used by `track_artifact::write`) ----
+
+impl From<&Gate> for LapGateDto {
+    fn from(g: &Gate) -> Self {
+        LapGateDto { lat1_deg: g.lat1, lon1_deg: g.lon1, lat2_deg: g.lat2, lon2_deg: g.lon2, name: String::new() }
+    }
+}
+impl From<&LapTiming> for LapTimingDto {
+    fn from(t: &LapTiming) -> Self {
+        match t {
+            LapTiming::Circuit { start_finish } => {
+                LapTimingDto::Circuit { name: String::new(), start_finish: start_finish.into() }
+            }
+            LapTiming::PointToPoint { start, finish } => {
+                LapTimingDto::PointToPoint { start: start.into(), finish: finish.into() }
+            }
+        }
+    }
+}
+impl From<&SectorGate> for SectorGateDto {
+    fn from(s: &SectorGate) -> Self {
+        SectorGateDto { name: s.name.clone(), gate: (&s.gate).into() }
+    }
+}
+impl From<&NeutralZone> for NeutralZoneDto {
+    fn from(z: &NeutralZone) -> Self {
+        NeutralZoneDto { name: z.name.clone(), enter: (&z.enter).into(), exit: (&z.exit).into() }
+    }
+}
+impl From<&GpsFix> for GpsFixDto {
+    fn from(f: &GpsFix) -> Self {
+        GpsFixDto { timestamp_ms: f.timestamp_ms, latitude_deg: f.lat, longitude_deg: f.lon }
+    }
+}
+impl From<&Track> for TrackArtifact {
+    fn from(t: &Track) -> Self {
+        TrackArtifact {
+            track_artifact_version: SUPPORTED_TRACK_ARTIFACT_VERSION,
+            track: TrackDto {
+                track_id: t.id.clone(),
+                name: t.name.clone(),
+                venue_name: t.venue.clone(),
+                lap_timing: t.timing.as_ref().map(Into::into),
+                sector_gates: t.sector_gates.iter().map(Into::into).collect(),
+                neutral_zones: t.neutral_zones.iter().map(Into::into).collect(),
+                reference_polyline: t.reference_polyline.iter().map(Into::into).collect(),
+                created_at_ms: t.created_at_ms,
+                updated_at_ms: t.updated_at_ms,
+            },
         }
     }
 }
