@@ -14,8 +14,11 @@ use super::error::{WorkbookError, WorkbookErrorKind};
 /// A cell's fence-language token (C2 §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellKindToken {
+    /// ` ```math ` — an expression-definition cell (C2 §3).
     Math,
+    /// ` ```table ` — a `TableModel` JSON cell (C2 §4).
     Table,
+    /// ` ```js ` — an Observable Runtime cell (C2 §5).
     Js,
 }
 
@@ -152,13 +155,31 @@ pub fn scan_cells(body: &str) -> (Vec<CellDoc>, Option<String>, Vec<WorkbookErro
                 id
             }
             None => {
-                let generated = generate_cell_id();
-                seen_ids.insert(generated.clone());
-                generated
+                // Loops only on a hash collision against an id already seen
+                // in this document (~2⁻³² per pair, C2 §2.2) — astronomically
+                // unlikely, but the generated-id path must uphold the same
+                // "never two cells share an id" invariant the explicit-id
+                // branch above enforces, so a hit regenerates rather than
+                // silently aliasing two cells.
+                loop {
+                    let generated = generate_cell_id();
+                    if seen_ids.insert(generated.clone()) {
+                        break generated;
+                    }
+                }
             }
         };
 
         cells.push(CellDoc { id, kind_token, prose_before, prose_after: None, raw_fence_body });
+        // `range` is the *Start* event's byte range, but it is used here as
+        // the fence-close boundary (the next cell's `prose_before` starts
+        // right after it). This relies on pulldown-cmark 0.13.4 giving
+        // `Start(CodeBlock)` and the eventual `End(CodeBlock)` the same
+        // range — both are the tree node's full `item.start..item.end`
+        // (verified against that version's `parse.rs`'s `OffsetIter::next`)
+        // — which is not part of pulldown-cmark's stated public contract. A
+        // future upgrade that changes this should re-read the range from the
+        // `End` event instead of assuming it still matches `Start`'s.
         segment_start = range.end;
     }
 

@@ -14,7 +14,9 @@ use super::error::{WorkbookError, WorkbookErrorKind};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UnitsPref {
+    /// Metric (m, m/s, kg, …) — the default.
     Si,
+    /// Imperial/US customary (ft, mph, lb, …).
     Imperial,
 }
 
