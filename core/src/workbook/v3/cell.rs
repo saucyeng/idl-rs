@@ -9,7 +9,7 @@ use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
-use super::error::{WorkbookError, WorkbookErrorKind};
+use super::error::{self, WorkbookError};
 
 /// A cell's fence-language token (C2 §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,11 +146,7 @@ pub fn scan_cells(body: &str) -> (Vec<CellDoc>, Option<String>, Vec<WorkbookErro
         let id = match explicit_id {
             Some(id) => {
                 if !seen_ids.insert(id.clone()) {
-                    errors.push(WorkbookError::new(
-                        id.clone(),
-                        WorkbookErrorKind::DuplicateCellId,
-                        format!("Cell id '{id}' used by more than one cell"),
-                    ));
+                    errors.push(error::duplicate_cell_id(&id));
                 }
                 id
             }
@@ -199,6 +195,7 @@ pub fn scan_cells(body: &str) -> (Vec<CellDoc>, Option<String>, Vec<WorkbookErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::error::WorkbookErrorKind;
 
     #[test]
     fn two_cells_same_id_duplicate_cell_id_collected_both_cells_still_returned() {

@@ -59,10 +59,7 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
     let (front_matter, body) = front_matter::parse_front_matter(markdown).map_err(|e| vec![e])?;
 
     if front_matter.version != 3 {
-        return Err(vec![WorkbookError::front_matter(
-            WorkbookErrorKind::UnsupportedWorkbookVersion,
-            format!("Workbook version {} is not supported (expected 3)", front_matter.version),
-        )]);
+        return Err(vec![error::unsupported_workbook_version(front_matter.version)]);
     }
 
     let (cells, trailing_prose, errors) = cell::scan_cells(body);
