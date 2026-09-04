@@ -205,6 +205,9 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
 }
 
 #[cfg(test)]
+mod tests_pipeline;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
