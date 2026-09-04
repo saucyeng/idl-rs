@@ -617,7 +617,7 @@ impl SessionHandle {
     /// buckets emit `[NaN, NaN]`; mixed buckets fold finite samples only.
     pub fn decimate_tile(&self, channel_id: &str, tier: u32, tile_index: u32) -> Vec<f64> {
         self.with_channel(channel_id, |c| {
-            let bucket = crate::chart_decimation::TIER_BASE.pow(tier) as usize;
+            let bucket = crate::chart_decimation::TIER_BASE.checked_pow(tier).unwrap_or(u32::MAX) as usize;
             let n_buckets = crate::chart_decimation::TILE_SIZE_BUCKETS as usize;
             let tile_start = (tile_index as usize).saturating_mul(n_buckets).saturating_mul(bucket);
             let mut out = Vec::with_capacity(n_buckets * 2);
@@ -1300,6 +1300,70 @@ mod tests {
             for tile in 0..2u32 {
                 let got = h.decimate_tile("C", tier, tile);
                 let want = crate::chart_decimation::decimate_channel(&samples, tier, tile);
+                assert_eq!(got.len(), want.len(), "tier {tier} tile {tile}");
+                for (g, w) in got.iter().zip(want.iter()) {
+                    assert!(
+                        (g.is_nan() && w.is_nan()) || g == w,
+                        "tier {tier} tile {tile}: got {g}, want {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decimate_tile_tier_above_max_tier_returns_all_nan_tile_no_panic() {
+        // Arrange — tile_index 1 (not 0) so the saturating start offset
+        // lands past the channel's length, making every bucket NaN.
+        let h = SessionHandle::from_channels(test_meta(), vec![input_channel("C", 10.0, vec![1.0; 20])]);
+
+        // Act
+        let out = h.decimate_tile("C", crate::chart_decimation::MAX_TIER + 1, 1);
+
+        // Assert — checked_pow degrades to an all-NaN tile, not a panic.
+        assert_eq!(out.len(), (crate::chart_decimation::TILE_SIZE_BUCKETS as usize) * 2);
+        assert!(out.iter().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn build_tile_bytes_sample_region_matches_decimate_tile_over_materialized_samples() {
+        // Arrange — same compact i16 fixture as
+        // decimate_tile_matches_pure_fold_over_materialized_samples, proving
+        // tile::build_tile_bytes itself (not just decimate_channel) agrees
+        // with the non-materializing SessionHandle::decimate_tile path.
+        let meta = SessionMetaInput {
+            session_id: String::new(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            config_checksum: None,
+        };
+        let mut h = SessionHandle::from_channels(meta, vec![]);
+        let raws: Vec<i16> = (0..5000).map(|i| ((i * 37) % 1000) as i16 - 500).collect();
+        let t_us: Vec<i64> = (0..5000i64).map(|i| i * 10_000).collect();
+        h.session.channels.push(Channel {
+            channel_id: "C".to_string(),
+            t_us: t_us.clone(),
+            t_recorded_us: None,
+            nominal_rate_hz: 100.0,
+            column: RawColumn::I16 { data: raws, scale: 0.5, offset: 1.0 },
+            source_kind: "c".to_string(),
+            unit: String::new(),
+            gaps: Vec::new(),
+        });
+
+        // Act + Assert
+        let samples = h.channel_samples("C");
+        for tier in 0..=6u32 {
+            for tile in 0..2u32 {
+                let want = h.decimate_tile("C", tier, tile);
+                let bytes = crate::tile::build_tile_bytes(&samples, &t_us, tier, tile, 0);
+                let sample_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+                let mut got = Vec::with_capacity(sample_count * 2);
+                for i in 0..sample_count {
+                    let base = 32 + i * 8;
+                    got.push(f32::from_le_bytes(bytes[base..base + 4].try_into().unwrap()) as f64);
+                    got.push(f32::from_le_bytes(bytes[base + 4..base + 8].try_into().unwrap()) as f64);
+                }
                 assert_eq!(got.len(), want.len(), "tier {tier} tile {tile}");
                 for (g, w) in got.iter().zip(want.iter()) {
                     assert!(

@@ -25,6 +25,7 @@ pub mod spectrogram;
 pub mod statistics;
 pub mod store;
 pub mod table;
+pub mod tile;
 pub mod track_artifact;
 pub mod track_projection;
 pub mod tracks;
