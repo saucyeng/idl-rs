@@ -4,7 +4,7 @@
 //! `lap_summary`.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use arrow::array::{Array, Float64Array, Int64Array};
 use arrow::record_batch::RecordBatch;
@@ -13,7 +13,7 @@ use parquet::arrow::ProjectionMask;
 use rusqlite::Connection;
 use uuid::Uuid;
 
-use crate::store::atomic::write_atomic;
+use crate::store::atomic::{sha256_hex, write_atomic_with_retry};
 use crate::store::blob::verify_blob;
 use crate::store::session_json::{read_session_json, LapJson, TrackVisitJson};
 use crate::track_artifact::read::read_track;
@@ -169,9 +169,17 @@ pub struct RebuildReport {
 /// Rebuilds `<data_root>/catalog.sqlite` from a full tree scan (C4 §5).
 /// Never mutates the live catalog in place — builds
 /// `tmp/catalog-rebuild-<uuid>.sqlite`, then atomically swaps it over
-/// `catalog.sqlite` via [`crate::store::atomic::write_atomic`] (the WAL
-/// sidecars are checkpointed into the main file before the swap, so no
-/// `-wal`/`-shm` files need to move separately).
+/// `catalog.sqlite` via [`crate::store::atomic::write_atomic_with_retry`]
+/// (the WAL sidecars are checkpointed into the main file before the swap, so
+/// no `-wal`/`-shm` files need to move separately; any stale sidecars left
+/// beside the *previous* `catalog.sqlite` are removed after a successful
+/// swap). The swap overwrites unconditionally — a rebuild supersedes
+/// whatever catalog was already there (C4 §5).
+///
+/// **Precondition:** no connection to the live `catalog.sqlite` may be open
+/// while this runs. C4 §5's rebuild is an offline swap, not a live
+/// replace-under-a-reader — the caller is responsible for not holding a
+/// [`open_catalog`] connection across a call to this function.
 pub fn rebuild_catalog(data_root: &Path) -> Result<RebuildReport, CatalogError> {
     let tmp_dir = data_root.join("tmp");
     std::fs::create_dir_all(&tmp_dir).map_err(io_err)?;
@@ -373,8 +381,21 @@ pub fn rebuild_catalog(data_root: &Path) -> Result<RebuildReport, CatalogError> 
 
     let bytes = std::fs::read(&staging_path).map_err(io_err)?;
     let final_path = data_root.join("catalog.sqlite");
-    write_atomic(data_root, &final_path, &bytes, None).map_err(|e| CatalogError { kind: CatalogErrorKind::Io, message: e.to_string() })?;
+    // The rebuild supersedes whatever is already at `final_path` (C4 §5: the
+    // staging file is "atomically renamed over catalog.sqlite") — this is an
+    // overwrite by design, not a caller-vs-peer-edit race, so `based_on`
+    // tracks whatever is currently there and `rederive` always re-offers this
+    // rebuild's own bytes rather than merging with a concurrent writer's.
+    let based_on = std::fs::read(&final_path).ok().map(|b| sha256_hex(&b));
+    write_atomic_with_retry(data_root, &final_path, &bytes, based_on.as_deref(), |_current| bytes.clone())
+        .map_err(|e| CatalogError { kind: CatalogErrorKind::Io, message: e.to_string() })?;
     let _ = std::fs::remove_file(&staging_path);
+    // Sidecars belong to the *previous* database — the new file just swapped
+    // in owns none of its own WAL/SHM state yet (checkpointed above). Not a
+    // C4 §5 contract line, just prudence: leaving a stale -wal/-shm next to a
+    // brand-new catalog.sqlite could otherwise be replayed against it.
+    let _ = std::fs::remove_file(data_root.join("catalog.sqlite-wal"));
+    let _ = std::fs::remove_file(data_root.join("catalog.sqlite-shm"));
 
     Ok(report)
 }
@@ -619,6 +640,8 @@ fn file_mtime_ms(meta: &std::fs::Metadata) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
     use crate::store::blob::write_blob;
     use crate::store::derived::{write_derived_parquet, DerivedOutput};
     use crate::store::parquet::write_session_parquet;
@@ -1123,6 +1146,34 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sessions WHERE session_id = 's-good'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(good_count, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebuild_catalog_twice_on_the_same_root_overwrites_the_previous_catalog() {
+        // Arrange — R16: `rebuild_catalog`'s final swap must overwrite an
+        // already-existing catalog.sqlite (C4 §5's rebuild procedure), not
+        // treat every rebuild after the first as a conflict.
+        let root = temp_root();
+        let doc = empty_session_json("s1");
+        write_full_session(&root, "s1", 0, &doc);
+
+        // Act
+        let first = rebuild_catalog(&root).unwrap();
+        let second = rebuild_catalog(&root).unwrap();
+
+        // Assert
+        assert_eq!(second.blobs_indexed, first.blobs_indexed);
+        assert_eq!(second.sessions_indexed, first.sessions_indexed);
+        assert_eq!(second.tracks_indexed, first.tracks_indexed);
+        assert_eq!(second.laps_indexed, first.laps_indexed);
+        assert_eq!(second.lap_summary_indexed, first.lap_summary_indexed);
+        assert_eq!(second.workbooks_indexed, first.workbooks_indexed);
+
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(user_version, CATALOG_SCHEMA_VERSION);
 
         let _ = std::fs::remove_dir_all(&root);
     }

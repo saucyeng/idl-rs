@@ -35,6 +35,13 @@ pub struct Finding {
 /// straightforward once L1's catalog, Task 12, is the only writer, but not
 /// written here to keep this task's own scope to what L1 alone can verify
 /// without guessing at another lane's not-yet-existing format).
+///
+/// A malformed `blobs/sha256/*/*` filename (not a well-formed 64-hex digest)
+/// can be reported twice: once by #1 ([`check_blobs`], whose reconstructed
+/// path fails content/length verification) and once by #10
+/// ([`check_unexpected_paths`], whose [`matches_layout`] rejects the
+/// non-conforming name). Both facts are independently true and at different
+/// severities — this overlap is intentional, not deduplicated.
 pub fn verify(data_root: &Path) -> Vec<Finding> {
     let mut findings = Vec::new();
     check_blobs(data_root, &mut findings); // #1
@@ -244,8 +251,11 @@ mod tests {
     use super::*;
     use crate::session::{Channel, RawColumn, Session, SourceFormat};
     use crate::store::blob::write_blob;
+    use crate::store::derived::{write_derived_parquet, DerivedOutput};
     use crate::store::parquet::write_session_parquet;
     use crate::store::session_json::{empty_session_json, write_session_json};
+    use crate::track_artifact::model::Track;
+    use crate::track_artifact::write::write_track;
     use uuid::Uuid;
 
     fn temp_root() -> PathBuf {
@@ -361,6 +371,82 @@ mod tests {
         // Assert
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_detects_a_malformed_session_json_as_an_error() {
+        // Arrange — session.json exists but is not valid JSON; no
+        // data.parquet yet, so only #2 fires (#3/#4 both need data.parquet).
+        let root = temp_root();
+        let session_dir = root.join("sessions").join("s1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("session.json"), b"not json").unwrap();
+
+        // Act
+        let findings = verify(&root);
+
+        // Assert
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert_eq!(findings[0].path, session_dir.join("session.json"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_detects_a_derived_file_whose_content_does_not_match_its_filename_hash() {
+        // Arrange — a real derived/<hash>.parquet, then its content is
+        // overwritten in place (filename, hence claimed hash, unchanged) —
+        // same corruption shape as `verify_detects_a_corrupted_blob`.
+        let root = temp_root();
+        let outputs = vec![DerivedOutput {
+            channel_id: "Roll (deg)".to_string(),
+            t_us: vec![0, 500_000],
+            values: vec![1.0, 2.0],
+            nominal_rate_hz: 2.0,
+            unit: "deg".to_string(),
+        }];
+        let path = write_derived_parquet(&root, "s1", "test_kind", &[], &serde_json::json!({}), &outputs, 0).unwrap();
+        std::fs::write(&path, b"corrupted").unwrap();
+
+        // Act
+        let findings = verify(&root);
+
+        // Assert
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_detects_a_track_file_whose_filename_does_not_match_its_track_id() {
+        // Arrange — write a valid `.idl0t` for "t-1", then rename it so the
+        // filename no longer matches the `track_id` inside its own JSON.
+        let root = temp_root();
+        let track = Track {
+            id: "t-1".to_string(),
+            name: "A-Line".to_string(),
+            venue: "Whistler".to_string(),
+            timing: None,
+            sector_gates: Vec::new(),
+            neutral_zones: Vec::new(),
+            reference_polyline: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let path = write_track(&root, &track).unwrap();
+        let renamed = path.parent().unwrap().join("t-2.idl0t");
+        std::fs::rename(&path, &renamed).unwrap();
+
+        // Act
+        let findings = verify(&root);
+
+        // Assert
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
 
         let _ = std::fs::remove_dir_all(&root);
     }

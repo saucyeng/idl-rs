@@ -129,6 +129,37 @@ mod tests {
     }
 
     #[test]
+    fn write_then_read_round_trips_point_to_point_timing() {
+        // Arrange — the round-trip test above only exercises Circuit;
+        // PointToPoint has its own `From<&LapTiming> for LapTimingDto` arm
+        // that needs its own coverage on the write side.
+        let root = temp_root();
+        let mut track = sample_track();
+        track.timing = Some(LapTiming::PointToPoint {
+            start: Gate { lat1: 21.0, lon1: 22.0, lat2: 23.0, lon2: 24.0 },
+            finish: Gate { lat1: 25.0, lon1: 26.0, lat2: 27.0, lon2: 28.0 },
+        });
+
+        // Act
+        let path = write_track(&root, &track).unwrap();
+        let back = read_track(&path).unwrap();
+
+        // Assert
+        match (&back.timing, &track.timing) {
+            (
+                Some(LapTiming::PointToPoint { start: a_start, finish: a_finish }),
+                Some(LapTiming::PointToPoint { start: b_start, finish: b_finish }),
+            ) => {
+                assert_eq!(a_start, b_start);
+                assert_eq!(a_finish, b_finish);
+            }
+            other => panic!("expected point-to-point timing to round-trip, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn write_track_overwrites_an_existing_file_with_new_values() {
         // Arrange
         let root = temp_root();
