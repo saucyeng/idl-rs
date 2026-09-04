@@ -97,9 +97,10 @@ pub fn duplicate_definition(cell_id: &str, name: &str) -> WorkbookError {
     WorkbookError::new(cell_id, WorkbookErrorKind::DuplicateDefinition, format!("'{name}' is defined more than once"))
 }
 
-/// `DuplicateConstant` (C2 §3.5.A) — `cell_id` is the owning cell for a
-/// `const`-line collision, or the literal `"front-matter"` when the
-/// collision involves the front-matter `constants` map.
+/// `DuplicateConstant` (C2 §3.5.A) — `cell_id` is the cell holding the
+/// colliding `const` line (the second occurrence), regardless of whether the
+/// name's first claim came from a `const` line or the front-matter
+/// `constants` map.
 pub fn duplicate_constant(cell_id: &str, name: &str) -> WorkbookError {
     WorkbookError::new(
         cell_id,

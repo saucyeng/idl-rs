@@ -31,15 +31,16 @@ enum Owner {
 /// of a name wins its table entry, and every later colliding declaration is
 /// reported without replacing it.
 ///
-/// **`cell_id` on a `DuplicateConstant`:** when the name's first claim came
-/// from front matter, every later collision (from any `const` line) is
-/// reported at the front-matter pseudo-cell id — matching
-/// [`error::duplicate_constant`]'s own doc comment ("the literal
-/// `"front-matter"` when the collision involves the front-matter `constants`
-/// map"). When the first claim came from a `const` line, a later collision
-/// is reported at the *colliding* line's own `cell_id` — the same "cell
-/// holding the second occurrence" rule [`error::duplicate_definition`]
-/// already uses.
+/// **`cell_id` on a `DuplicateConstant`:** regardless of which source made
+/// the *first* claim (front matter or a `const` line), a later collision is
+/// always reported at the *colliding* `const` line's own `cell_id` — the
+/// same "cell holding the second occurrence" rule
+/// [`error::duplicate_definition`] already uses. A front-matter-scoped
+/// `"front-matter"` `cell_id` is never used here: `eval_cells` drops
+/// front-matter-scoped errors (L3-R25), so such a report would silently
+/// vanish from the notebook. (A name can only collide *within* front matter
+/// itself if the front-matter map had a duplicate key, which is impossible
+/// for a `HashMap` — that case cannot occur.)
 ///
 /// For a `ConstantRaw::Number(v)` the merged value is `v`; for
 /// `ConstantRaw::WithUnit { value, .. }` it is `value` — `unit_display` is
@@ -83,7 +84,7 @@ pub fn merge_constants(
         }
         match owners.get(&line.name) {
             Some(Owner::FrontMatter) => {
-                errors.push(error::duplicate_constant("front-matter", &line.name));
+                errors.push(error::duplicate_constant(&line.cell_id, &line.name));
             }
             Some(Owner::ConstLine) => {
                 errors.push(error::duplicate_constant(&line.cell_id, &line.name));
@@ -117,10 +118,12 @@ mod tests {
         let (table, errors) = merge_constants(&front_matter, &const_lines);
 
         // Assert — front matter's value wins the table entry; the collision
-        // is reported at the front-matter pseudo-cell id.
+        // is reported at the colliding const line's own cell id, not
+        // "front-matter" (eval_cells drops front-matter-scoped errors, so a
+        // "front-matter"-scoped report here would silently vanish).
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, WorkbookErrorKind::DuplicateConstant);
-        assert_eq!(errors[0].cell_id, "front-matter");
+        assert_eq!(errors[0].cell_id, "aaaaaaaa");
         assert_eq!(table.get("k"), Some(&5.0));
     }
 
