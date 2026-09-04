@@ -371,29 +371,55 @@ mod tests {
 
     #[test]
     fn spectrogram_raster_meta_bounds_match_the_builder_even_when_rebin_drops_the_extreme_cell() {
-        // Arrange — parameters chosen so nearest-cell rebin structurally never
-        // selects the Nyquist frequency row (n_freqs=33, height=32): the
-        // review that raised R38 showed `bin_of(y) = (y*33/32).min(32)` never
-        // yields 32 for any y in 0..32, so that row of `power` is scanned for
-        // bounds but never rendered by any pixel.
+        // Arrange — a huge DC bias so the global-max power provably lands at
+        // freq_idx=0 (DC). For n_freqs=33 (nperseg=64), height=32, the
+        // rebin's `bin = (y*33/32).min(32)` only ever produces 0..31 for y in
+        // 0..31 (never 32), so `freq_idx = n_freqs-1-bin` never reaches 0 —
+        // DC, not the Nyquist row, is the one nearest-cell rebin structurally
+        // drops (corrects the prior version of this test, which misidentified
+        // the dropped row and picked a signal whose true extremes happened to
+        // land in *selected* cells, so it passed against the pre-R38-fix
+        // builder too). `Detrend::None` keeps DC power in `s.power` instead
+        // of subtracting it.
         let fs = 256.0;
         let n = 512usize;
-        let data: Vec<f64> = (0..n).map(|i| (2.0 * std::f64::consts::PI * 40.0 * i as f64 / fs).sin() + 0.3 * (i as f64 * 0.01).sin()).collect();
+        let data: Vec<f64> = (0..n)
+            .map(|i| 1000.0 + (2.0 * std::f64::consts::PI * 40.0 * i as f64 / fs).sin())
+            .collect();
         let (width, height) = (16u16, 32u16);
 
         // Act — the meta's reported bounds, and the actual bytes rendered.
-        let meta = spectrogram_raster_meta(&data, fs, FftWindow::Hann, 64, 32, Detrend::Mean, Scaling::Density);
-        let bytes = build_spectrogram_raster_bytes(&data, fs, width, height, FftWindow::Hann, 64, 32, Detrend::Mean, Scaling::Density);
+        let meta = spectrogram_raster_meta(&data, fs, FftWindow::Hann, 64, 32, Detrend::None, Scaling::Density);
+        let bytes = build_spectrogram_raster_bytes(&data, fs, width, height, FftWindow::Hann, 64, 32, Detrend::None, Scaling::Density);
 
-        // Assert — re-derive the expected pixel colours purely from the
-        // meta's own vmin/vmax (independent of the builder's internals) and
-        // require an exact byte match against what the builder actually
-        // produced. This is the invariant R38 requires: if the builder ever
-        // normalised over the rebinned subset instead of the full matrix,
-        // this would fail whenever the dropped row held the true min/max.
-        let s = spectrogram(data.clone(), fs, FftWindow::Hann, 64, 32, Detrend::Mean, Scaling::Density);
+        let s = spectrogram(data.clone(), fs, FftWindow::Hann, 64, 32, Detrend::None, Scaling::Density);
         let (n_times, n_freqs) = (s.n_times as usize, s.n_freqs as usize);
         let (w, h) = (width as usize, height as usize);
+
+        // Assert (1) — the fixture genuinely discriminates: the max power
+        // among only the cells rebin actually selects is strictly less than
+        // `meta.vmax` (scanned over the full matrix). A subset-scanning
+        // implementation (the pre-fix bug) would therefore compute a
+        // strictly smaller `vmax` than the meta function reports here — this
+        // is what makes the byte-match assertion below a real regression
+        // guard rather than a vacuous one.
+        let mut subset_max = f64::NEG_INFINITY;
+        for y in 0..h {
+            for x in 0..w {
+                let frame = (x * n_times / w).min(n_times - 1);
+                let bin = (y * n_freqs / h).min(n_freqs - 1);
+                subset_max = subset_max.max(s.power[frame * n_freqs + (n_freqs - 1 - bin)]);
+            }
+        }
+        assert!(
+            subset_max < meta.vmax,
+            "fixture does not discriminate: subset_max {subset_max} is not below the full-matrix vmax {}",
+            meta.vmax
+        );
+
+        // Assert (2) — the regression guard itself: re-derive every pixel
+        // purely from the meta's own vmin/vmax and require an exact byte
+        // match against what the builder actually produced.
         let mut expected = Vec::with_capacity(HEADER_LEN + w * h * 4);
         expected.extend_from_slice(&bytes[0..HEADER_LEN]); // header already checked elsewhere
         for y in 0..h {
