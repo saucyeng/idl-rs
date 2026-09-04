@@ -9,6 +9,7 @@ pub mod chart_decimation;
 pub mod clip_reconstruct;
 pub mod colormap;
 pub mod config;
+pub mod cursor;
 pub mod estimate;
 pub mod export;
 pub mod fft;

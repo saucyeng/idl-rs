@@ -988,11 +988,28 @@ impl crate::math::eval::ChannelLookup for SessionHandle {
 /// `NaN` when the arrays are empty. Times beyond the ends clamp to the
 /// first / last sample.
 fn nearest_by_t_us(samples: &[f64], t_us: &[i64], t_secs: f64) -> f64 {
+    let target_us = (t_secs * 1e6).round() as i64;
+    nearest_at_t_us(samples, t_us, target_us).unwrap_or(f64::NAN)
+}
+
+/// Value of a channel at recording-time `target_us` (µs) — the sample whose
+/// `t_us` entry (assumed ascending, contract C1 §3.5 invariant 1) is
+/// closest, ties resolving to the earlier sample. Clamped: a `target_us`
+/// before the first or after the last recorded sample returns that edge
+/// sample, not an error — callers that instead want `null` past a
+/// channel's recorded span (C3 §3.7, R31) check `t_us[0]`/`t_us[last]`
+/// themselves before calling this.
+///
+/// `None` iff there is no sample to return, i.e.
+/// `samples.len().min(t_us.len()) == 0` — never derived from `is_nan()`,
+/// since `NaN` is a legitimate *sample* value elsewhere in this crate
+/// (`decimate_tile_pure`'s NaN contract). A `NaN` sample nearest the
+/// target is `Some(f64::NAN)`.
+pub(crate) fn nearest_at_t_us(samples: &[f64], t_us: &[i64], target_us: i64) -> Option<f64> {
     let n = samples.len().min(t_us.len());
     if n == 0 {
-        return f64::NAN;
+        return None;
     }
-    let target_us = (t_secs * 1e6).round() as i64;
     let pos = t_us[..n].partition_point(|&x| x < target_us);
     let hi = pos.min(n - 1);
     let lo = pos.saturating_sub(1);
@@ -1001,12 +1018,57 @@ fn nearest_by_t_us(samples: &[f64], t_us: &[i64], t_secs: f64) -> f64 {
     } else {
         hi
     };
-    samples[pick]
+    Some(samples[pick])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearest_at_t_us_target_matches_a_sample_exactly() {
+        // Arrange
+        let samples = [1.0, 2.0, 3.0];
+        let t_us = [0_i64, 1_000_000, 2_000_000];
+
+        // Act
+        let v = nearest_at_t_us(&samples, &t_us, 1_000_000);
+
+        // Assert
+        assert_eq!(v, Some(2.0));
+    }
+
+    #[test]
+    fn nearest_at_t_us_target_between_samples_tie_goes_to_earlier() {
+        // Arrange — target is exactly halfway between the two samples.
+        let samples = [1.0, 2.0];
+        let t_us = [0_i64, 1_000_000];
+
+        // Act
+        let v = nearest_at_t_us(&samples, &t_us, 500_000);
+
+        // Assert — `<=` in the tie comparison picks the earlier sample.
+        assert_eq!(v, Some(1.0));
+    }
+
+    #[test]
+    fn nearest_at_t_us_target_past_the_ends_clamps() {
+        // Arrange
+        let samples = [1.0, 2.0, 3.0];
+        let t_us = [0_i64, 1_000_000, 2_000_000];
+
+        // Act + Assert
+        assert_eq!(nearest_at_t_us(&samples, &t_us, -500_000), Some(1.0));
+        assert_eq!(nearest_at_t_us(&samples, &t_us, 5_000_000), Some(3.0));
+    }
+
+    #[test]
+    fn nearest_at_t_us_empty_arrays_none_not_nan() {
+        // Arrange — empty samples, empty t_us.
+
+        // Act + Assert
+        assert_eq!(nearest_at_t_us(&[], &[], 0), None);
+    }
 
     /// Synthetic-uniform `t_us` (matches [`Channel::from_f64`]'s formula) —
     /// every caller here is a fixed-rate fixture.
