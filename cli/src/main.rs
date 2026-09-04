@@ -1001,13 +1001,10 @@ fn cmd_import(file: &Path, data_dir: &Path) -> ExitCode {
     if let Some(w) = &report.truncation_warning {
         eprintln!("warning: {w}");
     }
-    match report.plan {
-        import::ImportPlan::Write => println!("imported {} -> {}", file.display(), report.data_parquet.display()),
-        import::ImportPlan::Skip => println!("already imported (skip): {}", report.data_parquet.display()),
-        import::ImportPlan::Regenerate => println!("regenerated: {}", report.data_parquet.display()),
-        import::ImportPlan::Collision { .. } => {
-            unreachable!("import_idl0 returns Err(ImportErrorKind::Collision) rather than Ok(.. Collision ..)")
-        }
+    match report.outcome {
+        import::ImportOutcome::Written => println!("imported {} -> {}", file.display(), report.data_parquet.display()),
+        import::ImportOutcome::Skipped => println!("already imported (skip): {}", report.data_parquet.display()),
+        import::ImportOutcome::Regenerated => println!("regenerated: {}", report.data_parquet.display()),
     }
 
     match catalog::rebuild_catalog(data_dir) {

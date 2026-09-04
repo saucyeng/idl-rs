@@ -135,15 +135,29 @@ impl From<SessionJsonError> for ImportError {
     }
 }
 
+/// What [`import_idl0`] actually did to `data.parquet` on a successful call
+/// — unlike [`ImportPlan`], this has no `Collision` arm: a collision returns
+/// [`ImportError`] instead of an [`ImportReport`], so the impossible state
+/// (a report claiming `Collision`) is unrepresentable rather than merely
+/// documented-unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportOutcome {
+    /// No `data.parquet` existed yet — one was written.
+    Written,
+    /// `data.parquet` already matched this blob and build — nothing written.
+    Skipped,
+    /// `data.parquet` matched this blob but an older build — deleted and rewritten.
+    Regenerated,
+}
+
 /// Outcome of one successful [`import_idl0`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportReport {
     pub session_id: String,
     pub blob_sha256: String,
     pub data_parquet: PathBuf,
-    /// What actually happened. Never [`ImportPlan::Collision`] — that arm
-    /// returns [`ImportError`] instead of a report.
-    pub plan: ImportPlan,
+    /// What actually happened.
+    pub outcome: ImportOutcome,
     /// `true` if this call created `session.json` (it never overwrites an
     /// existing one).
     pub session_json_created: bool,
@@ -161,9 +175,12 @@ pub struct ImportReport {
 ///
 /// Does not touch the catalog — the caller rebuilds/refreshes it afterward.
 pub fn import_idl0(data_root: &Path, bytes: &[u8]) -> Result<ImportReport, ImportError> {
-    let blob_sha256 = blob::write_blob(data_root, bytes)?;
-
+    // Parse first — an unparseable `.idl0` file must leave nothing in the
+    // CAS (the hash is computed from `bytes` directly, independent of
+    // parsing, so ordering here costs nothing on the success path but
+    // avoids a permanent orphan blob on every failed import).
     let mut result = crate::parse::parse(bytes)?;
+    let blob_sha256 = blob::write_blob(data_root, bytes)?;
     result.session.blob_sha256 = blob_sha256.clone();
     crate::session::synthesis::synthesize_base_channels(&mut result.session);
 
@@ -178,7 +195,7 @@ pub fn import_idl0(data_root: &Path, bytes: &[u8]) -> Result<ImportReport, Impor
         crate::session::seam_correction::SEAM_CORRECTION_VERSION,
     );
 
-    let executed_plan = match plan {
+    let outcome = match plan {
         ImportPlan::Collision { existing_blob_sha256 } => {
             return Err(ImportError::new(
                 ImportErrorKind::Collision,
@@ -191,7 +208,7 @@ pub fn import_idl0(data_root: &Path, bytes: &[u8]) -> Result<ImportReport, Impor
         }
         ImportPlan::Write => {
             write_session_parquet(data_root, &result.session, crate::parse::IDL0_IMPORTER_VERSION)?;
-            ImportPlan::Write
+            ImportOutcome::Written
         }
         ImportPlan::Regenerate => {
             // C1 §4.3's regeneration rule: delete then rewrite. Explicit
@@ -204,9 +221,9 @@ pub fn import_idl0(data_root: &Path, bytes: &[u8]) -> Result<ImportReport, Impor
             std::fs::remove_file(&data_parquet_path)
                 .map_err(|e| ImportError::new(ImportErrorKind::Io, format!("removing stale {}: {e}", data_parquet_path.display())))?;
             write_session_parquet(data_root, &result.session, crate::parse::IDL0_IMPORTER_VERSION)?;
-            ImportPlan::Regenerate
+            ImportOutcome::Regenerated
         }
-        ImportPlan::Skip => ImportPlan::Skip,
+        ImportPlan::Skip => ImportOutcome::Skipped,
     };
 
     let sj_path = data_root.join("sessions").join(&session_id).join("session.json");
@@ -222,7 +239,7 @@ pub fn import_idl0(data_root: &Path, bytes: &[u8]) -> Result<ImportReport, Impor
         session_id,
         blob_sha256,
         data_parquet: data_parquet_path,
-        plan: executed_plan,
+        outcome,
         session_json_created,
         truncation_warning: result.truncation_warning.map(|w| w.to_string()),
     })
@@ -311,6 +328,25 @@ mod tests {
         assert_eq!(plan, ImportPlan::Collision { existing_blob_sha256: "abc".to_string() });
     }
 
+    #[test]
+    fn import_idl0_bad_magic_bytes_fails_and_leaves_no_orphan_blob() {
+        // Arrange — a buffer that fails `parse::parse` before any session
+        // work happens; its would-be blob digest must never land in the CAS.
+        let root = temp_root();
+        let bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let would_be_digest = crate::store::atomic::sha256_hex(&bytes);
+
+        // Act
+        let result = import_idl0(&root, &bytes);
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(ImportError { kind: ImportErrorKind::ParseInvalidMagicBytes, .. })
+        ));
+        assert!(!crate::store::blob::blob_exists(&root, &would_be_digest));
+    }
+
     /// One minimal, valid `.idl0` v3 buffer: one IMU sample, session UUID
     /// all-`0xAB` (matches `Header::default()` — every buffer built with the
     /// same UUID bytes belongs to the same `session_id`, matching real
@@ -336,7 +372,7 @@ mod tests {
         let report = import_idl0(&root, &bytes).unwrap();
 
         // Assert
-        assert_eq!(report.plan, ImportPlan::Write);
+        assert_eq!(report.outcome, ImportOutcome::Written);
         assert!(report.session_json_created);
         assert!(report.data_parquet.is_file());
         let sj_path = root.join("sessions").join(&report.session_id).join("session.json");
@@ -358,7 +394,7 @@ mod tests {
         let second = import_idl0(&root, &bytes).unwrap();
 
         // Assert
-        assert_eq!(second.plan, ImportPlan::Skip);
+        assert_eq!(second.outcome, ImportOutcome::Skipped);
         assert!(!second.session_json_created);
         let sj_bytes_after = std::fs::read(&sj_path).unwrap();
         assert_eq!(sj_bytes_before, sj_bytes_after);
@@ -382,7 +418,7 @@ mod tests {
         let report = import_idl0(&root, &bytes).unwrap();
 
         // Assert
-        assert_eq!(report.plan, ImportPlan::Regenerate);
+        assert_eq!(report.outcome, ImportOutcome::Regenerated);
         let meta = read_session_metadata(&report.data_parquet).unwrap();
         assert_eq!(meta.importer_version, crate::parse::IDL0_IMPORTER_VERSION);
 

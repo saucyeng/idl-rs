@@ -344,16 +344,15 @@ pub struct SessionParquetMetadata {
     pub seam_correction_version: String,
 }
 
-/// Reads `data.parquet`'s file-level key-value metadata (C1 §4.3) only — no
-/// row-group or column materialization, just the Parquet footer. The single
-/// parser for these nine keys; [`read_session_parquet`] calls this rather
-/// than duplicating the parsing logic.
-pub fn read_session_metadata(path: &Path) -> Result<SessionParquetMetadata, ParquetStoreError> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Io, format!("open {}: {e}", path.display())))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("{}: {e}", path.display())))?;
-
+/// Extracts the nine C1 §4.3 file-level key-value metadata keys from an
+/// already-open [`ParquetRecordBatchReaderBuilder`]'s footer — no additional
+/// I/O. The single parser for these keys; both [`read_session_metadata`]
+/// (which opens the file itself, for callers that only want metadata) and
+/// [`read_session_parquet`] (which needs the builder afterward too, to
+/// avoid parsing the footer twice) call this.
+fn metadata_from_builder(
+    builder: &ParquetRecordBatchReaderBuilder<std::fs::File>,
+) -> Result<SessionParquetMetadata, ParquetStoreError> {
     let file_kv: std::collections::HashMap<String, String> = builder
         .metadata()
         .file_metadata()
@@ -385,6 +384,16 @@ pub fn read_session_metadata(path: &Path) -> Result<SessionParquetMetadata, Parq
     })
 }
 
+/// Reads `data.parquet`'s file-level key-value metadata (C1 §4.3) only — no
+/// row-group or column materialization, just the Parquet footer.
+pub fn read_session_metadata(path: &Path) -> Result<SessionParquetMetadata, ParquetStoreError> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Io, format!("open {}: {e}", path.display())))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("{}: {e}", path.display())))?;
+    metadata_from_builder(&builder)
+}
+
 /// Reads `data.parquet` back into a [`Session`] (contract C1 §4.5's read
 /// rule: for each channel column, filter to non-null rows, take `t` at
 /// those rows as `t_us`, the values as the compact `RawColumn`).
@@ -392,12 +401,11 @@ pub fn read_session_metadata(path: &Path) -> Result<SessionParquetMetadata, Parq
 /// re-derived by `crate::session::synthesis::synthesize_base_channels`
 /// after this function returns, exactly as it already runs after parsing.
 pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
-    let meta = read_session_metadata(path)?;
-
     let file = std::fs::File::open(path)
         .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Io, format!("open {}: {e}", path.display())))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("{}: {e}", path.display())))?;
+    let meta = metadata_from_builder(&builder)?;
     let schema = builder.schema().clone();
 
     let reader = builder
