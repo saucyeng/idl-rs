@@ -13,6 +13,7 @@ pub mod error;
 pub mod front_matter;
 pub mod math_cell;
 pub mod resolve;
+pub mod table_cell;
 
 pub use cell::{CellDoc, CellKindToken};
 pub use constants::merge_constants;
@@ -20,6 +21,7 @@ pub use error::{WorkbookError, WorkbookErrorKind};
 pub use front_matter::{ConstantRaw, FrontMatter, UnitsPref};
 pub use math_cell::{parse_math_cell_body, MathCellLine};
 pub use resolve::resolve_workbook_defs;
+pub use table_cell::parse_table_cell;
 
 /// One `const` line collected from any `math` cell (C2 §3.1), flattened
 /// across the whole document. Workbook-scoped like a front-matter constant
@@ -134,32 +136,43 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
         return Err(vec![error::unsupported_workbook_version(front_matter.version)]);
     }
 
-    let (cells, trailing_prose, mut errors) = cell::scan_cells(body);
+    let (mut cells, trailing_prose, mut errors) = cell::scan_cells(body);
 
     let mut const_lines = Vec::new();
     let mut defs = Vec::new();
     let mut def_names = HashSet::new();
-    for cell in &cells {
-        if cell.kind_token != CellKindToken::Math {
-            continue;
-        }
-        let (lines, cell_errors) = math_cell::parse_math_cell_body(&cell.id, &cell.raw_fence_body);
-        errors.extend(cell_errors);
-        let mut order = 0;
-        for line in lines {
-            match line {
-                MathCellLine::Def { name, expr_text, label } => {
-                    if !def_names.insert(name.clone()) {
-                        errors.push(error::duplicate_definition(&cell.id, &name));
+    for cell in &mut cells {
+        match cell.kind_token {
+            CellKindToken::Math => {
+                let (lines, cell_errors) = math_cell::parse_math_cell_body(&cell.id, &cell.raw_fence_body);
+                errors.extend(cell_errors);
+                let mut order = 0;
+                for line in lines {
+                    match line {
+                        MathCellLine::Def { name, expr_text, label } => {
+                            if !def_names.insert(name.clone()) {
+                                errors.push(error::duplicate_definition(&cell.id, &name));
+                            }
+                            defs.push(MathCellDef { cell_id: cell.id.clone(), name, expr_text, label, order });
+                            order += 1;
+                        }
+                        MathCellLine::Const { name, value, unit_display } => {
+                            const_lines.push(ConstLine { cell_id: cell.id.clone(), name, value, unit_display });
+                        }
+                        MathCellLine::Blank | MathCellLine::Comment => {}
                     }
-                    defs.push(MathCellDef { cell_id: cell.id.clone(), name, expr_text, label, order });
-                    order += 1;
                 }
-                MathCellLine::Const { name, value, unit_display } => {
-                    const_lines.push(ConstLine { cell_id: cell.id.clone(), name, value, unit_display });
-                }
-                MathCellLine::Blank | MathCellLine::Comment => {}
             }
+            CellKindToken::Table => {
+                // C2 §4: a table cell's JSON either parses or it doesn't —
+                // eagerly parsed here (unlike a math cell's lazy text),
+                // since there is no per-line partial result to preserve.
+                match table_cell::parse_table_cell(&cell.id, &cell.raw_fence_body) {
+                    Ok(table) => cell.table = Some(table),
+                    Err(e) => errors.push(e),
+                }
+            }
+            CellKindToken::Js => {}
         }
     }
 

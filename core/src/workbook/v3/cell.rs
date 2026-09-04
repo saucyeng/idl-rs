@@ -9,6 +9,8 @@ use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
+use crate::table::TableModel;
+
 use super::error::{self, WorkbookError};
 
 /// A cell's fence-language token (C2 §2.1).
@@ -47,6 +49,14 @@ pub struct CellDoc {
     /// The fence body's literal source text, unparsed — kind-specific
     /// grammars (C2 §3/§4/§5) are later tasks' job.
     pub raw_fence_body: String,
+    /// For a `table` cell (`kind_token == Table`), the fence body eagerly
+    /// parsed as `TableModel` JSON (C2 §4) — `None` when parsing failed
+    /// (the error is collected into [`super::WorkbookDoc`]'s
+    /// `Vec<WorkbookError>` instead) or when `kind_token != Table`. Unlike
+    /// `math` cells, which stay lazy text until evaluation, a table cell's
+    /// JSON either parses or it doesn't — there is no per-line partial
+    /// result to preserve.
+    pub table: Option<TableModel>,
 }
 
 /// Parses a fence's info string against C2 §2.2's `fence_open` grammar:
@@ -166,7 +176,7 @@ pub fn scan_cells(body: &str) -> (Vec<CellDoc>, Option<String>, Vec<WorkbookErro
             }
         };
 
-        cells.push(CellDoc { id, kind_token, prose_before, prose_after: None, raw_fence_body });
+        cells.push(CellDoc { id, kind_token, prose_before, prose_after: None, raw_fence_body, table: None });
         // `range` is the *Start* event's byte range, but it is used here as
         // the fence-close boundary (the next cell's `prose_before` starts
         // right after it). This relies on pulldown-cmark 0.13.4 giving

@@ -37,6 +37,13 @@ pub enum WorkbookErrorKind {
     /// Front matter's `version` key is present and not `3` (C2 §1 — only
     /// *absence* of the key defaults to 3; a wrong value never does).
     UnsupportedWorkbookVersion,
+    /// A `table` cell's fence body does not deserialize as
+    /// [`crate::table::TableModel`] (C2 §4). Provisional pending the C2
+    /// §3.5.A amendment batch (lead ruling R21, `runs/2026-09-03/decisions.md`)
+    /// that lands this kind in the signed contract alongside
+    /// `InvalidFrontMatter`/`InvalidCellId` and L3-R4's `workbook_*` C3
+    /// kinds — this lane codes it now, the lead lands the spec text.
+    InvalidTableJson,
 }
 
 /// Names a `math`-cell definition or a `const` declaration may not use (C2
@@ -144,6 +151,12 @@ pub fn unsupported_workbook_version(n: u32) -> WorkbookError {
         WorkbookErrorKind::UnsupportedWorkbookVersion,
         format!("Workbook version {n} is not supported (expected 3)"),
     )
+}
+
+/// `InvalidTableJson` (C2 §4, lead ruling R21) — `cell_id` is the offending
+/// `table` cell; `detail` is the `serde_json::Error`'s `Display` text.
+pub fn invalid_table_json(cell_id: &str, detail: impl std::fmt::Display) -> WorkbookError {
+    WorkbookError::new(cell_id, WorkbookErrorKind::InvalidTableJson, format!("Table cell JSON is malformed: {detail}"))
 }
 
 #[cfg(test)]
