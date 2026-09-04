@@ -25,8 +25,10 @@ struct ChannelJson<'a> {
     /// Materialized physical samples (transient, owned — the channel stores a
     /// compact `RawColumn`, so there is no resident `&[f64]` to borrow).
     samples: Vec<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sample_times_secs: Option<&'a [f64]>,
+    /// Per-sample time, microseconds since the session's first sample
+    /// (contract C1 §3.1) — every channel carries one now, fixed-rate or
+    /// event-driven, so this is no longer optional.
+    t_us: &'a [i64],
 }
 
 /// Stream `channels` (filtered by `options`) to `w` as nested JSON. `meta`
@@ -43,11 +45,11 @@ pub(crate) fn write_json(
         .iter()
         .map(|c| ChannelJson {
             channel_id: &c.channel_id,
-            sample_rate_hz: c.sample_rate_hz,
+            sample_rate_hz: c.nominal_rate_hz,
             synthesized: synthesized_ids.iter().any(|id| id == &c.channel_id),
-            is_event_driven: c.sample_rate_hz == 0.0,
+            is_event_driven: c.nominal_rate_hz == 0.0,
             samples: c.materialize(),
-            sample_times_secs: c.sample_times_secs.as_deref(),
+            t_us: &c.t_us,
         })
         .collect();
     let export = JsonExport { session: meta.clone(), channels };
@@ -62,9 +64,9 @@ mod tests {
     fn handle_with(channels: Vec<ChannelInput>) -> SessionHandle {
         let meta = SessionMetaInput {
             session_id: "abc".to_string(),
-            device_id: "dev".to_string(),
+            device_id: Some("dev".to_string()),
             timestamp_utc_ms: 1700,
-            config_checksum: "crc".to_string(),
+            config_checksum: Some("crc".to_string()),
         };
         SessionHandle::from_channels(meta, channels)
     }
@@ -74,13 +76,14 @@ mod tests {
     }
 
     #[test]
-    fn json_fixed_rate_channel_has_no_sample_times_field() {
-        // Arrange
+    fn json_fixed_rate_channel_includes_t_us() {
+        // Arrange — 10 Hz, 2 samples → synthetic uniform t_us [0, 100_000] µs.
         let h = handle_with(vec![ChannelInput {
             channel_id: "X".to_string(),
             sample_rate_hz: 10.0,
             samples: vec![1.0, 2.0],
-            sample_times_secs: None,
+            t_us: vec![0, 100_000],
+            source_kind: "x".to_string(),
         }]);
 
         // Act
@@ -93,17 +96,18 @@ mod tests {
         assert_eq!(ch["is_event_driven"], false);
         assert_eq!(ch["synthesized"], false);
         assert_eq!(ch["samples"], serde_json::json!([1.0, 2.0]));
-        assert!(ch.get("sample_times_secs").is_none());
+        assert_eq!(ch["t_us"], serde_json::json!([0, 100_000]));
     }
 
     #[test]
-    fn json_event_channel_includes_sample_times() {
+    fn json_event_channel_includes_t_us() {
         // Arrange
         let h = handle_with(vec![ChannelInput {
             channel_id: "E".to_string(),
             sample_rate_hz: 0.0,
             samples: vec![5.0],
-            sample_times_secs: Some(vec![0.5]),
+            t_us: vec![500_000],
+            source_kind: "e".to_string(),
         }]);
 
         // Act
@@ -113,7 +117,7 @@ mod tests {
         // Assert
         let ch = &v["channels"][0];
         assert_eq!(ch["is_event_driven"], true);
-        assert_eq!(ch["sample_times_secs"], serde_json::json!([0.5]));
+        assert_eq!(ch["t_us"], serde_json::json!([500_000]));
     }
 
     #[test]
@@ -123,7 +127,8 @@ mod tests {
             channel_id: "X".to_string(),
             sample_rate_hz: 10.0,
             samples: vec![0.0, 0.0],
-            sample_times_secs: None,
+            t_us: vec![0, 100_000],
+            source_kind: "x".to_string(),
         }]);
 
         // Act — export all channels (includes synthesized "Time").

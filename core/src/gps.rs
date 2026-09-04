@@ -1,11 +1,11 @@
 //! General GPS utilities: assemble a fix list from the session handle's GPS
 //! channels. Shared by `laps` (gate crossings) and `tracks` (visit detection).
-//! Coordinates are copied at the raw channel-sample scale (degrees × 1e7); no
-//! rescaling happens here.
+//! Coordinates are copied at the channel-sample scale — physical decimal
+//! degrees, ruling R27; no rescaling happens here.
 
 use crate::session::handle::SessionHandle;
 
-/// A GPS position with timestamp. `lat`/`lon` are the raw channel-sample scale.
+/// A GPS position with timestamp. `lat`/`lon` are physical decimal degrees.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GpsFix {
     pub timestamp_ms: i64,
@@ -48,15 +48,22 @@ mod tests {
     fn handle_with(channels: Vec<ChannelInput>) -> SessionHandle {
         let meta = SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         SessionHandle::from_channels(meta, channels)
     }
 
     fn ch(id: &str, samples: Vec<f64>) -> ChannelInput {
-        ChannelInput { channel_id: id.to_string(), sample_rate_hz: 1.0, samples, sample_times_secs: None }
+        let t_us = (0..samples.len() as i64).map(|i| i * 1_000_000).collect();
+        ChannelInput {
+            channel_id: id.to_string(),
+            sample_rate_hz: 1.0,
+            samples,
+            t_us,
+            source_kind: id.to_lowercase(),
+        }
     }
 
     #[test]

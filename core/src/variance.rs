@@ -569,21 +569,22 @@ mod tests {
         fn session(id: &str, bias: f64) -> SessionHandle {
             let meta = SessionMetaInput {
                 session_id: id.into(),
-                device_id: "d".into(),
+                device_id: Some("d".into()),
                 timestamp_utc_ms: 0,
-                config_checksum: String::new(),
+                config_checksum: None,
             };
             let lat = vec![0.0; 11];
             let lon: Vec<f64> = (0..11).map(|i| i as f64 * 0.0001).collect(); // marches east
             let epoch: Vec<f64> = (0..11).map(|i| i as f64 * 1000.0).collect(); // ms, 1 Hz
             let fork: Vec<f64> = (0..11).map(|i| i as f64 + bias).collect();
+            let t_us: Vec<i64> = (0..11).map(|i| i * 1_000_000).collect();
             SessionHandle::from_channels(
                 meta,
                 vec![
-                    ChannelInput { channel_id: "GPS_Latitude".into(), sample_rate_hz: 1.0, samples: lat, sample_times_secs: None },
-                    ChannelInput { channel_id: "GPS_Longitude".into(), sample_rate_hz: 1.0, samples: lon, sample_times_secs: None },
-                    ChannelInput { channel_id: "GPS_EpochMs".into(), sample_rate_hz: 1.0, samples: epoch, sample_times_secs: None },
-                    ChannelInput { channel_id: "Fork".into(), sample_rate_hz: 1.0, samples: fork, sample_times_secs: None },
+                    ChannelInput { channel_id: "GPS_Latitude".into(), sample_rate_hz: 1.0, samples: lat, t_us: t_us.clone(), source_kind: "gps".into() },
+                    ChannelInput { channel_id: "GPS_Longitude".into(), sample_rate_hz: 1.0, samples: lon, t_us: t_us.clone(), source_kind: "gps".into() },
+                    ChannelInput { channel_id: "GPS_EpochMs".into(), sample_rate_hz: 1.0, samples: epoch, t_us: t_us.clone(), source_kind: "gps".into() },
+                    ChannelInput { channel_id: "Fork".into(), sample_rate_hz: 1.0, samples: fork, t_us, source_kind: "fork".into() },
                 ],
             )
         }

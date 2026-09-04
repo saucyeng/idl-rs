@@ -265,15 +265,22 @@ pub fn read_registry_entry_v3(reader: &mut ByteReader) -> Result<ChannelRegistry
 
 /// Parses a GPS_FIX (0x02) record — identical wire format in v2 and v3.
 ///
-/// Emits the eight raw GPS channels (no scale/offset). Optionally seeds the
+/// Emits the eight GPS channels, with lat/lon/alt/heading baked to physical
+/// units at parse time (ruling R27) and no metadata scale/offset. Optionally seeds the
 /// `anchor` from the first non-zero `gps_epoch_ms` (for §5.6 back-fill) and
-/// folds `device_timestamp_us` into `origin` (the event-time zero).
+/// folds `device_timestamp_us` into `origin` (the event-time zero). Pushes
+/// this fix's own `device_ts_us` into `gps_ts` only once every fallible field
+/// read below has succeeded — every GPS channel shares this one per-fix
+/// timestamp as its `t_us` source, and a mid-record truncation must not leave
+/// `gps_ts` ahead of the `GPS_*` columns (C1 §2's mandatory
+/// `t_us.len() == column.len()`).
 pub fn parse_gps_record(
     reader: &mut ByteReader,
     payload_len: usize,
     out: &mut ChannelAccumulator,
     anchor: Option<&mut GpsAnchor>,
     origin: Option<&mut TimeOrigin>,
+    gps_ts: &mut Vec<i64>,
 ) -> Result<(), ParseError> {
     let payload_start = reader.position();
     let gps_epoch_ms = reader.i64("gps_epoch_ms")?;
@@ -295,19 +302,28 @@ pub fn parse_gps_record(
     let fix_quality = reader.u8("fix_quality")?;
     let satellites = reader.u8("satellites")?;
 
+    // Pushed only once every fallible field above has succeeded, mirroring
+    // `parse_channel`'s `channel_ts_us` ordering (v3.rs) — a `.idl0` buffer
+    // truncated mid-GPS-record must not leave `gps_ts` one entry ahead of the
+    // `GPS_*` columns below (C1 §2's mandatory `t_us.len() == column.len()`).
+    gps_ts.push(device_ts_us);
+
     out.push("GPS_EpochMs", gps_epoch_ms as f64);
-    out.push("GPS_Latitude", latitude as f64);
-    out.push("GPS_Longitude", longitude as f64);
-    out.push("GPS_Altitude", altitude as f64);
-    // GPS_SpeedKmh is the one GPS-fix channel returned in physical units. The
+    // GPS_Latitude/Longitude/Altitude/Heading are baked to physical units at
+    // parse time (ruling R27), the same convention already used by
+    // `WheelFront`/`HR_RR`: no metadata `scale`/`offset` key, the division
+    // happens once here instead of in every consumer.
+    out.push("GPS_Latitude", latitude as f64 * 1e-7);
+    out.push("GPS_Longitude", longitude as f64 * 1e-7);
+    out.push("GPS_Altitude", altitude as f64 * 0.1);
+    // GPS_SpeedKmh is the one GPS-fix channel returned via metadata scale. The
     // firmware logs km/h × 100 (§5.6); a 0.01 scale on a compact i32 column makes
     // `materialize()` yield km/h, so Distance synthesis, math expressions, and the
     // colour-by-channel scale all get physical speed without each consumer
-    // dividing (§5.7). Lat/lon/alt/heading stay raw — their consumers apply the
-    // documented ÷1e7 / ÷10 / ÷100.
+    // dividing (§5.7).
     let speed_slot = out.slot_for_i32("GPS_SpeedKmh", 0.01, 0.0);
     out.push_i32_at(speed_slot, speed as i32);
-    out.push("GPS_Heading", heading as f64);
+    out.push("GPS_Heading", heading as f64 * 0.01);
     out.push("GPS_FixQuality", fix_quality as f64);
     out.push("GPS_Satellites", satellites as f64);
 
@@ -361,6 +377,24 @@ pub fn imu_period_us(odr_hz: u16) -> i64 {
 /// artifact this replaces — design §4.1).
 pub fn imu_nominal_rate(period_us: i64) -> f64 {
     1e6 / period_us as f64
+}
+
+/// Maps a generic registry channel name to its `source_kind` token (contract
+/// C1 §4.2). Falls back to the lower-cased channel name for any future
+/// sensor the registry adds without a schema change (SPEC §5.2's
+/// forward-compatibility philosophy, carried into C1 §4.2's `source_kind`
+/// definition verbatim).
+pub fn generic_source_kind(channel_id: &str) -> String {
+    match channel_id {
+        "WheelFront" => "wheel_front",
+        "WheelRear" => "wheel_rear",
+        "PressureFront" => "pressure_front",
+        "PressureRear" => "pressure_rear",
+        "HR_BPM" => "hr_bpm",
+        "HR_RR" => "hr_rr",
+        other => return other.to_lowercase(),
+    }
+    .to_string()
 }
 
 /// IMU index `0..=2` parsed from an `IMU{n}_` channel name, else `None`.
@@ -455,17 +489,19 @@ pub fn build_spans(
     spans
 }
 
-/// Drop-reconciliation plan for the three IMUs, derived once at parse
-/// finalization from the per-IMU first-sample timestamps, received counts, and
-/// drop lists collected in the hot loop. Anchors a single grid at the earliest
-/// IMU first-sample (`t0`), assigns the nominal rate, and rebuilds each IMU axis
-/// onto that grid so all IMU channels end equal-length and time-aligned. Design
-/// §4.
+/// Drop-reconciliation plan for the three IMUs, derived from each IMU's
+/// **burst-seam-corrected** stamp sequence (contract C1 §3.3 — gap detection
+/// runs on the corrected grid, never the nominal one; C1 §3.3/§8 item 1,
+/// ruled). Anchors a single grid at the earliest corrected first-sample
+/// across every reconciled IMU (`t0`, absolute device-clock domain — the
+/// caller subtracts the session-wide origin uniformly afterward, the same
+/// way it already does for every non-IMU channel).
 pub struct ImuGridPlan {
-    /// Nominal grid period (µs) shared by all IMUs.
-    pub period_us: i64,
-    /// Nominal rate (Hz) assigned to every IMU channel.
-    pub nominal_rate: f64,
+    /// Per-IMU corrected period (µs): `effective_period_us` from seam
+    /// correction, or `nominal_period_us` when unreconciled.
+    period_us: [i64; 3],
+    /// Grid origin, absolute device-clock µs.
+    t0: i64,
     /// Leading pad length (slots) per IMU — `round((first - t0) / period)`.
     leading: [usize; 3],
     /// Whether each IMU has ≥2 samples and is therefore reconciled.
@@ -476,42 +512,73 @@ pub struct ImuGridPlan {
     gaps_received: [Vec<(usize, usize)>; 3],
     /// Per-IMU grid-slot gap spans, shared across that IMU's six axes.
     spans: [Vec<GapSpan>; 3],
+    /// The corrected (pre-grid, dense-but-ungapped) stamps this plan was
+    /// built from — kept so `reconcile` can place each kept sample's exact
+    /// corrected time at its slot's `t_recorded_us` entry.
+    corrected: [Vec<i64>; 3],
 }
 
 impl ImuGridPlan {
-    /// Builds the plan from the hot-loop state. `period_us` comes from
-    /// [`imu_period_us`]. IMUs with fewer than two samples are left
-    /// unreconciled (design §6).
-    pub fn build(
-        first: &[Option<i64>; 3],
-        count: &[usize; 3],
-        gaps_received: [Vec<(usize, usize)>; 3],
-        period_us: i64,
+    /// Builds the plan. `corrected[i]` is IMU `i`'s burst-seam-corrected
+    /// stamp sequence (`seam_correction::correct_burst_seams(..).corrected_us`,
+    /// or the raw stamps verbatim for an IMU with <2 samples — correction is
+    /// a no-op there per the burst-correction module). `effective_period_us[i]`
+    /// is that same call's `effective_period_us`. `nominal_period_us` is the
+    /// fallback for an IMU with <2 samples (no correction ran, so no
+    /// effective period exists).
+    pub fn build_from_corrected(
+        corrected: [Vec<i64>; 3],
+        effective_period_us: [i64; 3],
+        nominal_period_us: i64,
     ) -> Self {
-        let nominal_rate = imu_nominal_rate(period_us);
-        // Session t0 = earliest IMU first-sample timestamp across all IMUs.
-        let t0 = first.iter().filter_map(|f| *f).min();
-
+        let mut period_us = [nominal_period_us; 3];
         let mut leading = [0usize; 3];
         let mut occupied = [0usize; 3];
         let mut reconciled = [false; 3];
-        let mut target_len = 0usize;
+        let mut gaps_received: [Vec<(usize, usize)>; 3] = Default::default();
+
+        let t0 = corrected
+            .iter()
+            .filter(|c| c.len() >= 2)
+            .filter_map(|c| c.first().copied())
+            .min();
+
         for i in 0..3 {
-            // < 2 samples → no reconciliation (design §6).
-            if count[i] < 2 {
+            if corrected[i].len() < 2 {
                 continue;
             }
-            let (Some(f), Some(t0v)) = (first[i], t0) else { continue };
+            let Some(t0v) = t0 else { continue };
             reconciled[i] = true;
-            // Leading offset onto the shared grid; f ≥ t0v so the diff is ≥ 0.
-            leading[i] = (((f - t0v) as f64) / period_us as f64).round().max(0.0) as usize;
+            period_us[i] = effective_period_us[i];
+            let first = corrected[i][0];
+            leading[i] = (((first - t0v) as f64) / period_us[i] as f64).round().max(0.0) as usize;
+
+            // Gap detection, once, against the corrected stamps and this
+            // IMU's own effective period — same absolute-slot rule as the
+            // pre-idl1 hot loop (SPEC §15.2), just relocated per C1 §3.3.
+            // Corrected stamps are already strictly increasing (burst
+            // correction's monotonicity guarantee), so there is no
+            // backward-step case to handle here — that was filtered
+            // pre-correction, in the parser's hot loop.
+            let mut last_abs_slot: i64 = 0;
+            for k in 1..corrected[i].len() {
+                let delta = corrected[i][k] - corrected[i][k - 1];
+                let abs_slot = if delta == period_us[i] {
+                    last_abs_slot + 1
+                } else {
+                    ((corrected[i][k] - first) as f64 / period_us[i] as f64).round() as i64
+                };
+                let missing = (abs_slot - last_abs_slot - 1).max(0) as usize;
+                if missing >= 1 {
+                    gaps_received[i].push((k, missing));
+                }
+                last_abs_slot = abs_slot;
+            }
             let total_missing: usize = gaps_received[i].iter().map(|g| g.1).sum();
-            occupied[i] = leading[i] + count[i] + total_missing;
-            target_len = target_len.max(occupied[i]);
+            occupied[i] = leading[i] + corrected[i].len() + total_missing;
         }
 
-        // Gap spans depend on the session-wide target_len, so build them after it
-        // is known.
+        let target_len = occupied.iter().copied().max().unwrap_or(0);
         let mut spans: [Vec<GapSpan>; 3] = Default::default();
         for i in 0..3 {
             if reconciled[i] {
@@ -521,33 +588,104 @@ impl ImuGridPlan {
 
         ImuGridPlan {
             period_us,
-            nominal_rate,
+            t0: t0.unwrap_or(0),
             leading,
             reconciled,
             target_len,
             gaps_received,
             spans,
+            corrected,
         }
     }
 
-    /// Reconciles one channel by name. IMU axes of a reconciled IMU are rebuilt
-    /// onto the shared grid and returned with that IMU's gap spans; every other
-    /// channel passes through unchanged with an empty gap list.
-    pub fn reconcile(&self, name: &str, column: RawColumn) -> (RawColumn, Vec<GapSpan>) {
+    /// Reconciles one channel by name: rebuilds its value column onto the
+    /// grid (unchanged fill logic — held-edge pads, linear interior fills),
+    /// and returns `(column, t_us, t_recorded_us, gaps)` — `t_us` is the
+    /// pure uniform grid (absolute device-clock µs, same domain as `t0`);
+    /// `t_recorded_us` is dense and equals the real corrected stamp at every
+    /// kept slot, and is **unspecified at every slot inside `gaps`** (callers
+    /// must consult `gaps`, never infer nullness from content — see this
+    /// module's doc for the reasoning). Every non-IMU channel passes
+    /// through with `t_us`/`t_recorded_us` empty and an empty gap list (the
+    /// caller already has real `t_us` for those from its own recorded-time
+    /// bookkeeping).
+    pub fn reconcile(&self, name: &str, column: RawColumn) -> (RawColumn, Vec<i64>, Vec<i64>, Vec<GapSpan>) {
         match imu_index_of(name) {
-            Some(i) if self.reconciled[i] => match column {
-                RawColumn::I16 { data, scale, offset } => {
-                    let rebuilt =
-                        rebuild_i16(&data, &self.gaps_received[i], self.leading[i], self.target_len);
-                    (RawColumn::I16 { data: rebuilt, scale, offset }, self.spans[i].clone())
+            Some(i) if self.reconciled[i] => {
+                let t_us: Vec<i64> = (0..self.target_len)
+                    .map(|slot| self.t0 + (slot as i64) * self.period_us[i])
+                    .collect();
+                let t_recorded_us = rebuild_i64_grid_or_real(
+                    &self.corrected[i], &self.gaps_received[i], self.leading[i], self.target_len, &t_us,
+                );
+                match column {
+                    RawColumn::I16 { data, scale, offset } => {
+                        let rebuilt = rebuild_i16(&data, &self.gaps_received[i], self.leading[i], self.target_len);
+                        (RawColumn::I16 { data: rebuilt, scale, offset }, t_us, t_recorded_us, self.spans[i].clone())
+                    }
+                    // IMU axes are always compact i16 on the parse path; pass any
+                    // other variant through untouched rather than panic.
+                    other => (other, t_us, t_recorded_us, self.spans[i].clone()),
                 }
-                // IMU axes are always compact i16 on the parse path; pass any
-                // other variant through untouched rather than panic.
-                other => (other, Vec::new()),
-            },
-            _ => (column, Vec::new()),
+            }
+            _ => (column, Vec::new(), Vec::new(), Vec::new()),
         }
     }
+}
+
+/// Builds a dense `t_recorded_us` array for one IMU's grid: at a slot that
+/// holds a real (non-synthesized) sample, its exact corrected timestamp; at
+/// every other slot (leading pad, interior fill, trailing pad — all covered
+/// by a `GapSpan`), the corresponding value from `grid_t_us` (a harmless,
+/// documented placeholder — see [`ImuGridPlan::reconcile`]'s doc). Mirrors
+/// `rebuild_i16`'s fill-pattern walk exactly, but placing real/placeholder
+/// timestamps rather than interpolating values.
+fn rebuild_i64_grid_or_real(
+    corrected: &[i64],
+    gaps_received: &[(usize, usize)],
+    leading: usize,
+    target_len: usize,
+    grid_t_us: &[i64],
+) -> Vec<i64> {
+    if corrected.is_empty() {
+        return Vec::new();
+    }
+    // Real/placeholder is tracked per index (not by sentinel-value
+    // collision), so a real corrected timestamp of exactly `0` — never
+    // physically possible for a device clock, but not worth relying on
+    // implicitly — cannot be mistaken for a placeholder.
+    let mut out: Vec<i64> = Vec::with_capacity(target_len);
+    let mut is_real: Vec<bool> = Vec::with_capacity(target_len);
+    out.resize(leading, 0);
+    is_real.resize(leading, false);
+    out.push(corrected[0]);
+    is_real.push(true);
+    let mut gi = 0usize;
+    for k in 1..corrected.len() {
+        let missing = if gi < gaps_received.len() && gaps_received[gi].0 == k {
+            let m = gaps_received[gi].1;
+            gi += 1;
+            m
+        } else {
+            0
+        };
+        for _ in 0..missing {
+            out.push(0);
+            is_real.push(false);
+        }
+        out.push(corrected[k]);
+        is_real.push(true);
+    }
+    if out.len() < target_len {
+        out.resize(target_len, 0);
+        is_real.resize(target_len, false);
+    }
+    for (i, real) in is_real.iter().enumerate() {
+        if !*real && i < grid_t_us.len() {
+            out[i] = grid_t_us[i];
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -723,35 +861,45 @@ mod tests {
 
     #[test]
     fn plan_reconciles_single_imu_axis_onto_grid() {
-        // Arrange — IMU0 is t0; 3 samples; 1 missing before received index 2.
-        let gaps = [vec![(2usize, 1usize)], Vec::new(), Vec::new()];
-        let plan = ImuGridPlan::build(&[Some(0), None, None], &[3, 0, 0], gaps, 1000);
+        // Arrange — IMU0 corrected stamps: 0, 1000 (exact period), 3000 (a
+        // 2000 µs jump → 1 sample missing before received index 2).
+        let corrected = [vec![0i64, 1000, 3000], Vec::new(), Vec::new()];
+        let plan = ImuGridPlan::build_from_corrected(corrected, [1000, 1000, 1000], 1000);
 
         // Act — raw [0, 10, 30]; one fill (20) between 10 and 30.
-        let (col, spans) = plan.reconcile(
+        let (col, t_us, t_recorded_us, spans) = plan.reconcile(
             "IMU0_AccelX",
             RawColumn::I16 { data: vec![0, 10, 30], scale: 1.0, offset: 0.0 },
         );
 
-        // Assert
+        // Assert — value fill unchanged; t_us is the pure uniform grid;
+        // t_recorded_us carries the real corrected stamp at every kept slot.
         assert_eq!(col.materialize(), vec![0.0, 10.0, 20.0, 30.0]);
         assert_eq!(spans, vec![GapSpan { start: 2, len: 1 }]);
-        assert_eq!(plan.nominal_rate, 1000.0);
+        assert_eq!(t_us, vec![0, 1000, 2000, 3000]);
+        assert_eq!(t_recorded_us[0], 0);
+        assert_eq!(t_recorded_us[1], 1000);
+        assert_eq!(t_recorded_us[3], 3000);
     }
 
     #[test]
     fn plan_makes_two_imus_with_different_drops_equal_length() {
-        // Arrange — IMU0: 4 received, a 2-sample drop (occupied 6).
-        //           IMU1: 5 received, no drops (occupied 5). target = 6.
-        let gaps = [vec![(1usize, 2usize)], Vec::new(), Vec::new()];
-        let plan = ImuGridPlan::build(&[Some(0), Some(0), None], &[4, 5, 0], gaps, 1000);
+        // Arrange — IMU0: 4 corrected stamps with a 2-sample gap between
+        // received index 0 and 1 (occupied 6). IMU1: 5 received, no drops
+        // (occupied 5). target = 6.
+        let corrected = [
+            vec![0i64, 3000, 4000, 5000],
+            vec![0i64, 1000, 2000, 3000, 4000],
+            Vec::new(),
+        ];
+        let plan = ImuGridPlan::build_from_corrected(corrected, [1000, 1000, 1000], 1000);
 
         // Act
-        let (c0, _) = plan.reconcile(
+        let (c0, _, _, _) = plan.reconcile(
             "IMU0_AccelX",
             RawColumn::I16 { data: vec![0, 10, 20, 30], scale: 1.0, offset: 0.0 },
         );
-        let (c1, _) = plan.reconcile(
+        let (c1, _, _, _) = plan.reconcile(
             "IMU1_AccelX",
             RawColumn::I16 { data: vec![1, 2, 3, 4, 5], scale: 1.0, offset: 0.0 },
         );
@@ -764,31 +912,95 @@ mod tests {
     #[test]
     fn plan_passes_through_non_imu_channels_unchanged() {
         // Arrange
-        let plan =
-            ImuGridPlan::build(&[Some(0), None, None], &[3, 0, 0], Default::default(), 1000);
+        let corrected = [vec![0i64, 1000, 2000], Vec::new(), Vec::new()];
+        let plan = ImuGridPlan::build_from_corrected(corrected, [1000, 1000, 1000], 1000);
 
         // Act
-        let (col, spans) = plan.reconcile("GPS_Latitude", RawColumn::F64(vec![1.0, 2.0]));
+        let (col, t_us, t_recorded_us, spans) =
+            plan.reconcile("GPS_Latitude", RawColumn::F64(vec![1.0, 2.0]));
 
         // Assert
         assert_eq!(col.materialize(), vec![1.0, 2.0]);
+        assert!(t_us.is_empty());
+        assert!(t_recorded_us.is_empty());
         assert!(spans.is_empty());
     }
 
     #[test]
     fn plan_leaves_under_two_sample_imu_unreconciled() {
         // Arrange — a single-sample IMU is not reconciled (design §6).
-        let plan =
-            ImuGridPlan::build(&[Some(0), None, None], &[1, 0, 0], Default::default(), 1000);
+        let corrected = [vec![42i64], Vec::new(), Vec::new()];
+        let plan = ImuGridPlan::build_from_corrected(corrected, [1000, 1000, 1000], 1000);
 
         // Act
-        let (col, spans) = plan.reconcile(
+        let (col, t_us, t_recorded_us, spans) = plan.reconcile(
             "IMU0_AccelX",
             RawColumn::I16 { data: vec![42], scale: 1.0, offset: 0.0 },
         );
 
-        // Assert — column unchanged, no gaps.
+        // Assert — column unchanged, no gaps, no grid/recorded time (unreconciled).
         assert_eq!(col.materialize(), vec![42.0]);
+        assert!(t_us.is_empty());
+        assert!(t_recorded_us.is_empty());
         assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn parse_gps_record_truncated_mid_record_keeps_gps_ts_in_sync_with_columns() {
+        // Arrange — a full first GPS fix, followed by a second fix whose
+        // buffer physically ends after `device_timestamp_us` but before the
+        // remaining five fallible fields (`latitude`..`satellites`) can be
+        // read — the real "buffer ended mid-record" recovery path `parse_v3`
+        // already documents.
+        use crate::parse::test_buffers::gps_payload;
+
+        let full = gps_payload(1_704_110_400_000, 1_000, 10, 20, 30, 40, 50, 1, 8);
+        let mut second = gps_payload(0, 2_000, 0, 0, 0, 0, 0, 0, 0);
+        second.truncate(18); // gps_epoch_ms(8) + device_ts_us(8) + 2 of latitude's 4 bytes
+        let mut buf = full.clone();
+        buf.extend_from_slice(&second);
+        let mut reader = ByteReader::new(&buf);
+        let mut acc = ChannelAccumulator::new();
+        let mut gps_ts: Vec<i64> = Vec::new();
+
+        // Act
+        parse_gps_record(&mut reader, full.len(), &mut acc, None, None, &mut gps_ts).unwrap();
+        let err = parse_gps_record(&mut reader, full.len(), &mut acc, None, None, &mut gps_ts);
+
+        // Assert — the second call reports the truncation and every GPS_*
+        // column still has exactly as many samples as `gps_ts` (C1 §2).
+        assert!(matches!(err, Err(ParseError::TruncatedRecord(_))));
+        assert_eq!(gps_ts.len(), 1);
+        let entries = acc.into_entries();
+        assert_eq!(entries.len(), 8);
+        for (name, col) in &entries {
+            assert_eq!(
+                col.materialize().len(),
+                gps_ts.len(),
+                "{name}: t_us/column length mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_i64_grid_or_real_fills_a_gap_even_when_the_first_real_stamp_is_exactly_zero() {
+        // Arrange — a real corrected timestamp of exactly 0 at index 0 (a
+        // legitimate, if rare, value — this plan's Open questions flagged a
+        // 0-sentinel placeholder-then-overwrite approach as a rough edge
+        // precisely because a naive "is it 0?" check would treat this real
+        // value as a placeholder and, depending on implementation, disable
+        // filling for the whole array). Received [0, 1000, 3000] with a
+        // 1-sample gap before received index 2 (period 1000).
+        let corrected = vec![0i64, 1000, 3000];
+        let gaps = vec![(2usize, 1usize)];
+        let grid_t_us = vec![0i64, 1000, 2000, 3000];
+
+        // Act
+        let out = rebuild_i64_grid_or_real(&corrected, &gaps, 0, 4, &grid_t_us);
+
+        // Assert — the real 0 at slot 0 is preserved as a real value, AND the
+        // synthesized slot 2 is correctly filled from the grid (2000), not
+        // left at the internal placeholder.
+        assert_eq!(out, vec![0, 1000, 2000, 3000]);
     }
 }

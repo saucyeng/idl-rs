@@ -47,10 +47,25 @@ mod tests {
         assert_eq!(t.sector_gates.len(), 1);
         assert_eq!(t.sector_gates[0].name, "S1");
         assert_eq!(t.reference_polyline.len(), 1);
-        assert_eq!(t.reference_polyline[0].lat, 501163000.0);
+        assert_eq!(t.reference_polyline[0].lat, 501163000.0 / 1e7);
         // track_ref carries id + polyline.
         assert_eq!(t.track_ref().track_id, "t-1");
         assert_eq!(t.track_ref().polyline.len(), 1);
+    }
+
+    #[test]
+    fn parse_track_wire_created_and_updated_at_ms_are_carried_into_domain_track() {
+        // Arrange — a track_id whose created_at_ms/updated_at_ms differ, so a
+        // field swap or a dropped value would be caught.
+        let json = r#"{"track_artifact_version":1,"track":{"track_id":"t","name":"n",
+            "created_at_ms":1000,"updated_at_ms":2000}}"#;
+
+        // Act
+        let t = parse_track(json.as_bytes()).unwrap();
+
+        // Assert
+        assert_eq!(t.created_at_ms, 1000);
+        assert_eq!(t.updated_at_ms, 2000);
     }
 
     #[test]

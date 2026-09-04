@@ -1,5 +1,5 @@
 //! Gate-crossing geometry: a flat-earth 2D segment intersection — scale-
-//! invariant, so it works on the raw degrees × 1e7 coordinates without
+//! invariant, so it works on physical decimal-degree coordinates without
 //! conversion. Verbatim port of the Dart `LapDetector._findCrossings`.
 
 use crate::gps::GpsFix;

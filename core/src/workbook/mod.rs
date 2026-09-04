@@ -5,6 +5,7 @@
 pub mod apply;
 pub mod model;
 pub mod read;
+pub mod v3;
 
 pub use apply::{apply_workbook, ApplyReport, ChannelApplyResult};
 pub use model::{Workbook, WorkbookTable, SUPPORTED_WORKBOOK_VERSION};

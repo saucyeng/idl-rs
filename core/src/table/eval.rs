@@ -161,8 +161,14 @@ impl ChannelLookup for CellLookup<'_> {
             return None;
         }
         // Rate is whatever the source channel reports; aggregates ignore it, and
-        // a cell must reduce to a scalar so the rate is never surfaced.
-        Some(LookupChannel { samples: std::sync::Arc::from(samples), sample_rate_hz: 0.0 })
+        // a cell must reduce to a scalar so the rate is never surfaced. Rate-0
+        // presentation — t_us is the "no time axis" marker (L3-R12), never a
+        // synthetic ramp.
+        Some(LookupChannel {
+            samples: std::sync::Arc::from(samples),
+            sample_rate_hz: 0.0,
+            t_us: std::sync::Arc::from(&[] as &[i64]),
+        })
     }
     /// Populate the estimator's outputs into the session store via the handle,
     /// then read the channel back through [`Self::lookup`] so a table cell
@@ -520,9 +526,9 @@ mod tests {
         // template max([Fork]); delta col template {fmax} - min({fmax[]}).
         let meta = SessionMetaInput {
             session_id: "s".into(),
-            device_id: "d".into(),
+            device_id: Some("d".into()),
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(
             meta,
@@ -530,7 +536,8 @@ mod tests {
                 channel_id: "Fork".into(),
                 sample_rate_hz: 10.0,
                 samples: (0..10).map(|i| i as f64).collect(),
-                sample_times_secs: None,
+                t_us: (0..10).map(|i| i * 100_000).collect(),
+                source_kind: "fork".into(),
             }],
         );
         let t = TableModel {
@@ -566,9 +573,9 @@ mod tests {
         // No channels needed — cycle short-circuits before evaluation.
         let meta = SessionMetaInput {
             session_id: "s".into(),
-            device_id: "d".into(),
+            device_id: Some("d".into()),
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(meta, vec![]);
         let res = evaluate_table(&h, &t, &[None, None]);
@@ -583,17 +590,19 @@ mod tests {
         fn handle(id: &str, samples: Vec<f64>) -> SessionHandle {
             let meta = SessionMetaInput {
                 session_id: id.into(),
-                device_id: "d".into(),
+                device_id: Some("d".into()),
                 timestamp_utc_ms: 0,
-                config_checksum: String::new(),
+                config_checksum: None,
             };
+            let t_us = (0..samples.len() as i64).map(|i| i * 100_000).collect();
             SessionHandle::from_channels(
                 meta,
                 vec![ChannelInput {
                     channel_id: "Fork".into(),
                     sample_rate_hz: 10.0,
                     samples,
-                    sample_times_secs: None,
+                    t_us,
+                    source_kind: "fork".into(),
                 }],
             )
         }
@@ -633,9 +642,9 @@ mod tests {
         // Arrange — single-handle path still works through the delegate.
         let meta = SessionMetaInput {
             session_id: "s".into(),
-            device_id: "d".into(),
+            device_id: Some("d".into()),
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
         };
         let h = SessionHandle::from_channels(
             meta,
@@ -643,7 +652,8 @@ mod tests {
                 channel_id: "Fork".into(),
                 sample_rate_hz: 10.0,
                 samples: (0..10).map(|i| i as f64).collect(),
-                sample_times_secs: None,
+                t_us: (0..10).map(|i| i * 100_000).collect(),
+                source_kind: "fork".into(),
             }],
         );
         let t = TableModel {

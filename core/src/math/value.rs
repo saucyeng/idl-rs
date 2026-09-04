@@ -18,6 +18,18 @@ pub struct ChannelValue {
     /// `[ChannelName]` reference; `None` for derived (function/arithmetic)
     /// results. Used by `variance_*` to find the matching overlay channel.
     pub channel_id: Option<String>,
+    /// Per-sample recording time, **microseconds since the session's first
+    /// sample** — the C1 §8 item 5 resolution: this is the same clock as
+    /// [`crate::session::Channel::t_us`], carried through evaluation so a
+    /// derived channel stays aligned to its source's *real* recorded time
+    /// rather than a fabricated `i / rate` ramp. `samples.len() == t_us.len()`
+    /// whenever `t_us` is non-empty. Empty is the explicit "no established
+    /// time axis" marker — used for scalar-as-channel results, rate-0 table
+    /// columns, and any value with no single source channel to inherit from
+    /// (e.g. an FFT's frequency bins); never filled with a synthetic ramp.
+    /// An `Arc<[i64]>` for the same reason `samples` is: shared, not
+    /// re-copied, across every reference to one widened channel.
+    pub t_us: Arc<[i64]>,
 }
 
 /// A 3-vector intermediate value: three component values sharing the
@@ -64,6 +76,7 @@ mod tests {
             samples: vec![1.0, 2.0, 3.0].into(),
             sample_rate_hz: 100.0,
             channel_id: Some("IMU0_AccelZ".to_string()),
+            t_us: Arc::from(&[] as &[i64]),
         });
 
         // Assert
@@ -94,6 +107,7 @@ mod tests {
                 samples: vec![3.0, 4.0].into(),
                 sample_rate_hz: 10.0,
                 channel_id: None,
+                t_us: Arc::from(&[] as &[i64]),
             }),
         }));
 

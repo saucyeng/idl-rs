@@ -7,10 +7,14 @@
 //! are out of scope for the engine's parse output (roadmap Phase 5).
 
 pub mod column;
+pub mod filename;
 pub mod handle;
+pub mod seam_correction;
 pub mod synthesis;
+pub mod time_map;
 
 pub use column::RawColumn;
+pub use seam_correction::{ImportWarning, ImportWarningKind};
 
 use std::fmt;
 
@@ -73,16 +77,15 @@ pub struct ChannelRegistryEntry {
     pub units: String,
 }
 
-/// A contiguous run of synthesized samples on a reconciled IMU grid.
+/// A contiguous run of synthesized samples on a reconciled grid.
 ///
 /// `start` is the grid-slot index of the first synthesized sample; `len` is the
-/// run length in slots. Produced by IMU drop reconciliation (§15): each run is
-/// either a linearly-interpolated interior fill (a real dropped-sample event) or
-/// a held-edge leading/trailing pad. Coordinates are grid slots — the same as a
-/// channel's sample indices — and a run is **shared across an IMU's six axes**
-/// (the same drops affect every axis). It is the honest record of every region
-/// the parser filled to put all IMUs on one nominal grid. No consumers ship in
-/// the change that introduced it (see the drop-reconciliation design §5).
+/// run length in slots. Produced by IMU drop reconciliation (SPEC §15.2): each
+/// run is either a linearly-interpolated interior fill (a real dropped-sample
+/// event) or a held-edge leading/trailing pad, computed on the burst-seam-corrected
+/// grid (contract C1 §3.3) rather than the nominal one. Coordinates are grid
+/// slots — the same as a channel's sample indices — and a run is **shared
+/// across an IMU's six axes** (the same drops affect every axis).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GapSpan {
     /// Grid-slot index of the first synthesized sample in the run.
@@ -91,44 +94,198 @@ pub struct GapSpan {
     pub len: usize,
 }
 
-/// Time-series data for a single sensor channel within a session. See §15.
+/// Which importer produced a [`Session`]. Serializes to the `source_format`
+/// `data.parquet` file-metadata string (contract C1 §4.3) lowercase, verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceFormat {
+    /// `.idl0` binary log from an IDL0 device.
+    Idl0,
+    /// Garmin/Wahoo/etc. `.fit` activity file.
+    Fit,
+    /// Garmin Connect/Strava-style `.gpx` track.
+    Gpx,
+    /// Generic `.csv` import (low priority — design doc D4).
+    Csv,
+}
+
+impl SourceFormat {
+    /// The lowercase wire token this variant serializes to (contract C1 §4.3
+    /// `source_format` file-metadata value).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SourceFormat::Idl0 => "idl0",
+            SourceFormat::Fit => "fit",
+            SourceFormat::Gpx => "gpx",
+            SourceFormat::Csv => "csv",
+        }
+    }
+}
+
+/// Time-series data for a single sensor channel within a session. See §15.2
+/// and contract C1 §2/§3.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Channel {
     /// Registry name for this channel, e.g. `IMU0_AccelZ` or `WheelFront`.
     pub channel_id: String,
-    /// Nominal sample rate in Hz. 0 indicates event-driven (variable rate).
-    pub sample_rate_hz: f64,
-    /// Compact, typed sample storage. Physical f64 is materialized on demand via
-    /// [`Channel::materialize`] (registry `scale`/`offset` applied lazily; GPS,
-    /// synthesized, and math channels are stored verbatim f64). See the
-    /// compact-raw-storage design spec.
+    /// Per-sample time, **microseconds since the session's first sample**
+    /// (contract C1 §3.1). One entry per sample in `column`;
+    /// `t_us.len() == column.len()`. Strictly increasing (C1 §3.5 invariant
+    /// 1) — traces back to a recorded device/GPS/FIT/GPX timestamp, verbatim
+    /// or burst-corrected, **never** `i / nominal_rate_hz` (invariant 4),
+    /// except the documented synthesis exception on `Time`/`Distance` (see
+    /// `session::synthesis`'s doc comment).
+    pub t_us: Vec<i64>,
+    /// Verbatim recorded time, **before** burst-seam correction (contract
+    /// C1 §3.2's `<source>_t_recorded_us`), same length/units/origin as
+    /// `t_us`. `None` when identical to `t_us` element-for-element by
+    /// construction (every non-IMU source, and any IMU channel session
+    /// with no burst correction applied yet) — avoids duplicating identical
+    /// data in RAM; `Some` only once §3.3 correction has actually moved a
+    /// value (Task 6). **This field is not explicit in C1 §2's struct
+    /// listing** — C1 §1 states the module layout implementing §2–§7 is
+    /// L1's own call, and C1 §4.1 requires both `t` (corrected) and
+    /// `_t_recorded_us` (verbatim) as separate, independently-readable
+    /// `data.parquet` columns; once correction diverges them for IMU
+    /// sources, the in-memory model needs to carry both, or the verbatim
+    /// value is unrecoverable at Parquet-write time. See this plan's Open
+    /// questions.
+    pub t_recorded_us: Option<Vec<i64>>,
+    /// Nominal sample rate in Hz — **metadata only**, never used to derive a
+    /// sample's time. `0.0` for event-driven channels.
+    pub nominal_rate_hz: f64,
+    /// Compact, typed sample storage. Physical f64 is materialized on demand
+    /// via [`Channel::materialize`].
     pub column: RawColumn,
-    /// Per-sample times in seconds for event-driven channels (`sample_rate_hz == 0`),
-    /// relative to session t=0 (earliest record `timestamp_us`). `None` for
-    /// fixed-rate channels, whose sample `i` is implicitly at `i / sample_rate_hz`.
-    pub sample_times_secs: Option<Vec<f64>>,
-    /// Synthesized-sample runs from IMU drop reconciliation (§15), in grid-slot
-    /// coordinates. Empty for every non-IMU channel and for any IMU channel with
-    /// no drops. Shared across an IMU's six axes. Recorded, not yet consumed.
+    /// Which recorded-timestamp source this channel's `t_us` was derived
+    /// from — one of the `source_kind` tokens contract C1 §4.2 enumerates
+    /// (`imu0`, `imu1`, `imu2`, `gps`, `wheel_front`, `wheel_rear`,
+    /// `pressure_front`, `pressure_rear`, `hr_bpm`, `hr_rr`, `fit`, `gpx`),
+    /// or `"synthesized"` for the engine's own `Time`/`Distance` channels
+    /// (not one of C1's wire `source_kind` tokens — those never round-trip
+    /// through `data.parquet` at all, so there is no metadata-key collision
+    /// to avoid; see C1 §2's `RawColumn` round-trip table).
+    pub source_kind: String,
+    /// Physical unit string (contract C1 §4.1's per-channel `unit` values,
+    /// e.g. `g`, `dps`, `km/h`, `deg`, `pulse`, `bar`, `bpm`). **Not
+    /// explicit in C1 §2's struct listing** — C1 §4.2 mandates a `unit`
+    /// column-metadata value on every `data.parquet` channel column
+    /// *always*, and the only place that value already exists today is the
+    /// registry's `ChannelRegistryEntry.units` (currently read at parse
+    /// time and discarded); this field carries it forward. Empty string for
+    /// engine-synthesized channels (`Time`: `s`, `Distance`: `m` — set
+    /// explicitly, not left empty, since both have an unambiguous physical
+    /// unit) and for any channel this session has no unit information for.
+    /// See this plan's Open questions.
+    pub unit: String,
+    /// Synthesized-sample runs from drop reconciliation (SPEC §15.2),
+    /// unchanged semantics from the pre-idl1 engine: empty for every channel
+    /// with no drops.
     pub gaps: Vec<GapSpan>,
 }
 
 impl Channel {
-    /// Construct a channel from physical f64 samples (verbatim `RawColumn::F64`).
-    /// The construction path for synthesized/GPX/math channels and tests.
-    pub fn from_f64(
+    /// Construct a channel from physical f64 samples with **synthetic
+    /// uniform** per-sample time (`t_us[i] = round(i * 1e6 / rate)` for
+    /// `rate > 0`, all-zero for `rate == 0` with an explicit `t_us` override
+    /// via [`Channel::from_f64_with_times`]).
+    ///
+    /// **Scoped, documented exception to C1 §3.5 invariant 4:** this
+    /// constructor is for the interior-mutable derived-channel store
+    /// (`SessionHandle`'s math-output and lap-slice entries) and test
+    /// fixtures — ephemeral, in-process channels that are never written to
+    /// `data.parquet` and are not subject to the *imported/canonical-file*
+    /// time invariant, which governs what a session's *persisted* channels
+    /// may claim about recorded time. A math-channel output computed
+    /// pointwise from a real channel should prefer
+    /// [`Channel::from_f64_with_times`] with the source's own `t_us` so its
+    /// samples stay aligned to real recorded time; `from_f64` remains for
+    /// callers (today: `SessionHandle::store_math`'s legacy call sites,
+    /// synthesized test channels) where no source `t_us` is at hand. See
+    /// this plan's Open questions for the reasoning.
+    pub fn from_f64(channel_id: impl Into<String>, nominal_rate_hz: f64, samples: Vec<f64>) -> Self {
+        let t_us = if nominal_rate_hz > 0.0 {
+            (0..samples.len())
+                .map(|i| (i as f64 * 1_000_000.0 / nominal_rate_hz).round() as i64)
+                .collect()
+        } else {
+            vec![0; samples.len()]
+        };
+        Channel {
+            channel_id: channel_id.into(),
+            t_us,
+            t_recorded_us: None,
+            nominal_rate_hz,
+            column: RawColumn::F64(samples),
+            source_kind: "synthesized".to_string(),
+            unit: String::new(),
+            gaps: Vec::new(),
+        }
+    }
+
+    /// Construct a channel from physical f64 samples with explicit,
+    /// caller-supplied `t_us` (µs since the session's first sample) — the
+    /// path for event-driven and imported channels, and for math outputs
+    /// that carry a real source's per-sample time forward. `t_us.len()` must
+    /// equal `samples.len()`; not enforced here (a length mismatch degrades
+    /// gracefully — [`Channel::len`] reads `column.len()`, so extra/missing
+    /// `t_us` entries are simply unreachable/absent rather than panicking,
+    /// CLAUDE.md §5).
+    pub fn from_f64_with_times(
         channel_id: impl Into<String>,
-        sample_rate_hz: f64,
+        nominal_rate_hz: f64,
         samples: Vec<f64>,
-        sample_times_secs: Option<Vec<f64>>,
+        t_us: Vec<i64>,
+        source_kind: impl Into<String>,
     ) -> Self {
         Channel {
             channel_id: channel_id.into(),
-            sample_rate_hz,
+            t_us,
+            t_recorded_us: None,
+            nominal_rate_hz,
             column: RawColumn::F64(samples),
-            sample_times_secs,
+            source_kind: source_kind.into(),
+            unit: String::new(),
             gaps: Vec::new(),
         }
+    }
+
+    /// Like [`Channel::from_f64_with_times`], but with an explicit,
+    /// possibly-different `t_recorded_us` (post burst-seam-correction
+    /// construction path — Task 6).
+    pub fn from_f64_corrected(
+        channel_id: impl Into<String>,
+        nominal_rate_hz: f64,
+        samples: Vec<f64>,
+        t_us: Vec<i64>,
+        t_recorded_us: Vec<i64>,
+        source_kind: impl Into<String>,
+    ) -> Self {
+        Channel {
+            channel_id: channel_id.into(),
+            t_us,
+            t_recorded_us: Some(t_recorded_us),
+            nominal_rate_hz,
+            column: RawColumn::F64(samples),
+            source_kind: source_kind.into(),
+            unit: String::new(),
+            gaps: Vec::new(),
+        }
+    }
+
+    /// Sets `unit` (builder-style, since every other constructor defaults it
+    /// to empty — most callers that care about a real unit are the parser,
+    /// which knows it only after construction, from the channel registry).
+    pub fn with_unit(mut self, unit: impl Into<String>) -> Self {
+        self.unit = unit.into();
+        self
+    }
+
+    /// The verbatim recorded time for this channel (contract C1 §3.2) —
+    /// `t_recorded_us` when correction actually diverged it, else `t_us`
+    /// itself (the two are identical by construction whenever
+    /// `t_recorded_us` is `None`).
+    pub fn t_recorded_us_or_t_us(&self) -> &[i64] {
+        self.t_recorded_us.as_deref().unwrap_or(&self.t_us)
     }
 
     /// Number of samples in the channel.
@@ -161,37 +318,47 @@ impl Channel {
         self.column.min_max()
     }
 
-    /// Duration of this channel's data in milliseconds.
-    ///
-    /// Fixed-rate: `len / sample_rate_hz × 1000`. Event-driven
-    /// (`sample_rate_hz == 0`): last `sample_times_secs` entry in ms, or 0
-    /// when no per-sample times are available. Matches Dart `ChannelData.durationMs`.
+    /// Duration of this channel's own data span, in milliseconds:
+    /// `(t_us.last() - t_us.first()) / 1000`, rounded. `0` when the channel
+    /// has fewer than 2 samples. **Changed from the pre-idl1 formula**
+    /// (`len / sample_rate_hz × 1000` for fixed-rate, last event time for
+    /// event-driven) — `t_us` is now mandatory and session-relative (C1
+    /// §3.1), so both cases collapse into one formula that reads real
+    /// recorded/corrected time instead of assuming a rate.
     pub fn duration_ms(&self) -> i64 {
-        if self.sample_rate_hz == 0.0 {
-            match &self.sample_times_secs {
-                Some(times) if !times.is_empty() => (times[times.len() - 1] * 1000.0).round() as i64,
-                _ => 0,
+        match (self.t_us.first(), self.t_us.last()) {
+            (Some(&first), Some(&last)) if last > first => {
+                ((last - first) as f64 / 1000.0).round() as i64
             }
-        } else {
-            ((self.len() as f64 / self.sample_rate_hz) * 1000.0).round() as i64
+            _ => 0,
         }
     }
 }
 
-/// In-memory representation of a parsed `.idl0` session. The `.idl0` file is the
-/// source of truth; this is the parsed view. Lap/sector/workspace data lives in
-/// the companion `.idl0w` file (Phase 5) and is not part of the parse output.
+/// In-memory representation of one imported session — the parsed/converted
+/// view of one immutable source blob (contract C1 §2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
-    /// UUID matching the session header, 32-char lowercase hex (empty for v1).
+    /// Stable identity. The device's session UUID (32-char lowercase hex)
+    /// for `.idl0` sources; a prefix of `blob_sha256` for FIT/GPX/CSV
+    /// sources (exact derivation: contract C4 §3).
     pub session_id: String,
-    /// Device ID, 12-char lowercase hex (empty for v1).
-    pub device_id: String,
-    /// Session start in UTC milliseconds, GPS-anchored when available.
+    /// 12-char lowercase hex MAC-derived device id. `None` for FIT/GPX/CSV
+    /// — there is no device.
+    pub device_id: Option<String>,
+    /// Session start, UTC milliseconds since the Unix epoch. `0` means
+    /// "unknown" (SPEC §5.1 sentinel convention, unchanged).
     pub timestamp_utc_ms: i64,
-    /// CRC32 of `idl0_config.json` at recording time, 8-char lowercase hex (empty for v1).
-    pub config_checksum: String,
-    /// Parsed channel data, one entry per enabled channel, in first-seen order.
+    /// CRC32 of `idl0_config.json` at recording time, 8-char lowercase hex.
+    /// `None` for FIT/GPX/CSV — there is no device config.
+    pub config_checksum: Option<String>,
+    /// Which importer produced this session.
+    pub source_format: SourceFormat,
+    /// SHA-256 of the raw source file bytes exactly as imported, 64
+    /// lowercase hex chars — the CAS blob this session's `data.parquet` is
+    /// a function of (design doc §5).
+    pub blob_sha256: String,
+    /// Parsed channel data, one entry per channel present in this session.
     pub channels: Vec<Channel>,
 }
 
@@ -207,6 +374,15 @@ pub struct ParseResult {
     /// `Some` when the file ended mid-record. Surface as
     /// "Log incomplete — showing data to <timestamp>".
     pub truncation_warning: Option<ParseError>,
+    /// Non-fatal import-time anomalies collected during parsing — today,
+    /// exclusively burst-seam correction's fallback cases (contract C1
+    /// §3.3; [`crate::session::seam_correction::correct_burst_seams`]).
+    /// Empty for a clean parse. Never silently dropped (CLAUDE.md §5) — a
+    /// caller that discards `ParseResult` without reading this is the one
+    /// place a warning could still go unseen; every constructor of a
+    /// [`SessionHandle`](crate::session::handle::SessionHandle) threads it
+    /// through instead.
+    pub import_warnings: Vec<ImportWarning>,
 }
 
 impl ParseResult {
@@ -221,33 +397,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn duration_ms_fixed_rate_channel_uses_sample_count_over_rate() {
-        // Arrange — 800 samples at 800 Hz = 1000 ms.
-        let ch = Channel::from_f64("IMU0_AccelX", 800.0, vec![0.0; 800], None);
+    fn duration_ms_uses_first_and_last_t_us_span() {
+        // Arrange — 800 samples at 800 Hz, t_us spanning exactly 1_000_000 µs.
+        let ch = Channel::from_f64("IMU0_AccelX", 800.0, vec![0.0; 800]);
 
         // Act
         let ms = ch.duration_ms();
 
         // Assert
-        assert_eq!(ms, 1000);
+        assert_eq!(ms, 999); // (799/800)*1e6 µs span, rounded
     }
 
     #[test]
-    fn duration_ms_event_driven_channel_uses_last_sample_time() {
-        // Arrange — event channel, last sample at 1.3 s → 1300 ms.
-        let ch = Channel::from_f64("HR_RR", 0.0, vec![1000.0, 900.0, 850.0], Some(vec![0.5, 1.0, 1.3]));
+    fn duration_ms_event_driven_channel_uses_t_us_span() {
+        // Arrange — event channel, t_us at 0.5s, 1.0s, 1.3s → span 800ms.
+        let ch = Channel::from_f64_with_times(
+            "HR_RR", 0.0, vec![1000.0, 900.0, 850.0],
+            vec![500_000, 1_000_000, 1_300_000], "hr_rr",
+        );
 
         // Act
         let ms = ch.duration_ms();
 
         // Assert
-        assert_eq!(ms, 1300);
+        assert_eq!(ms, 800);
     }
 
     #[test]
-    fn duration_ms_event_driven_without_times_is_zero() {
+    fn duration_ms_single_sample_is_zero() {
         // Arrange
-        let ch = Channel::from_f64("HR_RR", 0.0, vec![1.0], None);
+        let ch = Channel::from_f64("HR_RR", 0.0, vec![1.0]);
 
         // Act + Assert
         assert_eq!(ch.duration_ms(), 0);
@@ -258,18 +437,25 @@ mod tests {
         // Arrange
         let session = Session {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
+            config_checksum: None,
+            source_format: SourceFormat::Idl0,
+            blob_sha256: String::new(),
             channels: Vec::new(),
         };
 
         // Act + Assert
-        let clean = ParseResult { session: session.clone(), truncation_warning: None };
+        let clean = ParseResult {
+            session: session.clone(),
+            truncation_warning: None,
+            import_warnings: Vec::new(),
+        };
         assert!(clean.is_complete());
         let partial = ParseResult {
             session,
             truncation_warning: Some(ParseError::TruncatedRecord("eof".to_string())),
+            import_warnings: Vec::new(),
         };
         assert!(!partial.is_complete());
     }

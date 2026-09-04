@@ -58,6 +58,12 @@ impl ImuRouting {
 
 /// Parses a v3 `.idl0` buffer. Returns the parsed session plus an optional
 /// truncation warning (the buffer ended mid-record).
+///
+/// `session.blob_sha256` is left empty — this function only sees the decoded
+/// record stream, not the file's raw bytes, so it cannot compute the hash
+/// itself. The caller with file access (`SessionHandle::from_path`/
+/// `from_bytes`) computes `sha256(bytes)` over the same buffer and fills it
+/// in after `parse()` returns.
 pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     let mut reader = ByteReader::new(bytes);
 
@@ -101,20 +107,23 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
 
     let mut acc = ChannelAccumulator::new();
     let mut routing = HotRouting::new(&registry_by_name);
-    let mut event_ts_us: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut channel_ts_us: HashMap<String, Vec<i64>> = HashMap::new();
     let mut origin = TimeOrigin::default();
     let mut first: [Option<i64>; 3] = [None; 3];
     let mut last: [Option<i64>; 3] = [None; 3];
     let mut count: [usize; 3] = [0; 3];
     // Nominal IMU grid period (firmware back-counts each FIFO drain at this step,
-    // SPEC §5.5). The hot loop records a drop only when a timestamp jump deviates
-    // from it — a clean log never touches `imu_gaps`.
+    // SPEC §5.5) — the fallback period for an IMU with too few samples to run
+    // burst-seam correction, and `correct_burst_seams`'s own burst-detection
+    // tolerance window.
     let period_us = imu_period_us(imu_sample_rate_hz);
-    let mut imu_gaps: [Vec<(usize, usize)>; 3] = Default::default();
-    // Absolute grid slot (relative to each IMU's first sample) of the last *kept*
-    // sample. Placement anchors to absolute time so per-IMU drop/backstep history
-    // never accumulates cross-IMU drift (§15.2).
-    let mut last_abs_slot: [i64; 3] = [0; 3];
+    // Every kept IMU record's own device timestamp, per IMU — the raw recorded
+    // time burst-seam correction reconciles against (contract C1 §3.3), once
+    // per parse, after the whole stream is read.
+    let mut imu_recorded_ts: [Vec<i64>; 3] = Default::default();
+    // Per-fix GPS device timestamp — every GPS channel shares this as its
+    // `t_us` source (C1 §2; no burst structure to reconcile for GPS).
+    let mut gps_ts: Vec<i64> = Vec::new();
     let mut gps_anchor = GpsAnchor::default();
     let mut truncation: Option<ParseError> = None;
 
@@ -125,14 +134,13 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
             &registry,
             &mut routing,
             &mut acc,
-            &mut event_ts_us,
+            &mut channel_ts_us,
             &mut origin,
             &mut first,
             &mut last,
             &mut count,
-            period_us,
-            &mut imu_gaps,
-            &mut last_abs_slot,
+            &mut imu_recorded_ts,
+            &mut gps_ts,
             &mut gps_anchor,
         ) {
             Ok(true) => {}
@@ -145,28 +153,87 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
         }
     }
 
-    // Drop reconciliation (SPEC §15): all IMU channels share one nominal rate and
-    // a single grid anchored at the earliest IMU first-sample; each IMU column is
-    // rebuilt onto that grid (drops linear-filled, edges held), so cross-IMU
-    // element-wise math no longer sees mismatched rates/lengths.
-    let plan = ImuGridPlan::build(&first, &count, imu_gaps, period_us);
+    // Burst-seam correction (contract C1 §3.3): recover each IMU's true
+    // (possibly off-nominal) sample cadence from its recorded read-instant
+    // stamps and re-space every burst to a monotonic, uniform corrected
+    // axis, before gap detection ever runs — C1 §3.3's "ruled" ordering
+    // (§8 item 1). An IMU with fewer than 2 samples has no burst structure
+    // to correct; its (possibly empty) raw stamps pass through verbatim at
+    // the nominal period.
+    let mut corrected: [Vec<i64>; 3] = Default::default();
+    let mut effective_period_us = [period_us; 3];
+    let mut import_warnings: Vec<crate::session::seam_correction::ImportWarning> = Vec::new();
+    for i in 0..3 {
+        if imu_recorded_ts[i].len() >= 2 {
+            let seam = crate::session::seam_correction::correct_burst_seams(&imu_recorded_ts[i], period_us);
+            effective_period_us[i] = seam.effective_period_us;
+            corrected[i] = seam.corrected_us;
+            // Never silently drop a non-fatal anomaly (CLAUDE.md §5) — tag
+            // each with its source IMU so a caller reading the flattened
+            // list can tell which stream it came from.
+            import_warnings.extend(seam.warnings.into_iter().map(|w| {
+                crate::session::seam_correction::ImportWarning {
+                    kind: w.kind,
+                    message: format!("IMU{i}: {}", w.message),
+                }
+            }));
+        } else {
+            corrected[i] = imu_recorded_ts[i].clone();
+        }
+    }
+
+    // Drop reconciliation (contract C1 §3.3): gap detection runs once, here,
+    // against each IMU's own corrected stamps and effective period — never
+    // the nominal period, and never inline in the hot loop (that was the
+    // phantom-drop mechanism C1's worked example demonstrates).
+    let plan = ImuGridPlan::build_from_corrected(corrected, effective_period_us, period_us);
+    let t0_us = origin.min_us.unwrap_or(0);
     let mut channels = Vec::new();
     for (name, column) in acc.into_entries() {
-        let rate = resolve_rate(&name, gps_sample_rate_hz, &registry, plan.nominal_rate);
-        let sample_times_secs = match event_ts_us.get(&name) {
-            Some(ts) if !ts.is_empty() => {
-                let o = origin.min_us.unwrap_or(ts[0]);
-                Some(ts.iter().map(|&t| (t - o) as f64 / 1e6).collect())
-            }
-            _ => None,
+        if let Some(imu_idx) = imu_index_of(&name) {
+            let (rebuilt_column, t_us_abs, t_recorded_us_abs, gaps) = plan.reconcile(&name, column);
+            let t_us = t_us_abs.iter().map(|&t| t - t0_us).collect();
+            let t_recorded_us = if t_recorded_us_abs.is_empty() {
+                None
+            } else {
+                Some(t_recorded_us_abs.iter().map(|&t| t - t0_us).collect())
+            };
+            channels.push(Channel {
+                channel_id: name.clone(),
+                t_us,
+                t_recorded_us,
+                nominal_rate_hz: plan_nominal_rate_for(imu_idx, &effective_period_us),
+                column: rebuilt_column,
+                source_kind: format!("imu{imu_idx}"),
+                unit: unit_for(&name, &registry_by_name),
+                gaps,
+            });
+            continue;
+        }
+        let rate = resolve_rate(&name, gps_sample_rate_hz, &registry, 0.0);
+        let (column, _t_us, _t_recorded_us, _gaps) = plan.reconcile(&name, column);
+        let (t_us, source_kind) = if name.starts_with("GPS") {
+            let t = gps_ts.iter().map(|&ts| ts - t0_us).collect();
+            (t, "gps".to_string())
+        } else if let Some(ts) = channel_ts_us.get(&name) {
+            let t = ts.iter().map(|&ts| ts - t0_us).collect();
+            (t, generic_source_kind(&name))
+        } else {
+            // No recorded timestamp captured for this name (should not happen
+            // for a real registry channel) — empty t_us degrades gracefully
+            // rather than panicking (CLAUDE.md §5); surfaced by the round-trip
+            // test in Task 9 if it ever fires.
+            (Vec::new(), generic_source_kind(&name))
         };
-        let (column, gaps) = plan.reconcile(&name, column);
         channels.push(Channel {
-            channel_id: name,
-            sample_rate_hz: rate,
+            channel_id: name.clone(),
+            t_us,
+            t_recorded_us: None,
+            nominal_rate_hz: rate,
             column,
-            sample_times_secs,
-            gaps,
+            source_kind,
+            unit: unit_for(&name, &registry_by_name),
+            gaps: Vec::new(),
         });
     }
 
@@ -190,13 +257,78 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     Ok(ParseResult {
         session: Session {
             session_id,
-            device_id,
+            device_id: Some(device_id),
             timestamp_utc_ms: effective_start_ms,
-            config_checksum: format!("{config_crc:08x}"),
+            config_checksum: Some(format!("{config_crc:08x}")),
+            source_format: crate::session::SourceFormat::Idl0,
+            // Filled by the caller, not here — `parse_v3` only sees the
+            // decoded record stream, not the raw file bytes it came from.
+            // `SessionHandle::from_bytes` computes `sha256(bytes)` (the
+            // `sha2` dependency, Task 1) and overwrites this field after
+            // `parse()` returns, before synthesis runs (see store::blob,
+            // Task 8).
+            blob_sha256: String::new(),
             channels,
         },
         truncation_warning: truncation,
+        import_warnings,
     })
+}
+
+/// Per-IMU nominal rate (Hz) after burst-seam correction: `1e6 /
+/// effective_period_us[imu_idx]`. Replaces the old single session-wide
+/// `ImuGridPlan::nominal_rate` — each IMU can now have its own corrected
+/// period, so its `nominal_rate_hz` metadata must be its own (contract C1
+/// §4.2 already treats `nominal_rate_hz` as per-channel; see this plan's
+/// Open questions for the widening this represents from the pre-idl1
+/// single-shared-rate model).
+fn plan_nominal_rate_for(imu_idx: usize, effective_period_us: &[i64; 3]) -> f64 {
+    1e6 / effective_period_us[imu_idx] as f64
+}
+
+/// Resolves a channel's physical unit string (contract C1 §4.1). IMU axes and
+/// GPS channels get a small hardcoded table (the registry doesn't self-describe
+/// a useful unit for them today); every other registry channel falls back to
+/// `ChannelRegistryEntry.units` verbatim (SPEC §5.2); unknown names get an
+/// empty string.
+fn unit_for(channel_id: &str, registry_by_name: &HashMap<String, ChannelRegistryEntry>) -> String {
+    if let Some(u) = imu_axis_unit(channel_id) {
+        return u.to_string();
+    }
+    if let Some(u) = gps_channel_unit(channel_id) {
+        return u.to_string();
+    }
+    registry_by_name.get(channel_id).map(|e| e.units.clone()).unwrap_or_default()
+}
+
+/// IMU axis unit (`g` for accel, `dps` for gyro), or `None` for a non-IMU
+/// channel name.
+fn imu_axis_unit(channel_id: &str) -> Option<&'static str> {
+    if imu_index_of(channel_id).is_none() {
+        return None;
+    }
+    if channel_id.contains("Accel") {
+        Some("g")
+    } else if channel_id.contains("Gyro") {
+        Some("dps")
+    } else {
+        None
+    }
+}
+
+/// GPS channel unit, per contract C1 §4.1's table verbatim, or `None` for a
+/// non-GPS channel name.
+fn gps_channel_unit(channel_id: &str) -> Option<&'static str> {
+    match channel_id {
+        "GPS_SpeedKmh" => Some("km/h"),
+        "GPS_EpochMs" => Some("ms_raw"),
+        "GPS_Latitude" | "GPS_Longitude" => Some("deg"),
+        "GPS_Altitude" => Some("m"),
+        "GPS_Heading" => Some("deg"),
+        "GPS_FixQuality" => Some("enum_raw"),
+        "GPS_Satellites" => Some("count"),
+        _ => None,
+    }
 }
 
 /// Reads one record. Returns `Ok(true)` to continue, `Ok(false)` on SESSION_END.
@@ -207,14 +339,13 @@ fn read_record(
     registry: &HashMap<u8, ChannelRegistryEntry>,
     routing: &mut HotRouting,
     acc: &mut ChannelAccumulator,
-    event_ts_us: &mut HashMap<String, Vec<i64>>,
+    channel_ts_us: &mut HashMap<String, Vec<i64>>,
     origin: &mut TimeOrigin,
     first: &mut [Option<i64>; 3],
     last: &mut [Option<i64>; 3],
     count: &mut [usize; 3],
-    period_us: i64,
-    imu_gaps: &mut [Vec<(usize, usize)>; 3],
-    last_abs_slot: &mut [i64; 3],
+    imu_recorded_ts: &mut [Vec<i64>; 3],
+    gps_ts: &mut Vec<i64>,
     gps_anchor: &mut GpsAnchor,
 ) -> Result<bool, ParseError> {
     let type_ = reader.u8("record type")?;
@@ -223,17 +354,17 @@ fn read_record(
         0xFF => Ok(false),
         0x01 => {
             parse_imu(
-                reader, payload_len, imu_mask, &mut routing.imu, acc, first, last, count, period_us,
-                imu_gaps, last_abs_slot, origin,
+                reader, payload_len, imu_mask, &mut routing.imu, acc, first, last, count,
+                imu_recorded_ts, origin,
             )?;
             Ok(true)
         }
         0x02 => {
-            parse_gps_record(reader, payload_len, acc, Some(gps_anchor), Some(origin))?;
+            parse_gps_record(reader, payload_len, acc, Some(gps_anchor), Some(origin), gps_ts)?;
             Ok(true)
         }
         0x03 => {
-            parse_channel(reader, payload_len, registry, &mut routing.channel_slot, acc, event_ts_us, origin)?;
+            parse_channel(reader, payload_len, registry, &mut routing.channel_slot, acc, channel_ts_us, origin)?;
             Ok(true)
         }
         _ => {
@@ -253,9 +384,7 @@ fn parse_imu(
     first: &mut [Option<i64>; 3],
     last: &mut [Option<i64>; 3],
     count: &mut [usize; 3],
-    period_us: i64,
-    imu_gaps: &mut [Vec<(usize, usize)>; 3],
-    last_abs_slot: &mut [i64; 3],
+    imu_recorded_ts: &mut [Vec<i64>; 3],
     origin: &mut TimeOrigin,
 ) -> Result<(), ParseError> {
     let payload_start = reader.position();
@@ -263,46 +392,33 @@ fn parse_imu(
     let ts_us = reader.i64("timestamp_us")?;
     origin.observe(ts_us);
     let idx = imu_index as usize;
-    // Absolute-grid placement (§15.2): each sample lands on slot
-    // `round((ts - first) / period)`, so co-temporal events across IMUs share a
-    // slot regardless of differing drop histories — no per-step drift. Fast path
-    // (exact nominal Δ, the ~99% case) is one i64 compare + increment, no divide.
-    // A sample whose slot does not advance past the last kept one (a backward
-    // step / duplicate at a FIFO drain boundary) is dropped: not counted, its
-    // axes not stored. A forward jump records the missing run for the rebuild.
+    // A raw wire timestamp that does not advance is a genuine duplicate/
+    // backstep read at a FIFO drain boundary (SPEC §5.5) — safe to drop
+    // unconditionally: within-burst deltas are always exact at the
+    // *nominal* cadence regardless of true ODR (C1 §3.3), so this
+    // comparison needs no period knowledge and cannot itself manufacture a
+    // phantom drop. Gap detection against the *corrected* period happens
+    // once, after the whole stream is read (ImuGridPlan::build_from_corrected).
     let mut drop_sample = false;
     if idx < 3 {
-        match (first[idx], last[idx]) {
-            (Some(f), Some(prev)) => {
-                let delta = ts_us - prev;
-                let abs_slot = if delta == period_us {
-                    last_abs_slot[idx] + 1
-                } else {
-                    ((ts_us - f) as f64 / period_us as f64).round() as i64
-                };
-                if abs_slot <= last_abs_slot[idx] {
-                    drop_sample = true;
-                } else {
-                    let missing = (abs_slot - last_abs_slot[idx] - 1) as usize;
-                    if missing >= 1 {
-                        imu_gaps[idx].push((count[idx], missing));
-                    }
-                    last_abs_slot[idx] = abs_slot;
-                    last[idx] = Some(ts_us);
-                    count[idx] += 1;
-                }
+        match last[idx] {
+            Some(prev) if ts_us <= prev => {
+                drop_sample = true;
             }
             _ => {
-                // First sample of this IMU anchors relative slot 0.
-                first[idx] = Some(ts_us);
+                if first[idx].is_none() {
+                    first[idx] = Some(ts_us);
+                }
                 last[idx] = Some(ts_us);
-                last_abs_slot[idx] = 0;
                 count[idx] += 1;
             }
         }
     }
 
     if !drop_sample && idx < IMU_CHANNEL_NAMES.len() {
+        // One push per kept record (not per axis) — the raw recorded
+        // timestamp Task 6's burst-seam correction reconciles against.
+        imu_recorded_ts[idx].push(ts_us);
         let names = IMU_CHANNEL_NAMES[idx];
         for axis in 0..6u32 {
             let mask_bit = imu_index as u32 * 6 + axis;
@@ -349,7 +465,7 @@ fn parse_channel(
     registry: &HashMap<u8, ChannelRegistryEntry>,
     channel_slot: &mut [Option<usize>; 256],
     acc: &mut ChannelAccumulator,
-    event_ts_us: &mut HashMap<String, Vec<i64>>,
+    channel_ts_us: &mut HashMap<String, Vec<i64>>,
     origin: &mut TimeOrigin,
 ) -> Result<(), ParseError> {
     let payload_start = reader.position();
@@ -395,11 +511,10 @@ fn parse_channel(
                 read_typed_value(reader, entry.data_type)? * entry.scale + entry.offset,
             ),
         }
-        if entry.sample_rate_hz == 0 {
-            // Event-driven channel (low-rate): record the per-sample timestamp.
-            // The name is only cloned here, never on the high-rate path.
-            event_ts_us.entry(entry.name.clone()).or_default().push(ts_us);
-        }
+        // Every CHANNEL_SAMPLE record's own timestamp, regardless of the
+        // registry's declared rate — contract C1 §2 makes per-sample time
+        // mandatory on every channel, not just event-driven ones.
+        channel_ts_us.entry(entry.name.clone()).or_default().push(ts_us);
     }
 
     let consumed = reader.position() - payload_start;
@@ -474,19 +589,28 @@ mod tests {
         // Assert — metadata
         assert!(r.is_complete());
         assert_eq!(r.session.session_id, "0102030405060708090a0b0c0d0e0f10");
-        assert_eq!(r.session.device_id, "b0b1b2b3b4b5");
+        assert_eq!(r.session.device_id.as_deref(), Some("b0b1b2b3b4b5"));
         assert_eq!(r.session.timestamp_utc_ms, RMC_UTC_MS);
-        assert_eq!(r.session.config_checksum, "cafebabe");
+        assert_eq!(r.session.config_checksum.as_deref(), Some("cafebabe"));
 
         // IMU scaled
         assert_relative_eq!(find(&r, "IMU0_AccelX").materialize()[0], 16.0, epsilon = 1e-6);
         assert_relative_eq!(find(&r, "IMU0_AccelY").materialize()[0], -8192.0 * ACCEL_SCALE as f64, epsilon = 1e-6);
         assert_relative_eq!(find(&r, "IMU0_GyroX").materialize()[0], 1000.0 * GYRO_SCALE as f64, epsilon = 1e-3);
 
-        // GPS raw (lat/lon/epoch/sats are verbatim wire integers)
+        // GPS: epoch/sats are verbatim wire integers; lat/lon are baked to
+        // physical decimal degrees at parse time (ruling R27): raw ×1e-7.
         assert_eq!(find(&r, "GPS_EpochMs").materialize()[0], RMC_UTC_MS as f64);
-        assert_eq!(find(&r, "GPS_Latitude").materialize()[0], 515_250_000.0);
-        assert_eq!(find(&r, "GPS_Longitude").materialize()[0], -1_234_567.0);
+        assert_relative_eq!(
+            find(&r, "GPS_Latitude").materialize()[0],
+            51.525,
+            epsilon = 1e-9
+        );
+        assert_relative_eq!(
+            find(&r, "GPS_Longitude").materialize()[0],
+            -0.1234567,
+            epsilon = 1e-9
+        );
         assert_eq!(find(&r, "GPS_Satellites").materialize()[0], 8.0);
         // GPS_SpeedKmh is engine-scaled to physical km/h: raw 1000 (km/h × 100)
         // → 10.0 km/h via the 0.01 column scale (§5.7).
@@ -651,7 +775,7 @@ mod tests {
         let ch = find(&r, "IMU0_AccelX");
         assert_eq!(ch.len(), 6);
         assert!(ch.gaps.is_empty());
-        assert_relative_eq!(ch.sample_rate_hz, 1e6 / 600.0, epsilon = 1e-6);
+        assert_relative_eq!(ch.nominal_rate_hz, 1e6 / 600.0, epsilon = 1e-6);
     }
 
     #[test]
@@ -678,13 +802,22 @@ mod tests {
         assert_eq!(ch.len(), 4);
         assert!(ch.gaps.is_empty());
         assert_eq!(ch.materialize(), vec![10.0, 20.0, 30.0, 40.0]);
-        assert_relative_eq!(ch.sample_rate_hz, 1000.0, epsilon = 1e-9);
+        assert_relative_eq!(ch.nominal_rate_hz, 1000.0, epsilon = 1e-9);
     }
 
     #[test]
     fn single_imu_drop_is_linearly_filled_and_recorded() {
         // Arrange — IMU0 at 1000 Hz; the 3rd sample arrives 2 periods after the
-        // 2nd (one sample dropped between received indices 1 and 2).
+        // 2nd (one sample dropped between received indices 1 and 2), followed by
+        // 9 more single-sample "bursts" of ordinary ±2 µs read-instant jitter (5
+        // at 998 µs, 4 at 1002 µs) — realistic surrounding burst context so the
+        // drop's own skewed 1500 µs burst-to-burst estimate is one of 10 total
+        // estimates, not the only one. C1 §3.3's median-not-mean robustness
+        // guarantee only holds with enough other estimates for the skewed one to
+        // be an outlier the median ignores (R12):
+        // median(998, 998, 998, 998, 998, 1002, 1002, 1002, 1002, 1500) = 1000 µs,
+        // exactly nominal, so the drop is still detected as a genuine gap rather
+        // than reinterpreted as an off-nominal true ODR.
         let registry = vec![v3_registry_entry(0, 4, 1000, 1.0, 0.0, "IMU0_AccelX", "raw")];
         let buf = cat(&[
             Header { schema_version: 3, imu_mask: 0x01, imu_sample_rate_hz: 1000, ..Default::default() }
@@ -693,25 +826,48 @@ mod tests {
             frame(0x01, &imu_payload(0, 1_001_000, &[10])),
             frame(0x01, &imu_payload(0, 1_003_000, &[30])), // 2000 µs jump → 1 missing
             frame(0x01, &imu_payload(0, 1_004_000, &[40])),
+            // Ordinary jittery burst context appended after the drop (no
+            // further drops) — 5 seams at nominal-2 µs, 4 at nominal+2 µs.
+            frame(0x01, &imu_payload(0, 1_004_998, &[50])),
+            frame(0x01, &imu_payload(0, 1_005_996, &[60])),
+            frame(0x01, &imu_payload(0, 1_006_994, &[70])),
+            frame(0x01, &imu_payload(0, 1_007_992, &[80])),
+            frame(0x01, &imu_payload(0, 1_008_990, &[90])),
+            frame(0x01, &imu_payload(0, 1_009_992, &[100])),
+            frame(0x01, &imu_payload(0, 1_010_994, &[110])),
+            frame(0x01, &imu_payload(0, 1_011_996, &[120])),
+            frame(0x01, &imu_payload(0, 1_012_998, &[130])),
             session_end(),
         ]);
 
         // Act
         let r = parse_v3(&buf).unwrap();
 
-        // Assert — one linear fill (20) between 10 and 30; length 5; one GapSpan.
+        // Assert — one linear fill (20) between 10 and 30, the rest verbatim;
+        // one GapSpan at the drop's own location, unaffected by the extra
+        // context appended after it.
         let ch = find(&r, "IMU0_AccelX");
-        assert_eq!(ch.materialize(), vec![0.0, 10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(
+            ch.materialize(),
+            vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0]
+        );
         assert_eq!(ch.gaps, vec![GapSpan { start: 2, len: 1 }]);
-        assert_eq!(ch.len(), 5);
+        assert_eq!(ch.len(), 14);
     }
 
     #[test]
     fn two_imus_with_different_drops_align_a_shared_spike_to_the_same_slot() {
         // Arrange — IMU0 and IMU1 at 1000 Hz on one clock. Both record a spike
         // (1000) at the same timestamp (1_004_000), but IMU0 drops a sample
-        // before it while IMU1 does not. Reconciliation must make them
-        // equal-length and land the spike on the same slot so `[A] - [B]` works.
+        // before it while IMU1 does not. Both streams then carry 9 more samples
+        // of realistic surrounding burst context: IMU0 as ordinary jittery
+        // single-sample "bursts" (±2 µs seams, no further drops), IMU1 as plain
+        // nominal continuation — so IMU0's median has enough burst-to-burst
+        // estimates for its drop's skewed one to be an ignorable outlier (R12):
+        // median(1333.33, 998×5, 1002×4) = 1000 µs, matching IMU1's trivial
+        // (single-burst, no-estimate) nominal fallback exactly. Reconciliation
+        // must make them equal-length and land the spike on the same slot so
+        // `[A] - [B]` works.
         let registry = vec![
             v3_registry_entry(0, 4, 1000, 1.0, 0.0, "IMU0_AccelX", "raw"),
             v3_registry_entry(6, 4, 1000, 1.0, 0.0, "IMU1_AccelX", "raw"),
@@ -720,19 +876,38 @@ mod tests {
         let buf = cat(&[
             Header { schema_version: 3, imu_mask: 0x41, imu_count: 2, imu_sample_rate_hz: 1000, ..Default::default() }
                 .build(&registry),
-            // IMU0 — drops one sample between 1_001_000 and 1_003_000.
+            // IMU0 — drops one sample between 1_001_000 and 1_003_000, then 9
+            // ordinary jittery bursts (no further drops).
             frame(0x01, &imu_payload(0, 1_000_000, &[0])),
             frame(0x01, &imu_payload(0, 1_001_000, &[0])),
             frame(0x01, &imu_payload(0, 1_003_000, &[0])),
             frame(0x01, &imu_payload(0, 1_004_000, &[1000])), // spike
             frame(0x01, &imu_payload(0, 1_005_000, &[0])),
-            // IMU1 — no drops.
+            frame(0x01, &imu_payload(0, 1_005_998, &[0])),
+            frame(0x01, &imu_payload(0, 1_006_996, &[0])),
+            frame(0x01, &imu_payload(0, 1_007_994, &[0])),
+            frame(0x01, &imu_payload(0, 1_008_992, &[0])),
+            frame(0x01, &imu_payload(0, 1_009_990, &[0])),
+            frame(0x01, &imu_payload(0, 1_010_992, &[0])),
+            frame(0x01, &imu_payload(0, 1_011_994, &[0])),
+            frame(0x01, &imu_payload(0, 1_012_996, &[0])),
+            frame(0x01, &imu_payload(0, 1_013_998, &[0])),
+            // IMU1 — no drops, plain nominal continuation.
             frame(0x01, &imu_payload(1, 1_000_000, &[0])),
             frame(0x01, &imu_payload(1, 1_001_000, &[0])),
             frame(0x01, &imu_payload(1, 1_002_000, &[0])),
             frame(0x01, &imu_payload(1, 1_003_000, &[0])),
             frame(0x01, &imu_payload(1, 1_004_000, &[1000])), // spike, same timestamp
             frame(0x01, &imu_payload(1, 1_005_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_006_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_007_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_008_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_009_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_010_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_011_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_012_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_013_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_014_000, &[0])),
             session_end(),
         ]);
 
@@ -744,7 +919,7 @@ mod tests {
         // Assert — equal length, equal nominal rate, spike on the same slot, and
         // the two reconciled columns are identical (so the difference is all 0).
         assert_eq!(a.len(), b.len());
-        assert_eq!(a.sample_rate_hz, b.sample_rate_hz);
+        assert_eq!(a.nominal_rate_hz, b.nominal_rate_hz);
         assert_eq!(a.materialize()[4], 1000.0);
         assert_eq!(b.materialize()[4], 1000.0);
         assert_eq!(a.materialize(), b.materialize());
@@ -755,8 +930,14 @@ mod tests {
 
     #[test]
     fn all_imu_channels_report_the_single_nominal_rate_despite_different_drops() {
-        // Arrange — same two-IMU stream; IMU0 drops one, IMU1 drops none. The old
-        // (n-1)/span formula gave 800 vs 1000 Hz; the nominal rate is identical.
+        // Arrange — same two-IMU stream as the shared-spike test above (minus
+        // the spike itself): IMU0 drops one, IMU1 drops none, each carrying 9
+        // more samples of realistic surrounding burst context (IMU0 jittery
+        // single-sample "bursts", IMU1 plain nominal continuation) so IMU0's
+        // median has enough burst-to-burst estimates for its drop's skewed one
+        // to be an ignorable outlier (R12) rather than the only estimate. The
+        // old (n-1)/span formula gave 800 vs 1000 Hz; the nominal rate is
+        // identical.
         let registry = vec![
             v3_registry_entry(0, 4, 1000, 1.0, 0.0, "IMU0_AccelX", "raw"),
             v3_registry_entry(6, 4, 1000, 1.0, 0.0, "IMU1_AccelX", "raw"),
@@ -769,12 +950,30 @@ mod tests {
             frame(0x01, &imu_payload(0, 1_003_000, &[0])),
             frame(0x01, &imu_payload(0, 1_004_000, &[0])),
             frame(0x01, &imu_payload(0, 1_005_000, &[0])),
+            frame(0x01, &imu_payload(0, 1_005_998, &[0])),
+            frame(0x01, &imu_payload(0, 1_006_996, &[0])),
+            frame(0x01, &imu_payload(0, 1_007_994, &[0])),
+            frame(0x01, &imu_payload(0, 1_008_992, &[0])),
+            frame(0x01, &imu_payload(0, 1_009_990, &[0])),
+            frame(0x01, &imu_payload(0, 1_010_992, &[0])),
+            frame(0x01, &imu_payload(0, 1_011_994, &[0])),
+            frame(0x01, &imu_payload(0, 1_012_996, &[0])),
+            frame(0x01, &imu_payload(0, 1_013_998, &[0])),
             frame(0x01, &imu_payload(1, 1_000_000, &[0])),
             frame(0x01, &imu_payload(1, 1_001_000, &[0])),
             frame(0x01, &imu_payload(1, 1_002_000, &[0])),
             frame(0x01, &imu_payload(1, 1_003_000, &[0])),
             frame(0x01, &imu_payload(1, 1_004_000, &[0])),
             frame(0x01, &imu_payload(1, 1_005_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_006_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_007_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_008_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_009_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_010_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_011_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_012_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_013_000, &[0])),
+            frame(0x01, &imu_payload(1, 1_014_000, &[0])),
             session_end(),
         ]);
 
@@ -782,8 +981,8 @@ mod tests {
         let r = parse_v3(&buf).unwrap();
 
         // Assert
-        let r0 = find(&r, "IMU0_AccelX").sample_rate_hz;
-        let r1 = find(&r, "IMU1_AccelX").sample_rate_hz;
+        let r0 = find(&r, "IMU0_AccelX").nominal_rate_hz;
+        let r1 = find(&r, "IMU1_AccelX").nominal_rate_hz;
         assert_eq!(r0, r1);
         assert_relative_eq!(r0, 1000.0, epsilon = 1e-9);
     }
@@ -894,8 +1093,10 @@ mod tests {
         assert_relative_eq!(brake.materialize()[0], 100.0 * 0.5 + 1.0, epsilon = 1e-6);
         assert_relative_eq!(brake.materialize()[1], 200.0 * 0.5 + 1.0, epsilon = 1e-6);
         assert_relative_eq!(brake.materialize()[2], 300.0 * 0.5 + 1.0, epsilon = 1e-6);
-        // Fixed-rate channel → no per-sample event timestamps.
-        assert!(brake.sample_times_secs.is_none());
+        // Every channel carries real, strictly increasing t_us now (C1 §2/§3.5
+        // invariant 1) — fixed-rate channels are no longer distinguished by a
+        // "times present/absent" signal.
+        assert!(brake.t_us.windows(2).all(|w| w[1] > w[0]));
     }
 
     #[test]
@@ -978,18 +1179,21 @@ mod tests {
         ]);
         let r = parse_v3(&buf).unwrap();
         let rr = find(&r, "HR_RR");
-        assert_eq!(rr.sample_rate_hz, 0.0);
-        let times = rr.sample_times_secs.as_ref().unwrap();
-        assert_eq!(times.len(), 3);
-        assert_relative_eq!(times[0], 0.5, epsilon = 1e-9);
-        assert_relative_eq!(times[1], 1.0, epsilon = 1e-9);
-        assert_relative_eq!(times[2], 1.3, epsilon = 1e-9);
+        assert_eq!(rr.nominal_rate_hz, 0.0);
+        // Tightened to exact µs checks on t_us directly — the old
+        // sample_times_secs-presence signal ("this channel carries real
+        // per-sample time") is now true of every channel by construction.
+        assert_eq!(rr.t_us, vec![500_000, 1_000_000, 1_300_000]);
         assert_relative_eq!(rr.materialize()[0], 1000.0, epsilon = 1e-6);
-        assert!(find(&r, "IMU0_AccelX").sample_times_secs.is_none());
     }
 
     #[test]
-    fn event_channel_duration_reflects_last_timestamp() {
+    fn event_channel_duration_spans_its_own_first_to_last_sample() {
+        // duration_ms is (t_us.last() - t_us.first()) / 1000 (session::Channel
+        // doc comment) — the channel's own data span, not "time since the
+        // session origin to the last sample". HR_RR's own samples run from
+        // 500_000 µs to 1_300_000 µs (session-relative, origin = the IMU
+        // record at 1_000_000), an 800 ms span.
         let rr_scale: f32 = 1000.0 / 1024.0;
         let registry = vec![
             v3_registry_entry(0, 4, 800, ACCEL_SCALE, 0.0, "IMU0_AccelX", "g"),
@@ -1004,7 +1208,7 @@ mod tests {
             session_end(),
         ]);
         let r = parse_v3(&buf).unwrap();
-        assert_eq!(find(&r, "HR_RR").duration_ms(), 1300);
+        assert_eq!(find(&r, "HR_RR").duration_ms(), 800);
     }
 
     #[test]
@@ -1018,8 +1222,54 @@ mod tests {
             session_end(),
         ]);
         let r = parse_v3(&buf).unwrap();
-        let times = find(&r, "HR_RR").sample_times_secs.as_ref().unwrap();
-        assert_relative_eq!(times[0], 0.0, epsilon = 1e-9);
-        assert_relative_eq!(times[1], 0.4, epsilon = 1e-9);
+        let t_us = &find(&r, "HR_RR").t_us;
+        assert_eq!(t_us, &vec![0, 400_000]);
+    }
+
+    #[test]
+    fn imu_burst_off_nominal_odr_reports_the_corrected_rate_and_spacing() {
+        // Arrange — contract C1 §3.3's worked example's *raw* stamps
+        // verbatim: nominal 1250 µs (800 Hz configured), true period
+        // 1200 µs (≈833.3 Hz), 4 bursts of N=4. IMU0, single axis.
+        let raw_stamps: [i64; 16] = [
+            96250, 97500, 98750, 100000, // burst 0
+            101050, 102300, 103550, 104800, // burst 1
+            105850, 107100, 108350, 109600, // burst 2
+            110650, 111900, 113150, 114400, // burst 3
+        ];
+        let registry = vec![v3_registry_entry(0, 4, 800, 1.0, 0.0, "IMU0_AccelX", "raw")];
+        let mut parts = vec![Header {
+            schema_version: 3,
+            imu_mask: 0x01,
+            imu_sample_rate_hz: 800, // imu_period_us(800) == 1250, the nominal period.
+            ..Default::default()
+        }
+        .build(&registry)];
+        for &ts in raw_stamps.iter() {
+            parts.push(frame(0x01, &imu_payload(0, ts, &[10])));
+        }
+        parts.push(session_end());
+
+        // Act
+        let r = parse_v3(&cat(&parts)).unwrap();
+
+        // Assert — nominal_rate_hz reflects the *corrected* 1200 µs period,
+        // not the configured-ODR 1250 µs one; every sample lands cleanly on
+        // the corrected grid (no drops, since the worked example's corrected
+        // stamps are exactly evenly spaced), so t_us advances by exactly
+        // 1200 µs at every step.
+        let ch = find(&r, "IMU0_AccelX");
+        assert_eq!(ch.len(), 16);
+        assert!(ch.gaps.is_empty());
+        assert_relative_eq!(ch.nominal_rate_hz, 1e6 / 1200.0, epsilon = 1e-6);
+        assert!(ch.t_us.windows(2).all(|w| w[1] - w[0] == 1200));
+
+        // t_recorded_us is present (correction actually diverged it from the
+        // nominal-grid formula the pre-Task-6 parser used) and, since this
+        // IMU has no drops, advances at the same 1200 µs corrected spacing
+        // as t_us.
+        let t_recorded = ch.t_recorded_us.as_ref().expect("burst correction should set t_recorded_us");
+        assert_eq!(t_recorded.len(), 16);
+        assert!(t_recorded.windows(2).all(|w| w[1] - w[0] == 1200));
     }
 }

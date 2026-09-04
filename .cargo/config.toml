@@ -1,0 +1,10 @@
+# Shared build cache across every idl-rs worktree. Wave-1 lanes each work in
+# their own git worktree (docs/superpowers/plans/2026-09-03-idl1-wave1-*.md);
+# without this, each worktree cold-compiles the full arrow/parquet/tokio/
+# btleplug/reqwest dependency graph independently against the same
+# Cargo.lock -- expensive (these crates are known-heavy to build) and
+# entirely redundant. This path is local-machine-specific; if it causes
+# problems on a different machine/CI, delete this file or override with
+# CARGO_TARGET_DIR.
+[build]
+target-dir = "C:/Users/isaac/Documents/Saucy/saucyeng/.cargo-shared-target"

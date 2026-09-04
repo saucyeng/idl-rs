@@ -11,17 +11,6 @@ use crate::math::eval::{ChannelLookup, LookupChannel, MathOverlay};
 use crate::math::value::{ChannelValue, Value};
 use crate::math::{MathEvalError, MathEvalErrorKind};
 
-/// GPS_Latitude/Longitude are stored as degrees×1e7 (firmware i32) on binary
-/// imports; GPX uses raw degrees. Magnitude check is robust to both (real
-/// lat/lon never exceed 180 in degree form). Mirrors Dart `_toDeg`.
-pub fn to_deg(x: f64) -> f64 {
-    if x.abs() > 1000.0 {
-        x / 1e7
-    } else {
-        x
-    }
-}
-
 /// Cumulative arc length (metres) along a polyline given by parallel E/N
 /// arrays. `out[0] = 0.0`; length matches `min(e.len(), n.len())`. Mirrors
 /// Dart `_cumulativeArc`.
@@ -87,23 +76,23 @@ pub fn build_overlay_reference(
     // GPS sample is the origin. Both choices are re-used for main_positions.
     let mut sum_lat = 0.0;
     for &i in &indices {
-        sum_lat += to_deg(lat.samples[i]);
+        sum_lat += lat.samples[i];
     }
     let mean_lat_deg = sum_lat / indices.len() as f64;
     let mean_lat_rad = mean_lat_deg * std::f64::consts::PI / 180.0;
     let lat_scale = 111320.0;
     let lon_scale = 111320.0 * mean_lat_rad.cos();
 
-    let lat0 = to_deg(lat.samples[indices[0]]);
-    let lon0 = to_deg(lon.samples[indices[0]]);
+    let lat0 = lat.samples[indices[0]];
+    let lon0 = lon.samples[indices[0]];
 
     let rate = epoch.sample_rate_hz;
     let mut e = Vec::with_capacity(indices.len());
     let mut n = Vec::with_capacity(indices.len());
     let mut t_lap = Vec::with_capacity(indices.len());
     for &i in &indices {
-        e.push((to_deg(lon.samples[i]) - lon0) * lon_scale);
-        n.push((to_deg(lat.samples[i]) - lat0) * lat_scale);
+        e.push((lon.samples[i] - lon0) * lon_scale);
+        n.push((lat.samples[i] - lat0) * lat_scale);
         t_lap.push(i as f64 / rate - overlay_lap_start_uniform_sec);
     }
 
@@ -147,8 +136,8 @@ pub fn build_main_positions(
     let mut e = vec![0.0; len];
     let mut n = vec![0.0; len];
     for i in 0..len {
-        e[i] = (to_deg(lon.samples[i]) - lon0) * lon_scale;
-        n[i] = (to_deg(lat.samples[i]) - lat0) * lat_scale;
+        e[i] = (lon.samples[i] - lon0) * lon_scale;
+        n[i] = (lat.samples[i] - lat0) * lat_scale;
     }
 
     let mut heading = vec![0.0; len];
@@ -178,9 +167,12 @@ fn runtime_err(msg: impl Into<String>) -> MathEvalError {
 
 /// Assembles `variance_time` inputs and delegates to
 /// [`crate::variance::variance_time`]. Mirrors `_callVarianceTimeRust`.
+/// `main_t_us` is the main channel's own per-sample time (G5.7) — the
+/// result aligns to `main_samples`, so it carries that same axis forward.
 pub fn eval_variance_time(
     main_samples: &[f64],
     main_rate: f64,
+    main_t_us: &[i64],
     channel_id: &str,
     main: &dyn ChannelLookup,
     overlay: &MathOverlay,
@@ -208,7 +200,12 @@ pub fn eval_variance_time(
         })?;
 
     let result = variance_time_against(&r, &overlay_ch, &main_pos, main_samples, main_rate, main_window);
-    Ok(Value::Channel(ChannelValue { samples: std::sync::Arc::from(result), sample_rate_hz: main_rate, channel_id: None }))
+    Ok(Value::Channel(ChannelValue {
+        samples: std::sync::Arc::from(result),
+        sample_rate_hz: main_rate,
+        channel_id: None,
+        t_us: std::sync::Arc::from(main_t_us),
+    }))
 }
 
 /// Computes one target's `variance_time` series against a PREBUILT reference and
@@ -246,9 +243,12 @@ pub fn variance_time_against(
 
 /// Assembles `variance_dist` inputs and delegates to
 /// [`crate::variance::variance_dist`]. Mirrors `_callVarianceDistRust`.
+/// `main_t_us` is the main channel's own per-sample time (G5.7) — the
+/// result aligns to `main_samples`, so it carries that same axis forward.
 pub fn eval_variance_dist(
     main_samples: &[f64],
     main_rate: f64,
+    main_t_us: &[i64],
     channel_id: &str,
     main: &dyn ChannelLookup,
     overlay: &MathOverlay,
@@ -275,7 +275,12 @@ pub fn eval_variance_dist(
     let overlay_samples = subsample_to_arc(&overlay_ch.samples, &overlay_arc);
     let result =
         variance_dist_against(&overlay_arc, &overlay_samples, &main_pos, main_samples, main_rate, main_window);
-    Ok(Value::Channel(ChannelValue { samples: std::sync::Arc::from(result), sample_rate_hz: main_rate, channel_id: None }))
+    Ok(Value::Channel(ChannelValue {
+        samples: std::sync::Arc::from(result),
+        sample_rate_hz: main_rate,
+        channel_id: None,
+        t_us: std::sync::Arc::from(main_t_us),
+    }))
 }
 
 /// Computes one target's `variance_dist` series against a PREBUILT reference
@@ -344,13 +349,6 @@ fn align_main_positions(channel_len: usize, main_pos: &MainPositions) -> Vec<(f6
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn to_deg_passes_through_degree_values_and_scales_e7() {
-        // Arrange / Act / Assert — firmware degrees×1e7 vs raw degrees.
-        assert!((to_deg(-37.81) - -37.81).abs() < 1e-9);
-        assert!((to_deg(-378_100_000.0) - -37.81).abs() < 1e-6);
-    }
 
     #[test]
     fn cumulative_arc_sums_segment_lengths() {

@@ -30,6 +30,7 @@ use idl_rs::laps::model::Lap;
 use idl_rs::math::MathLapContext;
 use idl_rs::session::handle::{ChannelMeta, SessionHandle, SessionMeta};
 use idl_rs::session::Channel;
+use idl_rs::store::{catalog, import, verify};
 use idl_rs::track_artifact::{self, Track};
 use idl_rs::tracks::{detect_visits, VisitParams, VisitWindow};
 use idl_rs::workbook::{self, ApplyReport};
@@ -259,6 +260,48 @@ enum Command {
     Table {
         #[command(subcommand)]
         action: table_cmd::TableAction,
+    },
+    /// Imports an `.idl0` log into a C4 §2 data directory: writes the raw
+    /// bytes to the CAS blob store, writes `data.parquet` (contract C1 §4),
+    /// creates an empty `session.json` if none exists yet (contract C1 §6),
+    /// and rebuilds the catalog (contract C4 §5).
+    Import {
+        /// Path to the `.idl0` log file to import.
+        file: PathBuf,
+        /// Data directory root (contract C4 §1's `<data>` — this CLI has no
+        /// Tauri `app_data_dir()` resolver, so the path is explicit here;
+        /// the app layer, L5, resolves the platform default and passes it in
+        /// the same way when it shells out or reuses this code as a library).
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Rebuilds the catalog from `data_dir` and lists every indexed session.
+    Sessions {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long, value_enum, default_value_t = OutFormat::Text)]
+        format: OutFormat,
+    },
+    /// Runs contract C4 §7's `verify` checks against `data_dir` and prints
+    /// every finding.
+    Verify {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Lists (or, with `--confirm`, deletes) `derived/*.parquet` files older
+    /// than `--older-than` days (contract C4 §7; default 30 — the contract's
+    /// own proposal, C4 §8 item 5). **Age-based only, not orphan-verified**
+    /// in this task; defaults to a dry-run listing so nothing is deleted
+    /// without the operator seeing the candidate list first.
+    Prune {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        older_than: u32,
+        /// Actually delete the listed candidates. Without this flag, `prune`
+        /// only lists what it would delete.
+        #[arg(long)]
+        confirm: bool,
     },
 }
 
@@ -502,6 +545,14 @@ fn main() -> ExitCode {
             recover::scan_all(&device, out_dir.as_deref(), scan_limit.unwrap_or(u64::MAX)),
         ),
         Command::Table { action } => table_cmd::run(action),
+        Command::Import { file, data_dir } => cmd_import(&file, &data_dir),
+        Command::Sessions { data_dir, format } => cmd_sessions(&data_dir, format),
+        Command::Verify { data_dir } => cmd_verify(&data_dir),
+        Command::Prune {
+            data_dir,
+            older_than,
+            confirm,
+        } => cmd_prune(&data_dir, older_than, confirm),
     }
 }
 
@@ -924,6 +975,193 @@ fn cmd_fit(
 }
 
 // ---------------------------------------------------------------------------
+// Store commands (`import`/`sessions`/`verify`/`prune`) — these speak plain
+// stdout/stderr text, not the JSON envelope above: they operate over a data
+// directory (contract C4), not a single `.idl0` file, and have no natural
+// "success payload" shape the envelope's `Structured`/bulk-artifact split fits.
+// ---------------------------------------------------------------------------
+
+/// Reads `file`, imports it into `data_dir` via [`import::import_idl0`], and
+/// rebuilds the catalog so the import is immediately queryable.
+fn cmd_import(file: &Path, data_dir: &Path) -> ExitCode {
+    let bytes = match std::fs::read(file) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {e}", file.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = match import::import_idl0(data_dir, &bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: import: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(w) = &report.truncation_warning {
+        eprintln!("warning: {w}");
+    }
+    match report.outcome {
+        import::ImportOutcome::Written => println!("imported {} -> {}", file.display(), report.data_parquet.display()),
+        import::ImportOutcome::Skipped => println!("already imported (skip): {}", report.data_parquet.display()),
+        import::ImportOutcome::Regenerated => println!("regenerated: {}", report.data_parquet.display()),
+    }
+
+    match catalog::rebuild_catalog(data_dir) {
+        Ok(rr) => {
+            println!(
+                "catalog: {} sessions, {} blobs, {} laps ({} skipped)",
+                rr.sessions_indexed,
+                rr.blobs_indexed,
+                rr.laps_indexed,
+                rr.skipped.len()
+            );
+            for s in &rr.skipped {
+                eprintln!("  skipped: {s}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: catalog rebuild: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Rebuilds the catalog then lists every indexed session. No `.expect()` on
+/// any `rusqlite` call (CLAUDE.md §5) — a corrupt catalog is data the
+/// operator needs to see reported, not a bug this binary should crash on.
+fn cmd_sessions(data_dir: &Path, format: OutFormat) -> ExitCode {
+    let report = match catalog::rebuild_catalog(data_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let conn = match catalog::open_catalog(&data_dir.join("catalog.sqlite")) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stmt = match conn
+        .prepare("SELECT session_id, timestamp_utc_ms, rider, bike, venue_name, lap_count FROM sessions ORDER BY timestamp_utc_ms DESC")
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mapped = match stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rows: Vec<(String, i64, String, String, String, Option<i64>)> = match mapped.collect() {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match format {
+        OutFormat::Text => {
+            for (id, ts, rider, bike, venue, laps) in &rows {
+                println!("{id}  {ts}  {rider}  {bike}  {venue}  laps={}", laps.unwrap_or(0));
+            }
+            println!("({} session(s), {} catalog issue(s))", rows.len(), report.skipped.len());
+        }
+        OutFormat::Json => {
+            let json = json!({ "sessions": rows.iter().map(|(id, ts, rider, bike, venue, laps)| {
+                json!({ "session_id": id, "timestamp_utc_ms": ts, "rider": rider, "bike": bike, "venue_name": venue, "lap_count": laps })
+            }).collect::<Vec<_>>() });
+            match serde_json::to_string_pretty(&json) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Runs contract C4 §7's `verify` checks and prints every finding.
+fn cmd_verify(data_dir: &Path) -> ExitCode {
+    let findings = verify::verify(data_dir);
+    for f in &findings {
+        println!("[{:?}] {}: {}", f.severity, f.path.display(), f.message);
+    }
+    println!("{} finding(s)", findings.len());
+    if findings.iter().any(|f| f.severity == verify::Severity::Error) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Lists (or, with `confirm`, deletes) `derived/*.parquet` files older than
+/// `older_than_days`. Age-based only — not orphan-verified (a candidate may
+/// still be the live derived file for its column set; see C4 §7 check #6,
+/// deferred). Dry-run by default.
+fn cmd_prune(data_dir: &Path, older_than_days: u32, confirm: bool) -> ExitCode {
+    let cutoff_ms = chrono_free_now_ms() - i64::from(older_than_days) * 86_400_000;
+    let sessions_dir = data_dir.join("sessions");
+    let mut candidates = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for session in entries.flatten() {
+            let derived_dir = session.path().join("derived");
+            let Ok(files) = std::fs::read_dir(&derived_dir) else { continue };
+            for f in files.flatten() {
+                let path = f.path();
+                let Ok(meta) = f.metadata() else { continue };
+                let Ok(modified) = meta.modified() else { continue };
+                let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) else { continue };
+                let mtime_ms = dur.as_millis() as i64;
+                if mtime_ms < cutoff_ms {
+                    candidates.push(path);
+                }
+            }
+        }
+    }
+    println!(
+        "{} candidate(s) older than {older_than_days} day(s) (age-only — not orphan-verified):",
+        candidates.len()
+    );
+    for c in &candidates {
+        println!("  {}", c.display());
+    }
+    if confirm {
+        for c in &candidates {
+            if let Err(e) = std::fs::remove_file(c) {
+                eprintln!("error: removing {}: {e}", c.display());
+            }
+        }
+        println!("deleted {} file(s)", candidates.len());
+    } else {
+        println!("(dry run — pass --confirm to delete)");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Milliseconds since the Unix epoch, `std`-only (no date/time crate pinned
+/// in this workspace — see `session::filename`'s module doc for the same
+/// constraint).
+fn chrono_free_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // Human renderers (text mode) + shared helpers.
 // ---------------------------------------------------------------------------
 
@@ -1189,39 +1427,48 @@ mod tests {
     use idl_rs::workbook::ChannelApplyResult;
     use std::path::PathBuf;
 
-    fn test_handle() -> SessionHandle {
-        let meta = SessionMetaInput {
+    /// Synthetic uniform `t_us` at `rate_hz` for `len` samples — matches
+    /// `Channel::from_f64`'s own formula (`core/src/session/handle.rs`'s
+    /// `input_channel` test helper uses the same one).
+    fn uniform_t_us(rate_hz: f64, len: usize) -> Vec<i64> {
+        (0..len)
+            .map(|i| (i as f64 * 1_000_000.0 / rate_hz).round() as i64)
+            .collect()
+    }
+
+    fn test_meta() -> SessionMetaInput {
+        SessionMetaInput {
             session_id: String::new(),
-            device_id: String::new(),
+            device_id: None,
             timestamp_utc_ms: 0,
-            config_checksum: String::new(),
-        };
+            config_checksum: None,
+        }
+    }
+
+    fn test_handle() -> SessionHandle {
         SessionHandle::from_channels(
-            meta,
+            test_meta(),
             vec![ChannelInput {
                 channel_id: "X".to_string(),
                 sample_rate_hz: 10.0,
+                t_us: uniform_t_us(10.0, 2),
                 samples: vec![1.0, 2.0],
-                sample_times_secs: None,
+                source_kind: "x".to_string(),
             }],
         )
     }
 
     /// Build a handle with a named channel at `rate_hz` filled with `samples`.
     fn test_handle_with_channel(id: &str, rate_hz: f64, samples: Vec<f64>) -> SessionHandle {
-        let meta = SessionMetaInput {
-            session_id: String::new(),
-            device_id: String::new(),
-            timestamp_utc_ms: 0,
-            config_checksum: String::new(),
-        };
+        let len = samples.len();
         SessionHandle::from_channels(
-            meta,
+            test_meta(),
             vec![ChannelInput {
                 channel_id: id.to_string(),
                 sample_rate_hz: rate_hz,
+                t_us: uniform_t_us(rate_hz, len),
                 samples,
-                sample_times_secs: None,
+                source_kind: id.to_lowercase(),
             }],
         )
     }
@@ -1423,7 +1670,7 @@ mod tests {
                 name: "D".to_string(),
                 error: None,
             }],
-            evaluated: vec![Channel::from_f64("D", 10.0, vec![2.0, 4.0], None)],
+            evaluated: vec![Channel::from_f64("D", 10.0, vec![2.0, 4.0])],
         }
     }
 

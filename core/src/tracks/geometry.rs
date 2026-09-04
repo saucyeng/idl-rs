@@ -1,7 +1,7 @@
 //! Pure planar geometry for track matching: closest-point-on-polyline and an
 //! axis-aligned bounding box. Scale-agnostic — inputs share one consistent
-//! unit (raw degrees × 1e7 for the bbox pre-filter; local metres for the
-//! distance projection). Verbatim port of Dart `PolylineGeometry` / `_Bbox`.
+//! unit (physical decimal degrees for the bbox pre-filter; local metres for
+//! the distance projection). Verbatim port of Dart `PolylineGeometry` / `_Bbox`.
 
 use crate::gps::GpsFix;
 
