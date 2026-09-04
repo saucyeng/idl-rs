@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::math::parse::{parse, Ast, BinOp, UnOp};
+use crate::math::parse::{Ast, BinOp, UnOp};
 use crate::math::value::{ChannelValue, Value};
 use crate::math::{MathEvalError, MathEvalErrorKind};
 
@@ -230,12 +230,30 @@ fn err(kind: MathEvalErrorKind, msg: impl Into<String>) -> MathEvalError {
 }
 
 /// Parses and evaluates `expression`, returning the output buffer + rate.
+/// A zero-constants call to [`evaluate_with_constants`] (L3-R17) — additive,
+/// mirroring `math::parse`'s `parse`/`parse_with_constants` equivalence.
 pub fn evaluate(
     expression: &str,
     lookup: &dyn ChannelLookup,
     lap_ctx: &MathLapContext,
 ) -> Result<EvalOutput, MathEvalError> {
-    let ast = parse(expression)?;
+    evaluate_with_constants(expression, &HashMap::new(), lookup, lap_ctx)
+}
+
+/// Parses `expression` against `constants` (workbook-v3's flat constants
+/// table, C2 §3.1 — `math::parse::parse_with_constants` substitutes each
+/// `constants`-table name with its literal value before parsing) and
+/// evaluates it, returning the output buffer + rate. This is the one
+/// function that wraps the lookup in [`MemoLookup`] while still supporting
+/// constants (G6.3) — `workbook::v3::resolve::resolve_workbook_defs` calls
+/// this, never `parse_with_constants` + [`eval`] by hand.
+pub fn evaluate_with_constants(
+    expression: &str,
+    constants: &HashMap<String, f64>,
+    lookup: &dyn ChannelLookup,
+    lap_ctx: &MathLapContext,
+) -> Result<EvalOutput, MathEvalError> {
+    let ast = crate::math::parse::parse_with_constants(expression, constants)?;
     // Memoize lookups for this pass so a channel referenced N times is widened
     // once and shared (Arc) across references. See MemoLookup.
     let memo = MemoLookup::new(lookup);
@@ -691,6 +709,16 @@ fn value_at(v: &Value, i: usize) -> Result<f64, MathEvalError> {
     }
 }
 
+/// The `t_us` a `Value` contributes to `combine_t_us`'s fold: a channel's own
+/// axis, or empty for a scalar (a scalar `if()` branch establishes no time
+/// axis of its own — L3-R33).
+fn value_t_us(v: &Value) -> Arc<[i64]> {
+    match v {
+        Value::Channel(c) => c.t_us.clone(),
+        _ => Arc::from(&[] as &[i64]),
+    }
+}
+
 // Mirrors Dart `double.sign`: NaN→NaN, +/-0→0, else ±1.
 fn dart_sign(x: f64) -> f64 {
     if x.is_nan() {
@@ -984,6 +1012,13 @@ fn call_function(
             require_arg_count(name, &args, 3)?;
             let cond = require_channel(&args[0], "if(cond,t,f) — cond")?;
             let n = cond.samples.len();
+            // L3-R33: cond's t_us no longer wins by default — it is folded via
+            // combine_t_us against the t/f operands' own axes too (a scalar
+            // operand contributes no axis, i.e. empty). Equal-or-empty passes
+            // through; a genuine mismatch is the same typed Runtime error
+            // combine_t_us already gives elemwise(), naming both spans.
+            let t_us = combine_t_us("if(cond,t,f)", &cond.t_us, &value_t_us(&args[1]))?;
+            let t_us = combine_t_us("if(cond,t,f)", &t_us, &value_t_us(&args[2]))?;
             let mut out = vec![0.0; n];
             for i in 0..n {
                 out[i] = if cond.samples[i] != 0.0 {
@@ -992,9 +1027,7 @@ fn call_function(
                     value_at(&args[2], i)?
                 };
             }
-            // cond drives the output's shape, so its t_us is the output's axis
-            // (the branch values are sampled at cond's positions via value_at).
-            Ok(channel(out, cond.sample_rate_hz, cond.t_us))
+            Ok(channel(out, cond.sample_rate_hz, t_us))
         }
         "spectrogram" | "hilbert" | "correlate" | "convolve" | "resample" | "sosfilt" => {
             Err(err(MathEvalErrorKind::NotImplemented, format!("not yet implemented: {name}")))
@@ -1922,6 +1955,39 @@ mod tests {
     }
 
     #[test]
+    fn if_scalar_branches_passthrough_result_carries_conds_t_us_unchanged() {
+        // Arrange — L3-R33: cond has a real axis; both branches are scalars
+        // (no axis of their own), so cond's t_us passes through unchanged.
+        let lk = timed(&[("c", vec![1.0, 0.0], 10.0, vec![0, 100_000])]);
+
+        // Act
+        let v = eval_expr("if([c], 100, -1)", &lk).unwrap();
+
+        // Assert
+        match v {
+            Value::Channel(c) => assert_eq!(c.t_us.as_ref(), [0i64, 100_000].as_slice()),
+            _ => panic!("expected channel"),
+        }
+    }
+
+    #[test]
+    fn if_branch_channel_with_different_t_us_than_cond_is_runtime_error_naming_both() {
+        // Arrange — L3-R33: [c] and [t] carry genuinely different recorded
+        // axes; if() must not silently adopt cond's t_us and drop [t]'s.
+        let lk = timed(&[
+            ("c", vec![1.0, 0.0], 10.0, vec![0, 100_000]),
+            ("t", vec![100.0, 200.0], 10.0, vec![5, 100_005]),
+        ]);
+
+        // Act
+        let err = eval_expr("if([c], [t], -1)", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("different per-sample time axes"), "{}", err.message);
+    }
+
+    #[test]
     fn deferred_stub_reports_not_implemented() {
         // Arrange
         let lk = lookup(&[("a", vec![1.0], 1.0)]);
@@ -2465,6 +2531,36 @@ mod tests {
         // Assert — scalar result: rate 0, empty t_us.
         assert_eq!(out.sample_rate_hz, 0.0);
         assert!(out.t_us.is_empty());
+    }
+
+    #[test]
+    fn evaluate_equals_evaluate_with_constants_given_an_empty_constants_table() {
+        // Arrange — L3-R17: evaluate() is a zero-constants call to
+        // evaluate_with_constants(), so the two must agree exactly.
+        let lk = lookup(&[("a", vec![1.0, 2.0, 3.0], 10.0)]);
+
+        // Act
+        let via_evaluate = evaluate("[a] * 2 + 1", &lk, &MathLapContext::empty()).unwrap();
+        let via_with_constants =
+            evaluate_with_constants("[a] * 2 + 1", &HashMap::new(), &lk, &MathLapContext::empty()).unwrap();
+
+        // Assert
+        assert_eq!(via_evaluate, via_with_constants);
+    }
+
+    #[test]
+    fn evaluate_with_constants_substitutes_the_constants_table_by_name() {
+        // Arrange
+        let lk = lookup(&[("a", vec![1.0, 2.0], 10.0)]);
+        let constants = HashMap::from([("rider_mass_kg".to_string(), 82.0)]);
+
+        // Act
+        let out =
+            evaluate_with_constants("[a] * rider_mass_kg", &constants, &lk, &MathLapContext::empty()).unwrap();
+
+        // Assert
+        assert_relative_eq!(out.samples[0], 82.0);
+        assert_relative_eq!(out.samples[1], 164.0);
     }
 
     #[test]

@@ -12,12 +12,14 @@ pub mod constants;
 pub mod error;
 pub mod front_matter;
 pub mod math_cell;
+pub mod resolve;
 
 pub use cell::{CellDoc, CellKindToken};
 pub use constants::merge_constants;
 pub use error::{WorkbookError, WorkbookErrorKind};
 pub use front_matter::{ConstantRaw, FrontMatter, UnitsPref};
 pub use math_cell::{parse_math_cell_body, MathCellLine};
+pub use resolve::resolve_workbook_defs;
 
 /// One `const` line collected from any `math` cell (C2 §3.1), flattened
 /// across the whole document. Workbook-scoped like a front-matter constant
@@ -40,6 +42,28 @@ pub struct ConstLine {
     /// kept for shape symmetry with
     /// [`front_matter::ConstantRaw::WithUnit`].
     pub unit_display: Option<String>,
+}
+
+/// One flat-namespace `def_line` (C2 §2.4, §3.1), flattened across the whole
+/// document — Task 6's `resolve_workbook_defs` input. `order` is this
+/// definition's index within its own cell's `Def` lines (not a document-wide
+/// index): document order plus per-cell `order` together give Task 9 "which
+/// cell declared each identifier, in source order" (L3-R16).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MathCellDef {
+    /// The `math` cell this definition was declared in.
+    pub cell_id: String,
+    /// The `def_line`'s identifier (C2 §3.1) — already validated against
+    /// `identifier`/[`error::RESERVED_NAMES`] by [`parse_math_cell_body`].
+    pub name: String,
+    /// The unparsed right-hand side (C2 §3.2 expression parsing happens at
+    /// evaluation time, not here).
+    pub expr_text: String,
+    /// The definition's display name, from a `# label: <text>` trailing
+    /// comment (C2 §3.1). `None` when the line has no such comment.
+    pub label: Option<String>,
+    /// Index within this definition's own cell's `Def` lines (source order).
+    pub order: usize,
 }
 
 /// A parsed `.idl1wb` document (C2 §1–§2): front-matter identity plus the
@@ -69,6 +93,14 @@ pub struct WorkbookDoc {
     /// (C2 §2.4, §3.1) — Task 4's `merge_constants` input; see
     /// [`ConstLine`].
     pub const_lines: Vec<ConstLine>,
+    /// Every `def_line` from every `math` cell, flattened document-wide (C2
+    /// §2.4) in document-cell order, then `def_line` order within a cell —
+    /// Task 6's `resolve_workbook_defs` input (L3-R16); see [`MathCellDef`].
+    pub defs: Vec<MathCellDef>,
+    /// The flat constants table (C2 §3.1): [`merge_constants`]'s merged
+    /// `name → f64` output over `constants_raw` and `const_lines`, run once
+    /// inside [`parse_workbook`] (L3-R16/17).
+    pub constants: HashMap<String, f64>,
 }
 
 /// Parses a `.idl1wb` document's front matter, cell fences and prose spans
@@ -105,6 +137,7 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
     let (cells, trailing_prose, mut errors) = cell::scan_cells(body);
 
     let mut const_lines = Vec::new();
+    let mut defs = Vec::new();
     let mut def_names = HashSet::new();
     for cell in &cells {
         if cell.kind_token != CellKindToken::Math {
@@ -112,12 +145,15 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
         }
         let (lines, cell_errors) = math_cell::parse_math_cell_body(&cell.id, &cell.raw_fence_body);
         errors.extend(cell_errors);
+        let mut order = 0;
         for line in lines {
             match line {
-                MathCellLine::Def { name, .. } => {
+                MathCellLine::Def { name, expr_text, label } => {
                     if !def_names.insert(name.clone()) {
                         errors.push(error::duplicate_definition(&cell.id, &name));
                     }
+                    defs.push(MathCellDef { cell_id: cell.id.clone(), name, expr_text, label, order });
+                    order += 1;
                 }
                 MathCellLine::Const { name, value, unit_display } => {
                     const_lines.push(ConstLine { cell_id: cell.id.clone(), name, value, unit_display });
@@ -126,6 +162,12 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
             }
         }
     }
+
+    // L3-R16: merge_constants runs exactly once here — its errors half joins
+    // the collected Vec<WorkbookError>, its table half becomes
+    // WorkbookDoc.constants (Task 8's host_constants source).
+    let (constants, constant_errors) = merge_constants(&front_matter.constants, &const_lines);
+    errors.extend(constant_errors);
 
     let doc = WorkbookDoc {
         id: front_matter.id,
@@ -136,6 +178,8 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
         cells,
         trailing_prose,
         const_lines,
+        defs,
+        constants,
     };
 
     Ok((doc, errors))
