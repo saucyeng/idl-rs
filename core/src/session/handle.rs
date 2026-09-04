@@ -488,8 +488,14 @@ impl SessionHandle {
     /// One value per GPS fix, in the exact order [`crate::gps::build_gps_track`]
     /// returns fixes: `channel_id` resampled (nearest-sample, no interpolation)
     /// to each fix's recording-time instant. `NaN` where the fix falls outside
-    /// the channel's sample span or the channel is absent. Empty when the
-    /// session has no GPS fixes.
+    /// the channel's own recorded `[first, last]` span (R39, extending R31's
+    /// `cursor_readout` rule here — a channel that ends early stops
+    /// colouring the trace rather than freezing at its last value), the
+    /// channel has no samples, or the channel is absent. Empty when the
+    /// session has no GPS fixes. As elsewhere in this module, `NaN` doubles
+    /// as both "no value" and a legitimately-recorded `NaN` sample; this
+    /// function does not distinguish the two, matching its pre-existing
+    /// contract for the absent/empty-channel cases.
     ///
     /// The resampled vector is small (one f64 per fix; GPS ≈ 10 Hz) and is the
     /// only thing that crosses FFI — the channel's full sample column stays in
@@ -509,14 +515,30 @@ impl SessionHandle {
 
         self.with_channel(channel_id, |c| {
             let samples = c.materialize();
-            if samples.is_empty() {
+            let n = samples.len().min(c.t_us.len());
+            if n == 0 {
                 return vec![f64::NAN; times.len()];
             }
             // Every channel has real `t_us` now (C1 §2) — the old
             // event-driven/fixed-rate branch collapses into one lookup.
+            // R39: a fix time outside this channel's own recorded
+            // `[first, last]` span reads `NaN` (uncoloured), the same span
+            // check `cursor_readout` (R31) performs at its call site —
+            // `nearest_by_t_us`/`nearest_at_t_us` keep clamping and stay
+            // the shared primitive; the check lives here, not in them.
             times
                 .iter()
-                .map(|&t| nearest_by_t_us(&samples, &c.t_us, t))
+                .map(|&t| {
+                    // Same µs rounding `nearest_by_t_us` applies internally —
+                    // computed here only to test the span, not to look up
+                    // the value (that stays `nearest_by_t_us`'s job).
+                    let target_us = (t * 1e6).round() as i64;
+                    if target_us < c.t_us[0] || target_us > c.t_us[n - 1] {
+                        f64::NAN
+                    } else {
+                        nearest_by_t_us(&samples, &c.t_us, t)
+                    }
+                })
                 .collect()
         })
         .unwrap_or_else(|| vec![f64::NAN; times.len()])
@@ -2257,12 +2279,16 @@ mod gps_channel_values_tests {
     }
 
     #[test]
-    fn gps_channel_values_clamps_to_nearest_past_channel_span() {
-        // Arrange — fixes at secs 0,1,2 but target channel only spans sec 0
-        // (1 Hz, length 1). `nearest_by_t_us` (contract C1 — every channel
-        // has real `t_us` now) clamps beyond the last sample rather than
-        // returning NaN, matching the pre-idl1 event-driven "nearest"
-        // semantics — that behavior now applies uniformly.
+    fn gps_channel_values_nan_past_channel_span() {
+        // Arrange — R39: this asserts the reversal of the previous
+        // behaviour (`gps_channel_values_clamps_to_nearest_past_channel_span`,
+        // now renamed/inverted), a deliberate landed-behaviour change, not a
+        // fix to a broken test. Fixes at secs 0,1,2 but target channel only
+        // spans sec 0 (1 Hz, length 1): a fix time outside a channel's own
+        // recorded `[first, last]` span must now read `NaN` (uncoloured),
+        // the same rule `cursor_readout` (R31) applies — a channel that ends
+        // early stops painting the trace instead of freezing at its last
+        // value.
         let h = handle_with(vec![
             ch("GPS_Latitude", 1.0, vec![10.0, 11.0, 12.0]),
             ch("GPS_Longitude", 1.0, vec![5.0, 6.0, 7.0]),
@@ -2273,8 +2299,33 @@ mod gps_channel_values_tests {
         // Act
         let v = h.gps_channel_values("Short");
 
-        // Assert — every fix clamps to the channel's single sample.
-        assert_eq!(v, vec![42.0, 42.0, 42.0]);
+        // Assert — only the fix inside the channel's span (sec 0) gets a
+        // value; the rest read NaN, not the clamped last sample.
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0], 42.0);
+        assert!(v[1].is_nan());
+        assert!(v[2].is_nan());
+    }
+
+    #[test]
+    fn gps_channel_values_at_span_boundary_returns_value() {
+        // Arrange — fixes exactly at the channel's first and last recorded
+        // `t_us`; both ends of the span must still resolve to a value, not
+        // NaN (an off-by-one here would silently blank every trace's ends).
+        let h = handle_with(vec![
+            ch("GPS_Latitude", 1.0, vec![10.0, 11.0, 12.0]),
+            ch("GPS_Longitude", 1.0, vec![5.0, 6.0, 7.0]),
+            ch("GPS_EpochMs", 1.0, vec![0.0, 1000.0, 2000.0]),
+            ch("Fork", 1.0, vec![7.0, 8.0, 9.0]),
+        ]);
+
+        // Act — fixes at secs 0, 1, 2; "Fork" spans exactly the same range.
+        let v = h.gps_channel_values("Fork");
+
+        // Assert — first and last fixes sit exactly on the channel's
+        // recorded span edges and both return a value, not NaN.
+        assert_eq!(v, vec![7.0, 8.0, 9.0]);
+        assert!(v.iter().all(|x| !x.is_nan()));
     }
 
     #[test]
