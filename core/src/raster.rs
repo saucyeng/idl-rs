@@ -11,7 +11,7 @@
 //! assembles C3's JSON `RasterMeta` from this struct — do not add those
 //! fields here.
 
-use crate::colormap::{finite_bounds, normalize_to_colormap};
+use crate::colormap::{colorize_with_bounds, finite_bounds};
 use crate::fft::{Detrend, FftWindow, Scaling};
 use crate::histogram2d::histogram2d;
 use crate::spectrogram::spectrogram;
@@ -73,6 +73,19 @@ fn write_header(out: &mut Vec<u8>, width: u16, height: u16) {
 /// height)` would put time on the Y axis and DC (0 Hz) at row 0/top — this
 /// expression corrects both in one step.
 ///
+/// **Colour bounds are resolution-independent (ledger R38):** the Turbo
+/// normalisation uses `vmin`/`vmax` scanned over the **full, un-rebinned**
+/// `power` matrix — the same scan [`spectrogram_raster_meta`] performs — not
+/// over just the pixels this call happens to rebin onto. Nearest-cell rebin
+/// is a subset selection, not an average, so at low output resolution some
+/// extreme cells of `power` are never selected by any pixel; if the bounds
+/// came from the rebinned subset instead, the legend and the rendered image
+/// would disagree, and resizing a chart would re-normalise its own colours.
+/// Colour is data, not layout — a consequence of this: at low resolution the
+/// rendered raster can fail to contain any pixel at exactly `vmin` or
+/// `vmax`, since the cell that held that value may have been dropped by the
+/// rebin. The legend describes the mapping, not a census of what's on screen.
+///
 /// An empty/degenerate `samples` (or a spectrogram with `n_times == 0 ||
 /// n_freqs == 0`) still returns a well-formed header and a full transparent
 /// (`alpha = 0`) pixel region of the requested size — never truncated, never
@@ -92,6 +105,10 @@ pub fn build_spectrogram_raster_bytes(
     let (n_times, n_freqs) = (s.n_times as usize, s.n_freqs as usize);
     let (w, h) = (width as usize, height as usize);
 
+    // Bounds over the full matrix, before rebinning (R38) — matches
+    // `spectrogram_raster_meta` exactly, so the legend and the pixels agree.
+    let (vmin, vmax) = finite_bounds(&s.power);
+
     let mut values = Vec::with_capacity(w * h);
     for y in 0..h {
         for x in 0..w {
@@ -105,7 +122,7 @@ pub fn build_spectrogram_raster_bytes(
         }
     }
 
-    let colours = normalize_to_colormap(&values);
+    let colours = colorize_with_bounds(&values, vmin, vmax);
     let mut out = Vec::with_capacity(HEADER_LEN + w * h * 4);
     write_header(&mut out, width, height);
     for c in &colours {
@@ -139,7 +156,13 @@ pub fn build_histogram2d_raster_bytes(
         .map(|&c| if c == 0 { f64::NAN } else { c as f64 })
         .collect();
 
-    let colours = normalize_to_colormap(&values);
+    // Bounds over the full count grid, same substitution as above (R38) —
+    // here the "full" grid and the encoded grid are already identical
+    // (histogram2d is sized directly to width*height, no separate rebin),
+    // but computing bounds this way keeps the pattern identical to the
+    // spectrogram builder and to `histogram2d_raster_meta`.
+    let (vmin, vmax) = finite_bounds(&values);
+    let colours = colorize_with_bounds(&values, vmin, vmax);
     let mut out = Vec::with_capacity(HEADER_LEN + width as usize * height as usize * 4);
     write_header(&mut out, width, height);
     for c in &colours {
@@ -154,12 +177,18 @@ pub fn build_histogram2d_raster_bytes(
 /// "separate command, not stuffed into the header" design).
 ///
 /// `x_domain`/`y_domain` come from `times_secs`/`freqs_hz`'s own min/max.
-/// `vmin`/`vmax` are the finite bounds of the raw `power` matrix — the same
-/// bounds [`crate::colormap::normalize_to_colormap`] would compute internally
-/// for this data, exposed here instead of duplicated at the pixel-rebinned
-/// level (rebinning does not change the underlying value range).
-/// `transparent_zero` is always `false` — spectrogram power has no
-/// `count == 0` transparency rule.
+/// `vmin`/`vmax` are the finite bounds of the raw, un-rebinned `power`
+/// matrix — deliberately **not** rebinned to any particular `(width,
+/// height)` (this function takes none), so the colour scale is
+/// resolution-independent (ledger R38): the same channel at two different
+/// chart sizes gets the same legend, and resizing a chart never
+/// re-normalises its colours. [`build_spectrogram_raster_bytes`] scans these
+/// same, identical bounds before rebinning its pixels, so the legend this
+/// function reports and the pixels that builder draws always agree — even
+/// though nearest-cell rebin can drop the specific cell that held the
+/// extreme value, so the rendered raster may contain no pixel at exactly
+/// `vmin`/`vmax` at low output resolution. `transparent_zero` is always
+/// `false` — spectrogram power has no `count == 0` transparency rule.
 pub fn spectrogram_raster_meta(
     samples: &[f64],
     sample_rate_hz: f64,
@@ -338,6 +367,46 @@ mod tests {
         assert!(meta.x_domain.1 >= meta.x_domain.0);
         assert!(meta.vmax >= meta.vmin);
         assert!(!meta.transparent_zero);
+    }
+
+    #[test]
+    fn spectrogram_raster_meta_bounds_match_the_builder_even_when_rebin_drops_the_extreme_cell() {
+        // Arrange — parameters chosen so nearest-cell rebin structurally never
+        // selects the Nyquist frequency row (n_freqs=33, height=32): the
+        // review that raised R38 showed `bin_of(y) = (y*33/32).min(32)` never
+        // yields 32 for any y in 0..32, so that row of `power` is scanned for
+        // bounds but never rendered by any pixel.
+        let fs = 256.0;
+        let n = 512usize;
+        let data: Vec<f64> = (0..n).map(|i| (2.0 * std::f64::consts::PI * 40.0 * i as f64 / fs).sin() + 0.3 * (i as f64 * 0.01).sin()).collect();
+        let (width, height) = (16u16, 32u16);
+
+        // Act — the meta's reported bounds, and the actual bytes rendered.
+        let meta = spectrogram_raster_meta(&data, fs, FftWindow::Hann, 64, 32, Detrend::Mean, Scaling::Density);
+        let bytes = build_spectrogram_raster_bytes(&data, fs, width, height, FftWindow::Hann, 64, 32, Detrend::Mean, Scaling::Density);
+
+        // Assert — re-derive the expected pixel colours purely from the
+        // meta's own vmin/vmax (independent of the builder's internals) and
+        // require an exact byte match against what the builder actually
+        // produced. This is the invariant R38 requires: if the builder ever
+        // normalised over the rebinned subset instead of the full matrix,
+        // this would fail whenever the dropped row held the true min/max.
+        let s = spectrogram(data.clone(), fs, FftWindow::Hann, 64, 32, Detrend::Mean, Scaling::Density);
+        let (n_times, n_freqs) = (s.n_times as usize, s.n_freqs as usize);
+        let (w, h) = (width as usize, height as usize);
+        let mut expected = Vec::with_capacity(HEADER_LEN + w * h * 4);
+        expected.extend_from_slice(&bytes[0..HEADER_LEN]); // header already checked elsewhere
+        for y in 0..h {
+            for x in 0..w {
+                let frame = (x * n_times / w).min(n_times - 1);
+                let bin = (y * n_freqs / h).min(n_freqs - 1);
+                let v = s.power[frame * n_freqs + (n_freqs - 1 - bin)];
+                let range = meta.vmax - meta.vmin;
+                let t = if range > 0.0 { (v - meta.vmin) / range } else { 0.0 };
+                expected.extend_from_slice(&crate::colormap::colorize_with_bounds(&[t], 0.0, 1.0)[0]);
+            }
+        }
+        assert_eq!(bytes, expected);
     }
 
     #[test]

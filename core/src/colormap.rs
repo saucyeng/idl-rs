@@ -78,14 +78,33 @@ pub(crate) fn finite_bounds(values: &[f64]) -> (f64, f64) {
 /// from that one.
 pub fn normalize_to_colormap(values: &[f64]) -> Vec<[u8; 4]> {
     let (mn, mx) = finite_bounds(values);
-    let range = mx - mn;
+    colorize_with_bounds(values, mn, mx)
+}
+
+/// Like [`normalize_to_colormap`], but against caller-supplied `(lo, hi)`
+/// bounds instead of scanning `values` for its own min/max.
+///
+/// For a raster builder that rebins a larger source grid onto fewer output
+/// pixels (`raster.rs`'s spectrogram path, ledger R38), the bounds must come
+/// from the **full, un-rebinned** source data — nearest-cell rebinning is a
+/// subset selection, not an average, so scanning only the rebinned pixels can
+/// silently drop the true extreme value and produce a colour scale that
+/// disagrees with `*_raster_meta`'s reported `vmin`/`vmax`. This function is
+/// the shared mapping step both the meta function and the byte builder can
+/// call against the same bounds, so they can never disagree.
+///
+/// Same NaN/degenerate rules as `normalize_to_colormap`: non-finite `v` is
+/// transparent; `hi <= lo` (an empty or all-equal span) maps every finite `v`
+/// to `t = 0.0`, a flat visible colour, not transparency.
+pub(crate) fn colorize_with_bounds(values: &[f64], lo: f64, hi: f64) -> Vec<[u8; 4]> {
+    let range = hi - lo;
     values
         .iter()
         .map(|&v| {
             if !v.is_finite() {
                 return turbo_rgba8(f64::NAN);
             }
-            let t = if range > 0.0 { (v - mn) / range } else { 0.0 };
+            let t = if range > 0.0 { (v - lo) / range } else { 0.0 };
             turbo_rgba8(t)
         })
         .collect()
