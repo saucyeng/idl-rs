@@ -13,13 +13,24 @@ use crate::math::MathEvalErrorKind;
 
 const EPS: f64 = 1e-9;
 
+/// Synthetic uniform `t_us` for a test double with no real recorded time
+/// (matches [`crate::session::Channel::from_f64`]'s formula).
+fn synthetic_t_us(len: usize, rate: f64) -> Arc<[i64]> {
+    if rate > 0.0 {
+        (0..len).map(|i| (i as f64 * 1_000_000.0 / rate) as i64).collect()
+    } else {
+        vec![0i64; len].into()
+    }
+}
+
 struct Ctx(Vec<(String, Vec<f64>, f64)>);
 impl ChannelLookup for Ctx {
     fn lookup(&self, name: &str) -> Option<LookupChannel> {
-        self.0
-            .iter()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, s, r)| LookupChannel { samples: s.clone().into(), sample_rate_hz: *r })
+        self.0.iter().find(|(n, _, _)| n == name).map(|(_, s, r)| LookupChannel {
+            samples: s.clone().into(),
+            sample_rate_hz: *r,
+            t_us: synthetic_t_us(s.len(), *r),
+        })
     }
     fn best_time_base_dims(&self) -> Option<(usize, f64)> {
         self.0

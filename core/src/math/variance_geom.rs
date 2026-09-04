@@ -178,9 +178,12 @@ fn runtime_err(msg: impl Into<String>) -> MathEvalError {
 
 /// Assembles `variance_time` inputs and delegates to
 /// [`crate::variance::variance_time`]. Mirrors `_callVarianceTimeRust`.
+/// `main_t_us` is the main channel's own per-sample time (G5.7) — the
+/// result aligns to `main_samples`, so it carries that same axis forward.
 pub fn eval_variance_time(
     main_samples: &[f64],
     main_rate: f64,
+    main_t_us: &[i64],
     channel_id: &str,
     main: &dyn ChannelLookup,
     overlay: &MathOverlay,
@@ -208,7 +211,12 @@ pub fn eval_variance_time(
         })?;
 
     let result = variance_time_against(&r, &overlay_ch, &main_pos, main_samples, main_rate, main_window);
-    Ok(Value::Channel(ChannelValue { samples: std::sync::Arc::from(result), sample_rate_hz: main_rate, channel_id: None }))
+    Ok(Value::Channel(ChannelValue {
+        samples: std::sync::Arc::from(result),
+        sample_rate_hz: main_rate,
+        channel_id: None,
+        t_us: std::sync::Arc::from(main_t_us),
+    }))
 }
 
 /// Computes one target's `variance_time` series against a PREBUILT reference and
@@ -246,9 +254,12 @@ pub fn variance_time_against(
 
 /// Assembles `variance_dist` inputs and delegates to
 /// [`crate::variance::variance_dist`]. Mirrors `_callVarianceDistRust`.
+/// `main_t_us` is the main channel's own per-sample time (G5.7) — the
+/// result aligns to `main_samples`, so it carries that same axis forward.
 pub fn eval_variance_dist(
     main_samples: &[f64],
     main_rate: f64,
+    main_t_us: &[i64],
     channel_id: &str,
     main: &dyn ChannelLookup,
     overlay: &MathOverlay,
@@ -275,7 +286,12 @@ pub fn eval_variance_dist(
     let overlay_samples = subsample_to_arc(&overlay_ch.samples, &overlay_arc);
     let result =
         variance_dist_against(&overlay_arc, &overlay_samples, &main_pos, main_samples, main_rate, main_window);
-    Ok(Value::Channel(ChannelValue { samples: std::sync::Arc::from(result), sample_rate_hz: main_rate, channel_id: None }))
+    Ok(Value::Channel(ChannelValue {
+        samples: std::sync::Arc::from(result),
+        sample_rate_hz: main_rate,
+        channel_id: None,
+        t_us: std::sync::Arc::from(main_t_us),
+    }))
 }
 
 /// Computes one target's `variance_dist` series against a PREBUILT reference

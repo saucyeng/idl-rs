@@ -322,9 +322,23 @@ fn materialize(v: &Value, n: usize, ctx: &str) -> Result<Vec<f64>, MathEvalError
 }
 
 // A buffer at a positive rate is a channel; a rate-0 single sample is a scalar.
+//
+// t_us: empty. `rotate_euler_varying` combines up to six channel operands
+// (vx/vy/vz + roll/pitch/yaw) that `broadcast_shape` unifies on rate+length
+// only, not on t_us — there is no single source axis to propagate without
+// inventing a multi-operand equality rule L3-R12 doesn't specify, so this
+// (like current_lap()/sector_number()) marks "no established axis" rather
+// than guess. A downstream binary op still inherits a real axis from
+// whichever other operand it's combined with (combine_t_us's empty-side
+// rule).
 fn chan_or_scalar(samples: Vec<f64>, rate: f64) -> Value {
     if rate > 0.0 {
-        Value::Channel(ChannelValue { samples: std::sync::Arc::from(samples), sample_rate_hz: rate, channel_id: None })
+        Value::Channel(ChannelValue {
+            samples: std::sync::Arc::from(samples),
+            sample_rate_hz: rate,
+            channel_id: None,
+            t_us: std::sync::Arc::from(&[] as &[i64]),
+        })
     } else {
         Value::Scalar(samples[0])
     }
@@ -337,7 +351,12 @@ mod tests {
     use std::f64::consts::PI;
 
     fn chan(samples: Vec<f64>, rate: f64) -> Value {
-        Value::Channel(ChannelValue { samples: std::sync::Arc::from(samples), sample_rate_hz: rate, channel_id: None })
+        Value::Channel(ChannelValue {
+            samples: std::sync::Arc::from(samples),
+            sample_rate_hz: rate,
+            channel_id: None,
+            t_us: std::sync::Arc::from(&[] as &[i64]),
+        })
     }
     fn vec3(x: f64, y: f64, z: f64) -> Value {
         make_vec3(&Value::Scalar(x), &Value::Scalar(y), &Value::Scalar(z), "test").unwrap()

@@ -944,6 +944,16 @@ mod tests {
     use approx::assert_relative_eq;
     use std::collections::HashMap;
 
+    /// Synthetic uniform `t_us` for a test double with no real recorded time
+    /// (matches [`crate::session::Channel::from_f64`]'s formula).
+    fn synthetic_t_us(len: usize, rate: f64) -> std::sync::Arc<[i64]> {
+        if rate > 0.0 {
+            (0..len).map(|i| (i as f64 * 1_000_000.0 / rate) as i64).collect()
+        } else {
+            vec![0i64; len].into()
+        }
+    }
+
     /// A minimal ChannelLookup test double over a name → (samples, rate) map, with
     /// optional per-channel event times (the GPS path).
     struct FakeLookup {
@@ -953,9 +963,14 @@ mod tests {
 
     impl ChannelLookup for FakeLookup {
         fn lookup(&self, name: &str) -> Option<LookupChannel> {
-            self.channels
-                .get(name)
-                .map(|(s, r)| LookupChannel { samples: s.clone().into(), sample_rate_hz: *r })
+            self.channels.get(name).map(|(s, r)| {
+                // Synthetic uniform t_us consistent with the declared rate —
+                // this test double models no real recorded time, so a raw
+                // index relabeled as µs would be wrong; derive it the same
+                // way Channel::from_f64 does.
+                let t_us = synthetic_t_us(s.len(), *r);
+                LookupChannel { samples: s.clone().into(), sample_rate_hz: *r, t_us }
+            })
         }
 
         fn sample_times(&self, name: &str) -> Option<Vec<f64>> {

@@ -18,6 +18,15 @@ use crate::math::{MathEvalError, MathEvalErrorKind};
 pub struct LookupChannel {
     pub samples: Arc<[f64]>,
     pub sample_rate_hz: f64,
+    /// Per-sample recording time, **microseconds since the session's first
+    /// sample** — the C1 §8 item 5 resolution: this is
+    /// [`crate::session::Channel::t_us`] verbatim (real recorded time, not a
+    /// synthesized `i / rate` ramp), threaded through so downstream math
+    /// stays aligned to when a sample actually happened. Empty is the
+    /// explicit "no established time axis" marker (rate-0/table sources,
+    /// or a test double that declines to model time) — never a fabricated
+    /// ramp. `samples.len() == t_us.len()` whenever `t_us` is non-empty.
+    pub t_us: Arc<[i64]>,
 }
 
 /// Resolves `[Name]` channel references to sample data. Implemented by
@@ -67,6 +76,10 @@ pub trait ChannelLookup {
     /// timeline (the same clock as fixed-rate channels' `index / rate`).
     /// `None` for fixed-rate or absent channels. Default `None`;
     /// `SessionHandle` overrides it (GPS channels carry per-fix event times).
+    /// A seconds view of [`Channel::t_us`](crate::session::Channel::t_us)
+    /// kept for the estimator (`estimate/run.rs`'s one consumer); new code
+    /// reads [`LookupChannel::t_us`] instead (C1 §8 item 5) — unchanged this
+    /// task (L3-R15).
     fn sample_times(&self, _name: &str) -> Option<Vec<f64>> {
         None
     }
@@ -92,10 +105,11 @@ impl<'a> MemoLookup<'a> {
 impl ChannelLookup for MemoLookup<'_> {
     fn lookup(&self, name: &str) -> Option<LookupChannel> {
         if let Some(hit) = self.cache.borrow().get(name) {
-            // Cache hit: clone the shared Arc buffer (no data copy).
+            // Cache hit: clone the shared Arc buffers (no data copy).
             return Some(LookupChannel {
                 samples: hit.samples.clone(),
                 sample_rate_hz: hit.sample_rate_hz,
+                t_us: hit.t_us.clone(),
             });
         }
         // Miss: resolve once, cache an Arc-sharing copy, return the original.
@@ -103,7 +117,11 @@ impl ChannelLookup for MemoLookup<'_> {
         let resolved = self.inner.lookup(name)?;
         self.cache.borrow_mut().insert(
             name.to_string(),
-            LookupChannel { samples: resolved.samples.clone(), sample_rate_hz: resolved.sample_rate_hz },
+            LookupChannel {
+                samples: resolved.samples.clone(),
+                sample_rate_hz: resolved.sample_rate_hz,
+                t_us: resolved.t_us.clone(),
+            },
         );
         Some(resolved)
     }
@@ -158,7 +176,9 @@ impl std::fmt::Debug for MathOverlay {
 /// Injected lap/overlay state for the lap-aware and variance functions.
 /// Bounds and sectors are session-relative seconds (the Dart side converts
 /// epoch-ms → uniform-time before constructing this). `overlay` carries the
-/// second-handle data used by `variance_*`.
+/// second-handle data used by `variance_*`. These bounds stay a seconds view
+/// (kept for the estimator/lap-window math, L3-R15) — new code that needs a
+/// channel's own per-sample time reads [`LookupChannel::t_us`] instead.
 #[derive(Debug, Clone, Default)]
 pub struct MathLapContext {
     /// Per-lap `(start_s, end_s)` in session-relative seconds, in lap order.
@@ -196,6 +216,13 @@ impl MathLapContext {
 pub struct EvalOutput {
     pub samples: Vec<f64>,
     pub sample_rate_hz: f64,
+    /// Per-sample recording time, **microseconds since the session's first
+    /// sample** — the top-level result's [`ChannelValue::t_us`] (or
+    /// [`LookupChannel::t_us`]), owned rather than shared since this is the
+    /// outer return value, not an intermediate widened once per pass. Empty
+    /// for a scalar result or a channel with no established time axis; see
+    /// [`ChannelValue::t_us`]'s doc comment (C1 §8 item 5).
+    pub t_us: Vec<i64>,
 }
 
 fn err(kind: MathEvalErrorKind, msg: impl Into<String>) -> MathEvalError {
@@ -214,8 +241,10 @@ pub fn evaluate(
     let memo = MemoLookup::new(lookup);
     let value = eval(&ast, &memo, lap_ctx)?;
     match value {
-        Value::Channel(c) => Ok(EvalOutput { samples: c.samples.to_vec(), sample_rate_hz: c.sample_rate_hz }),
-        Value::Scalar(v) => Ok(EvalOutput { samples: vec![v], sample_rate_hz: 0.0 }),
+        Value::Channel(c) => {
+            Ok(EvalOutput { samples: c.samples.to_vec(), sample_rate_hz: c.sample_rate_hz, t_us: c.t_us.to_vec() })
+        }
+        Value::Scalar(v) => Ok(EvalOutput { samples: vec![v], sample_rate_hz: 0.0, t_us: Vec::new() }),
         Value::Str(_) => Err(err(
             MathEvalErrorKind::Type,
             "Expression evaluated to a string, not a channel or scalar",
@@ -270,6 +299,7 @@ pub fn eval(
                 samples: ch.samples,
                 sample_rate_hz: ch.sample_rate_hz,
                 channel_id: Some(name.clone()),
+                t_us: ch.t_us,
             }))
         }
         Ast::CellRef(name) => {
@@ -285,6 +315,9 @@ pub fn eval(
                     samples: Arc::from(vals),
                     sample_rate_hz: 0.0,
                     channel_id: None,
+                    // Rate-0 table-column source — empty is the "no time
+                    // axis" marker (L3-R12), never a synthetic ramp.
+                    t_us: Arc::from(&[] as &[i64]),
                 }))
             } else {
                 let v = lookup.lookup_cell(name).ok_or_else(|| {
@@ -391,6 +424,7 @@ pub(crate) fn elemwise(
                     ),
                 ));
             }
+            let t_us = combine_t_us(op_name, &a.t_us, &b.t_us)?;
             let mut out = Vec::with_capacity(a.samples.len());
             for i in 0..a.samples.len() {
                 out.push(op(a.samples[i], b.samples[i])?);
@@ -399,6 +433,7 @@ pub(crate) fn elemwise(
                 samples: Arc::from(out),
                 sample_rate_hz: a.sample_rate_hz,
                 channel_id: None,
+                t_us,
             }))
         }
         (Value::Channel(a), Value::Scalar(b)) => {
@@ -407,6 +442,9 @@ pub(crate) fn elemwise(
                 samples: Arc::from(out),
                 sample_rate_hz: a.sample_rate_hz,
                 channel_id: None,
+                // L3-R12: a channel×scalar op keeps the channel operand's
+                // t_us unchanged — the scalar contributes no time axis.
+                t_us: a.t_us,
             }))
         }
         (Value::Scalar(a), Value::Channel(b)) => {
@@ -415,6 +453,7 @@ pub(crate) fn elemwise(
                 samples: Arc::from(out),
                 sample_rate_hz: b.sample_rate_hz,
                 channel_id: None,
+                t_us: b.t_us,
             }))
         }
         (l, r) => Err(err(
@@ -422,6 +461,38 @@ pub(crate) fn elemwise(
             format!("\"{op_name}\": unexpected value types ({}, {})", type_name(&l), type_name(&r)),
         )),
     }
+}
+
+/// Resolves the `t_us` of a channel×channel [`elemwise`] result per L3-R12:
+/// when both operands carry a non-empty axis they must be identical (a
+/// silent misalignment is exactly the class of bug C1 §8 item 5 exists to
+/// prevent) — mismatched axes are a typed `Runtime` error naming both, not a
+/// guess at which one is "right". When either side is empty (no established
+/// axis — e.g. a table-column or scalar-derived operand) the result inherits
+/// whichever side is non-empty, or stays empty when both are.
+fn combine_t_us(op_name: &str, a: &Arc<[i64]>, b: &Arc<[i64]>) -> Result<Arc<[i64]>, MathEvalError> {
+    if a.is_empty() {
+        return Ok(b.clone());
+    }
+    if b.is_empty() {
+        return Ok(a.clone());
+    }
+    if a.as_ref() == b.as_ref() {
+        return Ok(a.clone());
+    }
+    Err(err(
+        MathEvalErrorKind::Runtime,
+        format!(
+            "\"{op_name}\": channels carry different per-sample time axes \
+             ({} samples spanning {}..{} µs vs {} samples spanning {}..{} µs)",
+            a.len(),
+            a.first().copied().unwrap_or(0),
+            a.last().copied().unwrap_or(0),
+            b.len(),
+            b.first().copied().unwrap_or(0),
+            b.last().copied().unwrap_or(0),
+        ),
+    ))
 }
 
 /// Applies `f` element-wise to a scalar or channel. Mirrors Dart `_mapValue`.
@@ -432,6 +503,8 @@ pub(crate) fn map_value(v: Value, f: impl Fn(f64) -> f64) -> Result<Value, MathE
             samples: c.samples.iter().map(|&x| f(x)).collect(),
             sample_rate_hz: c.sample_rate_hz,
             channel_id: None,
+            // Elementwise 1:1 map — same sample positions, same real times.
+            t_us: c.t_us,
         })),
         Value::Str(_) => {
             Err(err(MathEvalErrorKind::Type, "Cannot apply numeric operation to a string"))
@@ -532,17 +605,19 @@ fn estimator_channel_id(name: &str, arg: &str) -> Result<&'static str, MathEvalE
     }
 }
 
-fn channel(samples: Vec<f64>, sample_rate_hz: f64) -> Value {
-    Value::Channel(ChannelValue { samples: Arc::from(samples), sample_rate_hz, channel_id: None })
+fn channel(samples: Vec<f64>, sample_rate_hz: f64, t_us: Arc<[i64]>) -> Value {
+    Value::Channel(ChannelValue { samples: Arc::from(samples), sample_rate_hz, channel_id: None, t_us })
 }
 
 // Like require_channel but also demands a direct-reference channel_id (variance
-// needs it to find the same-named overlay channel). Returns (samples, rate, id).
-// Mirrors the Dart "argument must be a direct channel reference" guard.
-fn require_ref_channel(v: &Value, ctx: &str) -> Result<(Arc<[f64]>, f64, String), MathEvalError> {
+// needs it to find the same-named overlay channel), plus the channel's t_us —
+// variance_time/variance_dist's result aligns to the main channel's axis
+// (G5.7). Returns (samples, rate, t_us, id). Mirrors the Dart "argument must
+// be a direct channel reference" guard.
+fn require_ref_channel(v: &Value, ctx: &str) -> Result<(Arc<[f64]>, f64, Arc<[i64]>, String), MathEvalError> {
     match v {
         Value::Channel(c) => match &c.channel_id {
-            Some(id) => Ok((c.samples.clone(), c.sample_rate_hz, id.clone())),
+            Some(id) => Ok((c.samples.clone(), c.sample_rate_hz, c.t_us.clone(), id.clone())),
             None => Err(err(
                 MathEvalErrorKind::Runtime,
                 format!(
@@ -571,11 +646,19 @@ fn main_lap_window(lap_ctx: &MathLapContext) -> (f64, f64) {
 }
 
 // Resolves the per-sample time base for lap-aware functions as a closed-form
-// `(len, rate)`: consumers compute `i as f64 / rate` at the point of use, so the
-// zero-storage `Time` ramp is never materialized. Prefers an explicit `Time`
-// channel's dims; else the highest-rate channel's dims; else an empty 10 Hz base.
-// Time is the synthesized uniform ramp (value i/rate), so the closed form is
-// exact. Mirrors Dart `_resolveTimeBase`.
+// `(len, rate)`: consumers compute `i as f64 / rate` at the point of use, so
+// `Time` is never widened just to read its dims. Prefers an explicit `Time`
+// channel's dims; else the highest-rate channel's dims; else an empty 10 Hz
+// base. Mirrors Dart `_resolveTimeBase`.
+// TODO(idl0): `Time`'s real per-sample values are `t_us[i] / 1e6` from its
+// winning source channel (session::synthesis.rs:64), not a uniform `i/rate`
+// ramp — they can drift once a source has drops or burst-seam correction.
+// This closed form's `i as f64 / rate` computation is therefore only an
+// approximation of `Time`'s actual values; current_lap()/sector_number()
+// (the only closed-form consumers, eval.rs A10) inherit that measured drift.
+// Fixing this means either widening `Time` here (losing the zero-storage
+// win) or exposing its t_us via a new dims-only accessor — deferred pending
+// a decision on which; not this task's scope (L3-R13).
 fn resolve_time_base(lookup: &dyn ChannelLookup) -> (usize, f64) {
     if let Some((len, rate)) = lookup.channel_dims("Time") {
         if len > 0 && rate > 0.0 {
@@ -634,7 +717,11 @@ fn call_function(
         "integrate" => {
             require_arg_count(name, &args, 1)?;
             let ch = require_channel(&args[0], name)?;
-            Ok(channel(crate::integration::integrate(&ch.samples, ch.sample_rate_hz), ch.sample_rate_hz))
+            Ok(channel(
+                crate::integration::integrate(&ch.samples, ch.sample_rate_hz),
+                ch.sample_rate_hz,
+                ch.t_us,
+            ))
         }
         // ---- Estimator-backed virtual sensors ----
         // The offline geometry-constrained estimator (`estimate::run`) is run
@@ -652,7 +739,7 @@ fn call_function(
                     ),
                 )
             })?;
-            Ok(channel(ch.samples.to_vec(), ch.sample_rate_hz))
+            Ok(channel(ch.samples.to_vec(), ch.sample_rate_hz, ch.t_us))
         }
         "butter" => {
             require_arg_count(name, &args, 4)?;
@@ -665,10 +752,12 @@ fn call_function(
                 "high" | "highpass" => Ok(channel(
                     crate::filters::highpass(&ch.samples, order, cutoff, ch.sample_rate_hz),
                     ch.sample_rate_hz,
+                    ch.t_us,
                 )),
                 "low" | "lowpass" => Ok(channel(
                     crate::filters::lowpass(&ch.samples, order, cutoff, ch.sample_rate_hz),
                     ch.sample_rate_hz,
+                    ch.t_us,
                 )),
                 "band" => Err(err(
                     MathEvalErrorKind::Runtime,
@@ -698,20 +787,29 @@ fn call_function(
                 }
             };
             // Output is n/2+1 bins; preserve the original rate so the caller can
-            // compute freq[k] = k * sample_rate_hz / n.
-            Ok(channel(crate::fft::fft(&ch.samples, window), ch.sample_rate_hz))
+            // compute freq[k] = k * sample_rate_hz / n. Bins are not per-sample
+            // time — no t_us axis applies (empty, not ch's, per L3-R12).
+            Ok(channel(crate::fft::fft(&ch.samples, window), ch.sample_rate_hz, Arc::from(&[] as &[i64])))
         }
         "declip" => {
             require_arg_count(name, &args, 1)?;
             let ch = require_channel(&args[0], name)?;
-            Ok(channel(crate::clip_reconstruct::declip(&ch.samples, ch.sample_rate_hz), ch.sample_rate_hz))
+            Ok(channel(
+                crate::clip_reconstruct::declip(&ch.samples, ch.sample_rate_hz),
+                ch.sample_rate_hz,
+                ch.t_us,
+            ))
         }
 
         // ---- A7: time-domain statistics ----
         "differentiate" => {
             require_arg_count(name, &args, 1)?;
             let ch = require_channel(&args[0], name)?;
-            Ok(channel(crate::statistics::differentiate(&ch.samples, ch.sample_rate_hz), ch.sample_rate_hz))
+            Ok(channel(
+                crate::statistics::differentiate(&ch.samples, ch.sample_rate_hz),
+                ch.sample_rate_hz,
+                ch.t_us,
+            ))
         }
         "detrend" => {
             // Global least-squares trend removal over the sample index (NOT
@@ -743,7 +841,7 @@ fn call_function(
             } else {
                 crate::statistics::DetrendMode::Linear
             };
-            Ok(channel(crate::statistics::detrend(&ch.samples, mode), ch.sample_rate_hz))
+            Ok(channel(crate::statistics::detrend(&ch.samples, mode), ch.sample_rate_hz, ch.t_us))
         }
         "rms" => {
             // 1-arg → scalar aggregate; 2-arg → rolling RMS over a window.
@@ -753,7 +851,7 @@ fn call_function(
                 require_arg_count(name, &args, 2)?;
                 let ch = require_channel(&args[0], name)?;
                 let w = require_scalar(&args[1], name)?.round().max(0.0) as usize;
-                Ok(channel(crate::statistics::rolling_rms(&ch.samples, w), ch.sample_rate_hz))
+                Ok(channel(crate::statistics::rolling_rms(&ch.samples, w), ch.sample_rate_hz, ch.t_us))
             }
         }
         "mean" => {
@@ -764,7 +862,7 @@ fn call_function(
                 require_arg_count(name, &args, 2)?;
                 let ch = require_channel(&args[0], name)?;
                 let w = require_scalar(&args[1], name)?.round().max(0.0) as usize;
-                Ok(channel(crate::statistics::rolling_mean(&ch.samples, w), ch.sample_rate_hz))
+                Ok(channel(crate::statistics::rolling_mean(&ch.samples, w), ch.sample_rate_hz, ch.t_us))
             }
         }
         "std" => {
@@ -775,7 +873,7 @@ fn call_function(
                 require_arg_count(name, &args, 2)?;
                 let ch = require_channel(&args[0], name)?;
                 let w = require_scalar(&args[1], name)?.round().max(0.0) as usize;
-                Ok(channel(crate::statistics::rolling_std(&ch.samples, w), ch.sample_rate_hz))
+                Ok(channel(crate::statistics::rolling_std(&ch.samples, w), ch.sample_rate_hz, ch.t_us))
             }
         }
 
@@ -879,7 +977,8 @@ fn call_function(
             let ch = require_channel(&args[0], name)?;
             let lo = require_scalar(&args[1], name)?;
             let hi = require_scalar(&args[2], name)?;
-            Ok(channel(ch.samples.iter().map(|&x| x.clamp(lo, hi)).collect(), ch.sample_rate_hz))
+            let out = ch.samples.iter().map(|&x| x.clamp(lo, hi)).collect();
+            Ok(channel(out, ch.sample_rate_hz, ch.t_us))
         }
         "if" => {
             require_arg_count(name, &args, 3)?;
@@ -893,7 +992,9 @@ fn call_function(
                     value_at(&args[2], i)?
                 };
             }
-            Ok(channel(out, cond.sample_rate_hz))
+            // cond drives the output's shape, so its t_us is the output's axis
+            // (the branch values are sampled at cond's positions via value_at).
+            Ok(channel(out, cond.sample_rate_hz, cond.t_us))
         }
         "spectrogram" | "hilbert" | "correlate" | "convolve" | "resample" | "sosfilt" => {
             Err(err(MathEvalErrorKind::NotImplemented, format!("not yet implemented: {name}")))
@@ -908,7 +1009,11 @@ fn call_function(
                     crate::variance::current_lap_at(&lap_ctx.main_lap_bounds, i as f64 / rate) as f64
                 })
                 .collect();
-            Ok(channel(out, rate))
+            // Built off resolve_time_base's closed-form (len, rate), never a
+            // widened source — there is no real t_us to inherit here, and
+            // synthesizing one from i/rate would be exactly the fabricated
+            // axis L3-R12 forbids. Empty (no established axis).
+            Ok(channel(out, rate, Arc::from(&[] as &[i64])))
         }
         "lap_start_time" => {
             require_arg_count(name, &args, 1)?;
@@ -929,7 +1034,8 @@ fn call_function(
                             }
                         })
                         .collect();
-                    Ok(channel(out, c.sample_rate_hz))
+                    // 1:1 map over c's samples — same positions, same t_us.
+                    Ok(channel(out, c.sample_rate_hz, c.t_us.clone()))
                 }
                 other => Err(err(
                     MathEvalErrorKind::Type,
@@ -979,7 +1085,8 @@ fn call_function(
                             }
                         })
                         .collect();
-                    Ok(channel(out, c.sample_rate_hz))
+                    // 1:1 map over c's samples — same positions, same t_us.
+                    Ok(channel(out, c.sample_rate_hz, c.t_us.clone()))
                 }
                 other => Err(err(
                     MathEvalErrorKind::Type,
@@ -990,8 +1097,10 @@ fn call_function(
         "sector_number" => {
             require_arg_count(name, &args, 0)?;
             let (len, rate) = resolve_time_base(lookup);
+            // Same closed-form-only basis as current_lap() — no real t_us to
+            // inherit, so both branches are empty (no established axis).
             if lap_ctx.main_sectors.is_empty() {
-                return Ok(channel(vec![f64::NAN; len], rate));
+                return Ok(channel(vec![f64::NAN; len], rate, Arc::from(&[] as &[i64])));
             }
             let out = (0..len)
                 .map(|i| {
@@ -1004,7 +1113,7 @@ fn call_function(
                     }
                 })
                 .collect();
-            Ok(channel(out, rate))
+            Ok(channel(out, rate, Arc::from(&[] as &[i64])))
         }
 
         // ---- B2: variance (overlay second handle) ----
@@ -1021,10 +1130,12 @@ fn call_function(
                          Pick both in the Analyze lap table.",
                     )
                 })?;
-            let (main_samples, main_rate, channel_id) = require_ref_channel(&args[0], "variance_time")?;
+            let (main_samples, main_rate, main_t_us, channel_id) =
+                require_ref_channel(&args[0], "variance_time")?;
             crate::math::variance_geom::eval_variance_time(
                 &main_samples,
                 main_rate,
+                &main_t_us,
                 &channel_id,
                 lookup,
                 overlay,
@@ -1044,10 +1155,12 @@ fn call_function(
                          Pick both in the Analyze lap table.",
                     )
                 })?;
-            let (main_samples, main_rate, channel_id) = require_ref_channel(&args[0], "variance_dist")?;
+            let (main_samples, main_rate, main_t_us, channel_id) =
+                require_ref_channel(&args[0], "variance_dist")?;
             crate::math::variance_geom::eval_variance_dist(
                 &main_samples,
                 main_rate,
+                &main_t_us,
                 &channel_id,
                 lookup,
                 overlay,
@@ -1137,11 +1250,27 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
+    /// Synthetic uniform `t_us` for a test double with no real recorded time
+    /// (matches `Channel::from_f64`'s formula) — an explicit synthetic rate
+    /// consistent with the declared `sample_rate_hz`, never a raw index
+    /// relabeled as µs.
+    fn synthetic_t_us(len: usize, rate: f64) -> Arc<[i64]> {
+        if rate > 0.0 {
+            (0..len).map(|i| (i as f64 * 1_000_000.0 / rate) as i64).collect()
+        } else {
+            vec![0i64; len].into()
+        }
+    }
+
     // A minimal in-memory lookup for tests.
     struct MapLookup(std::collections::HashMap<String, (Vec<f64>, f64)>);
     impl ChannelLookup for MapLookup {
         fn lookup(&self, name: &str) -> Option<LookupChannel> {
-            self.0.get(name).map(|(s, r)| LookupChannel { samples: s.clone().into(), sample_rate_hz: *r })
+            self.0.get(name).map(|(s, r)| LookupChannel {
+                samples: s.clone().into(),
+                sample_rate_hz: *r,
+                t_us: synthetic_t_us(s.len(), *r),
+            })
         }
         fn channel_dims(&self, name: &str) -> Option<(usize, f64)> {
             // Mirror SessionHandle: (len, rate) without materializing, so the
@@ -1159,6 +1288,24 @@ mod tests {
     fn eval_expr(src: &str, lk: &dyn ChannelLookup) -> Result<Value, crate::math::MathEvalError> {
         let ast = crate::math::parse::parse(src).unwrap();
         eval(&ast, lk, &no_laps())
+    }
+
+    // A lookup double with an explicit, caller-chosen `t_us` per channel — for
+    // the t_us-propagation tests below, where `synthetic_t_us`'s always-agrees
+    // formula would defeat the point (need genuinely identical/differing/empty
+    // axes on demand).
+    struct TimedLookup(std::collections::HashMap<String, (Vec<f64>, f64, Vec<i64>)>);
+    impl ChannelLookup for TimedLookup {
+        fn lookup(&self, name: &str) -> Option<LookupChannel> {
+            self.0.get(name).map(|(s, r, t)| LookupChannel {
+                samples: s.clone().into(),
+                sample_rate_hz: *r,
+                t_us: t.clone().into(),
+            })
+        }
+    }
+    fn timed(pairs: &[(&str, Vec<f64>, f64, Vec<i64>)]) -> TimedLookup {
+        TimedLookup(pairs.iter().cloned().map(|(n, s, r, t)| (n.to_string(), (s, r, t))).collect())
     }
 
     #[test]
@@ -1218,9 +1365,11 @@ mod tests {
         impl ChannelLookup for CountingLookup {
             fn lookup(&self, name: &str) -> Option<LookupChannel> {
                 *self.counts.borrow_mut().entry(name.to_string()).or_insert(0) += 1;
-                self.data
-                    .get(name)
-                    .map(|(s, r)| LookupChannel { samples: s.clone().into(), sample_rate_hz: *r })
+                self.data.get(name).map(|(s, r)| LookupChannel {
+                    samples: s.clone().into(),
+                    sample_rate_hz: *r,
+                    t_us: synthetic_t_us(s.len(), *r),
+                })
             }
         }
 
@@ -1253,7 +1402,11 @@ mod tests {
                 *self.widen_calls.borrow_mut() += 1;
                 (name == "Time").then(|| {
                     let s: Vec<f64> = (0..self.len).map(|i| i as f64 / self.rate).collect();
-                    LookupChannel { samples: s.into(), sample_rate_hz: self.rate }
+                    LookupChannel {
+                        samples: s.into(),
+                        sample_rate_hz: self.rate,
+                        t_us: synthetic_t_us(self.len, self.rate),
+                    }
                 })
             }
             fn channel_dims(&self, name: &str) -> Option<(usize, f64)> {
@@ -1408,7 +1561,11 @@ mod tests {
         struct OneChannel;
         impl ChannelLookup for OneChannel {
             fn lookup(&self, name: &str) -> Option<LookupChannel> {
-                (name == "Fork").then(|| LookupChannel { samples: vec![1.0, 2.0].into(), sample_rate_hz: 10.0 })
+                (name == "Fork").then(|| LookupChannel {
+                    samples: vec![1.0, 2.0].into(),
+                    sample_rate_hz: 10.0,
+                    t_us: synthetic_t_us(2, 10.0),
+                })
             }
         }
         assert!(evaluate_scalar("[Fork]", &OneChannel, &MathLapContext::empty()).is_err());
@@ -1563,7 +1720,11 @@ mod tests {
         struct Ch;
         impl ChannelLookup for Ch {
             fn lookup(&self, name: &str) -> Option<LookupChannel> {
-                (name == "F").then(|| LookupChannel { samples: vec![1.0, 2.0, 3.0].into(), sample_rate_hz: 10.0 })
+                (name == "F").then(|| LookupChannel {
+                    samples: vec![1.0, 2.0, 3.0].into(),
+                    sample_rate_hz: 10.0,
+                    t_us: synthetic_t_us(3, 10.0),
+                })
             }
         }
         let out = evaluate_scalar("max([F]) - min([F])", &Ch, &MathLapContext::empty()).unwrap();
@@ -2074,6 +2235,7 @@ mod tests {
             Some(LookupChannel {
                 samples: std::sync::Arc::from(vec![channel_id.len() as f64].as_slice()),
                 sample_rate_hz: 800.0,
+                t_us: synthetic_t_us(1, 800.0),
             })
         }
     }
@@ -2173,5 +2335,148 @@ mod tests {
 
         // Assert
         assert!(got.is_some(), "MemoLookup swallowed estimator_channel");
+    }
+
+    // ---- L3 Task 5: per-sample t_us propagation (C1 §8 item 5, L3-R12) ----
+
+    #[test]
+    fn add_two_channels_with_identical_t_us_result_carries_the_same_t_us() {
+        // Arrange — both channels share the same real (non-uniform) axis.
+        let t = vec![0i64, 103_412, 210_005];
+        let lk = timed(&[
+            ("a", vec![1.0, 2.0, 3.0], 10.0, t.clone()),
+            ("b", vec![10.0, 20.0, 30.0], 10.0, t.clone()),
+        ]);
+
+        // Act
+        let v = eval_expr("[a] + [b]", &lk).unwrap();
+
+        // Assert
+        match v {
+            Value::Channel(c) => assert_eq!(c.t_us.as_ref(), t.as_slice()),
+            _ => panic!("expected channel"),
+        }
+    }
+
+    #[test]
+    fn add_two_channels_with_different_t_us_is_a_runtime_error_naming_both() {
+        // Arrange — same rate + length, but genuinely different recorded times.
+        let lk = timed(&[
+            ("a", vec![1.0, 2.0], 10.0, vec![0, 100_000]),
+            ("b", vec![3.0, 4.0], 10.0, vec![5, 100_005]),
+        ]);
+
+        // Act
+        let err = eval_expr("[a] + [b]", &lk).unwrap_err();
+
+        // Assert — Runtime, and the message names both axes (lengths + spans).
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("different per-sample time axes"), "{}", err.message);
+        assert!(err.message.contains("100000") || err.message.contains("100005"), "{}", err.message);
+    }
+
+    #[test]
+    fn differentiate_output_t_us_equals_input_t_us() {
+        // Arrange
+        let t = vec![0i64, 100_000, 200_000, 300_000, 400_000];
+        let lk = timed(&[("a", (0..5).map(|i| i as f64).collect(), 10.0, t.clone())]);
+
+        // Act
+        let v = eval_expr("differentiate([a])", &lk).unwrap();
+
+        // Assert
+        match v {
+            Value::Channel(c) => assert_eq!(c.t_us.as_ref(), t.as_slice()),
+            _ => panic!("expected channel"),
+        }
+    }
+
+    #[test]
+    fn col_minus_col_both_empty_t_us_still_evaluates() {
+        // Arrange — {a[]} and {b[]} are both rate-0 table columns (empty t_us).
+        struct ColLookup;
+        impl ChannelLookup for ColLookup {
+            fn lookup(&self, _: &str) -> Option<LookupChannel> {
+                None
+            }
+            fn lookup_cell_column(&self, name: &str) -> Option<Vec<f64>> {
+                match name {
+                    "a" => Some(vec![10.0, 20.0]),
+                    "b" => Some(vec![1.0, 2.0]),
+                    _ => None,
+                }
+            }
+        }
+
+        // Act
+        let v = eval_expr("{a[]} - {b[]}", &ColLookup).unwrap();
+
+        // Assert
+        match v {
+            Value::Channel(c) => {
+                assert_eq!(c.samples, vec![9.0, 18.0].into());
+                assert!(c.t_us.is_empty());
+            }
+            _ => panic!("expected channel"),
+        }
+    }
+
+    #[test]
+    fn channel_with_t_us_plus_channel_with_empty_t_us_result_carries_the_non_empty_axis() {
+        // Arrange — same rate + length; [a] has a real axis, [b] has none (as
+        // e.g. current_lap()'s closed-form output would — L3-R12).
+        struct Mixed;
+        impl ChannelLookup for Mixed {
+            fn lookup(&self, name: &str) -> Option<LookupChannel> {
+                match name {
+                    "a" => Some(LookupChannel {
+                        samples: vec![1.0, 2.0].into(),
+                        sample_rate_hz: 10.0,
+                        t_us: vec![0i64, 100_000].into(),
+                    }),
+                    "b" => Some(LookupChannel {
+                        samples: vec![10.0, 20.0].into(),
+                        sample_rate_hz: 10.0,
+                        t_us: Arc::from(&[] as &[i64]),
+                    }),
+                    _ => None,
+                }
+            }
+        }
+
+        // Act
+        let v = eval_expr("[a] + [b]", &Mixed).unwrap();
+
+        // Assert
+        match v {
+            Value::Channel(c) => assert_eq!(c.t_us.as_ref(), [0i64, 100_000].as_slice()),
+            _ => panic!("expected channel"),
+        }
+    }
+
+    #[test]
+    fn scalar_aggregate_rms_with_no_window_evaluate_t_us_is_empty() {
+        // Arrange
+        let lk = lookup(&[("a", vec![3.0, 4.0], 10.0)]);
+
+        // Act
+        let out = evaluate("rms([a])", &lk, &MathLapContext::empty()).unwrap();
+
+        // Assert — scalar result: rate 0, empty t_us.
+        assert_eq!(out.sample_rate_hz, 0.0);
+        assert!(out.t_us.is_empty());
+    }
+
+    #[test]
+    fn evaluate_t_us_matches_source_channels_axis_exactly() {
+        // Arrange
+        let t = vec![0i64, 100_000, 200_000];
+        let lk = timed(&[("X", vec![1.0, 2.0, 3.0], 10.0, t.clone())]);
+
+        // Act
+        let out = evaluate("[X] * 2", &lk, &MathLapContext::empty()).unwrap();
+
+        // Assert — t_us matches [X]'s t_us exactly (channel × scalar keeps it).
+        assert_eq!(out.t_us, t);
     }
 }

@@ -331,7 +331,8 @@ impl SessionHandle {
     /// field) rather than a retired dedicated field — the
     /// [`crate::math::eval::ChannelLookup::sample_times`] contract this
     /// backs is otherwise unchanged (event-driven only, seconds, not
-    /// touched by C1).
+    /// touched by C1). A seconds view kept for the estimator (L3-R15); new
+    /// code reads [`crate::math::eval::LookupChannel::t_us`] instead.
     pub fn channel_sample_times(&self, channel_id: &str) -> Option<Vec<f64>> {
         self.with_channel(channel_id, |c| {
             if c.nominal_rate_hz == 0.0 {
@@ -561,6 +562,31 @@ impl SessionHandle {
     /// (no per-sample times); `sample_rate_hz` 0.0 denotes a scalar-as-channel.
     pub fn store_math(&self, channel_id: &str, sample_rate_hz: f64, samples: Vec<f64>) {
         let ch = Channel::from_f64(channel_id, sample_rate_hz, samples);
+        self.derived
+            .write()
+            .unwrap()
+            .insert(DerivedKey::Math(channel_id.to_string()), ch);
+    }
+
+    /// Insert or replace a math-channel result by name (upsert), like
+    /// [`Self::store_math`], but with the caller's own `t_us` (µs since the
+    /// session's first sample) rather than a synthesized `i / rate` ramp — so
+    /// a derived math channel keeps its source's real per-sample time (C1 §8
+    /// item 5, L3-R11). `source_kind` is always `"synthesized"` in practice
+    /// (the only caller is [`crate::math::resolve::resolve_dependencies`]);
+    /// taking it as a parameter rather than hardcoding it, unlike
+    /// [`Channel::from_f64`], is deliberate — `crate::store::parquet`'s
+    /// `source_kind == "synthesized"` exclusion is exactly how a derived
+    /// channel avoids leaking into `data.parquet`, so an accidental wrong
+    /// value here is a real bug, not a style choice.
+    pub fn store_math_with_times(
+        &self,
+        channel_id: &str,
+        sample_rate_hz: f64,
+        samples: Vec<f64>,
+        t_us: Vec<i64>,
+    ) {
+        let ch = Channel::from_f64_with_times(channel_id, sample_rate_hz, samples, t_us, "synthesized");
         self.derived
             .write()
             .unwrap()
@@ -908,9 +934,12 @@ impl crate::math::eval::ChannelLookup for SessionHandle {
     fn lookup(&self, name: &str) -> Option<crate::math::eval::LookupChannel> {
         // Base + synthesized channels win over the math store (with_channel
         // checks session.channels first). The evaluator needs the whole array.
+        // t_us is the channel's own real recorded time (C1 §8 item 5) —
+        // never re-derived from the rate.
         self.with_channel(name, |c| crate::math::eval::LookupChannel {
             samples: Arc::from(c.materialize()),
             sample_rate_hz: c.nominal_rate_hz,
+            t_us: Arc::from(c.t_us.as_slice()),
         })
     }
 
@@ -1330,6 +1359,35 @@ mod tests {
         // Assert
         assert_eq!(got.samples, vec![7.0, 8.0].into());
         assert_eq!(got.sample_rate_hz, 10.0);
+    }
+
+    #[test]
+    fn store_math_with_times_round_trips_the_real_axis_not_a_synthesized_ramp() {
+        use crate::math::eval::ChannelLookup;
+        // Arrange — irregular t_us a synthesized `i/rate` ramp could never
+        // produce at 10 Hz (a uniform ramp would be [0, 100_000]).
+        let meta = SessionMetaInput {
+            session_id: String::new(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            config_checksum: None,
+        };
+        let h = SessionHandle::from_channels(meta, vec![input_channel("X", 10.0, vec![1.0, 2.0])]);
+        let real_t_us = vec![0i64, 103_412];
+
+        // Act — G5.2's round-trip fix: store_math_with_times, not store_math
+        // + Channel::from_f64 (which would discard this axis).
+        h.store_math_with_times("Derived", 10.0, vec![7.0, 8.0], real_t_us.clone());
+        let got = h.lookup("Derived").unwrap();
+
+        // Assert — the given axis survives verbatim, not a synthesized ramp.
+        assert_eq!(got.t_us.as_ref(), real_t_us.as_slice());
+        assert_ne!(got.t_us.as_ref(), [0i64, 100_000].as_slice());
+        // And the stored channel is marked "synthesized" so store/parquet.rs
+        // excludes it from data.parquet (C1 §4.1) — not optional.
+        let store = h.derived.read().unwrap();
+        let stored = store.get(&DerivedKey::Math("Derived".to_string())).unwrap();
+        assert_eq!(stored.source_kind, "synthesized");
     }
 
     #[test]
