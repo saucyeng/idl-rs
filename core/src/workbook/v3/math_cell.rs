@@ -221,13 +221,21 @@ fn is_identifier(s: &str) -> bool {
 /// [`crate::math::token`]'s `Number` literal (int/float, optional
 /// exponent). Reuses the tokenizer itself rather than re-implementing its
 /// scan, so the two can never drift; `s` must tokenize to exactly one
-/// `Number` token followed by `Eof` — no leading `-` (that's the
-/// tokenizer's separate unary-minus token, outside this grammar terminal's
-/// scope) and nothing else trailing.
+/// `Number` token followed by `Eof`, **or** (lead ruling R24) a leading
+/// `Minus` token immediately before that same shape — the tokenizer always
+/// emits a leading `-` as its own `Minus` token (unary negation is a
+/// parser-level concern, C2 §3.2, not part of the `Number` terminal itself),
+/// so a signed `const` value is accepted by matching that two-token prefix
+/// and negating. The tokenizer skips whitespace uniformly, so `-1.5` and
+/// `- 1.5` tokenize identically and are both accepted here — there is no
+/// lower-level distinction available to tell them apart.
 fn parse_bare_number(s: &str) -> Option<f64> {
     let tokens = tokenize(s).ok()?;
     match tokens.as_slice() {
         [Token { kind: TokenKind::Number, num_val, .. }, Token { kind: TokenKind::Eof, .. }] => Some(*num_val),
+        [Token { kind: TokenKind::Minus, .. }, Token { kind: TokenKind::Number, num_val, .. }, Token { kind: TokenKind::Eof, .. }] => {
+            Some(-*num_val)
+        }
         _ => None,
     }
 }
@@ -281,13 +289,73 @@ mod tests {
     }
 
     #[test]
-    fn const_line_const_k_eq_9_80665_const() {
+    fn const_line_const_k_eq_9_81_const() {
         // Act
         let (lines, errors) = parse_math_cell_body("aaaaaaaa", "const k = 9.81");
 
         // Assert
         assert!(errors.is_empty());
         assert_eq!(lines, vec![MathCellLine::Const { name: "k".to_string(), value: 9.81, unit_display: None }]);
+    }
+
+    #[test]
+    fn const_line_no_equals_invalid_identifier() {
+        // Act
+        let (lines, errors) = parse_math_cell_body("aaaaaaaa", "const k");
+
+        // Assert
+        assert!(lines.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind, WorkbookErrorKind::InvalidIdentifier);
+        assert_eq!(errors[0].cell_id, "aaaaaaaa");
+    }
+
+    #[test]
+    fn const_line_non_numeric_value_invalid_identifier() {
+        // Act
+        let (lines, errors) = parse_math_cell_body("aaaaaaaa", "const k = abc");
+
+        // Assert
+        assert!(lines.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind, WorkbookErrorKind::InvalidIdentifier);
+        assert_eq!(errors[0].cell_id, "aaaaaaaa");
+    }
+
+    #[test]
+    fn const_line_negative_literal_value_is_negative() {
+        // Arrange — R24: a `const` line's number accepts an optional leading
+        // `-`; the tokenizer yields `[Minus, Number, Eof]` for it (unary
+        // negation is otherwise a parser-level concern, C2 §3.2), so
+        // `parse_bare_number` special-cases that one shape and negates.
+
+        // Act
+        let (lines, errors) = parse_math_cell_body("aaaaaaaa", "const offset = -1.5");
+
+        // Assert
+        assert!(errors.is_empty());
+        assert_eq!(
+            lines,
+            vec![MathCellLine::Const { name: "offset".to_string(), value: -1.5, unit_display: None }]
+        );
+    }
+
+    #[test]
+    fn const_line_minus_5_with_a_space_still_accepted() {
+        // Arrange — the tokenizer skips whitespace uniformly (`token.rs`'s
+        // main loop advances past ' '/'\t' before dispatching on the next
+        // char), so it cannot distinguish "-5" from "- 5": both scan to the
+        // identical `[Minus, Number(5.0), Eof]` token stream. Since
+        // `parse_bare_number` matches on that shape, not on source text, a
+        // spaced sign is accepted too — there's no lower-level distinction to
+        // reject it on.
+
+        // Act
+        let (lines, errors) = parse_math_cell_body("aaaaaaaa", "const k = - 5");
+
+        // Assert
+        assert!(errors.is_empty());
+        assert_eq!(lines, vec![MathCellLine::Const { name: "k".to_string(), value: -5.0, unit_display: None }]);
     }
 
     #[test]
