@@ -22,7 +22,6 @@ pub use error::{IpcError, IpcErrorKind};
 pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         commands::engine_version,
-        commands::smoke_tile,
         commands::device::ble_scan,
         commands::device::ble_connect,
         commands::device::list_device_files,
@@ -42,5 +41,6 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::cursor::cursor_readout,
         commands::rasters::fetch_raster,
         commands::rasters::fetch_raster_meta,
+        commands::tiles::fetch_tile,
     ]
 }
