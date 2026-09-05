@@ -162,6 +162,24 @@ fn resolve_workbook_path(data_dir: &Path, id_or_path: &str) -> Result<PathBuf, I
     Err(IpcError::new(IpcErrorKind::NotFound, format!("workbook '{id_or_path}' not found")))
 }
 
+/// Filesystem-sanitises a display name into a `file_name` stem (C4 §2, SPEC
+/// §15.1) — every character that is not alphanumeric, space, `-`, `_`, or
+/// `.` becomes `_`; leading/trailing dots and whitespace (both illegal at a
+/// Windows path-segment edge) are trimmed. Falls back to `"workbook"` when
+/// that leaves nothing (e.g. a name made entirely of punctuation/emoji) — a
+/// workbook always needs *some* file name. No core sanitiser exists yet to
+/// reuse (only `session::filename::unique_file_base`'s collision-suffix
+/// half is landed); this is scoped to workbooks, not a general-purpose
+/// implementation.
+fn sanitize_file_name_stem(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect();
+    let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if trimmed.is_empty() { "workbook".to_string() } else { trimmed.to_string() }
+}
+
 /// Transport-agnostic core of `open_workbook`.
 fn open_workbook_via(data_dir: &Path, id_or_path: &str) -> Result<WorkbookHandle, IpcError> {
     let path = resolve_workbook_path(data_dir, id_or_path)?;
@@ -196,32 +214,14 @@ fn eval_workbook_via(data_dir: &Path, id: &str, session_id: Option<&str>) -> Res
         None => (empty_session_handle(), MathLapContext::empty()),
     };
 
-    // `eval_cells` (core, L3) panics today whenever a definition name is
-    // repeated anywhere in the document — `resolve_workbook_defs`'s output
-    // is keyed by name only, so a duplicate collapses to one entry and the
-    // second owning cell's `math_cell_defs` panics its `.expect("...every
-    // def")` (`core/src/workbook/v3/eval.rs:145`). That contradicts C2/C3's
-    // stated per-cell-only `DuplicateDefinition` semantics (it should never
-    // reject the whole command) but is a core bug this lane cannot fix
-    // (CLAUDE.md §7 — out of this crate). `catch_unwind` here is the command
-    // boundary's own CLAUDE.md §5 duty ("never a crash on bad data") — no
-    // lock is held across this call (`resolve_workbook_defs` has already
-    // returned by the time the panic fires), so nothing is left poisoned.
-    // TODO(idl0): file/fix the core bug (`resolve_workbook_defs`/
-    // `math_cell_defs` needs a duplicate-tolerant key, e.g. `(cell_id,
-    // name)`) so this degrades to a real per-cell `workbook_duplicate_
-    // definition` instead of a command-level `internal`.
-    let cell_results = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        idl_rs::workbook::v3::eval_cells(&doc, &structural, &handle, &lap_ctx)
-    })) {
-        Ok(results) => results,
-        Err(_) => {
-            return Err(IpcError::new(
-                IpcErrorKind::Internal,
-                "workbook evaluation failed internally (a definition name is likely repeated across more than one cell — tracked as a core bug, not a caller error)",
-            ))
-        }
-    };
+    // `eval_cells` used to panic here whenever a definition name repeated
+    // anywhere in the document (`resolve_workbook_defs`'s output was keyed
+    // by bare name, so a duplicate collapsed to one entry and the second
+    // owning cell's `math_cell_defs` found nothing left to remove). Fixed at
+    // the root, ledger R47: `resolve_workbook_defs`/`math_cell_defs` now key
+    // by `(cell_id, name)`, so every cell — including the offending one —
+    // always gets its own result back; no defensive net needed here.
+    let cell_results = idl_rs::workbook::v3::eval_cells(&doc, &structural, &handle, &lap_ctx);
 
     let out = cell_results
         .iter()
@@ -287,24 +287,35 @@ fn save_workbook_via(
     markdown: &str,
     based_on_hash: Option<&str>,
 ) -> Result<SaveResult, IpcError> {
-    // Step 1: resolve the target. `id` matches an existing workbook (path or
+    // Step 1 (reordered ahead of target resolution, ledger R48): parse; an
+    // `Err` writes nothing. Parsing first (rather than after resolving the
+    // target, the brief's original order) is required so a brand-new
+    // workbook's file name can be derived from the parsed front matter's
+    // `name` below — C2 §1 requires `name`, so a successful parse always
+    // has one.
+    let Ok((doc, _)) = parse_workbook(markdown) else {
+        return Err(IpcError::new(IpcErrorKind::InvalidArgument, "workbook markdown front matter failed to parse"));
+    };
+
+    // Step 2: resolve the target. `id` matches an existing workbook (path or
     // scanned front-matter id) whenever one exists; when it does not *and*
-    // `based_on_hash` is `None`, this is a genuinely new workbook — its
-    // identity lives in its own front matter (C4 §2), not in this filename,
-    // so a filename derived from `id` is a collision-safe, reversible choice
-    // (file_name is "a display convenience, not identity", C4 §2) rather
-    // than implementing C4 §2's user-facing sanitised-name/`-2`/`-3`
-    // convention here (out of this task's scope — no test names it).
+    // `based_on_hash` is `None`, this is a genuinely new workbook — C4 §2
+    // fixes its path as `workbooks/<file_name>.idl1wb`, `file_name` a
+    // filesystem-sanitised form of the *display* name (never `id`, which
+    // never names the file), with SPEC §15.1's `-2`/`-3`… collision suffix
+    // (ledger R48).
     let target = match resolve_workbook_path(data_dir, id) {
         Ok(path) => path,
         Err(e) if based_on_hash.is_some() => return Err(e),
-        Err(_) => data_dir.join("workbooks").join(format!("{id}.idl1wb")),
+        Err(_) => {
+            let workbooks_dir = data_dir.join("workbooks");
+            let stem = sanitize_file_name_stem(&doc.name);
+            let file_base = idl_rs::session::filename::unique_file_base(&stem, |candidate| {
+                workbooks_dir.join(format!("{candidate}.idl1wb")).exists()
+            });
+            workbooks_dir.join(format!("{file_base}.idl1wb"))
+        }
     };
-
-    // Step 2: parse; an `Err` writes nothing.
-    if parse_workbook(markdown).is_err() {
-        return Err(IpcError::new(IpcErrorKind::InvalidArgument, "workbook markdown front matter failed to parse"));
-    }
 
     // Step 3: hash.
     let hash = sha256_hex(markdown.as_bytes());
@@ -549,10 +560,35 @@ mod tests {
         // Act
         let result = save_workbook_via(&root, &hashes, WB_ID, &markdown, None).unwrap();
 
-        // Assert
+        // Assert — ledger R48: the file name comes from front matter `name`
+        // ("Fork tuning", `two_cell_markdown`'s fixture), sanitised, never
+        // from `id`.
         assert_eq!(result.hash, sha256_hex(markdown.as_bytes()));
-        let target = root.join("workbooks").join(format!("{WB_ID}.idl1wb"));
+        let target = root.join("workbooks").join("Fork tuning.idl1wb");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), markdown);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_workbook_creating_two_new_workbooks_with_the_same_front_matter_name_the_second_gets_a_collision_suffix() {
+        // Arrange — ledger R48's SPEC §15.1 collision rule: same display
+        // name, different workbook ids, second file becomes `-2`.
+        let root = temp_root();
+        let hashes = ExpectedHashSet::new();
+        let other_id = "1a2b3c4d-4b6a-4f1c-9c3d-2a7e8f9b0c1d";
+        let first = two_cell_markdown();
+        let second = format!(
+            "---\nid: {other_id}\nname: Fork tuning\nversion: 3\n---\n\n```math id=cccccccc\ny = 1\n```\n"
+        );
+
+        // Act
+        save_workbook_via(&root, &hashes, WB_ID, &first, None).unwrap();
+        save_workbook_via(&root, &hashes, other_id, &second, None).unwrap();
+
+        // Assert
+        assert!(root.join("workbooks").join("Fork tuning.idl1wb").exists());
+        assert!(root.join("workbooks").join("Fork tuning-2.idl1wb").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -565,7 +601,7 @@ mod tests {
         let hashes = ExpectedHashSet::new();
         let v1 = two_cell_markdown();
         let h1 = save_workbook_via(&root, &hashes, WB_ID, &v1, None).unwrap().hash;
-        let target = root.join("workbooks").join(format!("{WB_ID}.idl1wb"));
+        let target = root.join("workbooks").join("Fork tuning.idl1wb");
         let v2 = format!("{v1}\n<!-- edited -->\n");
         let h2 = sha256_hex(v2.as_bytes());
 
@@ -590,7 +626,7 @@ mod tests {
         let hashes = ExpectedHashSet::new();
         let v1 = two_cell_markdown();
         let h1 = save_workbook_via(&root, &hashes, WB_ID, &v1, None).unwrap().hash;
-        let target = root.join("workbooks").join(format!("{WB_ID}.idl1wb"));
+        let target = root.join("workbooks").join("Fork tuning.idl1wb");
         let external = format!("{v1}\n<!-- external edit -->\n");
         std::fs::write(&target, &external).unwrap(); // changed underneath the caller
 
@@ -616,9 +652,10 @@ mod tests {
         // Act
         let err = save_workbook_via(&root, &hashes, WB_ID, "not a workbook at all", None).unwrap_err();
 
-        // Assert
+        // Assert — parsing fails before any file name can even be derived,
+        // so nothing under `workbooks/` exists at all.
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
-        assert!(!root.join("workbooks").join(format!("{WB_ID}.idl1wb")).exists());
+        assert!(!root.join("workbooks").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -671,17 +708,13 @@ mod tests {
     }
 
     #[test]
-    fn eval_workbook_duplicate_definitions_across_cells_command_degrades_to_internal_rather_than_crashing(
+    fn eval_workbook_duplicate_definitions_both_cells_returned_the_offending_cell_carries_workbook_duplicate_definition_in_errors(
     ) {
-        // Arrange — a real core bug (`core/src/workbook/v3/eval.rs:145`,
-        // see this test's neighbouring `TODO(idl0)`): `resolve_workbook_defs`
-        // keys its output by name only, so a definition name repeated in a
-        // second cell collapses to one entry and that cell's
-        // `math_cell_defs` panics its `.expect(...)`. C2/C3 want this to be
-        // a per-cell `workbook_duplicate_definition`, not a command
-        // rejection — this test proves only that the command boundary
-        // survives (`catch_unwind` → `internal`), not the ideal per-cell
-        // shape, which needs a core-side fix this lane cannot make.
+        // Arrange — ledger R47 fixed the root cause (`resolve_workbook_defs`/
+        // `math_cell_defs` now key by `(cell_id, name)`), so this asserts
+        // the brief's original, C3-correct shape: both cells returned, the
+        // offending cell carries the structural error, neither cell's
+        // command rejects.
         let root = temp_root();
         let markdown = format!(
             "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = 1\n```\n\n```math id=bbbbbbbb\nx = 2\n```\n"
@@ -689,13 +722,15 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let err = match eval_workbook_via(&root, WB_ID, None) {
-            Err(e) => e,
-            Ok(_) => panic!("expected the command to degrade to an error, not panic or silently succeed"),
-        };
+        let out = eval_workbook_via(&root, WB_ID, None).unwrap();
 
         // Assert
-        assert_eq!(err.kind, IpcErrorKind::Internal);
+        assert_eq!(out.len(), 2);
+        assert!(out[1].errors.iter().any(|e| e.kind == IpcErrorKind::WorkbookDuplicateDefinition));
+        // Both cells still produced their own def value — a duplicate name
+        // never blanks the sibling cell's own result (CLAUDE.md §5).
+        assert_eq!(out[0].defs[0].value.as_ref().unwrap().length, 1);
+        assert_eq!(out[1].defs[0].value.as_ref().unwrap().length, 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }
