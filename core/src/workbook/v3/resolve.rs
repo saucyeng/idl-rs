@@ -81,13 +81,42 @@ impl ChannelLookup for OverlayLookup<'_> {
     }
 }
 
+/// One [`MathCellDef`]'s identity in [`resolve_workbook_defs`]'s returned
+/// map: `(cell_id, name)`, not `name` alone (ledger R47) — C2 §3.5.A's
+/// `DuplicateDefinition` means two different cells can declare the *same*
+/// name; each such definition is still evaluated and still gets its own
+/// entry here, so the owning cell it panicked recovering from before this
+/// fix (`eval.rs`'s `math_cell_defs`) can now always find its own result.
+pub type DefKey = (String, String);
+
 /// Resolves every flat-namespace `def_line` in `defs` deps-first (C2 §2.4),
 /// memoizing so a definition referenced by two others is computed once, and
 /// stores every definition's own result — `Ok` or `Err` — in the returned
-/// map, keyed by name, regardless of whether anything else references it
-/// (the property that makes this a new function rather than a v3-mode
-/// branch of [`crate::math::resolve::resolve_dependencies`]; see the module
-/// doc comment).
+/// map, keyed by [`DefKey`] (`(cell_id, name)`, ledger R47 — not `name`
+/// alone, which would collapse two same-named definitions in different
+/// cells to one entry and silently drop the other), regardless of whether
+/// anything else references it (the property that makes this a new
+/// function rather than a v3-mode branch of
+/// [`crate::math::resolve::resolve_dependencies`]; see the module doc
+/// comment).
+///
+/// **Cross-referencing is still by bare name**, via the internal `resolved`
+/// overlay: a `[Name]` reference from a third definition can only ever name
+/// one target. When two definitions share a name, **the first in document
+/// order wins** (ledger R49) — pinned by explicit construction
+/// (`primary_for_name` below), not left as a side effect of fixed-point
+/// pass timing, which resolved it order-dependently before this ruling (an
+/// unrelated edit could silently swing which duplicate a reference saw).
+/// This mirrors [`super::constants::merge_constants`]'s own rule for the
+/// same shape of collision (L3-R16/R17: the first declaration of a name
+/// wins its table entry, every later one reported) — one document format
+/// should not resolve the same kind of collision two different ways. The
+/// rejected alternative was making every referencing cell error too; that
+/// buries the one signal the user needs (the `DuplicateDefinition` error
+/// naming the actual mistake, C2 §3.5.A) under cascading errors on every
+/// cell that merely mentions the name. The non-winning duplicate still gets
+/// its own result in the returned map (R47) — only the cross-reference
+/// overlay ignores it.
 ///
 /// Dependency edges come from [`channel_refs`] filtered to names present in
 /// `defs` — a `[Name]` reference to a name *not* in `defs` is a base/session
@@ -111,23 +140,39 @@ pub fn resolve_workbook_defs(
     constants: &HashMap<String, f64>,
     lookup: &dyn ChannelLookup,
     lap_ctx: &MathLapContext,
-) -> HashMap<String, Result<EvalOutput, MathEvalError>> {
+) -> HashMap<DefKey, Result<EvalOutput, MathEvalError>> {
     let def_names: std::collections::HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
 
-    // Each def's within-defs dependency names, computed once up front.
-    let deps: HashMap<&str, Vec<String>> = defs
+    // Each def's within-defs dependency names, computed once up front. Keyed
+    // by `DefKey` (ledger R47), not bare name — two defs sharing a name
+    // would otherwise collapse to one `deps` entry here too, and a def could
+    // end up reading a sibling duplicate's dependency list instead of its
+    // own.
+    let deps: HashMap<DefKey, Vec<String>> = defs
         .iter()
         .map(|d| {
             let names = channel_refs(&d.expr_text)
                 .into_iter()
                 .filter(|n| def_names.contains(n.as_str()))
                 .collect();
-            (d.name.as_str(), names)
+            ((d.cell_id.clone(), d.name.clone()), names)
         })
         .collect();
 
+    // R47/R49: for a duplicated name, the *first* declaration in document
+    // order (`defs`'s own order) is the one cross-references see — pinned
+    // here, by identity, independent of which duplicate's evaluation
+    // happens to finish first in the fixed-point loop below (`.entry(...)
+    // .or_insert(d)` keeps only the first occurrence per name, since `defs`
+    // is iterated in document order).
+    let primary_for_name: HashMap<&str, &MathCellDef> =
+        defs.iter().fold(HashMap::new(), |mut m, d| {
+            m.entry(d.name.as_str()).or_insert(d);
+            m
+        });
+
     let mut resolved: HashMap<String, (Arc<[f64]>, f64, Arc<[i64]>)> = HashMap::new();
-    let mut results: HashMap<String, Result<EvalOutput, MathEvalError>> = HashMap::new();
+    let mut results: HashMap<DefKey, Result<EvalOutput, MathEvalError>> = HashMap::new();
     let mut remaining: Vec<&MathCellDef> = defs.iter().collect();
 
     loop {
@@ -135,7 +180,8 @@ pub fn resolve_workbook_defs(
         let mut still_remaining = Vec::new();
 
         for def in remaining {
-            let ready = deps[def.name.as_str()].iter().all(|dep| resolved.contains_key(dep));
+            let key = (def.cell_id.clone(), def.name.clone());
+            let ready = deps[&key].iter().all(|dep| resolved.contains_key(dep));
             if !ready {
                 still_remaining.push(def);
                 continue;
@@ -145,14 +191,24 @@ pub fn resolve_workbook_defs(
             let out = evaluate_with_constants(&def.expr_text, constants, &overlay, lap_ctx);
             match &out {
                 Ok(eval_out) => {
-                    resolved.insert(
-                        def.name.clone(),
-                        (
-                            Arc::from(eval_out.samples.as_slice()),
-                            eval_out.sample_rate_hz,
-                            Arc::from(eval_out.t_us.as_slice()),
-                        ),
-                    );
+                    // Cross-referencing overlay: still name-keyed (see this
+                    // function's doc comment) — but only the name's `primary`
+                    // (first-in-document-order) definition ever writes here
+                    // (R49), regardless of fixed-point pass timing. A
+                    // non-primary duplicate still gets its own `results`
+                    // entry below (so its own cell shows a real value, not a
+                    // suppressed one) — it just never becomes what a third
+                    // cell's `[Name]` reference sees.
+                    if std::ptr::eq(primary_for_name[def.name.as_str()], def) {
+                        resolved.insert(
+                            def.name.clone(),
+                            (
+                                Arc::from(eval_out.samples.as_slice()),
+                                eval_out.sample_rate_hz,
+                                Arc::from(eval_out.t_us.as_slice()),
+                            ),
+                        );
+                    }
                 }
                 Err(_) => {
                     // A failed definition still counts as "settled" for the
@@ -160,7 +216,7 @@ pub fn resolve_workbook_defs(
                     // leftover sweep below rather than looping forever.
                 }
             }
-            results.insert(def.name.clone(), out);
+            results.insert(key, out);
             made_progress = true;
         }
 
@@ -174,13 +230,14 @@ pub fn resolve_workbook_defs(
     // never inserted into `resolved` (either it errored, or it is itself
     // stuck in a cycle). Each gets UnknownChannel naming one blocking dep.
     for def in remaining {
-        let blocking = deps[def.name.as_str()]
+        let key = (def.cell_id.clone(), def.name.clone());
+        let blocking = deps[&key]
             .iter()
             .find(|dep| !resolved.contains_key(dep.as_str()))
             .cloned()
             .unwrap_or_else(|| def.name.clone());
         results.insert(
-            def.name.clone(),
+            key,
             Err(MathEvalError::new(
                 MathEvalErrorKind::UnknownChannel,
                 format!("Channel '[{blocking}]' not in this session"),
@@ -216,6 +273,17 @@ mod tests {
         MathLapContext::empty()
     }
 
+    /// Looks up a [`resolve_workbook_defs`] result by `(cell_id, name)`
+    /// (ledger R47) — every test below uses a single `cell_id` ("c1") per
+    /// def, so this is a thin convenience over the real `DefKey`.
+    fn get<'a>(
+        out: &'a HashMap<DefKey, Result<EvalOutput, MathEvalError>>,
+        cell_id: &str,
+        name: &str,
+    ) -> &'a Result<EvalOutput, MathEvalError> {
+        &out[&(cell_id.to_string(), name.to_string())]
+    }
+
     // A lookup double with one named base channel, for the overlay-precedence
     // and base-fallback tests below.
     struct OneChannel {
@@ -245,8 +313,8 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &HashMap::new(), &EmptyLookup, &no_laps());
 
         // Assert
-        assert_eq!(out["A"].as_ref().unwrap_err().kind, MathEvalErrorKind::UnknownChannel);
-        assert_eq!(out["B"].as_ref().unwrap_err().kind, MathEvalErrorKind::UnknownChannel);
+        assert_eq!(get(&out, "c1", "A").as_ref().unwrap_err().kind, MathEvalErrorKind::UnknownChannel);
+        assert_eq!(get(&out, "c1", "B").as_ref().unwrap_err().kind, MathEvalErrorKind::UnknownChannel);
     }
 
     #[test]
@@ -258,9 +326,9 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &HashMap::new(), &EmptyLookup, &no_laps());
 
         // Assert
-        assert_eq!(out["C"].as_ref().unwrap().samples, vec![10.0]);
-        assert_eq!(out["B"].as_ref().unwrap().samples, vec![11.0]);
-        assert_eq!(out["A"].as_ref().unwrap().samples, vec![12.0]);
+        assert_eq!(get(&out, "c1", "C").as_ref().unwrap().samples, vec![10.0]);
+        assert_eq!(get(&out, "c1", "B").as_ref().unwrap().samples, vec![11.0]);
+        assert_eq!(get(&out, "c1", "A").as_ref().unwrap().samples, vec![12.0]);
     }
 
     #[test]
@@ -277,7 +345,7 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &HashMap::new(), &base, &no_laps());
 
         // Assert
-        let err = out["IMU0_AccelZ"].as_ref().unwrap_err();
+        let err = get(&out, "c1", "IMU0_AccelZ").as_ref().unwrap_err();
         assert_eq!(err.kind, MathEvalErrorKind::UnknownChannel);
         assert!(err.message.contains("IMU0_AccelZ"), "{}", err.message);
     }
@@ -293,7 +361,7 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &HashMap::new(), &base, &no_laps());
 
         // Assert
-        assert_eq!(out["Speed"].as_ref().unwrap().samples, vec![99.0]);
+        assert_eq!(get(&out, "c1", "Speed").as_ref().unwrap().samples, vec![99.0]);
     }
 
     #[test]
@@ -305,9 +373,9 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &HashMap::new(), &EmptyLookup, &no_laps());
 
         // Assert
-        assert_eq!(out["A"].as_ref().unwrap().samples, vec![1.0]);
-        assert_eq!(out["B"].as_ref().unwrap().samples, vec![2.0]);
-        assert_eq!(out["C"].as_ref().unwrap().samples, vec![3.0]);
+        assert_eq!(get(&out, "c1", "A").as_ref().unwrap().samples, vec![1.0]);
+        assert_eq!(get(&out, "c1", "B").as_ref().unwrap().samples, vec![2.0]);
+        assert_eq!(get(&out, "c1", "C").as_ref().unwrap().samples, vec![3.0]);
     }
 
     #[test]
@@ -320,8 +388,8 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &HashMap::new(), &EmptyLookup, &no_laps());
 
         // Assert
-        assert_eq!(out["bad"].as_ref().unwrap_err().kind, MathEvalErrorKind::Parse);
-        assert_eq!(out["ok"].as_ref().unwrap().samples, vec![5.0]);
+        assert_eq!(get(&out, "c1", "bad").as_ref().unwrap_err().kind, MathEvalErrorKind::Parse);
+        assert_eq!(get(&out, "c1", "ok").as_ref().unwrap().samples, vec![5.0]);
     }
 
     #[test]
@@ -335,7 +403,7 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &HashMap::new(), &base, &no_laps());
 
         // Assert
-        assert_eq!(out["scaled"].as_ref().unwrap().samples, vec![2.0, 4.0]);
+        assert_eq!(get(&out, "c1", "scaled").as_ref().unwrap().samples, vec![2.0, 4.0]);
     }
 
     #[test]
@@ -349,9 +417,9 @@ mod tests {
 
         // Assert
         assert_eq!(out.len(), 3);
-        assert_eq!(out["A"].as_ref().unwrap().samples, vec![10.0]);
-        assert_eq!(out["B"].as_ref().unwrap().samples, vec![11.0]);
-        assert_eq!(out["C"].as_ref().unwrap().samples, vec![12.0]);
+        assert_eq!(get(&out, "c1", "A").as_ref().unwrap().samples, vec![10.0]);
+        assert_eq!(get(&out, "c1", "B").as_ref().unwrap().samples, vec![11.0]);
+        assert_eq!(get(&out, "c1", "C").as_ref().unwrap().samples, vec![12.0]);
     }
 
     #[test]
@@ -364,6 +432,43 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &constants, &EmptyLookup, &no_laps());
 
         // Assert
-        assert_eq!(out["scaled"].as_ref().unwrap().samples, vec![164.0]);
+        assert_eq!(get(&out, "c1", "scaled").as_ref().unwrap().samples, vec![164.0]);
+    }
+
+    #[test]
+    fn a_name_repeated_in_two_different_cells_both_still_get_their_own_result_no_panic_no_dropped_entry() {
+        // Arrange — ledger R47: `DuplicateDefinition` (C2 §3.5.A) means two
+        // cells can share a name; before this fix the second cell's
+        // `math_cell_defs` panicked recovering its own result because
+        // `results` was keyed by bare name and the first cell's entry had
+        // already been removed.
+        let defs = vec![def("c1", "x", "1", 0), def("c2", "x", "2", 0)];
+
+        // Act
+        let out = resolve_workbook_defs(&defs, &HashMap::new(), &EmptyLookup, &no_laps());
+
+        // Assert — both keyed entries present, each cell's own value intact.
+        assert_eq!(out.len(), 2);
+        assert_eq!(get(&out, "c1", "x").as_ref().unwrap().samples, vec![1.0]);
+        assert_eq!(get(&out, "c2", "x").as_ref().unwrap().samples, vec![2.0]);
+    }
+
+    #[test]
+    fn a_duplicated_name_a_third_definitions_reference_resolves_to_the_first_in_document_order_not_the_second(
+    ) {
+        // Arrange — ledger R49: two cells both define "x" (c1's first in
+        // document order, c2's second, deliberately different values so the
+        // assertion below fails outright if the rule ever flips to
+        // "last wins" or reverts to pass-timing-dependent behaviour); a
+        // third cell's `y = [x] + 1` must see c1's "x" (10), never c2's (20).
+        let defs = vec![def("c1", "x", "10", 0), def("c2", "x", "20", 0), def("c3", "y", "[x] + 1", 0)];
+
+        // Act
+        let out = resolve_workbook_defs(&defs, &HashMap::new(), &EmptyLookup, &no_laps());
+
+        // Assert
+        assert_eq!(get(&out, "c1", "x").as_ref().unwrap().samples, vec![10.0]);
+        assert_eq!(get(&out, "c2", "x").as_ref().unwrap().samples, vec![20.0]);
+        assert_eq!(get(&out, "c3", "y").as_ref().unwrap().samples, vec![11.0], "y must resolve against the first-declared x (10), not the second (20)");
     }
 }

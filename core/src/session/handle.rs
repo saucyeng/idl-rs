@@ -279,6 +279,24 @@ impl SessionHandle {
         }
     }
 
+    /// Builds a handle around an already-parsed [`Session`] — the read-back
+    /// path (`store::parquet::read_session_parquet`), which [`Self::
+    /// from_channels`] cannot serve without losing `source_format`,
+    /// `blob_sha256` and every channel's `unit` (that constructor hard-codes
+    /// `source_format = Gpx` and blanks the other two — a latent bug for any
+    /// non-GPX session, ledger R40). Runs [`synthesize_base_channels`]
+    /// exactly as the other constructors do.
+    pub fn from_session(mut session: Session) -> Self {
+        let synthesized_ids = synthesize_base_channels(&mut session);
+        Self {
+            session,
+            synthesized_ids,
+            truncation_warning: None,
+            import_warnings: Vec::new(),
+            derived: RwLock::new(HashMap::new()),
+        }
+    }
+
     /// Compact summary for the catalog / library list.
     pub fn metadata(&self) -> SessionMeta {
         SessionMeta {

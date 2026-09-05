@@ -126,23 +126,31 @@ pub fn eval_cells(
 
 /// Step 1: this `math` cell's own [`super::MathCellDef`]s, in `def_line`
 /// source order ([`super::MathCellDef::order`]), each paired with its
-/// resolved result taken out of `resolved` (a def's name is unique
-/// document-wide, so a `remove` never collides across cells).
+/// resolved result taken out of `resolved`. Keyed by `(cell_id, name)`
+/// (ledger R47 — `resolve_workbook_defs`'s [`super::resolve::DefKey`]), not
+/// name alone: a name is unique only when the document has no
+/// `DuplicateDefinition` structural error, and this function must still
+/// produce a result for *every* cell when one does — a bare-name key would
+/// let a second cell's own definition remove the first cell's already-taken
+/// entry and find nothing left (the exact panic R47 fixes).
 fn math_cell_defs(
     doc: &WorkbookDoc,
     cell: &CellDoc,
-    resolved: &mut HashMap<String, Result<crate::math::eval::EvalOutput, MathEvalError>>,
+    resolved: &mut HashMap<super::resolve::DefKey, Result<crate::math::eval::EvalOutput, MathEvalError>>,
 ) -> Vec<CellDefResult> {
     let mut own: Vec<&super::MathCellDef> = doc.defs.iter().filter(|d| d.cell_id == cell.id).collect();
     own.sort_by_key(|d| d.order);
 
     own.into_iter()
         .map(|def| {
-            // resolve_workbook_defs stores an entry for every def it is
-            // handed, Ok or Err, regardless of whether anything references
-            // it (its own doc comment) — a missing entry here is that
-            // invariant broken, not a value this function can recover from.
-            let result = resolved.remove(&def.name).expect("resolve_workbook_defs stores an entry for every def");
+            // resolve_workbook_defs stores an entry for every (cell_id, name)
+            // key it is handed, Ok or Err, regardless of whether anything
+            // references it (its own doc comment) — a missing entry here is
+            // that invariant broken, not a value this function can recover
+            // from (never reachable for a def actually present in
+            // `doc.defs`, since `key` is built from that same def).
+            let key = (def.cell_id.clone(), def.name.clone());
+            let result = resolved.remove(&key).expect("resolve_workbook_defs stores an entry for every (cell_id, name) key");
             match result {
                 Ok(out) => CellDefResult {
                     name: def.name.clone(),
