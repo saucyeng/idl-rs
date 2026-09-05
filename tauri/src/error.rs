@@ -29,6 +29,50 @@ pub enum IpcErrorKind {
     Io,
     /// Cross-cutting: an unexpected/programmer-error condition, not the caller's fault. Folds `ExportError::Json`.
     Internal,
+    /// Cross-cutting (added post-sign, 2026-09-04, lead ruling R44): an
+    /// optimistic-concurrency check failed (`store::atomic::RenameConflict`)
+    /// — the file on disk is no longer the version the caller based its edit
+    /// on. Not the caller's fault and not a bug (so not folded into
+    /// `InvalidArgument`) — a recoverable condition the UI must present
+    /// differently ("this file changed elsewhere — reload?"). Raised by
+    /// Workbook: `save_workbook`.
+    Conflict,
+    /// `WorkbookErrorKind::DuplicateCellId` — workbook: `eval_workbook` (per cell only, C2 §3.5.A).
+    WorkbookDuplicateCellId,
+    /// `WorkbookErrorKind::DuplicateDefinition` — workbook: `eval_workbook` (per cell only).
+    WorkbookDuplicateDefinition,
+    /// `WorkbookErrorKind::DuplicateConstant` — workbook: `eval_workbook` (per cell only).
+    WorkbookDuplicateConstant,
+    /// `WorkbookErrorKind::InvalidIdentifier` — workbook: `eval_workbook` (per cell only).
+    WorkbookInvalidIdentifier,
+    /// `WorkbookErrorKind::ReservedName` — workbook: `eval_workbook` (per cell only).
+    WorkbookReservedName,
+    /// `WorkbookErrorKind::MissingFrontMatterId` — workbook: `open_workbook`, `eval_workbook`
+    /// (fatal — no `WorkbookDoc` is constructable without a valid `id`, C2 §3.5.A).
+    WorkbookMissingFrontMatterId,
+    /// `WorkbookErrorKind::UnsupportedWorkbookVersion` — workbook: `open_workbook`, `eval_workbook`
+    /// (fatal — explicit `version` != 3, C2 §1).
+    WorkbookUnsupportedVersion,
+    /// `WorkbookErrorKind::InvalidTableJson` — workbook: `eval_workbook` (per cell only, C2 §4).
+    WorkbookInvalidTableJson,
+    /// `MathEvalErrorKind::Parse` — workbook: `eval_workbook` (per definition).
+    MathParse,
+    /// `MathEvalErrorKind::UnknownFunction` — workbook: `eval_workbook` (per definition).
+    MathUnknownFunction,
+    /// `MathEvalErrorKind::UnknownChannel` — workbook: `eval_workbook` (per definition).
+    MathUnknownChannel,
+    /// `MathEvalErrorKind::ArgCount` — workbook: `eval_workbook` (per definition).
+    MathArgCount,
+    /// `MathEvalErrorKind::Type` — workbook: `eval_workbook` (per definition).
+    MathType,
+    /// `MathEvalErrorKind::DivisionByZero` — workbook: `eval_workbook` (per definition).
+    MathDivisionByZero,
+    /// `MathEvalErrorKind::NoLapContext` — workbook: `eval_workbook` (per definition).
+    MathNoLapContext,
+    /// `MathEvalErrorKind::NotImplemented` — workbook: `eval_workbook` (per definition).
+    MathNotImplemented,
+    /// `MathEvalErrorKind::Runtime` — workbook: `eval_workbook` (per definition).
+    MathRuntime,
 }
 
 /// One JSON error crossing every fallible command (C3 §2). `detail`'s shape
@@ -83,6 +127,53 @@ impl From<idl_rs::store::catalog::CatalogError> for IpcError {
             CatalogErrorKind::Io => IpcErrorKind::Io,
         };
         IpcError::new(kind, e.message)
+    }
+}
+
+/// C3 §3.4 (Workbook). `idl_rs::math::MathEvalError` (evaluation-time,
+/// per-definition failures, C2 §3.5.B) — every variant gets its own
+/// `math_*` `IpcErrorKind` (C3 §2's naming rule: prefix every source enum's
+/// variants, even where no collision exists today).
+impl From<idl_rs::math::MathEvalError> for IpcError {
+    fn from(e: idl_rs::math::MathEvalError) -> Self {
+        use idl_rs::math::MathEvalErrorKind;
+        let kind = match e.kind {
+            MathEvalErrorKind::Parse => IpcErrorKind::MathParse,
+            MathEvalErrorKind::UnknownFunction => IpcErrorKind::MathUnknownFunction,
+            MathEvalErrorKind::UnknownChannel => IpcErrorKind::MathUnknownChannel,
+            MathEvalErrorKind::ArgCount => IpcErrorKind::MathArgCount,
+            MathEvalErrorKind::Type => IpcErrorKind::MathType,
+            MathEvalErrorKind::DivisionByZero => IpcErrorKind::MathDivisionByZero,
+            MathEvalErrorKind::NoLapContext => IpcErrorKind::MathNoLapContext,
+            MathEvalErrorKind::NotImplemented => IpcErrorKind::MathNotImplemented,
+            MathEvalErrorKind::Runtime => IpcErrorKind::MathRuntime,
+        };
+        IpcError::new(kind, e.message)
+    }
+}
+
+/// C3 §3.4 (Workbook). `idl_rs::workbook::v3::error::WorkbookErrorKind`
+/// (parse-time/structural failures, C2 §3.5.A) — only the eight variants
+/// the landed enum actually has (C3 §2's `workbook_invalid_front_matter`/
+/// `workbook_invalid_cell_id` rows have no source variant here; see this
+/// lane's report). Takes `&WorkbookError` (rather than by value) so a
+/// caller holding a `&WorkbookError` borrowed from a `Vec` (e.g.
+/// `eval_workbook`'s per-cell `errors` routing) does not need to clone
+/// first.
+impl From<&idl_rs::workbook::v3::WorkbookError> for IpcError {
+    fn from(e: &idl_rs::workbook::v3::WorkbookError) -> Self {
+        use idl_rs::workbook::v3::WorkbookErrorKind;
+        let kind = match e.kind {
+            WorkbookErrorKind::DuplicateCellId => IpcErrorKind::WorkbookDuplicateCellId,
+            WorkbookErrorKind::DuplicateDefinition => IpcErrorKind::WorkbookDuplicateDefinition,
+            WorkbookErrorKind::DuplicateConstant => IpcErrorKind::WorkbookDuplicateConstant,
+            WorkbookErrorKind::InvalidIdentifier => IpcErrorKind::WorkbookInvalidIdentifier,
+            WorkbookErrorKind::ReservedName => IpcErrorKind::WorkbookReservedName,
+            WorkbookErrorKind::MissingFrontMatterId => IpcErrorKind::WorkbookMissingFrontMatterId,
+            WorkbookErrorKind::UnsupportedWorkbookVersion => IpcErrorKind::WorkbookUnsupportedVersion,
+            WorkbookErrorKind::InvalidTableJson => IpcErrorKind::WorkbookInvalidTableJson,
+        };
+        IpcError::new(kind, e.message.clone())
     }
 }
 
@@ -151,6 +242,51 @@ mod tests {
 
         // Assert
         assert_eq!(ie.kind, IpcErrorKind::NotFound);
+    }
+
+    #[test]
+    fn conflict_kind_serialises_matching_c3_r44() {
+        // Arrange
+        let err = IpcError::with_detail(
+            IpcErrorKind::Conflict,
+            "workbooks/w1.idl1wb changed since it was read",
+            serde_json::json!({ "expected": "h0", "found": "h1" }),
+        );
+
+        // Act
+        let json = serde_json::to_string(&err).unwrap();
+
+        // Assert
+        assert_eq!(
+            json,
+            r#"{"kind":"conflict","message":"workbooks/w1.idl1wb changed since it was read","detail":{"expected":"h0","found":"h1"}}"#
+        );
+    }
+
+    #[test]
+    fn math_eval_error_converts_kind_preserving_message() {
+        // Arrange
+        let e = idl_rs::math::MathEvalError::new(idl_rs::math::MathEvalErrorKind::UnknownChannel, "Channel '[Nope]' not in this session");
+
+        // Act
+        let ie: IpcError = e.into();
+
+        // Assert
+        assert_eq!(ie.kind, IpcErrorKind::MathUnknownChannel);
+        assert_eq!(ie.message, "Channel '[Nope]' not in this session");
+    }
+
+    #[test]
+    fn workbook_error_ref_converts_kind_preserving_message() {
+        // Arrange
+        let e = idl_rs::workbook::v3::error::duplicate_definition("aaaaaaaa", "x");
+
+        // Act
+        let ie: IpcError = (&e).into();
+
+        // Assert
+        assert_eq!(ie.kind, IpcErrorKind::WorkbookDuplicateDefinition);
+        assert_eq!(ie.message, "'x' is defined more than once");
     }
 
     #[test]

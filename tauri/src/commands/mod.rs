@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod device;
+pub mod workbook;
 
 /// Reports the engine crate version so the UI (and sync peers) can prove
 /// they compute with the same engine.
