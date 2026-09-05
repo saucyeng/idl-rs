@@ -10,6 +10,7 @@
 //! C1 §3.3) does not implement this trait in this module — see
 //! `docs/IDL0_SPEC.md` §15a.1.
 
+pub mod fit;
 pub mod gpx;
 
 mod error;
@@ -100,6 +101,7 @@ pub fn session_id_from_blob_hash(blob_sha256: &str) -> String {
 pub fn importer_for_extension(ext: &str) -> Option<Box<dyn Importer>> {
     match ext {
         "gpx" => Some(Box::new(gpx::GpxImporter)),
+        "fit" => Some(Box::new(fit::FitImporter)),
         _ => None,
     }
 }
