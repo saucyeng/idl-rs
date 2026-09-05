@@ -19,7 +19,7 @@ use idl_rs::session::handle::{SessionHandle, SessionMetaInput};
 use idl_rs::store::atomic::{sha256_hex, write_atomic, AtomicWriteErrorKind};
 use idl_rs::table::eval::evaluate_table;
 use idl_rs::workbook::v3::front_matter::parse_front_matter;
-use idl_rs::workbook::v3::{parse_workbook, CellDoc, CellError, CellKindToken, WorkbookError};
+use idl_rs::workbook::v3::{parse_workbook, render_prose_html, CellDoc, CellError, CellKindToken, WorkbookError};
 
 use crate::error::{IpcError, IpcErrorKind};
 use crate::session_source::{load_lap_context, load_session_handle};
@@ -68,6 +68,23 @@ pub struct CellDefResult {
     pub error: Option<IpcError>,
 }
 
+/// One `${…}` inline span (C2 §5.2) inside a cell's rendered prose HTML
+/// (`CellOutput.prose_before_html`/`prose_after_html`) — added post-sign
+/// (2026-09-05, ledger R70) alongside those two fields so the sandbox
+/// consumer (L6 Task 13b) can fill each `<span data-span-id="…"></span>`
+/// placeholder without its own `${…}` scan of the raw prose text (that scan
+/// exists today, client-side, as `ProseSpan.tsx`'s less-correct regex —
+/// this field lets Task 13b retire it).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProseSpan {
+    /// Matches the `data-span-id` attribute of this span's placeholder
+    /// `<span>` in the same `CellOutput`'s prose HTML field.
+    pub id: String,
+    /// The JavaScript expression text between `${` and `}`, verbatim
+    /// (C2 §5.2).
+    pub expr: String,
+}
+
 /// One cell's evaluation result (C3 §3.4's `CellOutput`). A per-cell failure
 /// never rejects `eval_workbook` — it appears here, in `errors` or in a
 /// specific `defs[i].error`; other cells still evaluate.
@@ -90,6 +107,22 @@ pub struct CellOutput {
     /// structural (`workbook_*`) or evaluation (`math_*`) problem this cell
     /// carries.
     pub errors: Vec<IpcError>,
+    /// Rendered HTML of this cell's `CellDoc::prose_before` (C2 §2.4) —
+    /// added post-sign (2026-09-05, ledger R69 item 4, R70). `None` when
+    /// this cell has no `prose_before`. `${…}` spans (C2 §5.2) appear as
+    /// `<span data-span-id="{cell_id}-before:{i}"></span>` placeholders,
+    /// `i` 0-indexed in document order (see [`ProseSpan`] for the matching
+    /// expression text); raw HTML the author typed is escaped, never
+    /// passed through (R69's sandbox security boundary — see
+    /// `idl_rs::workbook::v3::render_prose_html`'s doc comment).
+    pub prose_before_html: Option<String>,
+    /// Same as `prose_before_html`, for `CellDoc::prose_after` — non-`None`
+    /// only on the last cell in the document (C2 §2.4).
+    pub prose_after_html: Option<String>,
+    /// Every `${…}` span across both `prose_before_html` and
+    /// `prose_after_html`, in document order (`prose_before` first, then
+    /// `prose_after`) — added post-sign (2026-09-05, ledger R70).
+    pub prose_spans: Vec<ProseSpan>,
 }
 
 /// `save_workbook`'s return (C3 §3.4).
@@ -309,7 +342,33 @@ fn eval_workbook_via(data_dir: &Path, id: &str, session_id: Option<&str>) -> Res
 
             let value = table_cell_value(cell_eval.kind, cell_doc, session_id.is_some(), &handle);
 
-            CellOutput { cell_id: cell_eval.cell_id.clone(), kind: cell_kind_str(cell_eval.kind).to_string(), value, defs, errors }
+            let before = cell_doc
+                .prose_before
+                .as_deref()
+                .map(|t| render_prose_html(t, &format!("{}-before", cell_doc.id)));
+            let after = cell_doc
+                .prose_after
+                .as_deref()
+                .map(|t| render_prose_html(t, &format!("{}-after", cell_doc.id)));
+
+            let mut prose_spans = Vec::new();
+            if let Some(rendered) = &before {
+                prose_spans.extend(rendered.spans.iter().map(|s| ProseSpan { id: s.id.clone(), expr: s.expr.clone() }));
+            }
+            if let Some(rendered) = &after {
+                prose_spans.extend(rendered.spans.iter().map(|s| ProseSpan { id: s.id.clone(), expr: s.expr.clone() }));
+            }
+
+            CellOutput {
+                cell_id: cell_eval.cell_id.clone(),
+                kind: cell_kind_str(cell_eval.kind).to_string(),
+                value,
+                defs,
+                errors,
+                prose_before_html: before.map(|r| r.html),
+                prose_after_html: after.map(|r| r.html),
+                prose_spans,
+            }
         })
         .collect();
 
@@ -943,6 +1002,33 @@ mod tests {
         assert!(value.get("model").is_some());
         let results = value.get("results").unwrap().as_array().unwrap();
         assert_eq!(results[0][0]["value"], serde_json::json!(5.0));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eval_workbook_via_first_cells_prose_before_renders_to_html_matching_render_prose_html_prose_after_none_on_non_last_cell(
+    ) {
+        // Arrange -- prose_before on the first (non-last) of two cells; C2
+        // §2.4 gives prose_after only to the document's last cell.
+        let root = temp_root();
+        let prose = "# Heading\n\nSee ${1 + 1}.\n\n";
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n{prose}```math id=aaaaaaaa\nx = 1\n```\n\n```js id=bbbbbbbb\n1 + 1\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+
+        // Act
+        let out = eval_workbook_via(&root, WB_ID, None).unwrap();
+
+        // Assert -- expected HTML is built by calling render_prose_html
+        // directly, not hand-written a second time.
+        let expected = render_prose_html(prose, "aaaaaaaa-before");
+        assert_eq!(out[0].prose_before_html, Some(expected.html));
+        assert_eq!(out[0].prose_after_html, None);
+        assert_eq!(out[0].prose_spans.len(), 1);
+        assert_eq!(out[0].prose_spans[0].id, "aaaaaaaa-before:0");
+        assert_eq!(out[0].prose_spans[0].expr, "1 + 1");
 
         let _ = std::fs::remove_dir_all(&root);
     }

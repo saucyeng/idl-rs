@@ -15,6 +15,7 @@ pub mod front_matter;
 pub mod host;
 pub mod js_cell;
 pub mod math_cell;
+pub mod prose;
 pub mod resolve;
 pub mod table_cell;
 
@@ -26,6 +27,7 @@ pub use front_matter::{ConstantRaw, FrontMatter, UnitsPref};
 pub use host::{channel, host_constants, host_laps, host_session, to_host_channel, HostChannel, HostLap, HostSession};
 pub use js_cell::{find_inline_exprs, InlineExpr};
 pub use math_cell::{parse_math_cell_body, MathCellLine};
+pub use prose::{render_prose_html, ProseSpanRef, RenderedProse};
 pub use resolve::resolve_workbook_defs;
 pub use table_cell::parse_table_cell;
 
