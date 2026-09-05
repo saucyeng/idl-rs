@@ -17,6 +17,7 @@ pub mod filters;
 pub mod gps;
 pub mod histogram;
 pub mod histogram2d;
+pub mod import;
 pub mod integration;
 pub mod laps;
 pub mod math;
