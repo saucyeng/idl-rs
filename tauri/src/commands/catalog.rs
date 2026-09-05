@@ -430,7 +430,10 @@ mod tests {
     use idl_rs::store::blob::write_blob;
     use idl_rs::store::catalog::rebuild_catalog as core_rebuild_catalog;
     use idl_rs::store::parquet::write_session_parquet;
-    use idl_rs::store::session_json::{empty_session_json, write_session_json};
+    use idl_rs::store::session_json::{
+        empty_session_json, write_session_json, LapJson, NeutralZoneVisitJson, OverlayLapKeyJson, SectorJson,
+        TrackVisitJson,
+    };
     use uuid::Uuid;
 
     fn temp_root() -> std::path::PathBuf {
@@ -491,6 +494,163 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, crate::error::IpcErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_session_via_happy_path_every_field_of_the_24_field_conversion_is_distinguishable() {
+        // Arrange — every field below holds a value no other field shares
+        // (within its own type), so a transposition or dropped field in
+        // `SessionDetail::from(catalog_read::SessionDetail)` (the largest
+        // `From` impl in this file) fails a specific assertion rather than
+        // slipping past a spot-check.
+        let root = temp_root();
+        let session_id = "s1";
+
+        let mut doc = empty_session_json(session_id);
+        doc.rider = "rider-A".to_string();
+        doc.bike = "bike-B".to_string();
+        doc.bike_comment = "bike-comment-C".to_string();
+        doc.venue_name = "venue-D".to_string();
+        doc.event_name = "event-E".to_string();
+        doc.event_session = "event-session-F".to_string();
+        doc.short_comment = "short-comment-G".to_string();
+        doc.long_comment = "long-comment-H".to_string();
+        doc.tag = "tag-I".to_string();
+        doc.bike_profile_snapshot = Some(serde_json::json!({ "snapshot_marker": "snapshot-J" }));
+        doc.laps = vec![LapJson {
+            lap_number: 1,
+            start_timestamp_ms: 1_000,
+            end_timestamp_ms: 2_000,
+            raw_elapsed_ms: 1_001,
+            lap_time_ms: 1_002,
+            start_time_secs: 1.1,
+            end_time_secs: 2.2,
+            sectors: vec![SectorJson {
+                name: "sector-K".to_string(),
+                start_ms: 1_100,
+                end_ms: 1_200,
+                start_time_secs: 1.3,
+                end_time_secs: 1.4,
+            }],
+            neutral_zone_visits: vec![NeutralZoneVisitJson { name: "nz-L".to_string(), enter_ms: 1_300, exit_ms: 1_400 }],
+        }];
+        doc.track_visits = vec![TrackVisitJson {
+            visit_id: "visit-M".to_string(),
+            track_id: "track-N".to_string(),
+            start_timestamp_ms: 3_000,
+            end_timestamp_ms: 4_000,
+            laps: vec![LapJson {
+                lap_number: 20,
+                start_timestamp_ms: 3_100,
+                end_timestamp_ms: 3_200,
+                raw_elapsed_ms: 3_101,
+                lap_time_ms: 3_102,
+                start_time_secs: 3.3,
+                end_time_secs: 3.4,
+                sectors: Vec::new(),
+                neutral_zone_visits: Vec::new(),
+            }],
+        }];
+        doc.reference_lap_number = Some(11);
+        doc.ignored_lap_numbers = vec![12, 13];
+        doc.main_lap_number = Some(14);
+        doc.overlay_lap_key = Some(OverlayLapKeyJson { session_id: "overlay-session-O".to_string(), lap_number: 15 });
+        doc.starred_lap_number = Some(16);
+        doc.track_visits_library_hash = Some("hash-P".to_string());
+        write_session_json(&root, session_id, &doc, None).unwrap();
+
+        let blob_sha256 = write_blob(&root, b"raw bytes for s1 (distinguishable test)").unwrap();
+        let session = Session {
+            session_id: session_id.to_string(),
+            device_id: Some("device-Q".to_string()),
+            timestamp_utc_ms: 5_000,
+            config_checksum: Some("checksum-R".to_string()),
+            source_format: SourceFormat::Idl0,
+            blob_sha256: blob_sha256.clone(),
+            channels: vec![Channel {
+                channel_id: "chan-S".to_string(),
+                t_us: vec![0, 500_000],
+                t_recorded_us: None,
+                nominal_rate_hz: 2.0,
+                column: RawColumn::F64(vec![1.0, 2.0]),
+                source_kind: "imu0".to_string(),
+                unit: "g".to_string(),
+                gaps: Vec::new(),
+            }],
+        };
+        write_session_parquet(&root, &session, "0.1.0").unwrap();
+
+        // Act
+        let detail = get_session_via(&root, session_id).unwrap();
+
+        // Assert
+        assert_eq!(detail.session_id, "s1");
+        assert_eq!(detail.device_id.as_deref(), Some("device-Q"));
+        assert_eq!(detail.timestamp_utc_ms, 5_000);
+        assert_eq!(detail.config_checksum.as_deref(), Some("checksum-R"));
+        assert_eq!(detail.source_format, "idl0");
+        assert_eq!(detail.blob_sha256, blob_sha256);
+
+        assert_eq!(detail.channels.len(), 1);
+        let ch = &detail.channels[0];
+        assert_eq!(ch.channel_id, "chan-S");
+        assert_eq!(ch.nominal_rate_hz, 2.0);
+        assert_eq!(ch.unit, "g");
+        assert_eq!(ch.source_kind, "imu0");
+        assert_eq!(ch.channel_kind, "fixed-rate");
+        assert_eq!(ch.sample_count, 2);
+
+        assert_eq!(detail.rider, "rider-A");
+        assert_eq!(detail.bike, "bike-B");
+        assert_eq!(detail.bike_comment, "bike-comment-C");
+        assert_eq!(detail.venue_name, "venue-D");
+        assert_eq!(detail.event_name, "event-E");
+        assert_eq!(detail.event_session, "event-session-F");
+        assert_eq!(detail.short_comment, "short-comment-G");
+        assert_eq!(detail.long_comment, "long-comment-H");
+        assert_eq!(detail.tag, "tag-I");
+        assert_eq!(detail.bike_profile_snapshot, Some(serde_json::json!({ "snapshot_marker": "snapshot-J" })));
+
+        assert_eq!(detail.laps.len(), 1);
+        let lap = &detail.laps[0];
+        assert_eq!(lap.lap_number, 1);
+        assert_eq!(lap.start_timestamp_ms, 1_000);
+        assert_eq!(lap.end_timestamp_ms, 2_000);
+        assert_eq!(lap.raw_elapsed_ms, 1_001);
+        assert_eq!(lap.lap_time_ms, 1_002);
+        assert_eq!(lap.start_time_secs, 1.1);
+        assert_eq!(lap.end_time_secs, 2.2);
+        assert_eq!(
+            lap.sectors,
+            serde_json::json!([{ "name": "sector-K", "start_ms": 1_100, "end_ms": 1_200, "start_time_secs": 1.3, "end_time_secs": 1.4 }])
+        );
+        assert_eq!(lap.neutral_zone_visits, serde_json::json!([{ "name": "nz-L", "enter_ms": 1_300, "exit_ms": 1_400 }]));
+
+        assert_eq!(detail.track_visits.len(), 1);
+        let visit = &detail.track_visits[0];
+        assert_eq!(visit.visit_id, "visit-M");
+        assert_eq!(visit.track_id, "track-N");
+        assert_eq!(visit.start_timestamp_ms, 3_000);
+        assert_eq!(visit.end_timestamp_ms, 4_000);
+        assert_eq!(visit.laps.len(), 1);
+        let nested_lap = &visit.laps[0];
+        assert_eq!(nested_lap.lap_number, 20);
+        assert_eq!(nested_lap.start_timestamp_ms, 3_100);
+        assert_eq!(nested_lap.end_timestamp_ms, 3_200);
+        assert_eq!(nested_lap.raw_elapsed_ms, 3_101);
+        assert_eq!(nested_lap.lap_time_ms, 3_102);
+        assert_eq!(nested_lap.start_time_secs, 3.3);
+        assert_eq!(nested_lap.end_time_secs, 3.4);
+
+        assert_eq!(detail.reference_lap_number, Some(11));
+        assert_eq!(detail.ignored_lap_numbers, vec![12, 13]);
+        assert_eq!(detail.main_lap_number, Some(14));
+        assert_eq!(detail.overlay_lap_key.as_ref().map(|k| k.session_id.as_str()), Some("overlay-session-O"));
+        assert_eq!(detail.overlay_lap_key.as_ref().map(|k| k.lap_number), Some(15));
+        assert_eq!(detail.starred_lap_number, Some(16));
+        assert_eq!(detail.track_visits_library_hash.as_deref(), Some("hash-P"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
