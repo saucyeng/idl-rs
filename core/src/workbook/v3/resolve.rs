@@ -101,16 +101,22 @@ pub type DefKey = (String, String);
 /// comment).
 ///
 /// **Cross-referencing is still by bare name**, via the internal `resolved`
-/// overlay (unchanged by R47): a `[Name]` reference from a third definition
-/// can only ever name one target, so when two definitions share a name,
-/// whichever is processed last in a given fixed-point pass is the one any
-/// dependent sees — the same ambiguity a duplicate name already has in a
-/// flat namespace (C2 §2.4), not a new one this fix introduces. R47 only
-/// guarantees that *both* duplicate definitions still get their own
-/// (`cell_id`-scoped) result in the returned map, not that a third
-/// definition's cross-reference to the shared name is well-defined — C2
-/// §3.5.A's `DuplicateDefinition` structural error is already flagging that
-/// state as a mistake.
+/// overlay: a `[Name]` reference from a third definition can only ever name
+/// one target. When two definitions share a name, **the first in document
+/// order wins** (ledger R49) — pinned by explicit construction
+/// (`primary_for_name` below), not left as a side effect of fixed-point
+/// pass timing, which resolved it order-dependently before this ruling (an
+/// unrelated edit could silently swing which duplicate a reference saw).
+/// This mirrors [`super::constants::merge_constants`]'s own rule for the
+/// same shape of collision (L3-R16/R17: the first declaration of a name
+/// wins its table entry, every later one reported) — one document format
+/// should not resolve the same kind of collision two different ways. The
+/// rejected alternative was making every referencing cell error too; that
+/// buries the one signal the user needs (the `DuplicateDefinition` error
+/// naming the actual mistake, C2 §3.5.A) under cascading errors on every
+/// cell that merely mentions the name. The non-winning duplicate still gets
+/// its own result in the returned map (R47) — only the cross-reference
+/// overlay ignores it.
 ///
 /// Dependency edges come from [`channel_refs`] filtered to names present in
 /// `defs` — a `[Name]` reference to a name *not* in `defs` is a base/session
@@ -153,6 +159,18 @@ pub fn resolve_workbook_defs(
         })
         .collect();
 
+    // R47/R49: for a duplicated name, the *first* declaration in document
+    // order (`defs`'s own order) is the one cross-references see — pinned
+    // here, by identity, independent of which duplicate's evaluation
+    // happens to finish first in the fixed-point loop below (`.entry(...)
+    // .or_insert(d)` keeps only the first occurrence per name, since `defs`
+    // is iterated in document order).
+    let primary_for_name: HashMap<&str, &MathCellDef> =
+        defs.iter().fold(HashMap::new(), |mut m, d| {
+            m.entry(d.name.as_str()).or_insert(d);
+            m
+        });
+
     let mut resolved: HashMap<String, (Arc<[f64]>, f64, Arc<[i64]>)> = HashMap::new();
     let mut results: HashMap<DefKey, Result<EvalOutput, MathEvalError>> = HashMap::new();
     let mut remaining: Vec<&MathCellDef> = defs.iter().collect();
@@ -174,16 +192,23 @@ pub fn resolve_workbook_defs(
             match &out {
                 Ok(eval_out) => {
                     // Cross-referencing overlay: still name-keyed (see this
-                    // function's doc comment) — a duplicate name's last
-                    // write here is what any dependent sees.
-                    resolved.insert(
-                        def.name.clone(),
-                        (
-                            Arc::from(eval_out.samples.as_slice()),
-                            eval_out.sample_rate_hz,
-                            Arc::from(eval_out.t_us.as_slice()),
-                        ),
-                    );
+                    // function's doc comment) — but only the name's `primary`
+                    // (first-in-document-order) definition ever writes here
+                    // (R49), regardless of fixed-point pass timing. A
+                    // non-primary duplicate still gets its own `results`
+                    // entry below (so its own cell shows a real value, not a
+                    // suppressed one) — it just never becomes what a third
+                    // cell's `[Name]` reference sees.
+                    if std::ptr::eq(primary_for_name[def.name.as_str()], def) {
+                        resolved.insert(
+                            def.name.clone(),
+                            (
+                                Arc::from(eval_out.samples.as_slice()),
+                                eval_out.sample_rate_hz,
+                                Arc::from(eval_out.t_us.as_slice()),
+                            ),
+                        );
+                    }
                 }
                 Err(_) => {
                     // A failed definition still counts as "settled" for the
@@ -426,5 +451,24 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(get(&out, "c1", "x").as_ref().unwrap().samples, vec![1.0]);
         assert_eq!(get(&out, "c2", "x").as_ref().unwrap().samples, vec![2.0]);
+    }
+
+    #[test]
+    fn a_duplicated_name_a_third_definitions_reference_resolves_to_the_first_in_document_order_not_the_second(
+    ) {
+        // Arrange — ledger R49: two cells both define "x" (c1's first in
+        // document order, c2's second, deliberately different values so the
+        // assertion below fails outright if the rule ever flips to
+        // "last wins" or reverts to pass-timing-dependent behaviour); a
+        // third cell's `y = [x] + 1` must see c1's "x" (10), never c2's (20).
+        let defs = vec![def("c1", "x", "10", 0), def("c2", "x", "20", 0), def("c3", "y", "[x] + 1", 0)];
+
+        // Act
+        let out = resolve_workbook_defs(&defs, &HashMap::new(), &EmptyLookup, &no_laps());
+
+        // Assert
+        assert_eq!(get(&out, "c1", "x").as_ref().unwrap().samples, vec![10.0]);
+        assert_eq!(get(&out, "c2", "x").as_ref().unwrap().samples, vec![20.0]);
+        assert_eq!(get(&out, "c3", "y").as_ref().unwrap().samples, vec![11.0], "y must resolve against the first-declared x (10), not the second (20)");
     }
 }

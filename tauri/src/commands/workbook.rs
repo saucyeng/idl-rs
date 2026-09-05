@@ -177,7 +177,28 @@ fn sanitize_file_name_stem(name: &str) -> String {
         .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' || c == '.' { c } else { '_' })
         .collect();
     let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
-    if trimmed.is_empty() { "workbook".to_string() } else { trimmed.to_string() }
+    if trimmed.is_empty() || is_windows_reserved_name(trimmed) {
+        "workbook".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// True iff `stem` case-insensitively matches one of Windows's reserved
+/// device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`9`, `LPT1`-`9`) —
+/// ledger R49's Minor: none of these fail to create on every filesystem
+/// (verified empirically, not live on this machine), but the failure mode
+/// where it *is* live is an opaque `io` error out of `write_atomic` rather
+/// than a clear message, and a sanitised stem becomes a real path. Exact
+/// match only (case-insensitive) — `stem` is already the whole file-name
+/// stem by the time this runs, not a substring search, so `"CONTAINER"` is
+/// not reserved.
+fn is_windows_reserved_name(stem: &str) -> bool {
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1",
+        "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r))
 }
 
 /// Transport-agnostic core of `open_workbook`.
@@ -591,6 +612,22 @@ mod tests {
         assert!(root.join("workbooks").join("Fork tuning-2.idl1wb").exists());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sanitize_file_name_stem_a_windows_reserved_device_name_case_insensitively_falls_back_to_workbook() {
+        // Arrange / Act / Assert — ledger R49's Minor: a stem that would
+        // otherwise sanitise to a reserved device name falls back the same
+        // way the empty-after-trim case already does, not through to a raw
+        // path a later `write_atomic` would fail on with an opaque `io`
+        // error.
+        assert_eq!(sanitize_file_name_stem("CON"), "workbook");
+        assert_eq!(sanitize_file_name_stem("con"), "workbook");
+        assert_eq!(sanitize_file_name_stem("Lpt3"), "workbook");
+        // Exact match only — a name that merely contains a reserved word is
+        // not reserved.
+        assert_eq!(sanitize_file_name_stem("CONTAINER"), "CONTAINER");
+        assert_eq!(sanitize_file_name_stem("Fork tuning"), "Fork tuning");
     }
 
     #[test]
