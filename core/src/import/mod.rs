@@ -10,6 +10,7 @@
 //! C1 §3.3) does not implement this trait in this module — see
 //! `docs/IDL0_SPEC.md` §15a.1.
 
+pub mod csv;
 pub mod fit;
 pub mod gpx;
 
@@ -102,6 +103,7 @@ pub fn importer_for_extension(ext: &str) -> Option<Box<dyn Importer>> {
     match ext {
         "gpx" => Some(Box::new(gpx::GpxImporter)),
         "fit" => Some(Box::new(fit::FitImporter)),
+        "csv" => Some(Box::new(csv::CsvImporter)),
         _ => None,
     }
 }
