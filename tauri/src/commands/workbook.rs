@@ -210,6 +210,35 @@ fn open_workbook_via(data_dir: &Path, id_or_path: &str) -> Result<WorkbookHandle
     Ok(WorkbookHandle { id: doc.id, name: doc.name, path: path.display().to_string(), cell_count: doc.cells.len() as u32 })
 }
 
+/// C3 §3.4 `WorkbookSource` — `read_workbook`'s return. Added post-sign
+/// (2026-09-05, ruling R59) to close the gap that made `save_workbook`
+/// unusable as specified: nothing previously let the editor read the file
+/// it is about to save `based_on_hash` against.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkbookSource {
+    /// The file's UTF-8 text, verbatim — never parsed by this command.
+    pub markdown: String,
+    /// sha256 of `markdown`'s bytes, hex — the `based_on_hash` a later
+    /// `save_workbook` call passes.
+    pub hash: String,
+    /// Absolute path, under `<data>/workbooks/`.
+    pub path: String,
+}
+
+/// Transport-agnostic core of `read_workbook`. Deliberately does **not**
+/// call [`parse_workbook`] or [`parse_front_matter`] — a document whose
+/// front matter is malformed enough for [`open_workbook_via`] to reject it
+/// must still be readable here, so it can be repaired in the editor. That
+/// separation from `open_workbook` is this command's entire reason to
+/// exist; do not add a parse/validation step here.
+fn read_workbook_via(data_dir: &Path, id_or_path: &str) -> Result<WorkbookSource, IpcError> {
+    let path = resolve_workbook_path(data_dir, id_or_path)?;
+    let markdown = std::fs::read_to_string(&path)
+        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
+    let hash = sha256_hex(markdown.as_bytes());
+    Ok(WorkbookSource { markdown, hash, path: path.display().to_string() })
+}
+
 /// The "no session bound" `ChannelLookup` (ledger R41): every `[Channel]`
 /// reference then surfaces as a per-cell `math_unknown_channel` rather than
 /// rejecting the whole command.
@@ -426,6 +455,14 @@ pub fn open_workbook(id_or_path: String, data_dir: tauri::State<'_, DataDir>) ->
     open_workbook_via(&data_dir.0, &id_or_path)
 }
 
+/// C3 §3.4 `read_workbook(id_or_path)` — returns the file's raw text and its
+/// hash, without parsing. See [`read_workbook_via`] for why this must not
+/// call `parse_workbook`.
+#[tauri::command]
+pub fn read_workbook(id_or_path: String, data_dir: tauri::State<'_, DataDir>) -> Result<WorkbookSource, IpcError> {
+    read_workbook_via(&data_dir.0, &id_or_path)
+}
+
 /// C3 §3.4 `eval_workbook(id, session_id)`.
 #[tauri::command]
 pub fn eval_workbook(
@@ -565,6 +602,77 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::WorkbookMissingFrontMatterId);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- Step 3: read_workbook ----
+
+    #[test]
+    fn read_workbook_via_lookup_by_id_returns_verbatim_markdown_and_matching_hash() {
+        // Arrange
+        let root = temp_root();
+        let markdown = two_cell_markdown();
+        let path = write_workbook(&root, "fork-tuning.idl1wb", &markdown);
+
+        // Act
+        let source = read_workbook_via(&root, WB_ID).unwrap();
+
+        // Assert
+        assert_eq!(source.markdown, markdown);
+        assert_eq!(source.path, path.display().to_string());
+        assert_eq!(source.hash, sha256_hex(markdown.as_bytes()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_workbook_via_lookup_by_literal_path_returns_the_same_result_as_by_id() {
+        // Arrange
+        let root = temp_root();
+        let markdown = two_cell_markdown();
+        let path = write_workbook(&root, "fork-tuning.idl1wb", &markdown);
+
+        // Act
+        let source = read_workbook_via(&root, path.to_str().unwrap()).unwrap();
+
+        // Assert
+        assert_eq!(source.markdown, markdown);
+        assert_eq!(source.path, path.display().to_string());
+        assert_eq!(source.hash, sha256_hex(markdown.as_bytes()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_workbook_via_unknown_id_or_path_not_found() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let err = read_workbook_via(&root, "nope").unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_workbook_via_malformed_front_matter_open_workbook_would_reject_still_succeeds_with_raw_text() {
+        // Arrange — the exact fixture `open_workbook_front_matter_without_an_id_...`
+        // above proves `open_workbook_via` rejects (missing `id:`); this test
+        // proves `read_workbook_via` does not parse, so it reads it anyway.
+        let root = temp_root();
+        let markdown = "---\nname: No id\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = 1\n```\n";
+        let path = write_workbook(&root, "no-id.idl1wb", markdown);
+
+        // Act
+        let source = read_workbook_via(&root, path.to_str().unwrap()).unwrap();
+
+        // Assert
+        assert_eq!(source.markdown, markdown);
+        assert_eq!(source.hash, sha256_hex(markdown.as_bytes()));
 
         let _ = std::fs::remove_dir_all(&root);
     }
