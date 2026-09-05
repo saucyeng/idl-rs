@@ -2083,6 +2083,7 @@ dependencies = [
  "nalgebra",
  "parquet",
  "pulldown-cmark",
+ "quick-xml",
  "realfft",
  "rusqlite",
  "rustfft",

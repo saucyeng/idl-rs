@@ -21,6 +21,7 @@ uuid = { version = "1.26.0", features = ["v4"] }
 sha2 = "0.10.9"
 pulldown-cmark = "0.13.4"
 serde_yaml_ng = "0.10.0"
+quick-xml = "0.41.0"
 
 [dev-dependencies]
 approx = "0.5"

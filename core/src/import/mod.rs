@@ -10,6 +10,8 @@
 //! C1 §3.3) does not implement this trait in this module — see
 //! `docs/IDL0_SPEC.md` §15a.1.
 
+pub mod gpx;
+
 mod error;
 
 pub use error::ImporterError;
@@ -90,6 +92,16 @@ pub fn session_id_from_blob_hash(blob_sha256: &str) -> String {
     );
 
     blob_sha256.to_ascii_lowercase().chars().take(16).collect()
+}
+
+/// Selects an importer by lowercase file extension (without the dot).
+/// `None` for anything this module does not (yet) cover — the caller
+/// (CLI/L1 store) decides how to report an unrecognised extension.
+pub fn importer_for_extension(ext: &str) -> Option<Box<dyn Importer>> {
+    match ext {
+        "gpx" => Some(Box::new(gpx::GpxImporter)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
