@@ -13,6 +13,7 @@
 pub mod csv;
 pub mod fit;
 pub mod gpx;
+pub mod hook;
 
 mod error;
 
