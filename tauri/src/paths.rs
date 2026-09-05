@@ -26,7 +26,8 @@ pub fn resolve_data_dir(app_data_dir: &Path, app_config_dir: &Path) -> Result<Pa
     let settings_path = app_config_dir.join("settings.json");
     let data_root = match std::fs::read_to_string(&settings_path) {
         Ok(text) => {
-            let settings: Settings = serde_json::from_str(&text).unwrap_or_default();
+            let text = text.trim_start_matches('\u{feff}');
+            let settings: Settings = serde_json::from_str(text).unwrap_or_default();
             match settings.data_dir.filter(|d| !d.is_empty()) {
                 Some(d) => PathBuf::from(d),
                 None => app_data_dir.to_path_buf(),
@@ -91,5 +92,28 @@ mod tests {
 
         // Assert
         assert_eq!(data, app_data.path().join("data"));
+    }
+
+    #[test]
+    fn settings_json_data_dir_override_with_a_leading_bom_is_still_honoured() {
+        // Arrange
+        let app_data = tempfile::tempdir().unwrap();
+        let app_config = tempfile::tempdir().unwrap();
+        let override_root = tempfile::tempdir().unwrap();
+        let json = format!(
+            r#"{{"data_dir":"{}"}}"#,
+            override_root.path().display().to_string().replace('\\', "\\\\"),
+        );
+        // '\u{feff}' prepended, matching a UTF-8 BOM as PowerShell's `Out-File`
+        // default encoding writes it — the exact real-world failure mode this
+        // task fixes (runs/2026-09-03/decisions.md, "settings.json BOM trap").
+        let with_bom = format!("\u{feff}{json}");
+        std::fs::write(app_config.path().join("settings.json"), with_bom).unwrap();
+
+        // Act
+        let data = resolve_data_dir(app_data.path(), app_config.path()).unwrap();
+
+        // Assert
+        assert_eq!(data, override_root.path().join("data"));
     }
 }
