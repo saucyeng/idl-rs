@@ -40,5 +40,7 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::workbook::save_workbook,
         commands::workbook::watch_workbook,
         commands::cursor::cursor_readout,
+        commands::rasters::fetch_raster,
+        commands::rasters::fetch_raster_meta,
     ]
 }

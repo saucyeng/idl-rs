@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod cursor;
 pub mod device;
+pub mod rasters;
 pub mod workbook;
 
 /// Reports the engine crate version so the UI (and sync peers) can prove
