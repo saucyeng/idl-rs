@@ -124,12 +124,15 @@ fn channel_array(c: &Channel, rows: &[usize], n_rows: usize) -> Result<ArrayRef,
     }
 }
 
-/// Scatters a `<source>_t_recorded_us` column: the verbatim recorded time
-/// at every row this source actually sampled (its own `t_us`, since that's
-/// where the row lives), null elsewhere. One call per distinct
-/// `source_kind` present, using any one of that source's channels (they
-/// all share the same `t_us`/`t_recorded_us` by construction — one FIFO
-/// read per source, C1 §3.2).
+/// Scatters one channel's own `t_recorded_us_or_t_us()` values into a
+/// `<source>_t_recorded_us` column: the verbatim recorded time at every row
+/// this channel actually sampled (its own `t_us`, since that's where the
+/// row lives), null elsewhere. Called once per channel of a `source_kind`
+/// (not once per source — L2-R10), since FIT/GPX/CSV channels of the same
+/// `source_kind` do not necessarily share one `t_us` the way idl0's
+/// single-FIFO-per-source channels do; the caller merges every channel's
+/// contribution into one shared array, first-channel-to-fill-a-row wins
+/// (C1 §3.2).
 fn recorded_us_array(c: &Channel, rows: &[usize], n_rows: usize) -> ArrayRef {
     let recorded = c.t_recorded_us_or_t_us();
     let mut vals: Vec<Option<i64>> = vec![None; n_rows];
@@ -247,7 +250,13 @@ pub fn write_session_parquet(
     let mut arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(t.clone()))];
 
     // <source>_t_recorded_us columns — one per distinct source_kind among
-    // real (non-synthesized) channels.
+    // real (non-synthesized) channels. L2-R10: a source's channels do not
+    // all share one `t_us` (a FIT import's per-field channels each only
+    // sample the records that carried that field, C1 §4.1), so the column
+    // is built from the union of every channel of that source_kind, not
+    // just the first one encountered — otherwise a row only a later
+    // channel covers would wrongly read back null on `<source>_t_recorded_us`
+    // despite `t` having a real row there.
     let mut seen_sources: Vec<&str> = Vec::new();
     for c in &session.channels {
         if c.source_kind == "synthesized" {
@@ -257,13 +266,32 @@ pub fn write_session_parquet(
             continue;
         }
         seen_sources.push(&c.source_kind);
-        let rows = row_indices_for(c, &t)?;
         let field_name = format!("{}_t_recorded_us", c.source_kind);
         fields.push(
             Field::new(field_name.as_str(), DataType::Int64, true)
                 .with_metadata([("source_kind".to_string(), c.source_kind.clone())].into_iter().collect()),
         );
-        arrays.push(recorded_us_array(c, &rows, n_rows));
+
+        // Merge every channel of this source_kind into one shared array —
+        // a row two channels both cover carries the same recorded value in
+        // practice (same underlying sample's timestamp), so the first
+        // channel to fill a row wins; a later channel never overwrites an
+        // already-filled row with `None`.
+        let mut merged: Vec<Option<i64>> = vec![None; n_rows];
+        for c2 in session.channels.iter().filter(|c2| c2.source_kind == c.source_kind) {
+            let rows = row_indices_for(c2, &t)?;
+            let arr = recorded_us_array(c2, &rows, n_rows);
+            let arr = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("recorded_us_array always returns an Int64Array");
+            for i in 0..n_rows {
+                if merged[i].is_none() && arr.is_valid(i) {
+                    merged[i] = Some(arr.value(i));
+                }
+            }
+        }
+        arrays.push(Arc::new(Int64Array::from(merged)));
     }
 
     // Channel value columns.
@@ -771,6 +799,72 @@ mod tests {
             }
             other => panic!("expected F64, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// thing — condition — result: two `fit`-source channels whose `t_us`
+    /// sets are disjoint on some rows — `fit_t_recorded_us` is non-null on
+    /// every row `t` has, not just the rows the first-registered channel
+    /// happened to cover (L2-R10).
+    #[test]
+    fn fit_t_recorded_us_is_non_null_on_the_union_of_its_channels_rows() {
+        // Arrange — GPS_Latitude only samples rows 0 and 2 (t_us
+        // 0/2_000_000); HR_BPM samples all three rows (0/1_000_000/
+        // 2_000_000). GPS_Latitude is registered first, so the pre-L2-R10
+        // bug would leave row 1 (t = 1_000_000) null in `fit_t_recorded_us`.
+        let root = temp_root();
+        let lat = Channel {
+            channel_id: "GPS_Latitude".to_string(),
+            t_us: vec![0, 2_000_000],
+            t_recorded_us: None,
+            nominal_rate_hz: 0.0,
+            column: RawColumn::F64(vec![45.0, 45.1]),
+            source_kind: "fit".to_string(),
+            unit: "deg".to_string(),
+            gaps: Vec::new(),
+        };
+        let hr = Channel {
+            channel_id: "HR_BPM".to_string(),
+            t_us: vec![0, 1_000_000, 2_000_000],
+            t_recorded_us: None,
+            nominal_rate_hz: 0.0,
+            column: RawColumn::F64(vec![140.0, 141.0, 142.0]),
+            source_kind: "fit".to_string(),
+            unit: "bpm".to_string(),
+            gaps: Vec::new(),
+        };
+        let session = Session {
+            session_id: "1112131415161718191a1b1c1d1e1f20".to_string(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            config_checksum: None,
+            source_format: SourceFormat::Fit,
+            blob_sha256: "1".repeat(64),
+            channels: vec![lat, hr],
+        };
+        let path = write_session_parquet(&root, &session, "0.1.0").unwrap();
+
+        // Act — read the raw column directly; `read_session_parquet` drops
+        // `<source>_t_recorded_us` columns from its `Channel` output
+        // (they're not a channel), so this test opens the file itself.
+        let file = std::fs::File::open(&path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let schema = builder.schema().clone();
+        let reader = builder.build().unwrap();
+        let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+        let batch = arrow::compute::concat_batches(&schema, &batches).unwrap();
+        let col = batch
+            .column_by_name("fit_t_recorded_us")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        // Assert — 3 rows total (union of both channels' t_us), none null.
+        assert_eq!(col.len(), 3);
+        assert_eq!(col.null_count(), 0);
+        assert_eq!(col.values(), &[0, 1_000_000, 2_000_000]);
 
         let _ = std::fs::remove_dir_all(&root);
     }

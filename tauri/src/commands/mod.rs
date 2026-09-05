@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod cursor;
 pub mod device;
+pub mod import;
 pub mod rasters;
 pub mod tiles;
 pub mod workbook;

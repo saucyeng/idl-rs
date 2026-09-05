@@ -19,8 +19,16 @@ use crate::session::{Channel, RawColumn, Session};
 /// formula is exactly the derivation invariant 4 forbids once a channel's
 /// `t_us` is not perfectly uniform (true after Task 6's burst correction, or
 /// for any channel with drops), so `Time` costs 8 B/sample again under idl1
-/// (`RawColumn::F64`, not `Ramp`). Omitted (returns `[]`) when the session
-/// has no fixed-rate channel.
+/// (`RawColumn::F64`, not `Ramp`).
+///
+/// When no channel has a positive `nominal_rate_hz` (every FIT/GPX/CSV
+/// channel today), falls back to the channel with the most samples, still
+/// using its own real `t_us` — the synthesized `Time` channel's
+/// `nominal_rate_hz` is `0.0` in this branch, never a fabricated rate
+/// (ledger R23 Q2): declaring a fake rate would make `channel_kind` lie
+/// about an irregular source (`channel_kind` is `event` iff
+/// `nominal_rate_hz == 0.0`, `store/parquet.rs:158`). Omitted (returns
+/// `[]`) only when `session.channels` is empty or every channel is empty.
 ///
 /// `Distance` (metres): trapezoidal-integrate `GPS_SpeedKmh / 3.6` (km/h → m/s)
 /// at the GPS rate, then linear-interpolate onto the `Time` grid, clamped at
@@ -45,10 +53,31 @@ pub fn synthesize_base_channels(session: &mut Session) -> Vec<String> {
             time_source_idx = Some(i);
         }
     }
-    let Some(time_source_idx) = time_source_idx else {
-        return Vec::new();
+    // No fixed-rate channel — fall back to the channel with the most
+    // samples, using its own real `t_us` (ledger R23 Q2). This is what
+    // makes every FIT/GPX/CSV session (every channel `nominal_rate_hz:
+    // 0.0`) actually gain a `Time` channel; `max_rate` stays `0.0` here,
+    // never a fabricated rate — `channel_kind` is `event` iff
+    // `nominal_rate_hz == 0.0` (`store/parquet.rs:158`), and an honest
+    // `Time` channel for event-driven data must itself read `event`.
+    let time_source_idx = if let Some(idx) = time_source_idx {
+        idx
+    } else {
+        let mut fallback_idx: Option<usize> = None;
+        let mut fallback_len = 0usize;
+        for (i, c) in session.channels.iter().enumerate() {
+            if c.len() > fallback_len {
+                fallback_len = c.len();
+                fallback_idx = Some(i);
+            }
+        }
+        let Some(idx) = fallback_idx else {
+            return Vec::new();
+        };
+        max_rate_len = fallback_len;
+        idx
     };
-    if max_rate <= 0.0 || max_rate_len == 0 {
+    if max_rate_len == 0 {
         return Vec::new();
     }
 
@@ -153,8 +182,11 @@ mod tests {
     }
 
     #[test]
-    fn no_fixed_rate_channel_synthesizes_nothing() {
-        // Arrange — only an event-driven channel (rate 0).
+    fn no_fixed_rate_channel_falls_back_to_its_own_t_us_with_zero_rate() {
+        // Arrange — only an event-driven channel (rate 0). Ledger R23 Q2:
+        // this is no longer "nothing to synthesize" — the fallback picks
+        // this channel (it's the only one, trivially "most samples") and
+        // carries its own real t_us into Time, at nominal_rate_hz 0.0.
         let mut s = session(vec![Channel::from_f64_with_times(
             "HR_RR",
             0.0,
@@ -167,8 +199,42 @@ mod tests {
         let added = synthesize_base_channels(&mut s);
 
         // Assert
-        assert!(added.is_empty());
-        assert!(s.channels.iter().all(|c| c.channel_id != "Time"));
+        assert_eq!(added, vec!["Time".to_string()]);
+        let time = s.channels.iter().find(|c| c.channel_id == "Time").unwrap();
+        assert_eq!(time.nominal_rate_hz, 0.0);
+        assert_eq!(time.t_us, vec![500_000, 1_000_000]);
+        assert_relative_eq!(time.materialize()[0], 0.5, epsilon = 1e-9);
+        assert_relative_eq!(time.materialize()[1], 1.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn event_driven_fallback_uses_longer_channels_own_t_us_not_a_ramp() {
+        // Arrange — two event-driven channels (rate 0), different lengths
+        // and different t_us. Ledger R23 Q2: Time follows the longer
+        // channel's own t_us exactly, not i/rate and not a synthesized
+        // ramp, with nominal_rate_hz 0.0 (never a fabricated rate).
+        let mut s = session(vec![
+            Channel::from_f64_with_times("Short", 0.0, vec![10.0, 20.0], vec![100, 200], "short"),
+            Channel::from_f64_with_times(
+                "Long",
+                0.0,
+                vec![1.0, 2.0, 3.0],
+                vec![7_000, 9_000, 11_000],
+                "long",
+            ),
+        ]);
+
+        // Act
+        let added = synthesize_base_channels(&mut s);
+
+        // Assert
+        assert_eq!(added, vec!["Time".to_string()]);
+        let time = s.channels.iter().find(|c| c.channel_id == "Time").unwrap();
+        assert_eq!(time.nominal_rate_hz, 0.0);
+        assert_eq!(time.t_us, vec![7_000, 9_000, 11_000]);
+        assert_relative_eq!(time.materialize()[0], 0.007, epsilon = 1e-9);
+        assert_relative_eq!(time.materialize()[1], 0.009, epsilon = 1e-9);
+        assert_relative_eq!(time.materialize()[2], 0.011, epsilon = 1e-9);
     }
 
     #[test]

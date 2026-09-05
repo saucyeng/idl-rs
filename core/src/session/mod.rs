@@ -110,8 +110,12 @@ pub enum SourceFormat {
 
 impl SourceFormat {
     /// The lowercase wire token this variant serializes to (contract C1 §4.3
-    /// `source_format` file-metadata value).
-    pub fn as_str(&self) -> &'static str {
+    /// `source_format` file-metadata value). `const fn` so `core::import`'s
+    /// `IMPORTER_TABLE` (R51 Q2) can call it inside a `const` initializer —
+    /// a `match` over a `Copy` enum returning `&'static str` is
+    /// const-fn-eligible and this change is behaviour-preserving for every
+    /// existing call site.
+    pub const fn as_str(&self) -> &'static str {
         match self {
             SourceFormat::Idl0 => "idl0",
             SourceFormat::Fit => "fit",

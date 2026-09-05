@@ -1217,7 +1217,11 @@ mod tests {
         // Arrange — one event-driven F64 channel (10 samples + 10 t_us) plus
         // a 5-sample math entry, which also carries its own synthetic t_us
         // now (contract C1 §2 — every channel has real per-sample time, not
-        // just event-driven ones). Event-only session → no Time/Distance.
+        // just event-driven ones). An event-only session gets a synthesized
+        // Time channel from its longest channel's real t_us (ledger R23
+        // Q2) — `from_channels` runs `synthesize_base_channels`, so this
+        // Time channel is present and costs its own 10×8 samples + 10×8
+        // t_us alongside "E"'s.
         let meta = SessionMetaInput {
             session_id: String::new(),
             device_id: None,
@@ -1237,8 +1241,11 @@ mod tests {
         h.store_math("M", 1.0, vec![2.0; 5]);
 
         // Act + Assert — E: 10×8 (samples) + 10×8 (t_us) = 160.
-        // M: 5×8 (samples) + 5×8 (its own synthetic t_us) = 80. Total 240.
-        assert_eq!(h.resident_bytes(), 240);
+        // M: 5×8 (samples) + 5×8 (its own synthetic t_us) = 80.
+        // Time (Q2's fallback, nominal_rate_hz 0.0, "E"'s own t_us since
+        // it's the only/longest channel): 10×8 (samples) + 10×8 (t_us) = 160.
+        // Total 400.
+        assert_eq!(h.resident_bytes(), 400);
     }
 
     #[test]

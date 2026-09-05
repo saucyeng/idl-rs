@@ -73,6 +73,46 @@ pub enum IpcErrorKind {
     MathNotImplemented,
     /// `MathEvalErrorKind::Runtime` — workbook: `eval_workbook` (per definition).
     MathRuntime,
+    /// `idl_rs::store::import::ImportErrorKind::ParseInvalidMagicBytes`
+    /// (mirrors `ParseError::InvalidMagicBytes`) — Import: `import_file`
+    /// (`.idl0` source, C3 §2 `parse_invalid_magic_bytes`).
+    ParseInvalidMagicBytes,
+    /// `ImportErrorKind::ParseUnsupportedSchemaVersion` — Import:
+    /// `import_file` (`.idl0` source, C3 §2 `parse_unsupported_schema_version`).
+    ParseUnsupportedSchemaVersion,
+    /// `ImportErrorKind::ParseTruncatedRecord` — Import: `import_file`
+    /// (`.idl0` source, buffer too short to read even the magic/schema
+    /// bytes; a log that parses but ends mid-record instead surfaces via
+    /// `ImportOutcome::warnings`, never this kind — C3 §2 `parse_truncated_record`).
+    ParseTruncatedRecord,
+    /// `ImportErrorKind::ImportFitMalformed` — Import: `import_file` (`.fit`
+    /// source, C3 §2 `import_fit_malformed`, R7).
+    ImportFitMalformed,
+    /// `ImportErrorKind::ImportGpxMalformedXml` — Import: `import_file`
+    /// (`.gpx` source, C3 §2 `import_gpx_malformed_xml`).
+    ImportGpxMalformedXml,
+    /// `ImportErrorKind::ImportGpxNoTrackpoints` — Import: `import_file`
+    /// (`.gpx` source, C3 §2 `import_gpx_no_trackpoints`).
+    ImportGpxNoTrackpoints,
+    /// `ImportErrorKind::ImportGpxMissingLatLon` — Import: `import_file`
+    /// (`.gpx` source, C3 §2 `import_gpx_missing_lat_lon`).
+    ImportGpxMissingLatLon,
+    /// `ImportErrorKind::ImportGpxUnparseableLatLon` — Import: `import_file`
+    /// (`.gpx` source, C3 §2 `import_gpx_unparseable_lat_lon`).
+    ImportGpxUnparseableLatLon,
+    /// `ImportErrorKind::ImportCsvMalformed` — Import: `import_file` (`.csv`
+    /// source, C3 §2 `import_csv_malformed`).
+    ImportCsvMalformed,
+    /// `ImportErrorKind::ImportNotUtf8` — Import: `import_file` (`.gpx`/
+    /// `.csv` source, C3 §2 `import_not_utf8`).
+    ImportNotUtf8,
+    /// `ImportErrorKind::Collision` (added post-sign, 2026-09-05, lead
+    /// ruling R60) — Import: `import_file`, a re-import of a different blob
+    /// under an existing `session_id` (C4 §3). Kept distinct from the
+    /// cross-cutting `Conflict` kind — same precedent R44 set for
+    /// `Conflict` itself — because this is not an optimistic-concurrency
+    /// failure (C3 §2 `import_collision`).
+    ImportCollision,
 }
 
 /// One JSON error crossing every fallible command (C3 §2). `detail`'s shape
@@ -174,6 +214,36 @@ impl From<&idl_rs::workbook::v3::WorkbookError> for IpcError {
             WorkbookErrorKind::InvalidTableJson => IpcErrorKind::WorkbookInvalidTableJson,
         };
         IpcError::new(kind, e.message.clone())
+    }
+}
+
+/// C3 §3.3 (Import). `idl_rs::store::import::ImportError` — the boundary
+/// type both `import_idl0` and `import_file` return (L2-R13); it already
+/// wraps `ParseError`/`ImporterError` internally, so this is the one `From`
+/// impl this task adds (**not** `From<idl_rs::session::ParseError>`, which
+/// this file's own type never sees directly). `UnknownExtension` folds into
+/// the cross-cutting `InvalidArgument` (no dedicated C3 §2 row — L2's own
+/// brief-task6 anticipated this mapping); every other variant gets its own
+/// `IpcErrorKind`, matching C3 §2's `import_*`/`parse_*` rows one for one.
+impl From<idl_rs::store::import::ImportError> for IpcError {
+    fn from(e: idl_rs::store::import::ImportError) -> Self {
+        use idl_rs::store::import::ImportErrorKind;
+        let kind = match e.kind {
+            ImportErrorKind::Io => IpcErrorKind::Io,
+            ImportErrorKind::ParseInvalidMagicBytes => IpcErrorKind::ParseInvalidMagicBytes,
+            ImportErrorKind::ParseUnsupportedSchemaVersion => IpcErrorKind::ParseUnsupportedSchemaVersion,
+            ImportErrorKind::ParseTruncatedRecord => IpcErrorKind::ParseTruncatedRecord,
+            ImportErrorKind::Collision => IpcErrorKind::ImportCollision,
+            ImportErrorKind::ImportFitMalformed => IpcErrorKind::ImportFitMalformed,
+            ImportErrorKind::ImportGpxMalformedXml => IpcErrorKind::ImportGpxMalformedXml,
+            ImportErrorKind::ImportGpxNoTrackpoints => IpcErrorKind::ImportGpxNoTrackpoints,
+            ImportErrorKind::ImportGpxMissingLatLon => IpcErrorKind::ImportGpxMissingLatLon,
+            ImportErrorKind::ImportGpxUnparseableLatLon => IpcErrorKind::ImportGpxUnparseableLatLon,
+            ImportErrorKind::ImportCsvMalformed => IpcErrorKind::ImportCsvMalformed,
+            ImportErrorKind::ImportNotUtf8 => IpcErrorKind::ImportNotUtf8,
+            ImportErrorKind::UnknownExtension => IpcErrorKind::InvalidArgument,
+        };
+        IpcError::new(kind, e.message)
     }
 }
 
@@ -300,5 +370,179 @@ mod tests {
         // Assert
         assert_eq!(ie.kind, IpcErrorKind::Wifi);
         assert_eq!(ie.message, "timeout");
+    }
+
+    /// `From<idl_rs::store::import::ImportError> for IpcError` conversion
+    /// tests — nested under `import` (rather than flat in `tests`) so the
+    /// crate's own `import::` test filter (Task 9's compute rule) picks
+    /// these up alongside `commands::import`'s tests.
+    mod import {
+        use super::*;
+
+        /// Builds a core `ImportError` for `kind` — `ImportError`'s fields
+        /// are `pub` (its own constructor is crate-private), so a test
+        /// outside `idl_rs::store::import` still builds one directly via
+        /// struct literal.
+        fn import_error(kind: idl_rs::store::import::ImportErrorKind, message: &str) -> idl_rs::store::import::ImportError {
+            idl_rs::store::import::ImportError { kind, message: message.to_string() }
+        }
+
+        #[test]
+        fn import_error_io_kind_converts_to_io() {
+            // Arrange
+            let e = import_error(idl_rs::store::import::ImportErrorKind::Io, "disk full");
+
+            // Act
+            let ie: IpcError = e.into();
+
+            // Assert
+            assert_eq!(ie.kind, IpcErrorKind::Io);
+            assert_eq!(ie.message, "disk full");
+        }
+
+        #[test]
+        fn import_error_parse_invalid_magic_bytes_converts_to_parse_invalid_magic_bytes() {
+            // Arrange
+            let e = import_error(idl_rs::store::import::ImportErrorKind::ParseInvalidMagicBytes, "not IDL0");
+
+            // Act
+            let ie: IpcError = e.into();
+
+            // Assert
+            assert_eq!(ie.kind, IpcErrorKind::ParseInvalidMagicBytes);
+        }
+
+        #[test]
+        fn import_error_parse_unsupported_schema_version_converts() {
+            // Arrange
+            let e = import_error(idl_rs::store::import::ImportErrorKind::ParseUnsupportedSchemaVersion, "schema 9");
+
+            // Act
+            let ie: IpcError = e.into();
+
+            // Assert
+            assert_eq!(ie.kind, IpcErrorKind::ParseUnsupportedSchemaVersion);
+        }
+
+        #[test]
+        fn import_error_parse_truncated_record_converts() {
+            // Arrange
+            let e = import_error(idl_rs::store::import::ImportErrorKind::ParseTruncatedRecord, "too short");
+
+            // Act
+            let ie: IpcError = e.into();
+
+            // Assert
+            assert_eq!(ie.kind, IpcErrorKind::ParseTruncatedRecord);
+        }
+
+        #[test]
+        fn import_error_collision_converts_to_import_collision_not_conflict() {
+            // Arrange — R60: kept distinct from the cross-cutting `Conflict`
+            // kind (same precedent R44 set for `Conflict` itself).
+            let e = import_error(idl_rs::store::import::ImportErrorKind::Collision, "blob mismatch");
+
+            // Act
+            let ie: IpcError = e.into();
+
+            // Assert
+            assert_eq!(ie.kind, IpcErrorKind::ImportCollision);
+        }
+
+        #[test]
+        fn import_error_import_fit_malformed_converts() {
+            // Arrange
+            let e = import_error(idl_rs::store::import::ImportErrorKind::ImportFitMalformed, "bad crc");
+
+            // Act
+            let ie: IpcError = e.into();
+
+            // Assert
+            assert_eq!(ie.kind, IpcErrorKind::ImportFitMalformed);
+        }
+
+        #[test]
+        fn import_error_import_gpx_malformed_xml_converts() {
+            // Arrange
+            let e = import_error(idl_rs::store::import::ImportErrorKind::ImportGpxMalformedXml, "bad xml");
+
+            // Act
+            let ie: IpcError = e.into();
+
+            // Assert
+            assert_eq!(ie.kind, IpcErrorKind::ImportGpxMalformedXml);
+        }
+
+        #[test]
+        fn import_error_import_gpx_no_trackpoints_converts() {
+            // Arrange
+            let e = import_error(idl_rs::store::import::ImportErrorKind::ImportGpxNoTrackpoints, "no trkpt");
+
+            // Act
+            let ie: IpcError = e.into();
+
+            // Assert
+            assert_eq!(ie.kind, IpcErrorKind::ImportGpxNoTrackpoints);
+        }
+
+        #[test]
+        fn import_error_import_gpx_missing_lat_lon_converts() {
+            // Arrange
+            let e = import_error(idl_rs::store::import::ImportErrorKind::ImportGpxMissingLatLon, "missing lat");
+
+            // Act
+            let ie: IpcError = e.into();
+
+            // Assert
+            assert_eq!(ie.kind, IpcErrorKind::ImportGpxMissingLatLon);
+        }
+
+        #[test]
+        fn import_error_import_gpx_unparseable_lat_lon_converts() {
+            // Arrange
+            let e = import_error(idl_rs::store::import::ImportErrorKind::ImportGpxUnparseableLatLon, "not a number");
+
+            // Act
+            let ie: IpcError = e.into();
+
+            // Assert
+            assert_eq!(ie.kind, IpcErrorKind::ImportGpxUnparseableLatLon);
+        }
+
+        #[test]
+        fn import_error_import_csv_malformed_converts() {
+            // Arrange
+            let e = import_error(idl_rs::store::import::ImportErrorKind::ImportCsvMalformed, "bad header");
+
+            // Act
+            let ie: IpcError = e.into();
+
+            // Assert
+            assert_eq!(ie.kind, IpcErrorKind::ImportCsvMalformed);
+        }
+
+        #[test]
+        fn import_error_import_not_utf8_converts() {
+            // Arrange
+            let e = import_error(idl_rs::store::import::ImportErrorKind::ImportNotUtf8, "invalid utf8");
+
+            // Act
+            let ie: IpcError = e.into();
+
+            // Assert
+            assert_eq!(ie.kind, IpcErrorKind::ImportNotUtf8);
+        }
+
+        #[test]
+        fn import_error_unknown_extension_folds_into_invalid_argument() {
+            // Arrange — no dedicated C3 §2 row for this core-internal condition.
+            let e = import_error(idl_rs::store::import::ImportErrorKind::UnknownExtension, "no importer for .xyz");
+
+            // Act
+            let ie: IpcError = e.into();
+
+            // Assert
+            assert_eq!(ie.kind, IpcErrorKind::InvalidArgument);
+        }
     }
 }

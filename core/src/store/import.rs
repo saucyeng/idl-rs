@@ -8,7 +8,9 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::session::ParseError;
+use crate::import::hook::PostImportHook;
+use crate::import::ImporterError;
+use crate::session::{ParseError, Session};
 use crate::store::blob::{self, BlobStoreError};
 use crate::store::parquet::{read_session_metadata, write_session_parquet, ParquetStoreError, SessionParquetMetadata};
 use crate::store::session_json::{empty_session_json, write_session_json, SessionJsonError};
@@ -82,6 +84,25 @@ pub enum ImportErrorKind {
     /// [`plan_import`] returned [`ImportPlan::Collision`] — refusing to
     /// overwrite a `data.parquet` written from a different blob.
     Collision,
+    /// Mirrors `ImporterError::FitMalformed` (C3 §2 `import_fit_malformed`).
+    ImportFitMalformed,
+    /// Mirrors `ImporterError::GpxMalformedXml` (C3 §2 `import_gpx_malformed_xml`).
+    ImportGpxMalformedXml,
+    /// Mirrors `ImporterError::GpxNoTrackpoints` (C3 §2 `import_gpx_no_trackpoints`).
+    ImportGpxNoTrackpoints,
+    /// Mirrors `ImporterError::GpxMissingLatLon` (C3 §2 `import_gpx_missing_lat_lon`).
+    ImportGpxMissingLatLon,
+    /// Mirrors `ImporterError::GpxUnparseableLatLon` (C3 §2 `import_gpx_unparseable_lat_lon`).
+    ImportGpxUnparseableLatLon,
+    /// Mirrors `ImporterError::CsvMalformed` (C3 §2 `import_csv_malformed`).
+    ImportCsvMalformed,
+    /// Mirrors `ImporterError::NotUtf8` (C3 §2 `import_not_utf8`).
+    ImportNotUtf8,
+    /// [`crate::import::importer_for_extension`] returned `None` — no
+    /// importer covers this file extension. Core-internal: no C3 §2 row of
+    /// its own (L5's Tauri layer maps this to C3's cross-cutting
+    /// `invalid_argument` at that layer, not this one).
+    UnknownExtension,
 }
 
 /// Error from [`import_idl0`]. Never `Err(String)` (CLAUDE.md §5).
@@ -135,6 +156,21 @@ impl From<SessionJsonError> for ImportError {
     }
 }
 
+impl From<ImporterError> for ImportError {
+    fn from(e: ImporterError) -> Self {
+        let kind = match &e {
+            ImporterError::FitMalformed(_) => ImportErrorKind::ImportFitMalformed,
+            ImporterError::GpxMalformedXml(_) => ImportErrorKind::ImportGpxMalformedXml,
+            ImporterError::GpxNoTrackpoints => ImportErrorKind::ImportGpxNoTrackpoints,
+            ImporterError::GpxMissingLatLon(_) => ImportErrorKind::ImportGpxMissingLatLon,
+            ImporterError::GpxUnparseableLatLon(_) => ImportErrorKind::ImportGpxUnparseableLatLon,
+            ImporterError::CsvMalformed(_) => ImportErrorKind::ImportCsvMalformed,
+            ImporterError::NotUtf8(_) => ImportErrorKind::ImportNotUtf8,
+        };
+        ImportError::new(kind, e.to_string())
+    }
+}
+
 /// What [`import_idl0`] actually did to `data.parquet` on a successful call
 /// — unlike [`ImportPlan`], this has no `Collision` arm: a collision returns
 /// [`ImportError`] instead of an [`ImportReport`], so the impossible state
@@ -165,6 +201,11 @@ pub struct ImportReport {
     /// what's readable" rule) — the underlying [`ParseError::TruncatedRecord`]'s
     /// message, not treated as a hard failure.
     pub truncation_warning: Option<String>,
+    /// Non-fatal advisory messages raised while importing — from
+    /// `crate::session::ParseResult::import_warnings` on the `.idl0` path,
+    /// or the importer's own `crate::import::ImporterWarning`s on the
+    /// [`import_file`] path. Never silently dropped (G0.6).
+    pub import_warnings: Vec<String>,
 }
 
 /// Imports one `.idl0` buffer into `data_root` (contract C4 §2 layout):
@@ -184,14 +225,88 @@ pub fn import_idl0(data_root: &Path, bytes: &[u8]) -> Result<ImportReport, Impor
     result.session.blob_sha256 = blob_sha256.clone();
     crate::session::synthesis::synthesize_base_channels(&mut result.session);
 
-    let session_id = result.session.session_id.clone();
+    let truncation_warning = result.truncation_warning.map(|w| w.to_string());
+    let import_warnings = result.import_warnings.iter().map(|w| w.message.clone()).collect();
+
+    let mut report = finish_import(
+        data_root,
+        result.session,
+        blob_sha256,
+        crate::parse::IDL0_IMPORTER_VERSION,
+        import_warnings,
+    )?;
+    report.truncation_warning = truncation_warning;
+    Ok(report)
+}
+
+/// Imports one non-`.idl0` source buffer (FIT/GPX/CSV, ledger R23 L2-R13)
+/// into `data_root`, generalising [`import_idl0`]'s blob/parquet/
+/// `session.json` pipeline to any format [`crate::import::importer_for_extension`]
+/// covers. Does not handle `"idl0"` — that stays [`import_idl0`]'s own entry
+/// point, called separately by whoever routes `.idl0` files.
+///
+/// `extension` is a lowercase file extension without the dot (e.g. `"gpx"`).
+/// Preserves the R18-addendum write-ordering invariant: `bytes` is hashed
+/// and parsed before anything is written to the CAS, so a malformed buffer
+/// leaves nothing behind. Runs [`crate::session::synthesis::synthesize_base_channels`]
+/// on the parsed session (this is what makes the `Time` synthesis fallback,
+/// ledger R23 Q2, actually reach FIT/GPX/CSV sessions) and, on success,
+/// [`crate::import::hook::NoopPostImportHook::on_imported`] — the extension
+/// point a real materialisation hook replaces at a future task; this
+/// function itself takes no hook parameter.
+pub fn import_file(data_root: &Path, extension: &str, bytes: &[u8]) -> Result<ImportReport, ImportError> {
+    let Some(importer) = crate::import::importer_for_extension(extension) else {
+        return Err(ImportError::new(
+            ImportErrorKind::UnknownExtension,
+            format!("no importer covers file extension \"{extension}\""),
+        ));
+    };
+
+    // Hashed before parsing — `Importer::import` takes the digest as an
+    // argument (to derive `session_id`) and does not write to the CAS
+    // itself. One extra hash beyond what `import_idl0` needs (that path
+    // only hashes once, inside `write_blob`, after parsing) — an accepted,
+    // documented cost of this trait's pure signature.
+    let blob_sha256 = crate::store::atomic::sha256_hex(bytes);
+
+    // On `Err`, return immediately — nothing has been written to the CAS
+    // yet (ordering preserved, R18 addendum).
+    let mut outcome = importer.import(bytes, &blob_sha256)?;
+    crate::session::synthesis::synthesize_base_channels(&mut outcome.session);
+    crate::import::hook::NoopPostImportHook.on_imported(&outcome.session);
+
+    // Now writes; its returned digest is guaranteed identical to the one
+    // computed above (same bytes, same hash function) — use it as the
+    // canonical blob_sha256 from here on.
+    let blob_sha256 = blob::write_blob(data_root, bytes)?;
+    outcome.session.blob_sha256 = blob_sha256.clone();
+
+    let warnings = outcome.warnings.into_iter().map(|w| w.message).collect();
+
+    finish_import(data_root, outcome.session, blob_sha256, importer.importer_version(), warnings)
+}
+
+/// Shared tail of [`import_idl0`] and [`import_file`]: decides via
+/// [`plan_import`] whether `data.parquet` needs writing/skipping/
+/// regenerating, writes it accordingly, and creates an empty `session.json`
+/// if none exists yet (never overwriting one that does). `warnings` becomes
+/// [`ImportReport::import_warnings`] verbatim; [`ImportReport::truncation_warning`]
+/// is left `None` here — only [`import_idl0`] ever sets it.
+fn finish_import(
+    data_root: &Path,
+    session: Session,
+    blob_sha256: String,
+    importer_version: &str,
+    warnings: Vec<String>,
+) -> Result<ImportReport, ImportError> {
+    let session_id = session.session_id.clone();
     let data_parquet_path = data_root.join("sessions").join(&session_id).join("data.parquet");
     let existing = if data_parquet_path.is_file() { Some(read_session_metadata(&data_parquet_path)?) } else { None };
 
     let plan = plan_import(
         existing.as_ref(),
         &blob_sha256,
-        crate::parse::IDL0_IMPORTER_VERSION,
+        importer_version,
         crate::session::seam_correction::SEAM_CORRECTION_VERSION,
     );
 
@@ -207,7 +322,7 @@ pub fn import_idl0(data_root: &Path, bytes: &[u8]) -> Result<ImportReport, Impor
             ));
         }
         ImportPlan::Write => {
-            write_session_parquet(data_root, &result.session, crate::parse::IDL0_IMPORTER_VERSION)?;
+            write_session_parquet(data_root, &session, importer_version)?;
             ImportOutcome::Written
         }
         ImportPlan::Regenerate => {
@@ -220,7 +335,7 @@ pub fn import_idl0(data_root: &Path, bytes: &[u8]) -> Result<ImportReport, Impor
             // become orphans, not silently-wrong data.
             std::fs::remove_file(&data_parquet_path)
                 .map_err(|e| ImportError::new(ImportErrorKind::Io, format!("removing stale {}: {e}", data_parquet_path.display())))?;
-            write_session_parquet(data_root, &result.session, crate::parse::IDL0_IMPORTER_VERSION)?;
+            write_session_parquet(data_root, &session, importer_version)?;
             ImportOutcome::Regenerated
         }
         ImportPlan::Skip => ImportOutcome::Skipped,
@@ -241,7 +356,8 @@ pub fn import_idl0(data_root: &Path, bytes: &[u8]) -> Result<ImportReport, Impor
         data_parquet: data_parquet_path,
         outcome,
         session_json_created,
-        truncation_warning: result.truncation_warning.map(|w| w.to_string()),
+        truncation_warning: None,
+        import_warnings: warnings,
     })
 }
 
@@ -249,6 +365,7 @@ pub fn import_idl0(data_root: &Path, bytes: &[u8]) -> Result<ImportReport, Impor
 mod tests {
     use super::*;
     use crate::parse::test_buffers::*;
+    use crate::store::parquet::read_session_parquet;
     use uuid::Uuid;
 
     fn temp_root() -> PathBuf {
@@ -453,6 +570,229 @@ mod tests {
         assert_eq!(err.kind, ImportErrorKind::Collision);
         let parquet_bytes_after = std::fs::read(&first.data_parquet).unwrap();
         assert_eq!(parquet_bytes_before, parquet_bytes_after);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_idl0_populates_import_warnings_from_parse_result() {
+        // Arrange — direct unit test on the new plumbing (G0.6): a
+        // `ParseResult` with a non-empty `import_warnings` must survive
+        // into the returned `ImportReport`, not be silently dropped as it
+        // was before this task.
+        let root = temp_root();
+        let bytes = synthetic_idl0_bytes();
+        let mut parsed = crate::parse::parse(&bytes).unwrap();
+        parsed.import_warnings.push(crate::session::ImportWarning {
+            kind: crate::session::ImportWarningKind::NonPositiveEffectivePeriod,
+            message: "a burst-seam correction warning".to_string(),
+        });
+        let blob_sha256 = blob::write_blob(&root, &bytes).unwrap();
+        parsed.session.blob_sha256 = blob_sha256.clone();
+        crate::session::synthesis::synthesize_base_channels(&mut parsed.session);
+        let import_warnings: Vec<String> = parsed.import_warnings.iter().map(|w| w.message.clone()).collect();
+
+        // Act
+        let report = finish_import(&root, parsed.session, blob_sha256, crate::parse::IDL0_IMPORTER_VERSION, import_warnings).unwrap();
+
+        // Assert
+        assert_eq!(report.import_warnings, vec!["a burst-seam correction warning".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A minimal, valid GPX buffer: three trackpoints, the last two sharing
+    /// a `<time>` so the importer drops one with a warning (L2-R7's
+    /// duplicate/non-monotonic rule) — proves `import_file` plumbs
+    /// `ImporterWarning`s into `ImportReport.import_warnings`, not just the
+    /// isolated importer call.
+    fn minimal_gpx_with_warning() -> Vec<u8> {
+        r#"<gpx><trk><trkseg>
+            <trkpt lat="1.0" lon="2.0"><time>2026-01-01T00:00:00Z</time></trkpt>
+            <trkpt lat="1.1" lon="2.1"><time>2026-01-01T00:00:01Z</time></trkpt>
+            <trkpt lat="1.2" lon="2.2"><time>2026-01-01T00:00:01Z</time></trkpt>
+        </trkseg></trk></gpx>"#
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// FIT CRC-16 — same table-driven algorithm `import::fit`'s own test
+    /// module uses; duplicated here rather than reached into (Task 5's
+    /// `fit.rs` is under review, out of this task's scope to touch or
+    /// import test-only items from).
+    fn fit_crc16(data: &[u8]) -> u16 {
+        const TABLE: [u16; 16] = [
+            0x0000, 0xCC01, 0xD801, 0x1400, 0xF001, 0x3C00, 0x2800, 0xE401, 0xA001, 0x6C00, 0x7800, 0xB401, 0x5000,
+            0x9C01, 0x8801, 0x4400,
+        ];
+        let mut crc: u16 = 0;
+        for &byte in data {
+            let tmp = TABLE[(crc & 0xF) as usize];
+            crc = (crc >> 4) & 0x0FFF;
+            crc = crc ^ tmp ^ TABLE[(byte & 0xF) as usize];
+            let tmp = TABLE[(crc & 0xF) as usize];
+            crc = (crc >> 4) & 0x0FFF;
+            crc = crc ^ tmp ^ TABLE[((byte >> 4) & 0xF) as usize];
+        }
+        crc
+    }
+
+    /// A minimal, valid `.fit` buffer: one `record` (global msg 20)
+    /// definition with two fields (`timestamp`, `heart_rate`), and three
+    /// data messages where the last two share a timestamp — the importer
+    /// drops one with a duplicate-timestamp warning, same shape as
+    /// `import::fit`'s own golden fixture, rebuilt minimally here for the
+    /// same out-of-lane-scope reason as `fit_crc16` above.
+    fn minimal_fit_with_warning() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(0x40); // definition, local_type 0
+        body.push(0x00); // reserved
+        body.push(0x00); // architecture: little-endian
+        body.extend_from_slice(&20u16.to_le_bytes()); // global_mesg_num = record
+        body.push(2); // field count
+        for &(num, size, base) in &[(253u8, 4u8, 0x86u8), (3, 1, 0x02)] {
+            // timestamp: uint32, heart_rate: uint8
+            body.push(num);
+            body.push(size);
+            body.push(base);
+        }
+        let t0: u32 = 1_000_000_000;
+        for &(timestamp, hr) in &[(t0, 140u8), (t0 + 1, 142), (t0 + 1, 145)] {
+            body.push(0x00); // data message, local_type 0
+            body.extend_from_slice(&timestamp.to_le_bytes());
+            body.push(hr);
+        }
+
+        let mut out = Vec::with_capacity(14 + body.len() + 2);
+        out.push(14); // header size
+        out.push(0x20); // protocol version 2.0
+        out.extend_from_slice(&2100u16.to_le_bytes()); // profile version
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes()); // data size
+        out.extend_from_slice(b".FIT");
+        let header_crc = fit_crc16(&out[0..12]);
+        out.extend_from_slice(&header_crc.to_le_bytes());
+        out.extend_from_slice(&body);
+        let file_crc = fit_crc16(&out);
+        out.extend_from_slice(&file_crc.to_le_bytes());
+        out
+    }
+
+    /// A minimal CSV buffer whose last two rows share `t_seconds` — the
+    /// importer drops one with a duplicate/non-monotonic warning.
+    fn minimal_csv_with_warning() -> Vec<u8> {
+        b"t_seconds,ch1\n0,1.0\n1,2.0\n1,3.0\n".to_vec()
+    }
+
+    #[test]
+    fn import_file_gpx_writes_parquet_and_session_json_with_warnings_and_time_channel() {
+        // Arrange
+        let root = temp_root();
+        let bytes = minimal_gpx_with_warning();
+
+        // Act
+        let report = import_file(&root, "gpx", &bytes).unwrap();
+
+        // Assert
+        assert_eq!(report.outcome, ImportOutcome::Written);
+        assert!(report.data_parquet.is_file());
+        let sj_path = root.join("sessions").join(&report.session_id).join("session.json");
+        assert!(sj_path.is_file());
+        assert!(!report.import_warnings.is_empty());
+
+        // `write_session_parquet` never persists synthesized `Time`/
+        // `Distance` (C1 §2) — re-run the same synthesis the real reader
+        // (`rust/tauri/src/session_source.rs::load_session`) does on every
+        // read-back, proving Q2's fallback survives the parquet round trip.
+        let mut session = read_session_parquet(&report.data_parquet).unwrap();
+        crate::session::synthesis::synthesize_base_channels(&mut session);
+        assert!(session.channels.iter().any(|c| c.channel_id == "Time"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_file_fit_writes_parquet_and_session_json_with_warnings_and_time_channel() {
+        // Arrange
+        let root = temp_root();
+        let bytes = minimal_fit_with_warning();
+
+        // Act
+        let report = import_file(&root, "fit", &bytes).unwrap();
+
+        // Assert
+        assert_eq!(report.outcome, ImportOutcome::Written);
+        assert!(report.data_parquet.is_file());
+        let sj_path = root.join("sessions").join(&report.session_id).join("session.json");
+        assert!(sj_path.is_file());
+        assert!(!report.import_warnings.is_empty());
+
+        // `write_session_parquet` never persists synthesized `Time`/
+        // `Distance` (C1 §2) — re-run the same synthesis the real reader
+        // (`rust/tauri/src/session_source.rs::load_session`) does on every
+        // read-back, proving Q2's fallback survives the parquet round trip.
+        let mut session = read_session_parquet(&report.data_parquet).unwrap();
+        crate::session::synthesis::synthesize_base_channels(&mut session);
+        assert!(session.channels.iter().any(|c| c.channel_id == "Time"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_file_csv_writes_parquet_and_session_json_with_warnings_and_time_channel() {
+        // Arrange
+        let root = temp_root();
+        let bytes = minimal_csv_with_warning();
+
+        // Act
+        let report = import_file(&root, "csv", &bytes).unwrap();
+
+        // Assert
+        assert_eq!(report.outcome, ImportOutcome::Written);
+        assert!(report.data_parquet.is_file());
+        let sj_path = root.join("sessions").join(&report.session_id).join("session.json");
+        assert!(sj_path.is_file());
+        assert!(!report.import_warnings.is_empty());
+
+        // `write_session_parquet` never persists synthesized `Time`/
+        // `Distance` (C1 §2) — re-run the same synthesis the real reader
+        // (`rust/tauri/src/session_source.rs::load_session`) does on every
+        // read-back, proving Q2's fallback survives the parquet round trip.
+        let mut session = read_session_parquet(&report.data_parquet).unwrap();
+        crate::session::synthesis::synthesize_base_channels(&mut session);
+        assert!(session.channels.iter().any(|c| c.channel_id == "Time"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_file_unknown_extension_returns_unknown_extension_kind() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let err = import_file(&root, "xyz", b"whatever").unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, ImportErrorKind::UnknownExtension);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_file_malformed_gpx_leaves_no_orphan_blob() {
+        // Arrange — non-UTF-8 bytes for a "gpx" extension, mirroring
+        // `import_idl0`'s own "bad magic bytes leaves nothing in the CAS"
+        // ordering test for the non-.idl0 path.
+        let root = temp_root();
+        let bytes: Vec<u8> = vec![0xFF, 0xFE, 0xFD];
+        let would_be_digest = crate::store::atomic::sha256_hex(&bytes);
+
+        // Act
+        let result = import_file(&root, "gpx", &bytes);
+
+        // Assert
+        assert!(matches!(result, Err(ImportError { kind: ImportErrorKind::ImportNotUtf8, .. })));
+        assert!(!crate::store::blob::blob_exists(&root, &would_be_digest));
 
         let _ = std::fs::remove_dir_all(&root);
     }
