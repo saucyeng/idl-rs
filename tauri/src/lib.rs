@@ -44,5 +44,9 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::tiles::fetch_tile,
         commands::import::list_importers,
         commands::import::import_file,
+        commands::app::get_settings,
+        commands::app::set_settings,
+        commands::app::get_data_dir,
+        commands::app::set_data_dir,
     ]
 }
