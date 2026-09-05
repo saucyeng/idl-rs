@@ -529,7 +529,10 @@ mod tests {
 
         // Assert — one warning for the whole file, not one per point.
         assert_eq!(outcome.warnings.len(), 1);
-        assert!(outcome.warnings[0].message.contains('2'));
+        assert_eq!(
+            outcome.warnings[0].message,
+            "2 GPX trackpoints have no parseable <time> — synthesized a 1 Hz index"
+        );
 
         let lat = outcome
             .session
@@ -591,6 +594,54 @@ mod tests {
             .find(|c| c.channel_id == "GPS_EpochMs")
             .unwrap();
         assert_eq!(epoch.materialize(), vec![946_684_800_000.0, 946_684_802_000.0]);
+    }
+
+    /// thing — condition — result: L2-R7 case (c) combined with the
+    /// duplicate/non-monotonic dedup pass — an untimestamped point is
+    /// dropped alongside a later-in-document point whose timestamp is
+    /// *earlier* than the point before it; `t0` still anchors to the true
+    /// minimum timestamp among all timestamped points (computed before the
+    /// document-order dedup pass runs), even though the point carrying that
+    /// minimum is itself the one the dedup pass drops.
+    #[test]
+    fn gpx_importer_untimestamped_and_out_of_order_points_both_dropped_t0_anchors_to_true_minimum() {
+        // Arrange — point 0 has no <time> (dropped, case (c)'s per-point
+        // warning); point 1's time (00:00:02Z) is later than point 2's
+        // (00:00:00Z) despite point 2 appearing later in the document, so
+        // the document-order dedup pass sees point 2's t_us <= point 1's
+        // already-kept t_us and drops point 2 as non-monotonic — even
+        // though point 2 carries the file's true minimum timestamp.
+        let gpx = r#"<gpx><trk><trkseg>
+            <trkpt lat="1.0" lon="2.0"><ele>10.0</ele></trkpt>
+            <trkpt lat="1.1" lon="2.1"><time>2000-01-01T00:00:02Z</time></trkpt>
+            <trkpt lat="1.2" lon="2.2"><time>2000-01-01T00:00:00Z</time></trkpt>
+        </trkseg></trk></gpx>"#;
+
+        // Act
+        let outcome = GpxImporter.import(gpx.as_bytes(), &"22".repeat(32)).unwrap();
+
+        // Assert — two warnings: point 0 (no <time>) and point 2
+        // (duplicate/non-monotonic).
+        assert_eq!(outcome.warnings.len(), 2);
+        assert!(outcome.warnings.iter().any(|w| w.message == "dropped GPX trackpoint 0: no parseable <time>"));
+        assert!(outcome
+            .warnings
+            .iter()
+            .any(|w| w.message == "dropped GPX trackpoint 2: duplicate/non-monotonic timestamp"));
+
+        // Assert — only point 1 survives; t0 anchors to point 2's
+        // 00:00:00Z (the true minimum among timestamped points), not point
+        // 1's own 00:00:02Z, so point 1's kept t_us is 2_000_000 rather
+        // than 0.
+        let lat = outcome
+            .session
+            .channels
+            .iter()
+            .find(|c| c.channel_id == "GPS_Latitude")
+            .unwrap();
+        assert_eq!(lat.t_us, vec![2_000_000]);
+        assert_eq!(lat.materialize(), vec![1.1]);
+        assert_eq!(outcome.session.timestamp_utc_ms, 946_684_800_000);
     }
 
     /// thing — condition — result: L2-R8 — a self-closing `<trkpt/>` with
