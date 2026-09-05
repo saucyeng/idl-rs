@@ -39,5 +39,6 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::workbook::eval_workbook,
         commands::workbook::save_workbook,
         commands::workbook::watch_workbook,
+        commands::cursor::cursor_readout,
     ]
 }
