@@ -43,32 +43,32 @@ pub fn cursor_readout_via(
 ) -> Result<CursorReadout, IpcError> {
     let session = load_session(data_dir, session_id)?;
 
+    // Resolved once per requested id — the existence check and the lookup
+    // used to materialize below are the same lookup, so there is no second
+    // `.find()` later that could fail on an id this loop already accepted
+    // (previously two separate lookups, the second pair asserted via
+    // `.unwrap()` on the "it was already checked above" invariant; a typed
+    // error here needs no such invariant to hold).
+    let mut resolved = Vec::with_capacity(channels.len());
     for id in channels {
-        if !session.channels.iter().any(|c| &c.channel_id == id) {
-            return Err(IpcError::with_detail(
+        let channel = session.channels.iter().find(|c| &c.channel_id == id).ok_or_else(|| {
+            IpcError::with_detail(
                 IpcErrorKind::InvalidArgument,
                 format!("channel '{id}' not found on session '{session_id}'"),
                 serde_json::json!({ "channel": id }),
-            ));
-        }
+            )
+        })?;
+        resolved.push(channel);
     }
 
     // Materialized samples must outlive the `&[f64]` slices borrowed into
     // `triples` below.
-    let materialized: Vec<Vec<f64>> = channels
-        .iter()
-        .map(|id| {
-            let channel = session.channels.iter().find(|c| &c.channel_id == id).unwrap();
-            channel.materialize()
-        })
-        .collect();
+    let materialized: Vec<Vec<f64>> = resolved.iter().map(|c| c.materialize()).collect();
     let triples: Vec<(&str, &[i64], &[f64])> = channels
         .iter()
+        .zip(resolved.iter())
         .zip(materialized.iter())
-        .map(|(id, samples)| {
-            let channel = session.channels.iter().find(|c| &c.channel_id == id).unwrap();
-            (id.as_str(), channel.t_us.as_slice(), samples.as_slice())
-        })
+        .map(|((id, channel), samples)| (id.as_str(), channel.t_us.as_slice(), samples.as_slice()))
         .collect();
 
     let values = idl_rs::cursor::cursor_readout(&triples, t_us).into_iter().collect();
