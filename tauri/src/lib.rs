@@ -48,5 +48,8 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::app::set_settings,
         commands::app::get_data_dir,
         commands::app::set_data_dir,
+        commands::app::list_profiles,
+        commands::app::save_profile,
+        commands::app::delete_profile,
     ]
 }
