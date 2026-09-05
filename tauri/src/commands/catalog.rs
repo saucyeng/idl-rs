@@ -537,13 +537,12 @@ fn other_session_dirs(data_dir: &Path, exclude_session_id: &str) -> impl Iterato
 
 /// Transport-agnostic core of `delete_session` (C3 §3.2). Removes
 /// `<data>/sessions/<session_id>/` recursively, then the catalog's rows for
-/// this session via a single `DELETE FROM sessions WHERE session_id = ?1`:
-/// `laps.session_id` and `lap_summary`'s foreign key onto `laps` are both
-/// `ON DELETE CASCADE` in the schema (`core/src/store/catalog.rs`'s
-/// `CREATE TABLE` block), so one statement removes all three tables' rows
-/// for this session — not a full `rebuild_catalog` (needlessly expensive
-/// per delete; an accepted, bounded divergence risk `rebuild_catalog`
-/// remains available to reconcile).
+/// this session via `idl_rs::store::catalog::delete_session` — the raw SQL
+/// and the `laps`/`lap_summary` `ON DELETE CASCADE` reasoning live in
+/// `core` (ruling R68: bytes-on-disk stays in `core`, this crate stays
+/// thin), not a full `rebuild_catalog` (needlessly expensive per delete; an
+/// accepted, bounded divergence risk `rebuild_catalog` remains available to
+/// reconcile).
 ///
 /// `delete_blob: true` additionally removes the blob at
 /// `blobs/sha256/<2>/<62>` named by the session's `blob_sha256`, but only
@@ -581,8 +580,7 @@ fn delete_session_via(data_dir: &Path, session_id: &str, delete_blob: bool) -> R
     }
 
     let conn = idl_rs::store::catalog::open_catalog(&data_dir.join("catalog.sqlite"))?;
-    conn.execute("DELETE FROM sessions WHERE session_id = ?1", rusqlite::params![session_id])
-        .map_err(|e| IpcError::new(IpcErrorKind::Internal, e.to_string()))?;
+    idl_rs::store::catalog::delete_session(&conn, session_id)?;
 
     Ok(())
 }

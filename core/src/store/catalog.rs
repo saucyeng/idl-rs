@@ -631,6 +631,25 @@ fn read_derived_channels(path: &Path) -> Result<(Vec<i64>, Vec<(String, Vec<f64>
     Ok((t_col, channels))
 }
 
+/// Deletes `session_id`'s row from `sessions`, and (via the schema's
+/// cascading foreign keys) every row in `laps`/`lap_summary` for it in the
+/// same statement: `laps.session_id` is `REFERENCES sessions(session_id)
+/// ON DELETE CASCADE`, and `lap_summary`'s foreign key onto `laps` is
+/// likewise `ON DELETE CASCADE` (see this file's `DDL`) — `open_catalog`
+/// enables `PRAGMA foreign_keys = ON` per connection, so both cascades fire
+/// for a connection built through it. Deliberately a single targeted
+/// `DELETE`, not a `rebuild_catalog` call (needlessly expensive per delete,
+/// R68) — the tauri command layer (`idl-rs-tauri`'s `delete_session`) calls
+/// this after removing `<data>/sessions/<session_id>/` from disk.
+///
+/// Returns `true` if a `sessions` row existed and was removed, `false` if
+/// `session_id` had no row (a no-op, not an error — the caller already
+/// knows whether the session directory existed).
+pub fn delete_session(conn: &Connection, session_id: &str) -> Result<bool, CatalogError> {
+    let rows_deleted = conn.execute("DELETE FROM sessions WHERE session_id = ?1", rusqlite::params![session_id])?;
+    Ok(rows_deleted > 0)
+}
+
 fn io_err(e: std::io::Error) -> CatalogError {
     CatalogError { kind: CatalogErrorKind::Io, message: e.to_string() }
 }
@@ -871,6 +890,75 @@ mod tests {
         assert_eq!(min, 1.0);
         assert_eq!(max, 2.0);
         assert_eq!(mean, 1.5);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_session_removes_the_session_row_and_cascades_to_laps_and_lap_summary() {
+        // Arrange — a session with one lap (-> `laps`) and one derived
+        // channel within that lap's window (-> `lap_summary`), rebuilt so
+        // all three tables actually hold a row for it before deletion.
+        let root = temp_root();
+        let session_id = "sess-1";
+        let mut doc = empty_session_json(session_id);
+        doc.laps = vec![LapJson {
+            lap_number: 1,
+            start_timestamp_ms: 10_000,
+            end_timestamp_ms: 10_500,
+            raw_elapsed_ms: 500,
+            lap_time_ms: 500,
+            start_time_secs: 0.0,
+            end_time_secs: 0.5,
+            sectors: Vec::new(),
+            neutral_zone_visits: Vec::new(),
+        }];
+        write_full_session(&root, session_id, 10_000, &doc);
+        let outputs = vec![DerivedOutput {
+            channel_id: "Roll (deg)".to_string(),
+            t_us: vec![0, 500_000, 1_000_000],
+            values: vec![1.0, 2.0, 3.0],
+            nominal_rate_hz: 2.0,
+            unit: "deg".to_string(),
+        }];
+        write_derived_parquet(&root, session_id, "test_kind", &[], &serde_json::json!({}), &outputs, 0).unwrap();
+        rebuild_catalog(&root).unwrap();
+
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+        let sessions_before: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        let laps_before: i64 = conn.query_row("SELECT COUNT(*) FROM laps", [], |r| r.get(0)).unwrap();
+        let lap_summary_before: i64 = conn.query_row("SELECT COUNT(*) FROM lap_summary", [], |r| r.get(0)).unwrap();
+        assert_eq!((sessions_before, laps_before, lap_summary_before), (1, 1, 1));
+
+        // Act
+        let deleted = delete_session(&conn, session_id).unwrap();
+
+        // Assert
+        assert!(deleted);
+        let sessions_after: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        let laps_after: i64 = conn.query_row("SELECT COUNT(*) FROM laps", [], |r| r.get(0)).unwrap();
+        let lap_summary_after: i64 = conn.query_row("SELECT COUNT(*) FROM lap_summary", [], |r| r.get(0)).unwrap();
+        assert_eq!((sessions_after, laps_after, lap_summary_after), (0, 0, 0));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_session_unknown_session_id_returns_false_and_deletes_nothing() {
+        // Arrange
+        let root = temp_root();
+        let doc = empty_session_json("s1");
+        write_full_session(&root, "s1", 0, &doc);
+        rebuild_catalog(&root).unwrap();
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+
+        // Act
+        let deleted = delete_session(&conn, "nope").unwrap();
+
+        // Assert
+        assert!(!deleted);
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

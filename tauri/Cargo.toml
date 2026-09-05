@@ -16,11 +16,6 @@ sha2 = "0.10"
 hex = "0.4"
 tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "fs", "io-util"] }
 uuid = { version = "1", features = ["v4"] }
-# Task 5's `delete_session` deletes `sessions`/`laps`/`lap_summary` rows via
-# a direct `DELETE FROM sessions` (the schema's `ON DELETE CASCADE` foreign
-# keys do the rest) — same version/features as `idl-rs` core's own
-# dependency (core/Cargo.toml) so the two resolve to one build.
-rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

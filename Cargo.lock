@@ -2113,7 +2113,6 @@ dependencies = [
  "idl-rs",
  "idl-transport",
  "notify",
- "rusqlite",
  "serde",
  "serde_json",
  "sha2",
