@@ -11,11 +11,11 @@
 //! impls; core's types are not `Serialize`, so they never cross the IPC
 //! boundary directly.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use idl_rs::store::catalog_read;
 
-use crate::error::IpcError;
+use crate::error::{IpcError, IpcErrorKind};
 use crate::state::DataDir;
 
 /// C3 §3.2 `SessionSummary` — mirrors the catalog `sessions` table.
@@ -423,6 +423,190 @@ pub fn get_track(track_id: String, data_dir: tauri::State<'_, DataDir>) -> Resul
     get_track_via(&data_dir.0, &track_id)
 }
 
+/// C3 §3.2 `SessionMetadataPatch` — `save_session_metadata`'s argument. A
+/// typed struct, not a JSON bag — an unknown key or a non-string value for
+/// a known key is a Tauri-level argument-deserialisation rejection, never
+/// reaches this command's body. C3's "unknown keys ignored" and
+/// "invalid_argument for a non-string field" wording describes the
+/// JSON-bag case this typed argument makes structurally moot.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SessionMetadataPatch {
+    pub rider: String,
+    pub bike: String,
+    pub bike_comment: String,
+    pub venue_name: String,
+    pub event_name: String,
+    pub event_session: String,
+    pub short_comment: String,
+    pub long_comment: String,
+    pub tag: String,
+}
+
+/// Maps a `session.json` read/write failure to `IpcError` for both of this
+/// task's commands. `Io` (a filesystem failure, including
+/// `write_session_json`'s `RenameConflict` — folded to `Io` upstream by
+/// `SessionJsonError`'s own `From<AtomicWriteError>` impl — R59 Q1(a) is
+/// explicit that this pair of commands never raises `Conflict`) maps
+/// straight through. `Parse`/`UnsupportedVersion` fold to `Internal`
+/// (deliberate — lead ruling 2026-09-05: C3 §3.2 lists only `not_found`/
+/// `io`/`internal` for these two commands, and a malformed `session.json`
+/// on an existing session directory is a data-integrity condition, not a
+/// caller argument problem; `path` is appended to the message here because
+/// neither `parse_config`'s nor `SessionJsonError`'s own message carries it
+/// for the `Parse`/`UnsupportedVersion` cases, and the lead ruling requires
+/// the parse reason and the path both be diagnosable from `IpcError.message`).
+fn map_session_json_error(e: idl_rs::store::session_json::SessionJsonError, path: &Path) -> IpcError {
+    use idl_rs::store::session_json::SessionJsonErrorKind;
+    match e.kind {
+        SessionJsonErrorKind::Io => IpcError::new(IpcErrorKind::Io, e.message),
+        SessionJsonErrorKind::Parse | SessionJsonErrorKind::UnsupportedVersion => {
+            IpcError::new(IpcErrorKind::Internal, format!("{}: {}", path.display(), e.message))
+        }
+    }
+}
+
+/// Transport-agnostic core of `save_session_metadata` (C3 §3.2). Reads
+/// `session.json`, replaces exactly the nine editable fields named in
+/// `SessionMetadataPatch`, and writes it back through
+/// `store::session_json::write_session_json` (C4 §4 atomic write) with a
+/// `based_on_hash` this function computes itself by hashing the bytes it
+/// just read — the read-hash-write optimistic-concurrency check lives
+/// entirely inside this command, last-write-wins, never raising `Conflict`
+/// (ruling R59 Q1(a)). Every other `session.json` key (`laps`,
+/// `track_visits`, the lap-flag fields, `bike_profile_snapshot`,
+/// `schema_version`) is left untouched. Re-reads and returns
+/// `catalog_read::get_session`'s canonical `SessionDetail` afterward, so
+/// the caller redraws from what was actually written rather than an echo
+/// of the argument. The catalog's `sessions` row is **not** re-indexed by
+/// this command; `rebuild_catalog` reconciles it later (C4 §5).
+///
+/// The not-found check (`session_dir.is_dir()`) duplicates
+/// `catalog_read::get_session`'s own identical check by design: this
+/// function needs the directory to exist before it can call
+/// `read_session_json`/`write_session_json`, and calling `get_session`
+/// first only to discard its result and re-read `session.json` a second
+/// time would be strictly more I/O for no benefit. Both checks test the
+/// exact same condition (`sessions/<id>/` is a directory), so this is a
+/// deliberate, matching duplication, not a drift risk.
+fn save_session_metadata_via(
+    data_dir: &Path,
+    session_id: &str,
+    metadata: SessionMetadataPatch,
+) -> Result<SessionDetail, IpcError> {
+    let session_dir = data_dir.join("sessions").join(session_id);
+    if !session_dir.is_dir() {
+        return Err(IpcError::new(IpcErrorKind::NotFound, format!("session {session_id} not found")));
+    }
+    let sj_path = session_dir.join("session.json");
+
+    let mut doc =
+        idl_rs::store::session_json::read_session_json(&sj_path).map_err(|e| map_session_json_error(e, &sj_path))?;
+    let current_bytes = std::fs::read(&sj_path)
+        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("read {}: {e}", sj_path.display())))?;
+    let current_hash = idl_rs::store::atomic::sha256_hex(&current_bytes);
+
+    doc.rider = metadata.rider;
+    doc.bike = metadata.bike;
+    doc.bike_comment = metadata.bike_comment;
+    doc.venue_name = metadata.venue_name;
+    doc.event_name = metadata.event_name;
+    doc.event_session = metadata.event_session;
+    doc.short_comment = metadata.short_comment;
+    doc.long_comment = metadata.long_comment;
+    doc.tag = metadata.tag;
+
+    idl_rs::store::session_json::write_session_json(data_dir, session_id, &doc, Some(&current_hash))
+        .map_err(|e| map_session_json_error(e, &sj_path))?;
+
+    Ok(catalog_read::get_session(data_dir, session_id)?.into())
+}
+
+/// Lists `<data_dir>/sessions/*` directory entries other than
+/// `exclude_session_id`, skipping anything that is not a directory. Used by
+/// `delete_session_via` to check whether another session's `data.parquet`
+/// still names the blob about to be removed.
+fn other_session_dirs(data_dir: &Path, exclude_session_id: &str) -> impl Iterator<Item = PathBuf> {
+    let exclude = exclude_session_id.to_string();
+    std::fs::read_dir(data_dir.join("sessions"))
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(move |path| path.is_dir() && path.file_name().and_then(|n| n.to_str()) != Some(exclude.as_str()))
+}
+
+/// Transport-agnostic core of `delete_session` (C3 §3.2). Removes
+/// `<data>/sessions/<session_id>/` recursively, then the catalog's rows for
+/// this session via a single `DELETE FROM sessions WHERE session_id = ?1`:
+/// `laps.session_id` and `lap_summary`'s foreign key onto `laps` are both
+/// `ON DELETE CASCADE` in the schema (`core/src/store/catalog.rs`'s
+/// `CREATE TABLE` block), so one statement removes all three tables' rows
+/// for this session — not a full `rebuild_catalog` (needlessly expensive
+/// per delete; an accepted, bounded divergence risk `rebuild_catalog`
+/// remains available to reconcile).
+///
+/// `delete_blob: true` additionally removes the blob at
+/// `blobs/sha256/<2>/<62>` named by the session's `blob_sha256`, but only
+/// when no *other* session's `data.parquet` still names the same digest —
+/// blobs are content-addressed and shared by construction (C4 §3), so a
+/// shared blob is never removed even when `delete_blob: true`.
+/// `delete_blob: false` keeps the blob unconditionally (idl0's "Forget
+/// session"). The blob's presence is checked by reading every other
+/// session's `data.parquet` metadata (`read_session_metadata`, cheap — no
+/// full parquet row load) rather than querying the catalog's own
+/// `sessions.blob_sha256` column, because this session's catalog row is
+/// about to be deleted in the same call and querying it mid-delete is an
+/// ordering hazard the file-based check avoids entirely.
+fn delete_session_via(data_dir: &Path, session_id: &str, delete_blob: bool) -> Result<(), IpcError> {
+    let session_dir = data_dir.join("sessions").join(session_id);
+    if !session_dir.is_dir() {
+        return Err(IpcError::new(IpcErrorKind::NotFound, format!("session {session_id} not found")));
+    }
+    let blob_sha256 = catalog_read::get_session(data_dir, session_id)?.blob_sha256;
+
+    std::fs::remove_dir_all(&session_dir)
+        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("remove {}: {e}", session_dir.display())))?;
+
+    if delete_blob {
+        let still_referenced = other_session_dirs(data_dir, session_id)
+            .filter_map(|dir| idl_rs::store::parquet::read_session_metadata(&dir.join("data.parquet")).ok())
+            .any(|m| m.blob_sha256 == blob_sha256);
+        if !still_referenced {
+            let blob_path = idl_rs::store::blob::blob_path(data_dir, &blob_sha256);
+            if blob_path.is_file() {
+                std::fs::remove_file(&blob_path)
+                    .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("remove {}: {e}", blob_path.display())))?;
+            }
+        }
+    }
+
+    let conn = idl_rs::store::catalog::open_catalog(&data_dir.join("catalog.sqlite"))?;
+    conn.execute("DELETE FROM sessions WHERE session_id = ?1", rusqlite::params![session_id])
+        .map_err(|e| IpcError::new(IpcErrorKind::Internal, e.to_string()))?;
+
+    Ok(())
+}
+
+/// C3 §3.2 `save_session_metadata(session_id, metadata)`.
+#[tauri::command]
+pub fn save_session_metadata(
+    session_id: String,
+    metadata: SessionMetadataPatch,
+    data_dir: tauri::State<'_, DataDir>,
+) -> Result<SessionDetail, IpcError> {
+    save_session_metadata_via(&data_dir.0, &session_id, metadata)
+}
+
+/// C3 §3.2 `delete_session(session_id, delete_blob)`.
+#[tauri::command]
+pub fn delete_session(
+    session_id: String,
+    delete_blob: bool,
+    data_dir: tauri::State<'_, DataDir>,
+) -> Result<(), IpcError> {
+    delete_session_via(&data_dir.0, &session_id, delete_blob)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +649,54 @@ mod tests {
             }],
         };
         write_session_parquet(root, &session, "0.1.0").unwrap();
+    }
+
+    /// Like `write_full_session`, but the caller supplies both the raw
+    /// blob bytes (so two sessions can be made to share one blob by
+    /// passing identical bytes — `write_blob` is a verified no-op on a
+    /// repeat digest) and the `session.json` document (so a test can seed
+    /// non-default `laps`/`bike_profile_snapshot` before calling
+    /// `save_session_metadata_via`). Also runs `core_rebuild_catalog` so
+    /// this session's `sessions`/`laps`/`lap_summary` rows exist for
+    /// Task 5's delete tests to remove. Returns the blob's sha256 hex.
+    fn write_full_session_seeded(root: &Path, session_id: &str, raw_bytes: &[u8], doc: &idl_rs::store::session_json::SessionJson) -> String {
+        let blob_sha256 = write_blob(root, raw_bytes).unwrap();
+        write_session_json(root, session_id, doc, None).unwrap();
+        let session = Session {
+            session_id: session_id.to_string(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            config_checksum: None,
+            source_format: SourceFormat::Idl0,
+            blob_sha256: blob_sha256.clone(),
+            channels: vec![Channel {
+                channel_id: "IMU0_AccelX".to_string(),
+                t_us: vec![0, 500_000],
+                t_recorded_us: None,
+                nominal_rate_hz: 2.0,
+                column: RawColumn::F64(vec![1.0, 2.0]),
+                source_kind: "imu0".to_string(),
+                unit: "g".to_string(),
+                gaps: Vec::new(),
+            }],
+        };
+        write_session_parquet(root, &session, "0.1.0").unwrap();
+        core_rebuild_catalog(root).unwrap();
+        blob_sha256
+    }
+
+    fn metadata_patch(suffix: &str) -> SessionMetadataPatch {
+        SessionMetadataPatch {
+            rider: format!("rider-{suffix}"),
+            bike: format!("bike-{suffix}"),
+            bike_comment: format!("bike-comment-{suffix}"),
+            venue_name: format!("venue-{suffix}"),
+            event_name: format!("event-{suffix}"),
+            event_session: format!("event-session-{suffix}"),
+            short_comment: format!("short-comment-{suffix}"),
+            long_comment: format!("long-comment-{suffix}"),
+            tag: format!("tag-{suffix}"),
+        }
     }
 
     #[test]
@@ -744,6 +976,170 @@ mod tests {
         // Assert
         assert_eq!(detail.track_id, "t-1");
         assert_eq!(detail.name, "A-Line");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_session_metadata_via_replaces_exactly_the_nine_fields_and_preserves_the_rest() {
+        // Arrange — seed non-default values for fields this command must
+        // leave untouched, plus the nine it must replace.
+        let root = temp_root();
+        let session_id = "s1";
+        let mut doc = empty_session_json(session_id);
+        doc.rider = "old-rider".to_string();
+        doc.schema_version = idl_rs::store::session_json::SESSION_JSON_SCHEMA_VERSION;
+        doc.bike_profile_snapshot = Some(serde_json::json!({ "marker": "untouched-snapshot" }));
+        doc.laps = vec![LapJson {
+            lap_number: 7,
+            start_timestamp_ms: 100,
+            end_timestamp_ms: 200,
+            raw_elapsed_ms: 100,
+            lap_time_ms: 100,
+            start_time_secs: 0.1,
+            end_time_secs: 0.2,
+            sectors: Vec::new(),
+            neutral_zone_visits: Vec::new(),
+        }];
+        doc.reference_lap_number = Some(7);
+        write_full_session_seeded(&root, session_id, b"raw bytes for s1", &doc);
+
+        // Act
+        let patch = metadata_patch("new");
+        let detail = save_session_metadata_via(&root, session_id, patch).unwrap();
+
+        // Assert — the nine replaced fields hold the patch's values.
+        assert_eq!(detail.rider, "rider-new");
+        assert_eq!(detail.bike, "bike-new");
+        assert_eq!(detail.bike_comment, "bike-comment-new");
+        assert_eq!(detail.venue_name, "venue-new");
+        assert_eq!(detail.event_name, "event-new");
+        assert_eq!(detail.event_session, "event-session-new");
+        assert_eq!(detail.short_comment, "short-comment-new");
+        assert_eq!(detail.long_comment, "long-comment-new");
+        assert_eq!(detail.tag, "tag-new");
+
+        // Assert — everything else is byte-for-byte unchanged.
+        assert_eq!(detail.bike_profile_snapshot, Some(serde_json::json!({ "marker": "untouched-snapshot" })));
+        assert_eq!(detail.laps.len(), 1);
+        assert_eq!(detail.laps[0].lap_number, 7);
+        assert_eq!(detail.reference_lap_number, Some(7));
+
+        let on_disk = idl_rs::store::session_json::read_session_json(&root.join("sessions").join(session_id).join("session.json")).unwrap();
+        assert_eq!(on_disk.bike_profile_snapshot, Some(serde_json::json!({ "marker": "untouched-snapshot" })));
+        assert_eq!(on_disk.laps.len(), 1);
+        assert_eq!(on_disk.reference_lap_number, Some(7));
+        assert_eq!(on_disk.schema_version, idl_rs::store::session_json::SESSION_JSON_SCHEMA_VERSION);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_session_metadata_via_unknown_session_id_ipc_error_kind_is_not_found() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let err = save_session_metadata_via(&root, "nope", metadata_patch("x")).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::error::IpcErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_session_metadata_via_return_value_matches_a_fresh_get_session_call() {
+        // Arrange — proves the "re-read, canonical truth" behaviour rather
+        // than an echo of the argument: the returned `SessionDetail` must
+        // equal an independent `catalog_read::get_session` call made after
+        // the write, not just reflect the patch fields back.
+        let root = temp_root();
+        let session_id = "s1";
+        write_full_session_seeded(&root, session_id, b"raw bytes for s1", &empty_session_json(session_id));
+
+        // Act
+        let returned = save_session_metadata_via(&root, session_id, metadata_patch("fresh")).unwrap();
+        let reread: SessionDetail = catalog_read::get_session(&root, session_id).unwrap().into();
+
+        // Assert
+        assert_eq!(returned.rider, reread.rider);
+        assert_eq!(returned.bike, reread.bike);
+        assert_eq!(returned.tag, reread.tag);
+        assert_eq!(returned.session_id, reread.session_id);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_session_via_delete_blob_false_removes_directory_and_catalog_rows_but_keeps_the_blob() {
+        // Arrange
+        let root = temp_root();
+        let session_id = "s1";
+        let blob_sha256 = write_full_session_seeded(&root, session_id, b"raw bytes for s1", &empty_session_json(session_id));
+
+        // Act
+        delete_session_via(&root, session_id, false).unwrap();
+
+        // Assert
+        assert!(!root.join("sessions").join(session_id).is_dir());
+        assert!(list_sessions_via(&root).unwrap().is_empty());
+        assert!(idl_rs::store::blob::blob_path(&root, &blob_sha256).is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_session_via_delete_blob_true_with_no_other_reference_removes_the_blob_file() {
+        // Arrange
+        let root = temp_root();
+        let session_id = "s1";
+        let blob_sha256 = write_full_session_seeded(&root, session_id, b"raw bytes for s1", &empty_session_json(session_id));
+
+        // Act
+        delete_session_via(&root, session_id, true).unwrap();
+
+        // Assert
+        assert!(!root.join("sessions").join(session_id).is_dir());
+        assert!(!idl_rs::store::blob::blob_path(&root, &blob_sha256).is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_session_via_delete_blob_true_with_a_second_session_sharing_the_blob_keeps_the_blob_file() {
+        // Arrange — two sessions built from identical raw bytes hash to the
+        // same blob (`write_blob` is a verified no-op on a repeat digest).
+        let root = temp_root();
+        let shared_bytes: &[u8] = b"shared raw bytes";
+        let blob_sha256 = write_full_session_seeded(&root, "s1", shared_bytes, &empty_session_json("s1"));
+        write_full_session_seeded(&root, "s2", shared_bytes, &empty_session_json("s2"));
+
+        // Act — deleting s1 must not remove the blob s2 still names.
+        delete_session_via(&root, "s1", true).unwrap();
+
+        // Assert
+        assert!(!root.join("sessions").join("s1").is_dir());
+        assert!(root.join("sessions").join("s2").is_dir());
+        assert!(idl_rs::store::blob::blob_path(&root, &blob_sha256).is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_session_via_unknown_session_id_not_found_and_touches_nothing() {
+        // Arrange — a real, untouched session must survive the failed call.
+        let root = temp_root();
+        let blob_sha256 = write_full_session_seeded(&root, "s1", b"raw bytes for s1", &empty_session_json("s1"));
+
+        // Act
+        let err = delete_session_via(&root, "nope", true).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::error::IpcErrorKind::NotFound);
+        assert!(root.join("sessions").join("s1").is_dir());
+        assert!(idl_rs::store::blob::blob_path(&root, &blob_sha256).is_file());
+        assert_eq!(list_sessions_via(&root).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }
