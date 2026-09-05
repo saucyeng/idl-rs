@@ -8,6 +8,7 @@
 pub mod atomic;
 pub mod blob;
 pub mod catalog;
+pub mod catalog_read;
 pub mod derived;
 pub mod import;
 pub mod parquet;

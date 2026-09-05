@@ -66,6 +66,30 @@ impl From<idl_transport::TransportError> for IpcError {
     }
 }
 
+/// C3 §3.2 (Catalog). `idl_rs::store::catalog::CatalogError` has exactly two
+/// variants, `Io` and `Sql` — `idl_rs::store::catalog_read` (L5,
+/// runs/2026-09-03/lanes/l5-tauri-scaffold/brief-task8.md) reuses `Sql` to
+/// mean "the requested entity does not exist" wherever it raises one
+/// explicitly, so that variant maps to `NotFound` here; `Io` maps to `Io`.
+/// **Known imperfection, not new here:** a genuine `rusqlite::Error` from a
+/// corrupt `catalog.sqlite` also carries `CatalogErrorKind::Sql` (via
+/// `catalog.rs`'s own `From<rusqlite::Error>`), so it would surface as
+/// `not_found` too, even for `list_sessions`/`list_workbooks`/`list_tracks`/
+/// `rebuild_catalog`, which C3 §3.2 declares `io`/`internal` only (no
+/// `not_found`) — a consequence of only two source variants existing for
+/// three IPC-facing buckets. C3 §2's catalog rows are `not_found`/`io`/
+/// `internal` only — no new `IpcErrorKind` variant is added here.
+impl From<idl_rs::store::catalog::CatalogError> for IpcError {
+    fn from(e: idl_rs::store::catalog::CatalogError) -> Self {
+        use idl_rs::store::catalog::CatalogErrorKind;
+        let kind = match e.kind {
+            CatalogErrorKind::Sql => IpcErrorKind::NotFound,
+            CatalogErrorKind::Io => IpcErrorKind::Io,
+        };
+        IpcError::new(kind, e.message)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

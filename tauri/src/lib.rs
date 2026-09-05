@@ -27,5 +27,12 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::device::list_device_files,
         commands::device::download_file,
         commands::device::push_config,
+        commands::catalog::list_sessions,
+        commands::catalog::get_session,
+        commands::catalog::list_laps,
+        commands::catalog::rebuild_catalog,
+        commands::catalog::list_workbooks,
+        commands::catalog::list_tracks,
+        commands::catalog::get_track,
     ]
 }

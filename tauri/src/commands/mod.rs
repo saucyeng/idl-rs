@@ -1,5 +1,6 @@
 //! `#[tauri::command]` handlers. Thin: convert, call the engine, return.
 
+pub mod catalog;
 pub mod device;
 
 /// Reports the engine crate version so the UI (and sync peers) can prove
