@@ -129,14 +129,21 @@ impl Importer for FitImporter {
         // time.
         let first_utc_s = records
             .iter()
-            .map(|r| r.timestamp_utc_s.unwrap())
+            .map(|r| {
+                r.timestamp_utc_s
+                    .expect("timestamp_utc_s is Some -- records without one were dropped above")
+            })
             .min()
             .expect("records is non-empty (checked above)");
 
         let mut kept: Vec<(usize, i64)> = Vec::with_capacity(records.len());
         let mut last_kept_t_us: Option<i64> = None;
         for (i, r) in records.iter().enumerate() {
-            let t_us = (r.timestamp_utc_s.unwrap() - first_utc_s) * 1_000_000;
+            let t_us = (r
+                .timestamp_utc_s
+                .expect("timestamp_utc_s is Some -- records without one were dropped above")
+                - first_utc_s)
+                * 1_000_000;
             if let Some(last) = last_kept_t_us {
                 if t_us <= last {
                     warnings.push(ImporterWarning::new(format!(
@@ -156,7 +163,12 @@ impl Importer for FitImporter {
         // (both lat and lon decoded), value = timestamp_utc_s * 1000, no
         // offset added a second time.
         channels.push(push_channel(&kept, &records, "GPS_EpochMs", "ms_raw", |r| {
-            (r.lat_deg.is_some() && r.lon_deg.is_some()).then(|| r.timestamp_utc_s.unwrap() as f64 * 1000.0)
+            (r.lat_deg.is_some() && r.lon_deg.is_some()).then(|| {
+                r.timestamp_utc_s
+                    .expect("timestamp_utc_s is Some -- records without one were dropped above")
+                    as f64
+                    * 1000.0
+            })
         }));
         channels.push(push_channel(&kept, &records, "GPS_Altitude", "m", |r| r.altitude_m));
         channels.push(push_channel(&kept, &records, "HR_BPM", "bpm", |r| r.hr_bpm));

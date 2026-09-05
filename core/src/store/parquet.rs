@@ -124,12 +124,15 @@ fn channel_array(c: &Channel, rows: &[usize], n_rows: usize) -> Result<ArrayRef,
     }
 }
 
-/// Scatters a `<source>_t_recorded_us` column: the verbatim recorded time
-/// at every row this source actually sampled (its own `t_us`, since that's
-/// where the row lives), null elsewhere. One call per distinct
-/// `source_kind` present, using any one of that source's channels (they
-/// all share the same `t_us`/`t_recorded_us` by construction — one FIFO
-/// read per source, C1 §3.2).
+/// Scatters one channel's own `t_recorded_us_or_t_us()` values into a
+/// `<source>_t_recorded_us` column: the verbatim recorded time at every row
+/// this channel actually sampled (its own `t_us`, since that's where the
+/// row lives), null elsewhere. Called once per channel of a `source_kind`
+/// (not once per source — L2-R10), since FIT/GPX/CSV channels of the same
+/// `source_kind` do not necessarily share one `t_us` the way idl0's
+/// single-FIFO-per-source channels do; the caller merges every channel's
+/// contribution into one shared array, first-channel-to-fill-a-row wins
+/// (C1 §3.2).
 fn recorded_us_array(c: &Channel, rows: &[usize], n_rows: usize) -> ArrayRef {
     let recorded = c.t_recorded_us_or_t_us();
     let mut vals: Vec<Option<i64>> = vec![None; n_rows];
