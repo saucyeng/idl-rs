@@ -6,21 +6,16 @@
 //! reads the catalog's cached `laps`/`lap_summary` tables, as C3 §3.2
 //! states explicitly for that one command.
 //!
-//! **Not-found encoding, a judgment call (see this file's doc comments on
-//! [`not_found`]):** [`CatalogErrorKind`] has exactly two variants, `Io` and
-//! `Sql`, and this task may not add a third (brief-task8.md). `Sql` is
-//! reused here to mean "the requested entity does not exist" wherever this
-//! module raises it explicitly; every other failure (genuine filesystem
-//! errors, corrupt/unparseable files) folds to `Io`. `idl-rs-tauri`'s
-//! `From<CatalogError> for IpcError` maps `Sql -> not_found`, `Io -> io`.
-//! This is exact for `get_session`/`list_laps`/`get_track` (C3 §3.2's
-//! `not_found, io, internal`); for `list_sessions`/`list_workbooks`/
-//! `list_tracks`/`rebuild_catalog` (`io, internal` only, no `not_found`) a
-//! genuine `rusqlite::Error` from a corrupt `catalog.sqlite` would also
-//! carry `CatalogErrorKind::Sql` (via `catalog.rs`'s existing
-//! `From<rusqlite::Error>`) and so would surface as `not_found` rather than
-//! `internal` — a known imperfection of only having two source variants for
-//! three IPC-facing buckets, not a new one introduced here.
+//! **Not-found encoding (ruling R46):** this module raises
+//! [`CatalogErrorKind::NotFound`] explicitly wherever an id/path has no
+//! backing row/file; a genuine `rusqlite::Error` (e.g. a corrupt
+//! `catalog.sqlite`) keeps `CatalogErrorKind::Sql` via `catalog.rs`'s own
+//! `From<rusqlite::Error>`, and any other failure (filesystem, parse) folds
+//! to `Io`. `idl-rs-tauri`'s `From<CatalogError> for IpcError` maps
+//! `NotFound -> not_found`, `Sql -> internal`, `Io -> io` — matching C3
+//! §3.2's per-command error sets exactly. (R46 replaced an earlier revision
+//! of this module, which reused `Sql` for both meanings and so surfaced a
+//! corrupt catalog as `not_found` instead of `internal`.)
 
 use std::path::Path;
 
@@ -242,10 +237,9 @@ pub struct TrackDetail {
     pub reference_polyline: serde_json::Value,
 }
 
-/// A not-found-shaped [`CatalogError`] — see this module's doc comment for
-/// why `Sql` is the chosen carrier.
+/// A not-found-shaped [`CatalogError`] (ruling R46).
 fn not_found(message: impl Into<String>) -> CatalogError {
-    CatalogError { kind: CatalogErrorKind::Sql, message: message.into() }
+    CatalogError { kind: CatalogErrorKind::NotFound, message: message.into() }
 }
 
 /// Folds any I/O/parse/schema failure into `CatalogErrorKind::Io` — this
@@ -549,6 +543,23 @@ mod tests {
     }
 
     #[test]
+    fn list_sessions_corrupt_catalog_file_is_a_sql_error_not_a_not_found_error() {
+        // Arrange — R46: a genuine SQLite failure must stay `Sql` (folds to
+        // `internal` at the IPC boundary), never `NotFound` (which would
+        // point the caller at re-importing rather than `rebuild_catalog`).
+        let root = temp_root();
+        std::fs::write(root.join("catalog.sqlite"), b"not a sqlite file").unwrap();
+
+        // Act
+        let err = list_sessions(&root).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, CatalogErrorKind::Sql);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn list_sessions_one_rebuilt_session_every_c3_field_matches_what_was_seeded() {
         // Arrange
         let root = temp_root();
@@ -586,7 +597,7 @@ mod tests {
         let err = get_session(&root, "nope").unwrap_err();
 
         // Assert
-        assert_eq!(err.kind, CatalogErrorKind::Sql);
+        assert_eq!(err.kind, CatalogErrorKind::NotFound);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -678,7 +689,7 @@ mod tests {
         let err = list_laps(&root, "nope").unwrap_err();
 
         // Assert
-        assert_eq!(err.kind, CatalogErrorKind::Sql);
+        assert_eq!(err.kind, CatalogErrorKind::NotFound);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -746,7 +757,7 @@ mod tests {
         let err = get_track(&root, "nope").unwrap_err();
 
         // Assert
-        assert_eq!(err.kind, CatalogErrorKind::Sql);
+        assert_eq!(err.kind, CatalogErrorKind::NotFound);
 
         let _ = std::fs::remove_dir_all(&root);
     }

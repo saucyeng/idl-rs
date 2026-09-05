@@ -29,8 +29,16 @@ pub const CATALOG_SCHEMA_VERSION: i64 = 1;
 pub enum CatalogErrorKind {
     /// A filesystem operation failed.
     Io,
-    /// A SQLite operation failed.
+    /// A SQLite operation failed (a genuine driver/schema/corruption error —
+    /// distinct from [`CatalogErrorKind::NotFound`], which is "the query
+    /// ran fine and found nothing").
     Sql,
+    /// The requested entity (session, lap, track, …) does not exist. Added
+    /// by ruling R46: `idl_rs::store::catalog_read` (L5) used to reuse `Sql`
+    /// for this, which meant a corrupt `catalog.sqlite` surfaced as
+    /// "not found" (inviting a re-import) rather than "internal" (pointing
+    /// at `rebuild_catalog`, the actual fix).
+    NotFound,
 }
 
 /// Error from the catalog. Never `Err(String)` (CLAUDE.md §5).
