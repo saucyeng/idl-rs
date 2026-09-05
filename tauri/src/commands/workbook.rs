@@ -112,6 +112,16 @@ pub struct WorkbookEvent {
     /// function; see [`diff_cell_ids`]). May be empty when only prose
     /// changed.
     pub cell_ids: Vec<String>,
+    /// sha256 of the file's bytes after this change, hex (ruling R67) —
+    /// equals `SaveResult.hash` when this event reflects the app's own
+    /// successful save. Defence in depth alongside the Rust-side
+    /// `ExpectedHashSet` (which already suppresses a genuine self-write
+    /// before any `WorkbookEvent` is built, `watcher.rs`): this field lets
+    /// the UI layer independently recognise its own save's echo rather than
+    /// relying solely on that suppression. Always present — no code path in
+    /// [`watch_workbook_via`] constructs a `WorkbookEvent` without a
+    /// successful, hashable read in hand.
+    pub hash: String,
 }
 
 fn cell_kind_str(k: CellKindToken) -> &'static str {
@@ -440,11 +450,12 @@ fn watch_workbook_via(
         }
         let Ok(markdown) = std::fs::read_to_string(&watch_path) else { return };
         let Ok((doc, _)) = parse_workbook(&markdown) else { return };
+        let hash = sha256_hex(markdown.as_bytes());
         let mut prev = baseline.lock().unwrap();
         let cell_ids = diff_cell_ids(&prev, &doc.cells);
         *prev = doc.cells;
         drop(prev);
-        on_event(WorkbookEvent { kind: "changed".to_string(), cell_ids });
+        on_event(WorkbookEvent { kind: "changed".to_string(), cell_ids, hash });
     })
     .map_err(|e| IpcError::new(IpcErrorKind::Internal, format!("starting workbook watcher: {e}")))
 }
@@ -960,6 +971,42 @@ mod tests {
         let event = rx.recv_timeout(std::time::Duration::from_millis(1000)).expect("callback fired");
         assert_eq!(event.kind, "changed");
         assert_eq!(event.cell_ids, vec!["aaaaaaaa".to_string()]);
+        assert_eq!(event.hash, sha256_hex(edited.as_bytes()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn watch_workbook_via_event_hash_computation_matches_save_workbook_vias_hash_for_the_same_bytes() {
+        // Arrange — two independent `ExpectedHashSet`s (the watcher's own
+        // is never told about this write), so the external-edit path fires
+        // rather than the self-write-suppression path (ledger, lead ruling
+        // 2026-09-05: this is a unit test of hash-computation agreement,
+        // not a claim that a genuine self-write reaches this closure).
+        let root = temp_root();
+        let markdown = two_cell_markdown();
+        let path = write_workbook(&root, "test.idl1wb", &markdown);
+        let watcher_hashes = Arc::new(ExpectedHashSet::new());
+        let (tx, rx) = std::sync::mpsc::channel::<WorkbookEvent>();
+
+        let _watcher = watch_workbook_via(&root, watcher_hashes, WB_ID, move |e| {
+            let _ = tx.send(e);
+        })
+        .unwrap();
+
+        // Act — write via `save_workbook_via` with its own, separate
+        // `ExpectedHashSet` so the watcher never sees this write registered.
+        let save_hashes = ExpectedHashSet::new();
+        let edited = markdown.replace("x = 1", "x = 2");
+        let based_on_hash = sha256_hex(markdown.as_bytes());
+        let save_result = save_workbook_via(&root, &save_hashes, WB_ID, &edited, Some(&based_on_hash)).unwrap();
+        let _ = path; // written by save_workbook_via, not std::fs::write, in this test
+
+        // Assert — the watcher's closure hashed the same bytes with the same
+        // function `save_workbook_via` used for `SaveResult.hash`.
+        let event = rx.recv_timeout(std::time::Duration::from_millis(1000)).expect("callback fired");
+        assert_eq!(event.hash, save_result.hash);
+        assert_eq!(event.hash, sha256_hex(edited.as_bytes()));
 
         let _ = std::fs::remove_dir_all(&root);
     }
