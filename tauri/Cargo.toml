@@ -20,3 +20,8 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["test-util"] }
+# `test_buffers` (Task 9's own `.idl0` fixture builders) is gated behind
+# this feature (core/Cargo.toml) — enabled for test builds only, unified by
+# Cargo with the plain `idl-rs` dependency above (same pattern `cli/Cargo.toml`
+# uses non-dev, since the CLI needs it outside tests too).
+idl-rs = { path = "../core", features = ["test-fixtures"] }
