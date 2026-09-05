@@ -116,4 +116,22 @@ mod tests {
         // Assert
         assert_eq!(data, override_root.path().join("data"));
     }
+
+    #[test]
+    fn resolve_data_dir_bom_prefixed_invalid_json_falls_back_to_the_platform_default() {
+        // Arrange
+        let app_data = tempfile::tempdir().unwrap();
+        let app_config = tempfile::tempdir().unwrap();
+        // '\u{feff}' (UTF-8 BOM) prepended to text that is not valid JSON
+        // even once the BOM is stripped — distinct from
+        // `corrupt_settings_json_falls_back_to_platform_default` above,
+        // which has no BOM.
+        std::fs::write(app_config.path().join("settings.json"), "\u{feff}{ not json").unwrap();
+
+        // Act
+        let data = resolve_data_dir(app_data.path(), app_config.path()).unwrap();
+
+        // Assert
+        assert_eq!(data, app_data.path().join("data"));
+    }
 }
