@@ -12,25 +12,30 @@
 //! design doc's own "proven at M2" risk note), so this layer's own tests are
 //! argument-shape / error-mapping tests, not device round-trips.
 //!
-//! **Connection lifetime, a judgment call:** every command below connects,
-//! acts, and disconnects within its own call — there is no managed,
-//! cross-command BLE session (that would need new `app.manage()`-registered
-//! state, out of this task's file list). `ble_connect`'s `ConnectionInfo.
-//! connected` therefore reflects the state at the moment GATT setup
-//! finished inside that one call, not a connection the caller can assume
-//! still exists a moment later; a persistent connection manager (so the
-//! Device tab can show live status between actions) is left to whichever
-//! later task builds that UI (L6/L9), not fixed by C3 or SPEC §14a.
+//! **Connection lifetime (superseded by this task's `state::Connections`):**
+//! `ble_scan`/`ble_connect`/`list_device_files`/`download_file`/`push_config`
+//! above still connect, act, and disconnect within their own call — `ble_connect`
+//! stays registered unchanged, a snapshot rather than a live handle (C3 §3.8).
+//! `connect_device`/`disconnect_device`/`device_status` below add the managed,
+//! cross-command session this module's earlier note said didn't exist yet:
+//! `connect_device` opens a link and leaves it open in `state::Connections`,
+//! keyed by `device_id`; `disconnect_device` tears it down; `device_status`
+//! (and, per C3 §3.8, `device_control`/`pull_config` in later tasks) uses the
+//! managed link when one exists for `device_id`, and otherwise falls back to
+//! this module's connect-act-disconnect idiom.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use idl_transport::ble_control::ControlCommand;
 use idl_transport::ble_transport::{BleTransport, BtleplugBle};
 use idl_transport::wifi_transport::{ReqwestWifi, WifiTransport, DEVICE_BASE_URL};
+use idl_transport::TransportError;
 
 use crate::error::{IpcError, IpcErrorKind};
-use crate::state::DataDir;
+use crate::state::{Connections, DataDir};
 
 /// One device found during a `ble_scan` (C3 §3.8).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -60,6 +65,127 @@ pub struct ConnectionInfo {
 impl From<idl_transport::ConnectionInfo> for ConnectionInfo {
     fn from(c: idl_transport::ConnectionInfo) -> Self {
         Self { device_id: c.device_id, firmware_version: c.firmware_version, connected: c.connected }
+    }
+}
+
+/// SD card state (C3 §3.8's `device_status`), mirroring
+/// `idl_transport::ble_status::SdState` variant for variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SdState {
+    /// Card present and writable.
+    Ok,
+    /// Card present but has no free space left.
+    Full,
+    /// Card present but unreadable/unwritable.
+    Error,
+    /// No card inserted.
+    Absent,
+}
+
+impl From<idl_transport::ble_status::SdState> for SdState {
+    fn from(s: idl_transport::ble_status::SdState) -> Self {
+        match s {
+            idl_transport::ble_status::SdState::Ok => Self::Ok,
+            idl_transport::ble_status::SdState::Full => Self::Full,
+            idl_transport::ble_status::SdState::Error => Self::Error,
+            idl_transport::ble_status::SdState::Absent => Self::Absent,
+        }
+    }
+}
+
+/// GPS fix state (C3 §3.8's `device_status`), mirroring
+/// `idl_transport::ble_status::GpsState` variant for variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpsState {
+    /// GPS module has a valid position fix.
+    Fix,
+    /// GPS module is powered but has not yet acquired a fix.
+    NoFix,
+    /// No GPS module detected.
+    Absent,
+}
+
+impl From<idl_transport::ble_status::GpsState> for GpsState {
+    fn from(s: idl_transport::ble_status::GpsState) -> Self {
+        match s {
+            idl_transport::ble_status::GpsState::Fix => Self::Fix,
+            idl_transport::ble_status::GpsState::NoFix => Self::NoFix,
+            idl_transport::ble_status::GpsState::Absent => Self::Absent,
+        }
+    }
+}
+
+/// IMU health state (C3 §3.8's `device_status`), mirroring
+/// `idl_transport::ble_status::ImuState` variant for variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImuState {
+    /// All configured IMU sensors are reporting.
+    Ok,
+    /// Some but not all configured IMU sensors are reporting.
+    Partial,
+    /// IMU present but reporting a fault.
+    Error,
+    /// No IMU detected.
+    Absent,
+}
+
+impl From<idl_transport::ble_status::ImuState> for ImuState {
+    fn from(s: idl_transport::ble_status::ImuState) -> Self {
+        match s {
+            idl_transport::ble_status::ImuState::Ok => Self::Ok,
+            idl_transport::ble_status::ImuState::Partial => Self::Partial,
+            idl_transport::ble_status::ImuState::Error => Self::Error,
+            idl_transport::ble_status::ImuState::Absent => Self::Absent,
+        }
+    }
+}
+
+/// `device_status`'s return (C3 §3.8): one read of SPEC §7.3's status
+/// characteristic, mirroring `idl_transport::ble_status::DeviceStatus` field
+/// for field. Every field except `ota_pending_verify` is nullable — `None`
+/// means "the device did not report this line", never a zero/false default.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeviceStatus {
+    /// `true` when the WiFi radio is on, `None` if unreported.
+    pub wifi_on: Option<bool>,
+    /// `true` while a recording session is active, `None` if unreported.
+    pub logging: Option<bool>,
+    /// Main battery charge, percent. `None` if unreported.
+    pub battery_pct: Option<u8>,
+    /// SD card state. `None` if unreported.
+    pub sd: Option<SdState>,
+    /// GPS fix state. `None` if unreported.
+    pub gps: Option<GpsState>,
+    /// IMU health state. `None` if unreported.
+    pub imu: Option<ImuState>,
+    /// Running firmware version, e.g. `"1.5.0"`. `None` if unreported.
+    pub firmware: Option<String>,
+    /// `true` only while the device's `OTA: PENDING_VERIFY` line is present.
+    /// Never nullable — the device either reports this state or does not.
+    pub ota_pending_verify: bool,
+    /// Raw heart-rate strap status line. `None` if unreported.
+    pub hr: Option<String>,
+    /// Heart-rate strap battery, percent. `None` if unreported.
+    pub hr_battery_pct: Option<u8>,
+}
+
+impl From<idl_transport::ble_status::DeviceStatus> for DeviceStatus {
+    fn from(s: idl_transport::ble_status::DeviceStatus) -> Self {
+        Self {
+            wifi_on: s.wifi_on,
+            logging: s.logging,
+            battery_pct: s.battery_pct,
+            sd: s.sd.map(SdState::from),
+            gps: s.gps.map(GpsState::from),
+            imu: s.imu.map(ImuState::from),
+            firmware: s.firmware,
+            ota_pending_verify: s.ota_pending_verify,
+            hr: s.hr,
+            hr_battery_pct: s.hr_battery_pct,
+        }
     }
 }
 
@@ -157,6 +283,75 @@ async fn connect_via(ble: &mut impl BleTransport, device_id: &str) -> Result<Con
     let info = ble.connect(device_id).await.map_err(IpcError::from)?;
     let _ = ble.disconnect().await;
     Ok(info.into())
+}
+
+/// The shape `state::Connections` operates at, generic over the transport so
+/// this module's tests can exercise it against `StubBle` instead of a real
+/// `BtleplugBle` (this module's own doc comment on tests, and L4's own
+/// `StubBle` precedent). `state::Connections` is this type instantiated at
+/// `BtleplugBle`.
+type ConnectionMap<T> = StdMutex<HashMap<String, Arc<tokio::sync::Mutex<T>>>>;
+
+/// Transport-agnostic core of `connect_device`: connects `ble`, then inserts
+/// it into `connections` under `device_id`, replacing any existing entry —
+/// this task's own judgment call for the "already connected" edge case (C3
+/// §3.8 does not fix it): re-running `connect()` on a fresh transport and
+/// replacing is simpler than trying to read a still-fresh `ConnectionInfo`
+/// off an existing live connection, and matches "last caller wins" for a
+/// UI-driven Connect button. The outer lock is held only for the
+/// synchronous `insert`, never across an `.await`.
+async fn connect_device_via<T: BleTransport>(
+    connections: &ConnectionMap<T>,
+    mut ble: T,
+    device_id: &str,
+) -> Result<ConnectionInfo, IpcError> {
+    let info = ble.connect(device_id).await.map_err(IpcError::from)?;
+    connections.lock().unwrap().insert(device_id.to_string(), Arc::new(tokio::sync::Mutex::new(ble)));
+    Ok(info.into())
+}
+
+/// Transport-agnostic core of `disconnect_device`: removes `device_id`'s
+/// entry from `connections` (dropping the outer lock immediately after), then
+/// disconnects it if one was present. Disconnecting an unconnected
+/// `device_id` is a no-op, `Ok(())` — never `not_found` (C3 §3.8's own
+/// wording).
+async fn disconnect_device_via<T: BleTransport>(
+    connections: &ConnectionMap<T>,
+    device_id: &str,
+) -> Result<(), IpcError> {
+    let entry = connections.lock().unwrap().remove(device_id);
+    if let Some(ble) = entry {
+        ble.lock().await.disconnect().await.map_err(IpcError::from)?;
+    }
+    Ok(())
+}
+
+/// Transport-agnostic core of `device_status`: reads via `connections`'
+/// managed entry for `device_id` when one exists (no reconnect); otherwise
+/// builds a fresh transport via `new_ble`, connects, reads, and disconnects
+/// — the "otherwise connect-act-disconnect" degrade path C3 §3.8 names for
+/// this command cluster.
+async fn device_status_via<T, F, Fut>(
+    connections: &ConnectionMap<T>,
+    device_id: &str,
+    new_ble: F,
+) -> Result<DeviceStatus, IpcError>
+where
+    T: BleTransport,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, TransportError>>,
+{
+    let managed = connections.lock().unwrap().get(device_id).cloned();
+    let status = if let Some(ble) = managed {
+        ble.lock().await.read_status().await.map_err(IpcError::from)?
+    } else {
+        let mut ble = new_ble().await.map_err(IpcError::from)?;
+        ble.connect(device_id).await.map_err(IpcError::from)?;
+        let result = ble.read_status().await;
+        let _ = ble.disconnect().await;
+        result.map_err(IpcError::from)?
+    };
+    Ok(status.into())
 }
 
 /// Transport-agnostic core of `list_device_files`: switches to WiFi mode,
@@ -294,6 +489,41 @@ pub async fn ble_connect(device_id: String) -> Result<ConnectionInfo, IpcError> 
     connect_via(&mut ble, &device_id).await
 }
 
+/// Connects to `device_id` and leaves the BLE link **open**, held in
+/// `state::Connections` (C3 §3.8) — unlike `ble_connect` above, the returned
+/// `ConnectionInfo` describes a connection the caller can assume still
+/// exists afterward, until `disconnect_device` or a later `connect_device`
+/// for the same `device_id` tears it down.
+#[tauri::command]
+pub async fn connect_device(
+    connections: tauri::State<'_, Connections>,
+    device_id: String,
+) -> Result<ConnectionInfo, IpcError> {
+    let ble = BtleplugBle::new().await.map_err(IpcError::from)?;
+    connect_device_via(&connections.0, ble, &device_id).await
+}
+
+/// Tears down `device_id`'s managed connection, if any (C3 §3.8).
+/// Disconnecting an unconnected device is a no-op, not an error.
+#[tauri::command]
+pub async fn disconnect_device(
+    connections: tauri::State<'_, Connections>,
+    device_id: String,
+) -> Result<(), IpcError> {
+    disconnect_device_via(&connections.0, &device_id).await
+}
+
+/// One read of `device_id`'s status characteristic (C3 §3.8): uses the
+/// managed connection from `state::Connections` when one exists, otherwise
+/// connects, reads, and disconnects.
+#[tauri::command]
+pub async fn device_status(
+    connections: tauri::State<'_, Connections>,
+    device_id: String,
+) -> Result<DeviceStatus, IpcError> {
+    device_status_via(&connections.0, &device_id, || async { BtleplugBle::new().await }).await
+}
+
 /// Lists files on `device_id`'s SD card, switching the device into WiFi
 /// mode first (C3 §3.8).
 #[tauri::command]
@@ -361,9 +591,16 @@ mod tests {
         send_command_result: Result<(), TransportError>,
         push_config_result: Result<(), TransportError>,
         /// One entry consumed per `read_status` call; the last entry repeats
-        /// once the queue is drained.
+        /// once the queue is drained. Ignored once `status_override` is `Some`.
         wifi_on_reads: StdMutex<VecDeque<Option<bool>>>,
-        disconnect_calls: AtomicUsize,
+        /// When `Some`, `read_status` returns this directly instead of
+        /// consulting `wifi_on_reads` — the managed-connection `device_status`
+        /// tests need a full `DeviceStatus`, not just `wifi_on`.
+        status_override: StdMutex<Option<DeviceStatus>>,
+        /// `Arc`-shared so a test can hold a clone after a `StubBle` built
+        /// inside a `device_status_via` factory closure is moved and dropped.
+        connect_calls: Arc<AtomicUsize>,
+        disconnect_calls: Arc<AtomicUsize>,
         send_command_calls: AtomicUsize,
     }
 
@@ -378,7 +615,9 @@ mod tests {
                     "StubBle::push_config not configured",
                 )),
                 wifi_on_reads: StdMutex::new(VecDeque::new()),
-                disconnect_calls: AtomicUsize::new(0),
+                status_override: StdMutex::new(None),
+                connect_calls: Arc::new(AtomicUsize::new(0)),
+                disconnect_calls: Arc::new(AtomicUsize::new(0)),
                 send_command_calls: AtomicUsize::new(0),
             }
         }
@@ -394,6 +633,7 @@ mod tests {
         }
 
         async fn connect(&mut self, _device_id: &str) -> Result<idl_transport::ConnectionInfo, TransportError> {
+            self.connect_calls.fetch_add(1, Ordering::SeqCst);
             self.connect_result.clone()
         }
 
@@ -403,6 +643,9 @@ mod tests {
         }
 
         async fn read_status(&self) -> Result<DeviceStatus, TransportError> {
+            if let Some(status) = self.status_override.lock().unwrap().clone() {
+                return Ok(status);
+            }
             let mut q = self.wifi_on_reads.lock().unwrap();
             let wifi_on = if q.len() > 1 { q.pop_front().unwrap() } else { q.front().copied().flatten() };
             Ok(DeviceStatus { wifi_on, ..DeviceStatus::default() })
@@ -544,6 +787,205 @@ mod tests {
         // Assert
         assert_eq!(err.kind, IpcErrorKind::Ble);
         assert_eq!(err.message, "device not found");
+    }
+
+    /// Compile-time guard (L8w Task 6): `state::Connections` holds
+    /// `Arc<tokio::sync::Mutex<BtleplugBle>>` map values inside `tauri::State`,
+    /// which requires `BtleplugBle: Send`. If this stops compiling, the
+    /// managed-connection shape is unusable and needs a lead ruling, not an
+    /// implementer workaround (CLAUDE.md §1) — do not delete or "fix" this
+    /// test without that ruling.
+    #[test]
+    fn btleplug_ble_is_send_required_for_arc_mutex_managed_connection_state() {
+        fn assert_send<T: Send>() {}
+        assert_send::<BtleplugBle>();
+    }
+
+    #[tokio::test]
+    async fn connect_device_via_success_inserts_map_entry_and_returns_connection_info() {
+        // Arrange
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        let ble = StubBle {
+            connect_result: Ok(idl_transport::ConnectionInfo {
+                device_id: "AA:BB".to_string(),
+                firmware_version: "2.0.0".to_string(),
+                connected: true,
+            }),
+            ..Default::default()
+        };
+
+        // Act
+        let info = connect_device_via(&connections, ble, "AA:BB").await.unwrap();
+
+        // Assert
+        assert_eq!(info.device_id, "AA:BB");
+        assert_eq!(info.firmware_version, "2.0.0");
+        assert!(info.connected);
+        assert!(connections.lock().unwrap().contains_key("AA:BB"));
+    }
+
+    #[tokio::test]
+    async fn connect_device_via_called_twice_for_same_device_id_replaces_the_map_entry() {
+        // Arrange
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        let make_ble = || StubBle {
+            connect_result: Ok(idl_transport::ConnectionInfo {
+                device_id: "AA:BB".to_string(),
+                firmware_version: "1.0.0".to_string(),
+                connected: true,
+            }),
+            ..Default::default()
+        };
+
+        // Act
+        connect_device_via(&connections, make_ble(), "AA:BB").await.unwrap();
+        connect_device_via(&connections, make_ble(), "AA:BB").await.unwrap();
+
+        // Assert — this task's own choice: replace, not error or ignore.
+        assert_eq!(connections.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn disconnect_device_via_connected_device_id_removes_entry_and_disconnects_once() {
+        // Arrange
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        let ble = Arc::new(tokio::sync::Mutex::new(StubBle::default()));
+        connections.lock().unwrap().insert("AA:BB".to_string(), ble.clone());
+
+        // Act
+        let result = disconnect_device_via(&connections, "AA:BB").await;
+
+        // Assert
+        assert!(result.is_ok());
+        assert!(!connections.lock().unwrap().contains_key("AA:BB"));
+        assert_eq!(ble.lock().await.disconnect_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn disconnect_device_via_unconnected_device_id_is_ok_noop() {
+        // Arrange
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+
+        // Act
+        let result = disconnect_device_via(&connections, "AA:BB").await;
+
+        // Assert — C3 §3.8's own wording: never `not_found`.
+        assert!(result.is_ok());
+        assert!(connections.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn device_status_via_managed_connection_reads_without_reconnecting() {
+        // Arrange
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        let ble = Arc::new(tokio::sync::Mutex::new(StubBle {
+            status_override: StdMutex::new(Some(DeviceStatus { battery_pct: Some(42), ..Default::default() })),
+            ..Default::default()
+        }));
+        connections.lock().unwrap().insert("AA:BB".to_string(), ble.clone());
+
+        // Act — `new_ble` errors if actually called, failing this test.
+        let status = device_status_via(&connections, "AA:BB", || async {
+            Err(TransportError::new(TransportErrorKind::Ble, "new_ble must not be called when a managed connection exists"))
+        })
+        .await
+        .unwrap();
+
+        // Assert
+        assert_eq!(status.battery_pct, Some(42));
+        assert_eq!(ble.lock().await.connect_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ble.lock().await.disconnect_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn device_status_via_no_managed_connection_connects_reads_and_disconnects() {
+        // Arrange
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        let connect_calls = Arc::new(AtomicUsize::new(0));
+        let disconnect_calls = Arc::new(AtomicUsize::new(0));
+        let connect_calls_for_factory = connect_calls.clone();
+        let disconnect_calls_for_factory = disconnect_calls.clone();
+
+        // Act
+        let status = device_status_via(&connections, "AA:BB", move || {
+            let connect_calls = connect_calls_for_factory.clone();
+            let disconnect_calls = disconnect_calls_for_factory.clone();
+            async move {
+                Ok(StubBle {
+                    connect_result: Ok(idl_transport::ConnectionInfo {
+                        device_id: "AA:BB".to_string(),
+                        firmware_version: "1.0.0".to_string(),
+                        connected: true,
+                    }),
+                    status_override: StdMutex::new(Some(DeviceStatus { battery_pct: Some(7), ..Default::default() })),
+                    connect_calls,
+                    disconnect_calls,
+                    ..Default::default()
+                })
+            }
+        })
+        .await
+        .unwrap();
+
+        // Assert
+        assert_eq!(status.battery_pct, Some(7));
+        assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(disconnect_calls.load(Ordering::SeqCst), 1);
+        assert!(connections.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn device_status_from_transport_status_maps_every_field_including_enum_variants() {
+        // Arrange
+        let source = DeviceStatus {
+            wifi_on: Some(true),
+            logging: Some(false),
+            battery_pct: Some(55),
+            sd: Some(idl_transport::ble_status::SdState::Full),
+            gps: Some(idl_transport::ble_status::GpsState::NoFix),
+            imu: Some(idl_transport::ble_status::ImuState::Partial),
+            firmware: Some("1.6.0".to_string()),
+            ota_pending_verify: true,
+            hr: Some("CONNECTED 140".to_string()),
+            hr_battery_pct: Some(88),
+        };
+
+        // Act
+        let dto: super::DeviceStatus = source.into();
+
+        // Assert
+        assert_eq!(dto.wifi_on, Some(true));
+        assert_eq!(dto.logging, Some(false));
+        assert_eq!(dto.battery_pct, Some(55));
+        assert_eq!(dto.sd, Some(super::SdState::Full));
+        assert_eq!(dto.gps, Some(super::GpsState::NoFix));
+        assert_eq!(dto.imu, Some(super::ImuState::Partial));
+        assert_eq!(dto.firmware.as_deref(), Some("1.6.0"));
+        assert!(dto.ota_pending_verify);
+        assert_eq!(dto.hr.as_deref(), Some("CONNECTED 140"));
+        assert_eq!(dto.hr_battery_pct, Some(88));
+    }
+
+    #[test]
+    fn device_status_from_transport_default_status_every_field_none_except_ota_flag() {
+        // Arrange
+        let source = DeviceStatus::default();
+
+        // Act
+        let dto: super::DeviceStatus = source.into();
+
+        // Assert — every field but `ota_pending_verify` is nullable by
+        // construction (an `Option` wrapper, not a runtime check).
+        assert_eq!(dto.wifi_on, None);
+        assert_eq!(dto.logging, None);
+        assert_eq!(dto.battery_pct, None);
+        assert_eq!(dto.sd, None);
+        assert_eq!(dto.gps, None);
+        assert_eq!(dto.imu, None);
+        assert_eq!(dto.firmware, None);
+        assert!(!dto.ota_pending_verify);
+        assert_eq!(dto.hr, None);
+        assert_eq!(dto.hr_battery_pct, None);
     }
 
     #[tokio::test(start_paused = true)]

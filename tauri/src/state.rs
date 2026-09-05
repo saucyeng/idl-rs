@@ -22,3 +22,17 @@ pub struct Hashes(pub Arc<crate::watcher::ExpectedHashSet>);
 /// channel-close signal this task can observe, so there is no unsubscribe
 /// command in wave 1 (see the CHANGELOG entry).
 pub struct Watchers(pub Mutex<HashMap<String, crate::watcher::WorkbookWatcher>>);
+
+/// Live managed BLE connections, keyed by `device_id` (C3 §3.8's
+/// `connect_device`/`disconnect_device`/`device_status`). The outer
+/// `std::sync::Mutex` guards only the map's shape (insert/remove/lookup —
+/// short, synchronous critical sections); each connection's own `BtleplugBle`
+/// sits behind an `Arc<tokio::sync::Mutex<_>>` so a command can clone the
+/// `Arc` out, drop the outer lock, then hold the inner async lock across its
+/// own `.await`s without blocking every other command touching the map.
+/// `connect_device` inserts an entry and leaves the link open; `device_status`/
+/// `device_control`/`pull_config` use it when present and otherwise
+/// connect-act-disconnect (C3 §3.8).
+pub struct Connections(
+    pub Mutex<HashMap<String, Arc<tokio::sync::Mutex<idl_transport::ble_transport::BtleplugBle>>>>,
+);
