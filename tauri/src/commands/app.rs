@@ -136,9 +136,19 @@ fn get_data_dir_via(
 /// `set_data_dir`'s transport-agnostic core: read-modify-write of only the
 /// `data_dir` key, preserving `rider_name`/`unit_system` (ruling R59 Q5).
 /// Does not move existing files. `path` must be an absolute path the app
-/// can create the C4 §2 tree under; a relative path or an uncreatable path
-/// is `invalid_argument`. The new tree is created *before* `settings.json`
-/// is written — a failed create leaves nothing written.
+/// can create a `data` subdir under; a relative path or an uncreatable path
+/// is `invalid_argument`. That `data` subdir is created *before*
+/// `settings.json` is written — a failed create leaves nothing written.
+/// The **full** C4 §2 tree (`blobs/sha256/`, `sessions/`, `workbooks/`,
+/// `tracks/`, `tmp/quarantine/`) is completed immediately afterward, in
+/// this same call, as a side effect of the trailing
+/// `crate::paths::resolve_data_dir` call below re-reading the just-written
+/// override — the identical code path `get_data_dir`/app startup use, so
+/// there is no second, duplicated subdirectory list to keep in sync. This
+/// does *not* wait for the caller's restart; `restart_required` on the
+/// returned [`DataDirInfo`] reflects only that the *running* managed
+/// `state::DataDir` value still points at the old root until relaunch, not
+/// that the new root's tree is incomplete.
 fn set_data_dir_via(
     settings_path: &Path,
     app_data_dir: &Path,
@@ -512,6 +522,24 @@ mod tests {
     }
 
     #[test]
+    fn app_settings_dto_unit_system_serialises_to_the_literal_imperial_and_metric_strings() {
+        // Arrange
+        let imperial = AppSettingsDto { data_dir: None, rider_name: String::new(), unit_system: UnitSystem::Imperial };
+        let metric = AppSettingsDto { data_dir: None, rider_name: String::new(), unit_system: UnitSystem::Metric };
+
+        // Act
+        let imperial_json = serde_json::to_value(&imperial).unwrap();
+        let metric_json = serde_json::to_value(&metric).unwrap();
+
+        // Assert — the entire justification for typing `unit_system` as
+        // `UnitSystem` rather than a hand-rolled `String` mapping rests on
+        // this exact byte-for-byte wire shape (C3 §3.10:
+        // `"imperial" | "metric"`), not just "is a string".
+        assert_eq!(imperial_json["unit_system"], serde_json::json!("imperial"));
+        assert_eq!(metric_json["unit_system"], serde_json::json!("metric"));
+    }
+
+    #[test]
     fn set_settings_via_ignores_data_dir_in_the_argument() {
         // Arrange
         let app_config = temp_root();
@@ -618,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn set_data_dir_via_absolute_path_succeeds_and_creates_the_data_subdir() {
+    fn set_data_dir_via_absolute_path_succeeds_and_creates_the_full_c4_2_tree_at_the_new_root() {
         // Arrange
         let app_data = temp_root();
         let app_config = temp_root();
@@ -630,8 +658,18 @@ mod tests {
         // Act
         let info = set_data_dir_via(&path, &app_data, &app_config, &resolved, Some(new_root_str.clone())).unwrap();
 
-        // Assert
+        // Assert — the full C4 §2 tree, not just the pre-created `data`
+        // subdir: this is completed by `set_data_dir_via`'s own trailing
+        // `resolve_data_dir` call re-reading the just-written override, the
+        // same code path `get_data_dir`/startup use (no duplicated tree
+        // list). A future edit that dropped or reordered that call would
+        // fail this assertion even though `data/` alone would still exist.
         assert!(new_root.join("data").is_dir());
+        assert!(new_root.join("data/blobs/sha256").is_dir());
+        assert!(new_root.join("data/sessions").is_dir());
+        assert!(new_root.join("data/workbooks").is_dir());
+        assert!(new_root.join("data/tracks").is_dir());
+        assert!(new_root.join("data/tmp/quarantine").is_dir());
         assert_eq!(info.override_path, Some(new_root_str));
         assert!(info.restart_required);
     }
