@@ -5,5 +5,6 @@
 //! `idl-transport` and this lane's later core tasks (`workbook::merge`).
 //! `std::fs` only (CLAUDE.md §2).
 
+pub mod base_cache;
 pub mod diff;
 pub mod manifest;
