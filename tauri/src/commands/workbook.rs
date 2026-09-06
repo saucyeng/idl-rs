@@ -125,6 +125,27 @@ pub struct CellOutput {
     pub prose_spans: Vec<ProseSpan>,
 }
 
+/// C3 §3.4 `LapContext` (ruling R52 Q5, added post-sign 2026-09-05, ruling
+/// R59; same-session-only `overlay_laps` per lead ruling R64.1) — a per-call
+/// UI selection (ledger R41: not a property of the file), passed unchanged
+/// from `state/AppState.tsx`'s `selection.lapContext`. 1-based lap numbers,
+/// matching `LapSummary.lap_number`. `main_lap`/`overlay_laps` both `None`/
+/// empty is a valid "no selection" object, distinct from the argument's own
+/// absence at the command boundary but producing the same
+/// [`idl_rs::math::MathLapContext::empty`]-equivalent result (see
+/// `eval_workbook_via`'s doc comment).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LapContext {
+    /// The lap the workbook's lap-aware functions (`current_lap()`,
+    /// `sector_number()`, `lap_start_time(n)`, `lap_start_distance(n)`)
+    /// read. `None` designates no main lap.
+    pub main_lap: Option<u32>,
+    /// Laps `variance_time(ch)`/`variance_dist(ch)` compare the main lap
+    /// against. Same session only in wave 2 (R64.1); a future amendment
+    /// carries a `{ session_id, lap }[]` shape for cross-session overlay.
+    pub overlay_laps: Vec<u32>,
+}
+
 /// `save_workbook`'s return (C3 §3.4).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SaveResult {
@@ -294,16 +315,39 @@ fn empty_session_handle() -> SessionHandle {
 
 /// Transport-agnostic core of `eval_workbook`. `session_id = None` evaluates
 /// against [`empty_session_handle`] and [`MathLapContext::empty`] (ledger
-/// R41); `session_id = Some(id)` for an id that does not exist is a caller
-/// error (`not_found`), not a per-cell one.
-fn eval_workbook_via(data_dir: &Path, id: &str, session_id: Option<&str>) -> Result<Vec<CellOutput>, IpcError> {
+/// R41), and `lap_context` is ignored — there is no session to validate a
+/// lap selection against; `session_id = Some(id)` for an id that does not
+/// exist is a caller error (`not_found`), not a per-cell one.
+///
+/// `lap_context = None` reproduces today's behaviour exactly (byte-identical
+/// `CellOutput`s, see this module's `eval_workbook_via_lap_context_none_...`
+/// regression test): `MathLapContext` is built from `session_id`'s
+/// `session.json` own stored `laps[]`/`main_lap_number`, with no per-call
+/// override. `lap_context = Some(lc)` is a per-call UI selection (R41) that
+/// must resolve against that same `laps[]` — `lc.main_lap`/
+/// `lc.overlay_laps` naming a lap absent from `laps[]` rejects
+/// `invalid_argument` with `detail: { lap }` (C3 §3.4). `laps[]` is always
+/// empty today (lap indexing has not landed), so every non-empty selection
+/// rejects in practice — see [`crate::session_source::load_lap_context`]'s
+/// doc comment for the full resolution, including the same-session
+/// `overlay` construction (R64.1).
+fn eval_workbook_via(
+    data_dir: &Path,
+    id: &str,
+    session_id: Option<&str>,
+    lap_context: Option<&LapContext>,
+) -> Result<Vec<CellOutput>, IpcError> {
     let path = resolve_workbook_path(data_dir, id)?;
     let markdown = std::fs::read_to_string(&path)
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
     let (doc, structural) = parse_workbook(&markdown).map_err(fatal_parse_error)?;
 
     let (handle, lap_ctx) = match session_id {
-        Some(sid) => (load_session_handle(data_dir, sid)?, load_lap_context(data_dir, sid)),
+        Some(sid) => {
+            let handle = load_session_handle(data_dir, sid)?;
+            let lap_ctx = load_lap_context(data_dir, sid, &handle, lap_context)?;
+            (handle, lap_ctx)
+        }
         None => (empty_session_handle(), MathLapContext::empty()),
     };
 
@@ -533,14 +577,18 @@ pub fn read_workbook(id_or_path: String, data_dir: tauri::State<'_, DataDir>) ->
     read_workbook_via(&data_dir.0, &id_or_path)
 }
 
-/// C3 §3.4 `eval_workbook(id, session_id)`.
+/// C3 §3.4 `eval_workbook(id, session_id, lap_context)`. `lap_context` added
+/// post-sign (2026-09-05, ledger R59, R64.1) as an additive trailing
+/// argument — absent (`null` on the wire) reproduces today's behaviour
+/// exactly (C3 §5, no `_v2`).
 #[tauri::command]
 pub fn eval_workbook(
     id: String,
     session_id: Option<String>,
+    lap_context: Option<LapContext>,
     data_dir: tauri::State<'_, DataDir>,
 ) -> Result<Vec<CellOutput>, IpcError> {
-    eval_workbook_via(&data_dir.0, &id, session_id.as_deref())
+    eval_workbook_via(&data_dir.0, &id, session_id.as_deref(), lap_context.as_ref())
 }
 
 /// C3 §3.4 `save_workbook(id, markdown, based_on_hash)`.
@@ -580,6 +628,7 @@ mod tests {
 
     use idl_rs::session::{Channel, RawColumn, Session, SourceFormat};
     use idl_rs::store::parquet::write_session_parquet;
+    use idl_rs::store::session_json::{empty_session_json, write_session_json};
     use uuid::Uuid;
 
     fn temp_root() -> PathBuf {
@@ -888,7 +937,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let out = eval_workbook_via(&root, WB_ID, Some("s1")).unwrap();
+        let out = eval_workbook_via(&root, WB_ID, Some("s1"), None).unwrap();
 
         // Assert
         assert_eq!(out.len(), 1);
@@ -896,6 +945,33 @@ mod tests {
         assert_eq!(x.name, "x");
         assert!(x.error.is_none());
         assert_eq!(x.value.as_ref().unwrap().length, 3);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eval_workbook_via_lap_context_none_output_byte_identical_to_the_pre_task9_fixture() {
+        // Arrange — literal JSON captured from this exact seeded
+        // session+workbook by running this test's body against the
+        // pre-Task-9 `eval_workbook_via(&root, WB_ID, Some("s1"))` (two
+        // trailing args, no `lap_context`), before the `lap_context`
+        // parameter was added. `None` here must reproduce it exactly.
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0, 2.0, 3.0], vec![0, 100_000, 200_000]);
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [ChanA]\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+
+        // Act
+        let out = eval_workbook_via(&root, WB_ID, Some("s1"), None).unwrap();
+
+        // Assert
+        let json = serde_json::to_string(&out).unwrap();
+        assert_eq!(
+            json,
+            r#"[{"cell_id":"aaaaaaaa","kind":"math","value":null,"defs":[{"name":"x","label":null,"value":{"length":3,"has_t":true},"error":null}],"errors":[],"prose_before_html":"","prose_after_html":"","prose_spans":[]}]"#
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -912,7 +988,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let out = eval_workbook_via(&root, WB_ID, Some("s1")).unwrap();
+        let out = eval_workbook_via(&root, WB_ID, Some("s1"), None).unwrap();
 
         // Assert
         let x = &out[0].defs[0];
@@ -937,7 +1013,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let out = eval_workbook_via(&root, WB_ID, None).unwrap();
+        let out = eval_workbook_via(&root, WB_ID, None, None).unwrap();
 
         // Assert
         assert_eq!(out.len(), 2);
@@ -960,7 +1036,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let out = eval_workbook_via(&root, WB_ID, None).unwrap();
+        let out = eval_workbook_via(&root, WB_ID, None, None).unwrap();
 
         // Assert
         let x = &out[0].defs[0];
@@ -977,7 +1053,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let err = eval_workbook_via(&root, WB_ID, None).unwrap_err();
+        let err = eval_workbook_via(&root, WB_ID, None, None).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::WorkbookUnsupportedVersion);
@@ -995,13 +1071,81 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let out = eval_workbook_via(&root, WB_ID, Some("s1")).unwrap();
+        let out = eval_workbook_via(&root, WB_ID, Some("s1"), None).unwrap();
 
         // Assert
         let value = out[0].value.as_ref().unwrap();
         assert!(value.get("model").is_some());
         let results = value.get("results").unwrap().as_array().unwrap();
         assert_eq!(results[0][0]["value"], serde_json::json!(5.0));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eval_workbook_via_lap_context_main_lap_absent_from_session_json_laps_command_level_invalid_argument() {
+        // Arrange — session.json's laps[] is always empty today (lap
+        // indexing has not landed, C3 §3.4's "Note"), so any non-null
+        // `main_lap` is unresolvable.
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        write_session_json(&root, "s1", &empty_session_json("s1"), None).unwrap();
+        let markdown = format!("---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = 1\n```\n");
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let lap_context = LapContext { main_lap: Some(1), overlay_laps: Vec::new() };
+
+        // Act
+        let err = eval_workbook_via(&root, WB_ID, Some("s1"), Some(&lap_context)).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(err.detail, Some(serde_json::json!({ "lap": 1 })));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eval_workbook_via_lap_context_overlay_laps_absent_from_session_json_laps_command_level_invalid_argument_names_the_first_offender(
+    ) {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        write_session_json(&root, "s1", &empty_session_json("s1"), None).unwrap();
+        let markdown = format!("---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = 1\n```\n");
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let lap_context = LapContext { main_lap: None, overlay_laps: vec![2, 3] };
+
+        // Act
+        let err = eval_workbook_via(&root, WB_ID, Some("s1"), Some(&lap_context)).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(err.detail, Some(serde_json::json!({ "lap": 2 })));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eval_workbook_via_lap_context_none_and_explicit_empty_selection_produce_the_same_cell_output() {
+        // Arrange — `lap_context: None` (absent at the wire) and an
+        // explicit `Some(LapContext { main_lap: None, overlay_laps: [] })`
+        // ("no selection" object) are distinct wire values (C3 §3.4) but
+        // must behave identically here: neither names a lap, so both reach
+        // `MathLapContext::empty()`-equivalent bounds.
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0, 2.0, 3.0], vec![0, 100_000, 200_000]);
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [ChanA]\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let empty_selection = LapContext { main_lap: None, overlay_laps: Vec::new() };
+
+        // Act
+        let none_out = eval_workbook_via(&root, WB_ID, Some("s1"), None).unwrap();
+        let empty_out = eval_workbook_via(&root, WB_ID, Some("s1"), Some(&empty_selection)).unwrap();
+
+        // Assert
+        assert_eq!(serde_json::to_string(&none_out).unwrap(), serde_json::to_string(&empty_out).unwrap());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1019,7 +1163,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let out = eval_workbook_via(&root, WB_ID, None).unwrap();
+        let out = eval_workbook_via(&root, WB_ID, None, None).unwrap();
 
         // Assert -- expected HTML is built by calling render_prose_html
         // directly, not hand-written a second time.
