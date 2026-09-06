@@ -18,7 +18,7 @@ use idl_rs::math::MathLapContext;
 use idl_rs::session::handle::{SessionHandle, SessionMetaInput};
 use idl_rs::store::atomic::{sha256_hex, write_atomic, AtomicWriteErrorKind};
 use idl_rs::table::eval::evaluate_table;
-use idl_rs::workbook::v3::front_matter::parse_front_matter;
+use idl_rs::workbook::v3::front_matter::{parse_front_matter, render_front_matter, FrontMatter};
 use idl_rs::workbook::v3::{parse_workbook, render_prose_html, CellDoc, CellError, CellKindToken, WorkbookError};
 
 use crate::error::{IpcError, IpcErrorKind};
@@ -605,13 +605,18 @@ fn create_workbook_via(data_dir: &Path, name: &str) -> Result<WorkbookHandle, Ip
     let target = workbooks_dir.join(format!("{file_base}.idl1wb"));
 
     let id = uuid::Uuid::new_v4().to_string();
-    // Hand-built minimal front matter — no "empty `WorkbookDoc`" constructor
-    // exists yet in `idl_rs::workbook::v3::front_matter`/`mod.rs` (checked:
-    // that module only parses, it does not serialise). This string must stay
-    // in sync with C2 §1's front-matter grammar by hand; a maintenance note
-    // worth flagging, not a blocker (`parse_front_matter`'s own round-trip
-    // test below is what actually keeps it honest).
-    let markdown = format!("---\nid: {id}\nname: {name}\nversion: 3\n---\n");
+    // Minimal front matter, serialised by core (R75) — never hand-built YAML
+    // here. `render_front_matter` quotes/escapes `name` for us, so a name
+    // containing YAML-significant characters (`: `, ` #`, quotes, …) still
+    // round-trips through `parse_front_matter` unchanged.
+    let front_matter = FrontMatter {
+        id: id.clone(),
+        name: name.to_string(),
+        constants: HashMap::new(),
+        units: Default::default(),
+        version: 3,
+    };
+    let markdown = render_front_matter(&front_matter);
 
     write_atomic(data_dir, &target, markdown.as_bytes(), None).map_err(|e| match e.kind {
         AtomicWriteErrorKind::RenameConflict => {
@@ -1085,6 +1090,30 @@ mod tests {
         assert!(root.join("workbooks").join("Fork tuning-2.idl1wb").exists());
         assert_eq!(second.path, root.join("workbooks").join("Fork tuning-2.idl1wb").display().to_string());
         assert_ne!(first.id, second.id);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_workbook_via_an_adversarial_name_still_reads_back_with_the_same_name() {
+        // Arrange — review-task10 Critical / ledger R75: a hand-built
+        // `format!`-YAML front matter either fails to parse (an unquoted
+        // colon-space) or silently truncates (an unquoted space-then-hash)
+        // for exactly these two names; `render_front_matter` must not.
+        let root = temp_root();
+
+        // Act
+        let colon_handle = create_workbook_via(&root, "Wheel: front").unwrap();
+        let hash_handle = create_workbook_via(&root, "Test #1").unwrap();
+
+        // Assert
+        let colon_source = read_workbook_via(&root, &colon_handle.id).unwrap();
+        let (colon_front_matter, _) = parse_front_matter(&colon_source.markdown).unwrap();
+        assert_eq!(colon_front_matter.name, "Wheel: front");
+
+        let hash_source = read_workbook_via(&root, &hash_handle.id).unwrap();
+        let (hash_front_matter, _) = parse_front_matter(&hash_source.markdown).unwrap();
+        assert_eq!(hash_front_matter.name, "Test #1");
 
         let _ = std::fs::remove_dir_all(&root);
     }
