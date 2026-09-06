@@ -419,6 +419,78 @@ fn eval_workbook_via(
     Ok(out)
 }
 
+/// Transport-agnostic core of `fetch_host_channel` (C3 §3.4). Validates
+/// `budget` in `1..=65536` before touching the workbook/session at all (C3
+/// §3.4's binary-command validation-before-bytes rule) — a rejection here
+/// never opens the file or reads a session. Resolves the workbook + session
+/// via the same [`resolve_workbook_path`]/[`load_session_handle`]/
+/// [`load_lap_context`] path [`eval_workbook_via`] uses (not a fresh
+/// reimplementation), then evaluates the **whole** document via
+/// [`idl_rs::workbook::v3::eval_cells`] and picks `def_name` out of the
+/// resulting defs — no single-definition evaluation entry point exists in
+/// `idl_rs::workbook::v3::eval`/`resolve` today, and at wave-2 scale a
+/// document has at most a few dozen cells, so evaluating all of them is the
+/// correct scope for this task (a new single-definition entry point in
+/// `core` "for efficiency" is out of scope here).
+///
+/// Unlike [`eval_workbook_via`] (which never rejects the whole command for
+/// one cell's failure), this command **does** reject on `def_name`'s own
+/// evaluation failure — there is no partial result to return for the one
+/// channel actually requested. `lap_context` is not a `fetch_host_channel`
+/// argument (C3 §3.4's signature has none), so lap resolution always uses
+/// the session's own stored `laps[]`/`main_lap_number` (same as
+/// `eval_workbook`'s `lap_context = None` behaviour).
+///
+/// # Errors
+/// [`IpcErrorKind::InvalidArgument`] for `budget` outside `1..=65536`;
+/// [`IpcErrorKind::NotFound`] for an unknown `workbook_id` or a `def_name`
+/// that names no definition in the document; the `math_*` kinds
+/// ([`From<idl_rs::math::MathEvalError>`]) when `def_name`'s own definition
+/// fails to evaluate; [`IpcErrorKind::Io`] for a file-read failure;
+/// [`IpcErrorKind::Internal`] for the (unreachable in practice) case of a
+/// def with neither a value nor an error.
+fn fetch_host_channel_via(
+    data_dir: &Path,
+    id: &str,
+    session_id: Option<&str>,
+    def_name: &str,
+    budget: u32,
+) -> Result<Vec<u8>, IpcError> {
+    if !(1..=65536).contains(&budget) {
+        return Err(IpcError::new(IpcErrorKind::InvalidArgument, format!("budget {budget} outside 1..=65536")));
+    }
+
+    let path = resolve_workbook_path(data_dir, id)?;
+    let markdown = std::fs::read_to_string(&path)
+        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
+    let (doc, structural) = parse_workbook(&markdown).map_err(fatal_parse_error)?;
+
+    let (handle, lap_ctx) = match session_id {
+        Some(sid) => {
+            let handle = load_session_handle(data_dir, sid)?;
+            let lap_ctx = load_lap_context(data_dir, sid, &handle, None)?;
+            (handle, lap_ctx)
+        }
+        None => (empty_session_handle(), MathLapContext::empty()),
+    };
+
+    let cell_results = idl_rs::workbook::v3::eval_cells(&doc, &structural, &handle, &lap_ctx);
+
+    let def = cell_results.iter().flat_map(|c| c.defs.iter()).find(|d| d.name == def_name).ok_or_else(|| {
+        IpcError::new(IpcErrorKind::NotFound, format!("no definition named '{def_name}' in workbook '{id}'"))
+    })?;
+
+    if let Some(err) = &def.error {
+        return Err(IpcError::from(err.clone()));
+    }
+
+    let hc = def.value.as_ref().ok_or_else(|| {
+        IpcError::new(IpcErrorKind::Internal, format!("definition '{def_name}' has neither a value nor an error"))
+    })?;
+
+    Ok(idl_rs::workbook::v3::encode_host_channel_idlh(hc, budget))
+}
+
 /// A `table` cell's `value` (C3 §3.4): `{ model, results }` when a session is
 /// bound and the cell's JSON parsed; `null` otherwise (no session bound —
 /// nothing to evaluate against, not an error — or the JSON didn't parse,
@@ -639,6 +711,24 @@ pub fn eval_workbook(
     data_dir: tauri::State<'_, DataDir>,
 ) -> Result<Vec<CellOutput>, IpcError> {
     eval_workbook_via(&data_dir.0, &id, session_id.as_deref(), lap_context.as_ref())
+}
+
+/// C3 §3.4 `fetch_host_channel(workbook_id, session_id, def_name, budget)` —
+/// evaluates the named `math` definition and returns its sample data as
+/// `IDLH` v1 raw bytes (see [`idl_rs::workbook::v3::encode_host_channel_idlh`]),
+/// not JSON — the binary counterpart to `eval_workbook`'s `HostChannelRef`
+/// marker. See [`fetch_host_channel_via`] for the full resolution and error
+/// mapping.
+#[tauri::command]
+pub fn fetch_host_channel(
+    data_dir: tauri::State<'_, DataDir>,
+    workbook_id: String,
+    session_id: Option<String>,
+    def_name: String,
+    budget: u32,
+) -> Result<tauri::ipc::Response, IpcError> {
+    let bytes = fetch_host_channel_via(&data_dir.0, &workbook_id, session_id.as_deref(), &def_name, budget)?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// C3 §3.4 `save_workbook(id, markdown, based_on_hash)`.
@@ -1440,6 +1530,118 @@ mod tests {
             Err(e) => assert_eq!(e.kind, IpcErrorKind::NotFound),
             Ok(_) => panic!("expected not_found for an unresolvable id"),
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- Step 4: fetch_host_channel ----
+
+    #[test]
+    fn fetch_host_channel_via_budget_zero_invalid_argument() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let err = fetch_host_channel_via(&root, WB_ID, None, "x", 0).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_host_channel_via_budget_over_65536_invalid_argument() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let err = fetch_host_channel_via(&root, WB_ID, None, "x", 65537).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_host_channel_via_unknown_workbook_id_not_found() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let err = fetch_host_channel_via(&root, "nope", None, "x", 100).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_host_channel_via_unknown_def_name_on_a_real_workbook_not_found() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0, 2.0, 3.0], vec![0, 100_000, 200_000]);
+        let markdown =
+            format!("---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [ChanA]\n```\n");
+        write_workbook(&root, "test.idl1wb", &markdown);
+
+        // Act
+        let err = fetch_host_channel_via(&root, WB_ID, Some("s1"), "nope", 100).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_host_channel_via_a_definition_that_fails_to_evaluate_rejects_with_its_math_kind_not_a_partial_response()
+    {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [NopeChannel]\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+
+        // Act
+        let err = fetch_host_channel_via(&root, WB_ID, Some("s1"), "x", 100).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::MathUnknownChannel);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_host_channel_via_a_successful_fetch_returns_idlh_bytes_matching_the_named_defs_channel() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0, 2.0, 3.0], vec![0, 100_000, 200_000]);
+        let markdown =
+            format!("---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [ChanA]\n```\n");
+        write_workbook(&root, "test.idl1wb", &markdown);
+
+        // Act
+        let bytes = fetch_host_channel_via(&root, WB_ID, Some("s1"), "x", 65536).unwrap();
+
+        // Assert — decode the header manually at the documented offsets.
+        assert_eq!(&bytes[0..4], b"IDLH");
+        let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        let flags = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+        let length = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let t_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        assert_eq!(version, 1);
+        assert_eq!(flags & 1, 1, "ChanA has a recorded time axis");
+        assert_eq!(length, 3);
+        assert_eq!(t_length, 3);
+        assert_eq!(bytes.len(), 24 + 3 * 8 + 3 * 8);
+
+        let v0 = f64::from_le_bytes(bytes[48..56].try_into().unwrap());
+        assert_eq!(v0, 1.0);
 
         let _ = std::fs::remove_dir_all(&root);
     }
