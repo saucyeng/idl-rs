@@ -15,8 +15,10 @@ use uuid::Uuid;
 
 use crate::store::atomic::{sha256_hex, write_atomic_with_retry};
 use crate::store::blob::{blob_path, verify_blob};
+use crate::store::catalog_read::WorkbookSummary;
 use crate::store::session_json::{read_session_json, LapJson, TrackVisitJson};
 use crate::track_artifact::read::read_track;
+use crate::workbook::v3::front_matter::parse_front_matter;
 
 /// Schema version this build of `idl-rs` writes/expects for `catalog.sqlite`
 /// (C4 §5). A mismatch on open means the catalog is deleted and rebuilt, not
@@ -269,9 +271,24 @@ pub fn rebuild_catalog(data_root: &Path) -> Result<RebuildReport, CatalogError> 
         }
     }
 
-    // 6. workbooks — L3/C2 owns the workbook format; this step is a no-op
-    // until `.idl1wb` front-matter parsing exists (out of L1's scope,
-    // design doc §10's L3 row). `workbooks` table stays empty until then.
+    // 6. workbooks — L3 shipped `.idl1wb` front-matter parsing (ruling R87):
+    // walk `workbooks/*.idl1wb`, parse each file's front matter for
+    // `workbook_id`/`name`, and upsert its row. A file that fails to parse
+    // is skipped and reported, not inserted (same non-fatal-per-entity rule
+    // as steps 2/3 above).
+    let workbooks_dir = data_root.join("workbooks");
+    if workbooks_dir.is_dir() {
+        for entry in std::fs::read_dir(&workbooks_dir).map_err(io_err)?.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("idl1wb") {
+                continue;
+            }
+            match index_workbook_file(&conn, &path) {
+                Ok(()) => report.workbooks_indexed += 1,
+                Err(e) => report.skipped.push(format!("{}: {e}", path.display())),
+            }
+        }
+    }
 
     // 7. schema version already set in create_schema.
 
@@ -854,6 +871,46 @@ pub fn delete_track(conn: &Connection, track_id: &str) -> Result<bool, CatalogEr
     Ok(rows_deleted > 0)
 }
 
+/// Inserts or updates one `workbooks` row (C4 §5, ruling R87) keyed on
+/// `workbook_id` — a rename of the file keeps the id, so a later upsert with
+/// the same `workbook_id` but a different `file_name`/`name` updates the
+/// existing row rather than creating a second one. Called by
+/// [`rebuild_catalog`]'s step 6 and by `idl-rs-tauri`'s `create_workbook`/
+/// `save_workbook` commands right after their own atomic write, so
+/// `list_workbooks` (C3 §3.2) reflects a new/edited workbook without waiting
+/// for the next rebuild.
+pub fn upsert_workbook(conn: &Connection, row: &WorkbookSummary) -> Result<(), CatalogError> {
+    conn.execute(
+        "INSERT INTO workbooks (workbook_id, file_name, name, updated_at_ms, size_bytes) VALUES (?1,?2,?3,?4,?5) \
+         ON CONFLICT(workbook_id) DO UPDATE SET file_name = excluded.file_name, name = excluded.name, \
+         updated_at_ms = excluded.updated_at_ms, size_bytes = excluded.size_bytes",
+        rusqlite::params![row.workbook_id, row.file_name, row.name, row.updated_at_ms, row.size_bytes as i64],
+    )?;
+    Ok(())
+}
+
+/// Parses `path`'s front matter for `workbook_id`/`name`, reads its own file
+/// metadata for `updated_at_ms` (mtime) and `size_bytes`, and upserts the
+/// row. `file_name` is the file's own stem, not anything from the front
+/// matter (C4 §2: `file_name` names the file; `id`/`name` come from inside
+/// it). Returns the failure's message on a parse error — the caller
+/// ([`rebuild_catalog`]'s step 6) reports and skips, it does not abort the
+/// scan (CLAUDE.md §5).
+fn index_workbook_file(conn: &Connection, path: &Path) -> Result<(), String> {
+    let markdown = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let (front_matter, _) = parse_front_matter(&markdown).map_err(|e| e.to_string())?;
+    let file_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    let row = WorkbookSummary {
+        workbook_id: front_matter.id,
+        file_name,
+        name: front_matter.name,
+        updated_at_ms: file_mtime_ms(&meta),
+        size_bytes: meta.len(),
+    };
+    upsert_workbook(conn, &row).map_err(|e| e.to_string())
+}
+
 fn io_err(e: std::io::Error) -> CatalogError {
     CatalogError { kind: CatalogErrorKind::Io, message: e.to_string() }
 }
@@ -1017,6 +1074,91 @@ mod tests {
 
         // Assert
         assert_eq!(report, RebuildReport::default());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebuild_catalog_indexes_two_valid_workbooks_and_skips_one_malformed() {
+        // Arrange — C4 §5 step 6: two valid `.idl1wb` front-matter files and
+        // one that fails to parse (no `---`-delimited block at all).
+        use crate::workbook::v3::front_matter::{render_front_matter, FrontMatter};
+
+        let root = temp_root();
+        let workbooks_dir = root.join("workbooks");
+        std::fs::create_dir_all(&workbooks_dir).unwrap();
+        let fm_a = FrontMatter {
+            id: "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d".to_string(),
+            name: "Fork tuning".to_string(),
+            constants: Default::default(),
+            units: Default::default(),
+            version: 3,
+        };
+        let fm_b = FrontMatter {
+            id: "1a2b3c4d-4b6a-4f1c-9c3d-2a7e8f9b0c1d".to_string(),
+            name: "Session review".to_string(),
+            constants: Default::default(),
+            units: Default::default(),
+            version: 3,
+        };
+        std::fs::write(workbooks_dir.join("Fork tuning.idl1wb"), render_front_matter(&fm_a)).unwrap();
+        std::fs::write(workbooks_dir.join("Session review.idl1wb"), render_front_matter(&fm_b)).unwrap();
+        std::fs::write(workbooks_dir.join("Broken.idl1wb"), b"not front matter at all").unwrap();
+
+        // Act
+        let report = rebuild_catalog(&root).unwrap();
+
+        // Assert
+        assert_eq!(report.workbooks_indexed, 2);
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].contains("Broken.idl1wb"));
+
+        let rows = crate::store::catalog_read::list_workbooks(&root).unwrap();
+        assert_eq!(rows.len(), 2);
+        // C3 §3.2 `list_workbooks` orders by `name` ASC.
+        assert_eq!(rows[0].name, "Fork tuning");
+        assert_eq!(rows[0].workbook_id, "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d");
+        assert_eq!(rows[0].file_name, "Fork tuning");
+        assert_eq!(rows[1].name, "Session review");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upsert_workbook_a_rename_keeps_the_id() {
+        // Arrange
+        let root = temp_root();
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+        create_schema(&conn).unwrap();
+        let row = crate::store::catalog_read::WorkbookSummary {
+            workbook_id: "wb-1".to_string(),
+            file_name: "Old name".to_string(),
+            name: "Old name".to_string(),
+            updated_at_ms: 1000,
+            size_bytes: 10,
+        };
+        upsert_workbook(&conn, &row).unwrap();
+
+        // Act — same `workbook_id`, new `file_name`/`name` (a rename).
+        let renamed = crate::store::catalog_read::WorkbookSummary {
+            workbook_id: "wb-1".to_string(),
+            file_name: "New name".to_string(),
+            name: "New name".to_string(),
+            updated_at_ms: 2000,
+            size_bytes: 20,
+        };
+        upsert_workbook(&conn, &renamed).unwrap();
+
+        // Assert — one row, updated in place.
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM workbooks", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+        let (file_name, updated_at_ms): (String, i64) = conn
+            .query_row("SELECT file_name, updated_at_ms FROM workbooks WHERE workbook_id = 'wb-1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(file_name, "New name");
+        assert_eq!(updated_at_ms, 2000);
 
         let _ = std::fs::remove_dir_all(&root);
     }

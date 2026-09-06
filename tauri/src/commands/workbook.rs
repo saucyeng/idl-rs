@@ -569,9 +569,53 @@ fn save_workbook_via(
         AtomicWriteErrorKind::Io => IpcError::new(IpcErrorKind::Io, e.message),
     })?;
 
+    // Step 6 (ruling R87): keep the `workbooks` catalog row current so
+    // `list_workbooks` reflects this save without waiting for the next
+    // rebuild. Never fails the save — `SaveResult` (C3 §3.4) has no warning
+    // field for it, so a problem here is logged, not returned.
+    index_workbook_after_write(data_dir, &target, &doc.id, &doc.name);
+
     let saved_utc_ms =
         SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
     Ok(SaveResult { hash, saved_utc_ms })
+}
+
+/// After writing `target` (a `.idl1wb` file, from `create_workbook_via` or
+/// `save_workbook_via`), upserts its `workbooks` catalog row
+/// (`idl_rs::store::catalog::upsert_workbook`, ruling R87) — mirrors
+/// `commands/catalog.rs`'s `save_track_via`, which does the same
+/// after-write upsert for `tracks`. Never touches a `catalog.sqlite` that
+/// doesn't already exist (C4 §5's incremental-indexing rule: these
+/// after-write upserts keep an existing catalog current, they don't create
+/// one) and never fails the caller — a read/parse/SQL problem here is
+/// logged and swallowed, since neither `WorkbookHandle` nor `SaveResult`
+/// (C3 §3.4) has a warning field to carry it on.
+fn index_workbook_after_write(data_dir: &Path, target: &Path, workbook_id: &str, name: &str) {
+    let catalog_path = data_dir.join("catalog.sqlite");
+    if !catalog_path.is_file() {
+        return;
+    }
+    let file_name = target.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+    let result: Result<(), String> = std::fs::metadata(target).map_err(|e| e.to_string()).and_then(|meta| {
+        let row = idl_rs::store::catalog_read::WorkbookSummary {
+            workbook_id: workbook_id.to_string(),
+            file_name,
+            name: name.to_string(),
+            updated_at_ms: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+            size_bytes: meta.len(),
+        };
+        idl_rs::store::catalog::open_catalog(&catalog_path)
+            .map_err(|e| e.to_string())
+            .and_then(|conn| idl_rs::store::catalog::upsert_workbook(&conn, &row).map_err(|e| e.to_string()))
+    });
+    if let Err(e) = result {
+        eprintln!("workbook catalog index failed (non-fatal, the workbook save already succeeded): {e}");
+    }
 }
 
 /// Transport-agnostic core of `create_workbook` (C3 §3.4). Mints a UUIDv4
@@ -625,6 +669,9 @@ fn create_workbook_via(data_dir: &Path, name: &str) -> Result<WorkbookHandle, Ip
         }
         AtomicWriteErrorKind::Io => IpcError::new(IpcErrorKind::Io, e.message),
     })?;
+
+    // Ruling R87 — see `save_workbook_via`'s own call for the full rationale.
+    index_workbook_after_write(data_dir, &target, &id, name);
 
     Ok(WorkbookHandle { id, name: name.to_string(), path: target.display().to_string(), cell_count: 0 })
 }
@@ -1152,6 +1199,94 @@ mod tests {
         let hash_source = read_workbook_via(&root, &hash_handle.id).unwrap();
         let (hash_front_matter, _) = parse_front_matter(&hash_source.markdown).unwrap();
         assert_eq!(hash_front_matter.name, "Test #1");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_workbook_via_upserts_a_workbooks_row_when_a_catalog_already_exists() {
+        // Arrange — ruling R87: `create_workbook_via` indexes its own row
+        // right after the write, so `list_workbooks` shows it with no
+        // rebuild.
+        let root = temp_root();
+        idl_rs::store::catalog::rebuild_catalog(&root).unwrap();
+
+        // Act
+        let handle = create_workbook_via(&root, "Fork tuning").unwrap();
+
+        // Assert
+        let rows = idl_rs::store::catalog_read::list_workbooks(&root).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].workbook_id, handle.id);
+        assert_eq!(rows[0].name, "Fork tuning");
+        assert_eq!(rows[0].file_name, "Fork tuning");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_workbook_via_no_catalog_yet_still_succeeds_no_catalog_is_created() {
+        // Arrange — C4 §5's incremental-indexing rule: never creates a
+        // catalog that doesn't already exist.
+        let root = temp_root();
+
+        // Act
+        let handle = create_workbook_via(&root, "Fork tuning").unwrap();
+
+        // Assert
+        assert!(!handle.id.is_empty());
+        assert!(!root.join("catalog.sqlite").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_workbook_via_upserts_a_workbooks_row_when_a_catalog_already_exists() {
+        // Arrange
+        let root = temp_root();
+        idl_rs::store::catalog::rebuild_catalog(&root).unwrap();
+        let hashes = ExpectedHashSet::new();
+        let markdown = two_cell_markdown();
+
+        // Act
+        save_workbook_via(&root, &hashes, WB_ID, &markdown, None).unwrap();
+
+        // Assert
+        let rows = idl_rs::store::catalog_read::list_workbooks(&root).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].workbook_id, WB_ID);
+        assert_eq!(rows[0].name, "Fork tuning");
+        assert_eq!(rows[0].file_name, "Fork tuning");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_workbook_via_a_front_matter_name_edit_updates_the_same_workbook_id_row_in_place() {
+        // Arrange — a `name` edit alone does not move the file
+        // (`resolve_workbook_path` finds it by scanning for `id`, so the
+        // second save still targets the original `Fork tuning.idl1wb`); the
+        // catalog row for that `workbook_id` is updated in place, not
+        // duplicated (the id-keyed `ON CONFLICT` `upsert_workbook` relies
+        // on for an out-of-band file rename, exercised directly in
+        // `idl-rs`'s own `store::catalog::tests::upsert_workbook_a_rename_
+        // keeps_the_id`).
+        let root = temp_root();
+        idl_rs::store::catalog::rebuild_catalog(&root).unwrap();
+        let hashes = ExpectedHashSet::new();
+        let first = two_cell_markdown();
+        let first_save = save_workbook_via(&root, &hashes, WB_ID, &first, None).unwrap();
+        let renamed = format!("---\nid: {WB_ID}\nname: Fork tuning v2\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = 1\n```\n");
+
+        // Act
+        save_workbook_via(&root, &hashes, WB_ID, &renamed, Some(&first_save.hash)).unwrap();
+
+        // Assert
+        let rows = idl_rs::store::catalog_read::list_workbooks(&root).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].workbook_id, WB_ID);
+        assert_eq!(rows[0].name, "Fork tuning v2");
+        assert_eq!(rows[0].file_name, "Fork tuning");
 
         let _ = std::fs::remove_dir_all(&root);
     }
