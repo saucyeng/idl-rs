@@ -125,6 +125,12 @@ pub enum IpcErrorKind {
     /// from a real `AckCode` yet. Device: `device_control` (see the
     /// `// TODO(idl0):` at its `send_command` call site).
     DeviceRejected,
+    /// `ConfigErrorKind::Parse` — Device: `preview_channel_registry` (C3 §3.8,
+    /// malformed `idl0_config.json` JSON or a required field missing).
+    ConfigParse,
+    /// `ConfigErrorKind::UnsupportedVersion` — Device: `preview_channel_registry`
+    /// (C3 §3.8, `config_version` exceeds `DeviceConfig::SUPPORTED_VERSION`).
+    ConfigUnsupportedVersion,
 }
 
 /// One JSON error crossing every fallible command (C3 §2). `detail`'s shape

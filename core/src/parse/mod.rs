@@ -12,6 +12,7 @@
 
 pub mod reader;
 pub mod records;
+pub mod registry_preview;
 pub mod v3;
 
 #[cfg(any(test, feature = "test-fixtures"))]
