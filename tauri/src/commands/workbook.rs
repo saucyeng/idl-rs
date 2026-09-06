@@ -501,6 +501,56 @@ fn save_workbook_via(
     Ok(SaveResult { hash, saved_utc_ms })
 }
 
+/// Transport-agnostic core of `create_workbook` (C3 §3.4). Mints a UUIDv4
+/// id, writes a minimal valid v3 document (front matter only, `id`/`name`/
+/// `version: 3`, no cells/constants), and returns the new
+/// [`WorkbookHandle`]. `file_name` is derived from `name`, filesystem-
+/// sanitised, never from the minted id — identical rule to
+/// [`save_workbook_via`]'s Step 2, and reuses the same
+/// [`sanitize_file_name_stem`]/[`idl_rs::session::filename::unique_file_base`]
+/// pair rather than a second sanitiser.
+fn create_workbook_via(data_dir: &Path, name: &str) -> Result<WorkbookHandle, IpcError> {
+    if name.trim().is_empty() {
+        return Err(IpcError::new(IpcErrorKind::InvalidArgument, "workbook name must not be empty"));
+    }
+
+    let stem = sanitize_file_name_stem(name);
+    if stem.is_empty() {
+        // Defensive only — `sanitize_file_name_stem` never actually returns
+        // an empty string today (it falls back to `"workbook"` for both the
+        // empty-after-trim and reserved-device-name cases), so this branch
+        // is unreachable with the current sanitiser. Kept to match C3
+        // §3.4's stated `invalid_argument` error for "a name that sanitises
+        // to an empty filename", in case that sanitiser's fallback ever
+        // changes.
+        return Err(IpcError::new(IpcErrorKind::InvalidArgument, "name sanitises to an empty filename"));
+    }
+
+    let workbooks_dir = data_dir.join("workbooks");
+    let file_base = idl_rs::session::filename::unique_file_base(&stem, |candidate| {
+        workbooks_dir.join(format!("{candidate}.idl1wb")).exists()
+    });
+    let target = workbooks_dir.join(format!("{file_base}.idl1wb"));
+
+    let id = uuid::Uuid::new_v4().to_string();
+    // Hand-built minimal front matter — no "empty `WorkbookDoc`" constructor
+    // exists yet in `idl_rs::workbook::v3::front_matter`/`mod.rs` (checked:
+    // that module only parses, it does not serialise). This string must stay
+    // in sync with C2 §1's front-matter grammar by hand; a maintenance note
+    // worth flagging, not a blocker (`parse_front_matter`'s own round-trip
+    // test below is what actually keeps it honest).
+    let markdown = format!("---\nid: {id}\nname: {name}\nversion: 3\n---\n");
+
+    write_atomic(data_dir, &target, markdown.as_bytes(), None).map_err(|e| match e.kind {
+        AtomicWriteErrorKind::RenameConflict => {
+            IpcError::new(IpcErrorKind::Internal, format!("new workbook path already existed: {}", e.message))
+        }
+        AtomicWriteErrorKind::Io => IpcError::new(IpcErrorKind::Io, e.message),
+    })?;
+
+    Ok(WorkbookHandle { id, name: name.to_string(), path: target.display().to_string(), cell_count: 0 })
+}
+
 /// Cell ids affected by an edit between two parses (decided here — L3 ships
 /// no diff function, `grep core/src/workbook/v3 diff`: no hits): every id
 /// whose `raw_fence_body` changed, plus every id present in exactly one of
@@ -601,6 +651,13 @@ pub fn save_workbook(
     hashes: tauri::State<'_, Hashes>,
 ) -> Result<SaveResult, IpcError> {
     save_workbook_via(&data_dir.0, &hashes.0, &id, &markdown, based_on_hash.as_deref())
+}
+
+/// C3 §3.4 `create_workbook(name)`. Mints a new workbook file and returns
+/// its [`WorkbookHandle`]; see [`create_workbook_via`].
+#[tauri::command]
+pub fn create_workbook(name: String, data_dir: tauri::State<'_, DataDir>) -> Result<WorkbookHandle, IpcError> {
+    create_workbook_via(&data_dir.0, &name)
 }
 
 /// C3 §3.4 `watch_workbook(id, channel)`. Parks the started watcher in
@@ -837,6 +894,107 @@ mod tests {
         // Assert
         assert!(root.join("workbooks").join("Fork tuning.idl1wb").exists());
         assert!(root.join("workbooks").join("Fork tuning-2.idl1wb").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- Step 10: create_workbook ----
+
+    #[test]
+    fn create_workbook_via_a_fresh_name_writes_a_minimal_document_that_parses_back_with_matching_front_matter() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let handle = create_workbook_via(&root, "Fork tuning").unwrap();
+
+        // Assert
+        let target = root.join("workbooks").join("Fork tuning.idl1wb");
+        assert_eq!(handle.path, target.display().to_string());
+        assert_eq!(handle.name, "Fork tuning");
+        assert_eq!(handle.cell_count, 0);
+
+        let markdown = std::fs::read_to_string(&target).unwrap();
+        let (front_matter, _) = parse_front_matter(&markdown).unwrap();
+        assert_eq!(front_matter.id, handle.id);
+        assert_eq!(front_matter.name, "Fork tuning");
+        assert_eq!(front_matter.version, 3);
+        let (doc, _) = parse_workbook(&markdown).unwrap();
+        assert_eq!(doc.cells.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_workbook_via_an_empty_name_invalid_argument_and_nothing_written() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let err = create_workbook_via(&root, "").unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert!(!root.join("workbooks").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_workbook_via_a_whitespace_only_name_invalid_argument_and_nothing_written() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let err = create_workbook_via(&root, "   ").unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert!(!root.join("workbooks").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_workbook_via_an_all_symbols_name_falls_back_to_the_shared_sanitisers_workbook_default_not_an_error() {
+        // Arrange — `sanitize_file_name_stem` trims only dots/whitespace at
+        // the edges after replacing disallowed characters, and `.` is one
+        // of its *allowed* characters, so an all-dots name ("...") is the
+        // input that actually reduces to an empty-after-trim stem (`"???"`
+        // instead sanitises to `"___"`, non-empty — verified empirically,
+        // matching this task's Step 1 instruction to confirm rather than
+        // assume). `sanitize_file_name_stem`'s own tested fallback then
+        // yields `"workbook"`, never an empty stem, so this input does not
+        // hit C3 §3.4's "name sanitises to an empty filename" error at all
+        // with the current shared sanitiser; documenting the actual
+        // behaviour rather than a scenario that cannot occur.
+        let root = temp_root();
+
+        // Act
+        let handle = create_workbook_via(&root, "...").unwrap();
+
+        // Assert
+        let target = root.join("workbooks").join("workbook.idl1wb");
+        assert_eq!(handle.path, target.display().to_string());
+        assert!(target.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_workbook_via_two_calls_with_the_same_name_the_second_gets_a_collision_suffix_and_distinct_ids() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let first = create_workbook_via(&root, "Fork tuning").unwrap();
+        let second = create_workbook_via(&root, "Fork tuning").unwrap();
+
+        // Assert
+        assert!(root.join("workbooks").join("Fork tuning.idl1wb").exists());
+        assert!(root.join("workbooks").join("Fork tuning-2.idl1wb").exists());
+        assert_eq!(second.path, root.join("workbooks").join("Fork tuning-2.idl1wb").display().to_string());
+        assert_ne!(first.id, second.id);
 
         let _ = std::fs::remove_dir_all(&root);
     }
