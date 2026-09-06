@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 
 use crate::import::hook::PostImportHook;
 use crate::import::ImporterError;
+use crate::session::handle::SessionHandle;
 use crate::session::{ParseError, Session};
 use crate::store::blob::{self, BlobStoreError};
+use crate::store::lap_index::{index_laps, LapIndexReport};
 use crate::store::parquet::{read_session_metadata, write_session_parquet, ParquetStoreError, SessionParquetMetadata};
 use crate::store::session_json::{empty_session_json, write_session_json, SessionJsonError};
 
@@ -186,8 +188,10 @@ pub enum ImportOutcome {
     Regenerated,
 }
 
-/// Outcome of one successful [`import_idl0`] call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Outcome of one successful [`import_idl0`] call. Not `Clone`/`PartialEq` —
+/// [`LapIndexReport`] carries neither, and nothing needs to compare or
+/// duplicate a whole report (tests compare individual fields instead).
+#[derive(Debug)]
 pub struct ImportReport {
     pub session_id: String,
     pub blob_sha256: String,
@@ -206,6 +210,16 @@ pub struct ImportReport {
     /// or the importer's own `crate::import::ImporterWarning`s on the
     /// [`import_file`] path. Never silently dropped (G0.6).
     pub import_warnings: Vec<String>,
+    /// Outcome of the import-time lap-index step (IDL0_SPEC §17.4), run on
+    /// every plan this function reaches (`Write`/`Regenerate`/`Skip` — not
+    /// `Collision`, which never produces a report at all). `None` only when
+    /// the step itself returned `Err`; see [`Self::lap_index_warning`].
+    pub lap_index: Option<LapIndexReport>,
+    /// Set to [`crate::store::lap_index::LapIndexError`]'s `Display` when the
+    /// lap-index step failed; the import itself still succeeds (this field
+    /// and [`Self::lap_index`] are never both `Some`). Recoverable by
+    /// `idl-rs rescan`.
+    pub lap_index_warning: Option<String>,
 }
 
 /// Imports one `.idl0` buffer into `data_root` (contract C4 §2 layout):
@@ -350,6 +364,21 @@ fn finish_import(
         false
     };
 
+    // Lap indexing (IDL0_SPEC §17.4), non-fatal (mirrors idl0's
+    // `_detectAndSaveVisits`): a failure here must not fail the import, and
+    // recovers on the next import or an explicit `rescan`. Runs with
+    // `force = false` on every plan reaching this point (`Collision` already
+    // returned above) — on `Skip` this costs one hash + one read and lets a
+    // session imported before this lane pick up laps on its next import.
+    // Building the handle from `session` (moved, not cloned) is why this is
+    // the last thing this function does with it — the sessions this pipeline
+    // imports are hundreds of MB, so a clone here is not an option.
+    let handle = SessionHandle::from_session(session);
+    let (lap_index, lap_index_warning) = match index_laps(data_root, &session_id, &handle, false) {
+        Ok(report) => (Some(report), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+
     Ok(ImportReport {
         session_id,
         blob_sha256,
@@ -358,14 +387,20 @@ fn finish_import(
         session_json_created,
         truncation_warning: None,
         import_warnings: warnings,
+        lap_index,
+        lap_index_warning,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gps::GpsFix;
+    use crate::laps::model::{Gate, LapTiming};
     use crate::parse::test_buffers::*;
     use crate::store::parquet::read_session_parquet;
+    use crate::store::session_json::read_session_json;
+    use crate::track_artifact::{write_track, Track};
     use uuid::Uuid;
 
     fn temp_root() -> PathBuf {
@@ -774,6 +809,165 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, ImportErrorKind::UnknownExtension);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- lap-index-at-import fixtures ---------------------------------------
+    //
+    // A there-and-back-and-there GPS track: 3 legs of 100 one-second
+    // trackpoints, lat sweeping 0.000→0.099→0.000→0.099 at a fixed longitude
+    // — the same geometry `store::lap_index`'s own tests use (not reachable
+    // from here: that module's fixtures live inside its own `#[cfg(test)]`),
+    // duplicated minimally rather than reached into, same precedent as
+    // `fit_crc16` above.
+
+    /// `2026-01-01T00:MM:SSZ` for `offset_secs` since midnight (never wraps
+    /// an hour for this fixture's < 300 s span).
+    fn iso_time(offset_secs: i64) -> String {
+        format!("2026-01-01T{:02}:{:02}:{:02}Z", offset_secs / 3600, (offset_secs % 3600) / 60, offset_secs % 60)
+    }
+
+    /// A GPX file crossing lat 0.05 three times over 300 s — enough for
+    /// `circuit_track_fixture`'s start/finish gate to detect 3 laps.
+    fn gpx_three_lap_bytes() -> Vec<u8> {
+        let mut trkpts = String::new();
+        for leg in 0..3i64 {
+            let up = leg % 2 == 0;
+            for i in 0..100i64 {
+                let lat = if up { i as f64 * 0.001 } else { 0.099 - i as f64 * 0.001 };
+                trkpts.push_str(&format!(
+                    "<trkpt lat=\"{lat}\" lon=\"0.0005\"><time>{}</time></trkpt>\n",
+                    iso_time(leg * 100 + i)
+                ));
+            }
+        }
+        format!("<gpx><trk><trkseg>\n{trkpts}</trkseg></trk></gpx>").into_bytes()
+    }
+
+    /// A circuit track whose reference polyline covers the same lat range as
+    /// [`gpx_three_lap_bytes`], with a start/finish gate at lat 0.05.
+    fn circuit_track_fixture(id: &str) -> Track {
+        let polyline: Vec<GpsFix> =
+            (0..=100).map(|i| GpsFix { timestamp_ms: i * 1000, lat: i as f64 * 0.001, lon: 0.0005 }).collect();
+        Track {
+            id: id.to_string(),
+            name: "Loop".to_string(),
+            venue: String::new(),
+            timing: Some(LapTiming::Circuit { start_finish: Gate { lat1: 0.05, lon1: -0.001, lat2: 0.05, lon2: 0.001 } }),
+            sector_gates: Vec::new(),
+            neutral_zones: Vec::new(),
+            reference_polyline: polyline,
+            created_at_ms: 0,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn import_file_gpx_with_matching_track_indexes_laps_into_session_json() {
+        // Arrange
+        let root = temp_root();
+        write_track(&root, &circuit_track_fixture("loop-1")).unwrap();
+        let bytes = gpx_three_lap_bytes();
+
+        // Act
+        let report = import_file(&root, "gpx", &bytes).unwrap();
+
+        // Assert
+        let lap_index = report.lap_index.as_ref().expect("lap_index should be Some on a successful step");
+        assert!(report.lap_index_warning.is_none());
+        assert_eq!(lap_index.visits_indexed, 1);
+        assert_eq!(lap_index.laps_indexed, 3);
+        let doc = read_session_json(&root.join("sessions").join(&report.session_id).join("session.json")).unwrap();
+        assert_eq!(doc.laps.len(), 3);
+        assert_eq!(doc.track_visits.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_file_gpx_with_no_tracks_dir_is_honest_empty_lap_index() {
+        // Arrange — no `tracks/` at all.
+        let root = temp_root();
+        let bytes = minimal_gpx_with_warning();
+
+        // Act
+        let report = import_file(&root, "gpx", &bytes).unwrap();
+
+        // Assert
+        let lap_index = report.lap_index.as_ref().unwrap();
+        assert_eq!(lap_index.laps_indexed, 0);
+        assert!(lap_index.warnings.is_empty());
+        let doc = read_session_json(&root.join("sessions").join(&report.session_id).join("session.json")).unwrap();
+        assert!(doc.laps.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_file_gpx_reimport_same_bytes_skips_lap_index_and_leaves_session_json_untouched() {
+        // Arrange
+        let root = temp_root();
+        write_track(&root, &circuit_track_fixture("loop-1")).unwrap();
+        let bytes = gpx_three_lap_bytes();
+        let first = import_file(&root, "gpx", &bytes).unwrap();
+        let sj_path = root.join("sessions").join(&first.session_id).join("session.json");
+        let bytes_before = std::fs::read(&sj_path).unwrap();
+
+        // Act — the `Skip` plan (same bytes, same build).
+        let second = import_file(&root, "gpx", &bytes).unwrap();
+
+        // Assert
+        assert_eq!(second.outcome, ImportOutcome::Skipped);
+        assert!(second.lap_index.as_ref().unwrap().skipped_up_to_date);
+        assert_eq!(std::fs::read(&sj_path).unwrap(), bytes_before);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_file_gpx_with_malformed_track_artifact_still_indexes_readable_tracks_and_warns() {
+        // Arrange — one valid `.idl0t`, one that isn't JSON.
+        let root = temp_root();
+        write_track(&root, &circuit_track_fixture("loop-1")).unwrap();
+        std::fs::write(root.join("tracks").join("bad.idl0t"), b"not json").unwrap();
+        let bytes = gpx_three_lap_bytes();
+
+        // Act
+        let report = import_file(&root, "gpx", &bytes).unwrap();
+
+        // Assert
+        let lap_index = report.lap_index.as_ref().unwrap();
+        assert_eq!(lap_index.laps_indexed, 3);
+        assert!(lap_index.warnings.iter().any(|w| w.contains("bad.idl0t")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_file_gpx_regenerate_plan_still_reindexes_laps() {
+        // Arrange — a stale `data.parquet` (older importer_version) already
+        // exists for this exact blob, so the next import takes the
+        // `Regenerate` plan.
+        let root = temp_root();
+        write_track(&root, &circuit_track_fixture("loop-1")).unwrap();
+        let bytes = gpx_three_lap_bytes();
+        let importer = crate::import::importer_for_extension("gpx").unwrap();
+        let blob_sha256 = crate::store::atomic::sha256_hex(&bytes);
+        let mut outcome = importer.import(&bytes, &blob_sha256).unwrap();
+        crate::session::synthesis::synthesize_base_channels(&mut outcome.session);
+        let written_blob = blob::write_blob(&root, &bytes).unwrap();
+        outcome.session.blob_sha256 = written_blob;
+        write_session_parquet(&root, &outcome.session, "0.0.1").unwrap();
+
+        // Act
+        let report = import_file(&root, "gpx", &bytes).unwrap();
+
+        // Assert
+        assert_eq!(report.outcome, ImportOutcome::Regenerated);
+        let lap_index = report.lap_index.as_ref().unwrap();
+        assert!(!lap_index.skipped_up_to_date);
+        assert_eq!(lap_index.laps_indexed, 3);
 
         let _ = std::fs::remove_dir_all(&root);
     }
