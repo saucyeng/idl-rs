@@ -39,6 +39,20 @@ impl From<AtomicWriteError> for TrackWriteError {
     }
 }
 
+/// Rejects a `track_id` that would escape `<data_root>/tracks/` once joined
+/// with `.idl0t` — a path separator (`/` or `\`) or a `..` segment. Shared by
+/// [`write_track`] and [`delete_track`], the only two functions that join a
+/// caller-supplied id onto a filesystem path.
+fn validate_track_id(track_id: &str) -> Result<(), TrackWriteError> {
+    if track_id.contains('/') || track_id.contains('\\') || track_id.contains("..") {
+        return Err(TrackWriteError {
+            kind: TrackWriteErrorKind::Io,
+            message: format!("track_id {track_id:?} is not a valid file name component"),
+        });
+    }
+    Ok(())
+}
+
 /// Serialises `track` to the `.idl0t` wire JSON shape (mirroring
 /// [`read_track`](crate::track_artifact::read::read_track) exactly, via the
 /// shared `TrackDto`) and writes it atomically to
@@ -46,8 +60,10 @@ impl From<AtomicWriteError> for TrackWriteError {
 /// the same id (last-write-wins, consistent with C4 §6's LWW-by-
 /// `updated_at_ms`) via [`write_atomic_with_retry`] (C4 §4 step 4).
 /// `track.created_at_ms`/`updated_at_ms` are written verbatim — the caller
-/// owns picking real timestamps.
+/// owns picking real timestamps. Rejects a `track_id` containing a path
+/// separator or a `..` segment before writing anything.
 pub fn write_track(data_root: &Path, track: &Track) -> Result<PathBuf, TrackWriteError> {
+    validate_track_id(&track.id)?;
     let artifact = TrackArtifact::from(track);
     let bytes = serde_json::to_vec_pretty(&artifact)
         .map_err(|e| TrackWriteError { kind: TrackWriteErrorKind::Encode, message: e.to_string() })?;
@@ -55,6 +71,21 @@ pub fn write_track(data_root: &Path, track: &Track) -> Result<PathBuf, TrackWrit
     let based_on = std::fs::read(&target).ok().map(|b| sha256_hex(&b));
     write_atomic_with_retry(data_root, &target, &bytes, based_on.as_deref(), |_current| bytes.clone())?;
     Ok(target)
+}
+
+/// Removes `<data_root>/tracks/<track_id>.idl0t`. `Ok(false)` when the file
+/// was already absent — not an error; the caller decides whether that is
+/// `not_found`. Touches no catalog and no `session.json`. Rejects a
+/// `track_id` containing a path separator or a `..` segment before touching
+/// the filesystem.
+pub fn delete_track(data_root: &Path, track_id: &str) -> Result<bool, TrackWriteError> {
+    validate_track_id(track_id)?;
+    let target = data_root.join("tracks").join(format!("{track_id}.idl0t"));
+    match std::fs::remove_file(&target) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(TrackWriteError { kind: TrackWriteErrorKind::Io, message: e.to_string() }),
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +206,78 @@ mod tests {
         // Assert
         assert_eq!(back.name, "B-Line");
         assert_eq!(back.updated_at_ms, 999);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_track_an_existing_artifact_removes_the_file_and_returns_ok_true() {
+        // Arrange
+        let root = temp_root();
+        let track = sample_track();
+        let path = write_track(&root, &track).unwrap();
+        assert!(path.exists());
+
+        // Act
+        let removed = delete_track(&root, &track.id).unwrap();
+
+        // Assert
+        assert!(removed);
+        assert!(!path.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_track_an_absent_id_returns_ok_false_and_removes_nothing_else() {
+        // Arrange
+        let root = temp_root();
+        let track = sample_track();
+        let path = write_track(&root, &track).unwrap();
+
+        // Act
+        let removed = delete_track(&root, "no-such-track").unwrap();
+
+        // Assert
+        assert!(!removed);
+        assert!(path.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_track_an_id_containing_a_path_separator_is_io_and_removes_nothing() {
+        // Arrange — a decoy file outside `tracks/` that a path-traversal
+        // join would otherwise be able to reach.
+        let root = temp_root();
+        let decoy = root.join("decoy.idl0t");
+        std::fs::write(&decoy, b"do not touch").unwrap();
+
+        // Act
+        let result = delete_track(&root, "../decoy");
+
+        // Assert
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, TrackWriteErrorKind::Io);
+        assert!(decoy.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_track_an_id_containing_dotdot_is_io_and_writes_nothing() {
+        // Arrange
+        let root = temp_root();
+        let mut track = sample_track();
+        track.id = "../escape".to_string();
+
+        // Act
+        let result = write_track(&root, &track);
+
+        // Assert
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, TrackWriteErrorKind::Io);
+        assert!(!root.join("tracks").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
