@@ -736,6 +736,43 @@ pub fn fetch_host_channel(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// One `list_math_builtins` catalog row (C3 §3.4, lead ruling R64.2,
+/// `runs/2026-09-03/decisions.md`): a wire-shape mapping of
+/// [`idl_rs::math::MathBuiltin`], `status` rendered as its two documented
+/// string values (`"implemented"` / `"not_implemented"`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MathBuiltinDto {
+    pub name: String,
+    /// The set of valid argument counts for `name` (more than one entry
+    /// when the function has more than one call form).
+    pub arity: Vec<u32>,
+    /// `"implemented"` or `"not_implemented"` (R64.2's wire enum; no
+    /// `unit_rule` field — dropped by that ruling, no source defines its
+    /// vocabulary).
+    pub status: String,
+}
+
+impl From<&idl_rs::math::MathBuiltin> for MathBuiltinDto {
+    fn from(b: &idl_rs::math::MathBuiltin) -> Self {
+        let status = match b.status {
+            idl_rs::math::MathBuiltinStatus::Implemented => "implemented",
+            idl_rs::math::MathBuiltinStatus::NotImplemented => "not_implemented",
+        };
+        Self { name: b.name.to_string(), arity: b.arity.to_vec(), status: status.to_string() }
+    }
+}
+
+/// C3 §3.4 `list_math_builtins()` (lead-added L8w Task 12b, spec-during,
+/// R64.2) — a thin pass-through over
+/// [`idl_rs::math::math_builtin_catalog`] for the notebook editor's
+/// function reference to verify itself against once at startup. Never
+/// fails — no device/session/file dependency, matching `engine_version`'s
+/// "no `Result`" precedent (C3 §3.1).
+#[tauri::command]
+pub fn list_math_builtins() -> Vec<MathBuiltinDto> {
+    idl_rs::math::math_builtin_catalog().iter().map(MathBuiltinDto::from).collect()
+}
+
 /// C3 §3.4 `save_workbook(id, markdown, based_on_hash)`.
 #[tauri::command]
 pub fn save_workbook(
@@ -1673,5 +1710,22 @@ mod tests {
         assert_eq!(v0, 1.0);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_math_builtins_returns_the_same_count_and_names_as_the_core_catalog() {
+        // Arrange
+        let core_catalog = idl_rs::math::math_builtin_catalog();
+
+        // Act
+        let dtos = list_math_builtins();
+
+        // Assert — a pass-through mapping test, not re-deriving the data
+        // (the core catalog's own tests own correctness of the data).
+        assert_eq!(dtos.len(), core_catalog.len());
+        for (dto, entry) in dtos.iter().zip(core_catalog.iter()) {
+            assert_eq!(dto.name, entry.name);
+            assert_eq!(dto.arity, entry.arity.to_vec());
+        }
     }
 }
