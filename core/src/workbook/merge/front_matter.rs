@@ -63,7 +63,10 @@ pub fn merge_front_matter(
     let _ = peer_name; // reserved for Task 5's marker-text rendering; unused here.
 
     if local.id != peer.id {
-        return Err(MergeError { local_id: local.id.clone(), peer_id: peer.id.clone() });
+        return Err(MergeError::IdMismatch { local_id: local.id.clone(), peer_id: peer.id.clone() });
+    }
+    if local.version != peer.version {
+        return Err(MergeError::VersionMismatch { local_version: local.version, peer_version: peer.version });
     }
 
     let mut warnings = Vec::new();
@@ -129,8 +132,28 @@ mod tests {
         let err = merge_front_matter(&local, &peer, &base, "peer-laptop").unwrap_err();
 
         // Assert
-        assert_eq!(err.local_id, ID);
-        assert_eq!(err.peer_id, "00000000-0000-4000-8000-000000000000");
+        assert_eq!(
+            err,
+            MergeError::IdMismatch {
+                local_id: ID.to_string(),
+                peer_id: "00000000-0000-4000-8000-000000000000".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn merge_front_matter_differing_versions_mergeerror_nothing_merged() {
+        // Arrange
+        let base = fm("Fork tuning", HashMap::new());
+        let local = fm("Fork tuning", HashMap::new());
+        let mut peer = fm("Fork tuning", HashMap::new());
+        peer.version = 2;
+
+        // Act
+        let err = merge_front_matter(&local, &peer, &base, "peer-laptop").unwrap_err();
+
+        // Assert
+        assert_eq!(err, MergeError::VersionMismatch { local_version: 3, peer_version: 2 });
     }
 
     #[test]

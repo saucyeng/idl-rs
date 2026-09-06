@@ -14,9 +14,13 @@ use super::{CellOutcome, MergeWarning};
 /// `Added` (absent from base, present in this side).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellState {
+    /// Present in `base`, byte-identical content on this side.
     Unchanged,
+    /// Present in `base`, different content on this side.
     Changed,
+    /// Absent from `base`, present on this side.
     Added,
+    /// Present in `base`, absent from this side.
     Deleted,
 }
 
@@ -250,6 +254,66 @@ mod tests {
         assert!(warnings.is_empty());
         assert_eq!(outcomes.get("aaaaaaaa"), Some(&CellOutcome::KeepLocal));
         assert_eq!(outcomes.get("bbbbbbbb"), Some(&CellOutcome::TakePeer));
+    }
+
+    #[test]
+    fn decide_cells_unchanged_on_both_sides_keeplocal() {
+        // Arrange
+        let base = doc(vec![cell("aaaaaaaa", "x = 1")]);
+        let local = doc(vec![cell("aaaaaaaa", "x = 1")]);
+        let peer = doc(vec![cell("aaaaaaaa", "x = 1")]);
+
+        // Act
+        let (outcomes, warnings) = decide_cells(&local, &peer, &base);
+
+        // Assert
+        assert!(warnings.is_empty());
+        assert_eq!(outcomes.get("aaaaaaaa"), Some(&CellOutcome::KeepLocal));
+    }
+
+    #[test]
+    fn decide_cells_unchanged_locally_changed_by_the_peer_takepeer() {
+        // Arrange
+        let base = doc(vec![cell("aaaaaaaa", "x = 1")]);
+        let local = doc(vec![cell("aaaaaaaa", "x = 1")]);
+        let peer = doc(vec![cell("aaaaaaaa", "x = 2")]);
+
+        // Act
+        let (outcomes, warnings) = decide_cells(&local, &peer, &base);
+
+        // Assert
+        assert!(warnings.is_empty());
+        assert_eq!(outcomes.get("aaaaaaaa"), Some(&CellOutcome::TakePeer));
+    }
+
+    #[test]
+    fn decide_cells_unchanged_locally_deleted_by_the_peer_drop() {
+        // Arrange
+        let base = doc(vec![cell("aaaaaaaa", "x = 1")]);
+        let local = doc(vec![cell("aaaaaaaa", "x = 1")]);
+        let peer = empty_doc();
+
+        // Act
+        let (outcomes, warnings) = decide_cells(&local, &peer, &base);
+
+        // Assert
+        assert!(warnings.is_empty());
+        assert_eq!(outcomes.get("aaaaaaaa"), Some(&CellOutcome::Drop));
+    }
+
+    #[test]
+    fn decide_cells_deleted_locally_unchanged_by_the_peer_drop() {
+        // Arrange
+        let base = doc(vec![cell("aaaaaaaa", "x = 1")]);
+        let local = empty_doc();
+        let peer = doc(vec![cell("aaaaaaaa", "x = 1")]);
+
+        // Act
+        let (outcomes, warnings) = decide_cells(&local, &peer, &base);
+
+        // Assert
+        assert!(warnings.is_empty());
+        assert_eq!(outcomes.get("aaaaaaaa"), Some(&CellOutcome::Drop));
     }
 
     #[test]

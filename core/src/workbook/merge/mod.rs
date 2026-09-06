@@ -77,24 +77,45 @@ pub enum MergeWarning {
     ConstantConflict { name: String, peer_value: String },
 }
 
-/// Front matter's `id` differs between `local` and `peer` (C2 §7.1) — not
-/// the same workbook, so sync must refuse to merge rather than silently
-/// overwrite one side with the other's unrelated document.
+/// Front matter's `id` or `version` differs between `local` and `peer` (C2
+/// §7.1) — either not the same workbook, or not the same schema version, so
+/// sync must refuse to merge rather than silently overwrite one side with
+/// the other's document.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergeError {
-    /// `local`'s front-matter `id`.
-    pub local_id: String,
-    /// `peer`'s front-matter `id`.
-    pub peer_id: String,
+pub enum MergeError {
+    /// `local.id != peer.id` — not the same workbook.
+    IdMismatch {
+        /// `local`'s front-matter `id`.
+        local_id: String,
+        /// `peer`'s front-matter `id`.
+        peer_id: String,
+    },
+    /// `local.version != peer.version`. Unreachable in practice today — the
+    /// landed parser is fatal on any front-matter `version` other than 3, so
+    /// two documents that both parsed successfully already agree — but kept
+    /// as C2 §7.1's named defensive check against a future relaxation of
+    /// that parser rule letting a real mismatch through unmerged and
+    /// unreported.
+    VersionMismatch {
+        /// `local`'s front-matter `version`.
+        local_version: u32,
+        /// `peer`'s front-matter `version`.
+        peer_version: u32,
+    },
 }
 
 impl fmt::Display for MergeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "workbook front-matter ids differ: local is '{}', peer is '{}' — not the same workbook",
-            self.local_id, self.peer_id
-        )
+        match self {
+            MergeError::IdMismatch { local_id, peer_id } => write!(
+                f,
+                "workbook front-matter ids differ: local is '{local_id}', peer is '{peer_id}' — not the same workbook"
+            ),
+            MergeError::VersionMismatch { local_version, peer_version } => write!(
+                f,
+                "workbook front-matter versions differ: local is {local_version}, peer is {peer_version}"
+            ),
+        }
     }
 }
 
@@ -443,8 +464,13 @@ mod merge_tests {
         let err = merge(&local, &peer, &base, "peer-laptop").unwrap_err();
 
         // Assert
-        assert_eq!(err.local_id, ID);
-        assert_eq!(err.peer_id, "00000000-0000-4000-8000-000000000000");
+        assert_eq!(
+            err,
+            MergeError::IdMismatch {
+                local_id: ID.to_string(),
+                peer_id: "00000000-0000-4000-8000-000000000000".to_string(),
+            }
+        );
     }
 
     #[test]
