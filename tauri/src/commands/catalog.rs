@@ -348,9 +348,89 @@ impl From<catalog_read::TrackSummary> for TrackSummary {
     }
 }
 
-/// C3 §3.2 `TrackDetail` — `get_track`'s return. The four fields C3 leaves
-/// `unknown` cross as raw JSON, exactly as `idl_rs::store::catalog_read`
-/// already lifted them.
+/// C3 §3.2 `Gate` — decimal degrees. The `.idl0t` file stores degrees x1e7
+/// (SPEC §17b.1); that scaling is a wire detail of the file, never of the
+/// IPC surface — core's `laps::model::Gate` is already decimal degrees
+/// (ruling R27).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GateWire {
+    pub lat1: f64,
+    pub lon1: f64,
+    pub lat2: f64,
+    pub lon2: f64,
+}
+
+impl From<&idl_rs::laps::model::Gate> for GateWire {
+    fn from(g: &idl_rs::laps::model::Gate) -> Self {
+        Self { lat1: g.lat1, lon1: g.lon1, lat2: g.lat2, lon2: g.lon2 }
+    }
+}
+
+/// C3 §3.2 `SectorGate`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SectorGateWire {
+    pub name: String,
+    pub gate: GateWire,
+}
+
+impl From<&idl_rs::laps::model::SectorGate> for SectorGateWire {
+    fn from(s: &idl_rs::laps::model::SectorGate) -> Self {
+        Self { name: s.name.clone(), gate: (&s.gate).into() }
+    }
+}
+
+/// C3 §3.2 `NeutralZone`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NeutralZoneWire {
+    pub name: String,
+    pub enter: GateWire,
+    pub exit: GateWire,
+}
+
+impl From<&idl_rs::laps::model::NeutralZone> for NeutralZoneWire {
+    fn from(z: &idl_rs::laps::model::NeutralZone) -> Self {
+        Self { name: z.name.clone(), enter: (&z.enter).into(), exit: (&z.exit).into() }
+    }
+}
+
+/// C3 §3.2 `GpsFix`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GpsFixWire {
+    pub timestamp_ms: i64,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+impl From<&idl_rs::gps::GpsFix> for GpsFixWire {
+    fn from(f: &idl_rs::gps::GpsFix) -> Self {
+        Self { timestamp_ms: f.timestamp_ms, lat: f.lat, lon: f.lon }
+    }
+}
+
+/// C3 §3.2 `LapTiming` — a sealed union, `kind: "circuit" | "point_to_point"`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LapTimingWire {
+    Circuit { start_finish: GateWire },
+    PointToPoint { start: GateWire, finish: GateWire },
+}
+
+impl From<&idl_rs::laps::model::LapTiming> for LapTimingWire {
+    fn from(t: &idl_rs::laps::model::LapTiming) -> Self {
+        match t {
+            idl_rs::laps::model::LapTiming::Circuit { start_finish } => {
+                LapTimingWire::Circuit { start_finish: start_finish.into() }
+            }
+            idl_rs::laps::model::LapTiming::PointToPoint { start, finish } => {
+                LapTimingWire::PointToPoint { start: start.into(), finish: finish.into() }
+            }
+        }
+    }
+}
+
+/// C3 §3.2 `TrackDetail` — `get_track`'s return. **REVISED (2026-09-06, L8x,
+/// ruling R86)** — the four fields C3 §6 open question 10 left `unknown` are
+/// now typed, decimal degrees on the wire.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TrackDetail {
     pub track_id: String,
@@ -358,10 +438,10 @@ pub struct TrackDetail {
     pub venue_name: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    pub lap_timing: serde_json::Value,
-    pub neutral_zones: serde_json::Value,
-    pub sector_gates: serde_json::Value,
-    pub reference_polyline: serde_json::Value,
+    pub lap_timing: Option<LapTimingWire>,
+    pub neutral_zones: Vec<NeutralZoneWire>,
+    pub sector_gates: Vec<SectorGateWire>,
+    pub reference_polyline: Vec<GpsFixWire>,
 }
 
 impl From<catalog_read::TrackDetail> for TrackDetail {
@@ -372,10 +452,10 @@ impl From<catalog_read::TrackDetail> for TrackDetail {
             venue_name: t.venue_name,
             created_at_ms: t.created_at_ms,
             updated_at_ms: t.updated_at_ms,
-            lap_timing: t.lap_timing,
-            neutral_zones: t.neutral_zones,
-            sector_gates: t.sector_gates,
-            reference_polyline: t.reference_polyline,
+            lap_timing: t.lap_timing.as_ref().map(Into::into),
+            neutral_zones: t.neutral_zones.iter().map(Into::into).collect(),
+            sector_gates: t.sector_gates.iter().map(Into::into).collect(),
+            reference_polyline: t.reference_polyline.iter().map(Into::into).collect(),
         }
     }
 }
@@ -1099,6 +1179,42 @@ mod tests {
         // Assert
         assert_eq!(detail.track_id, "t-1");
         assert_eq!(detail.name, "A-Line");
+        assert!(detail.lap_timing.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_track_via_serialised_track_detail_field_names_match_c3() {
+        // Arrange — a circuit-timed track with one sector gate, one neutral
+        // zone, and one reference-polyline fix, wire degrees x1e7.
+        let root = temp_root();
+        let tracks_dir = root.join("tracks");
+        std::fs::create_dir_all(&tracks_dir).unwrap();
+        let json = r#"{"track_artifact_version":1,"track":{"track_id":"t-1","name":"A-Line","venue_name":"Whistler",
+            "lap_timing":{"kind":"circuit","name":"S/F","start_finish":{"lat1_deg":501163000,"lon1_deg":-1229574000,"lat2_deg":10,"lon2_deg":20,"name":""}},
+            "sector_gates":[{"name":"S1","gate":{"lat1_deg":10,"lon1_deg":20,"lat2_deg":30,"lon2_deg":40,"name":""}}],
+            "neutral_zones":[{"name":"Pit","enter":{"lat1_deg":1,"lon1_deg":2,"lat2_deg":3,"lon2_deg":4,"name":""},"exit":{"lat1_deg":5,"lon1_deg":6,"lat2_deg":7,"lon2_deg":8,"name":""}}],
+            "reference_polyline":[{"timestamp_ms":9000,"latitude_deg":501163000,"longitude_deg":-1229574000}],
+            "created_at_ms":1111,"updated_at_ms":2222}}"#;
+        std::fs::write(tracks_dir.join("t-1.idl0t"), json).unwrap();
+
+        // Act
+        let detail = get_track_via(&root, "t-1").unwrap();
+        let value = serde_json::to_value(&detail).unwrap();
+
+        // Assert — field names and the sealed-union tag match C3 §3.2.
+        assert_eq!(value["lap_timing"]["kind"], serde_json::json!("circuit"));
+        assert_eq!(value["lap_timing"]["start_finish"]["lat1"], serde_json::json!(50.1163));
+        assert_eq!(value["lap_timing"]["start_finish"]["lon1"], serde_json::json!(-122.9574));
+        assert_eq!(value["sector_gates"][0]["name"], serde_json::json!("S1"));
+        assert_eq!(value["sector_gates"][0]["gate"]["lat1"], serde_json::json!(0.000001));
+        assert_eq!(value["neutral_zones"][0]["name"], serde_json::json!("Pit"));
+        assert_eq!(value["neutral_zones"][0]["enter"]["lat1"], serde_json::json!(0.0000001));
+        assert_eq!(value["neutral_zones"][0]["exit"]["lat1"], serde_json::json!(0.0000005));
+        assert_eq!(value["reference_polyline"][0]["timestamp_ms"], serde_json::json!(9000));
+        assert_eq!(value["reference_polyline"][0]["lat"], serde_json::json!(50.1163));
+        assert_eq!(value["reference_polyline"][0]["lon"], serde_json::json!(-122.9574));
 
         let _ = std::fs::remove_dir_all(&root);
     }
