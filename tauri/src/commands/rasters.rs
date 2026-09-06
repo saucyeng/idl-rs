@@ -510,24 +510,12 @@ pub fn fetch_fft_via(
 }
 
 /// Returns the `t_us` entries whose sample time falls in `[t0_secs,
-/// t1_secs]` (ruling R85). Mirrors `idl_rs`'s private `slice_channel_by_time`
-/// boundary convention exactly — round each end to microseconds, then
-/// `partition_point` for `< t0_us` / `<= t1_us` — so `check_none_averaging_
-/// segments`/`effective_rate_hz_from_t_us` see the identical window that
-/// `SessionHandle::slice_by_time` sliced `samples` from; not a core change,
-/// since `t_us` is already `pub` on `Channel` and this performs no DSP, only
-/// the same index-window arithmetic `fetch_fft_via` already relies on.
+/// t1_secs]` (ruling R85), via core's `time_window_index_range` (the same
+/// boundary math `SessionHandle::slice_by_time` used to slice `samples`
+/// from) so `check_none_averaging_segments`/`effective_rate_hz_from_t_us`
+/// see the identical window.
 fn slice_t_us_by_time(t_us: &[i64], t0_secs: f64, t1_secs: f64) -> Vec<i64> {
-    if t_us.is_empty() || t1_secs < t0_secs {
-        return Vec::new();
-    }
-    let t0_us = (t0_secs * 1e6).round() as i64;
-    let t1_us = (t1_secs * 1e6).round() as i64;
-    let lo = t_us.partition_point(|&t| t < t0_us);
-    let hi = t_us.partition_point(|&t| t <= t1_us);
-    if lo >= hi {
-        return Vec::new();
-    }
+    let (lo, hi) = idl_rs::session::handle::time_window_index_range(t_us, t0_secs, t1_secs);
     t_us[lo..hi].to_vec()
 }
 
