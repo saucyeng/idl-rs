@@ -465,18 +465,22 @@ fn map_fft_error(e: idl_rs::fft::FftError) -> IpcError {
 /// `idl_rs::session::handle::SessionHandle::slice_by_time`'s samples in that
 /// window — an unknown `n` surfaces `resolve_lap_window`'s own
 /// `invalid_argument`/`detail: { "lap": n }` before any FFT runs. Either way,
-/// `averaging: none` is validated against the *resulting* sample count (see
-/// `idl_rs::fft::check_none_averaging_segments`) — a lap window is checked
-/// against its own length, never the whole channel's — and `sample_rate_hz`
-/// is derived from the whole channel's recorded `t_us` axis (see
-/// `idl_rs::fft::effective_rate_hz_from_t_us`): rate is a channel property,
-/// not a window one, and a short lap slice must not make rate derivation
-/// flakier than the full record's. Both core validations run before any FFT
-/// executes. `not_found`: unknown `session_id` or `channel`.
-/// `invalid_argument`: an unknown `lap`, `params` that fail
-/// [`resolve_spectrogram_params`]'s validation, `averaging: none` with more
-/// than one segment (`detail: { "segments": n }`), or a channel with too few
-/// samples/duplicate timestamps to derive a sample rate.
+/// both of R76's core guards run against the *resulting* window, never the
+/// whole channel: `averaging: none` is validated against the sliced sample
+/// count (see `idl_rs::fft::check_none_averaging_segments`), and
+/// `sample_rate_hz` is derived from the sliced window's own `t_us` (see
+/// `idl_rs::fft::effective_rate_hz_from_t_us`) using the same
+/// inclusive-window boundary as `slice_by_time` itself (ruling R85) — a
+/// 1–2-sample lap window (a degenerate lap boundary) fails this guard
+/// instead of silently clamping to a one-segment, possibly-`NaN` spectrum.
+/// The whole-channel path (`lap: None`) is unaffected: its window *is* the
+/// whole channel, so both guards already ran against the same `t_us` before
+/// this ruling. Both core validations run before any FFT executes.
+/// `not_found`: unknown `session_id` or `channel`. `invalid_argument`: an
+/// unknown `lap`, `params` that fail [`resolve_spectrogram_params`]'s
+/// validation, `averaging: none` with more than one segment (`detail: {
+/// "segments": n }`), or a window with too few samples/duplicate timestamps
+/// to derive a sample rate.
 pub fn fetch_fft_via(
     data_dir: &Path,
     session_id: &str,
@@ -488,18 +492,43 @@ pub fn fetch_fft_via(
     let handle = load_session_handle(data_dir, session_id)?;
     let ch = find_channel_in(handle.channel_data(), channel)?;
     let (window, detrend, scaling, window_size, noverlap) = resolve_spectrogram_params(params)?;
-    let samples = match lap {
-        None => ch.materialize(),
+    let (samples, window_t_us) = match lap {
+        None => (ch.materialize(), None),
         Some(n) => {
             let (t0_secs, t1_secs) = resolve_lap_window(data_dir, session_id, n)?;
-            handle.slice_by_time(channel, t0_secs, t1_secs)
+            let sliced = handle.slice_by_time(channel, t0_secs, t1_secs);
+            let t_us = slice_t_us_by_time(&ch.t_us, t0_secs, t1_secs);
+            (sliced, Some(t_us))
         }
     };
     idl_rs::fft::check_none_averaging_segments(&averaging, window_size, noverlap, samples.len())
         .map_err(map_fft_error)?;
-    let sample_rate_hz = idl_rs::fft::effective_rate_hz_from_t_us(&ch.t_us).map_err(map_fft_error)?;
+    let rate_t_us = window_t_us.as_deref().unwrap_or(&ch.t_us);
+    let sample_rate_hz = idl_rs::fft::effective_rate_hz_from_t_us(rate_t_us).map_err(map_fft_error)?;
     let result = idl_rs::fft::welch(samples, sample_rate_hz, window, window_size, noverlap, detrend, averaging, scaling);
     Ok(idl_rs::fft_wire::encode_fft_idlf(&result.values, sample_rate_hz))
+}
+
+/// Returns the `t_us` entries whose sample time falls in `[t0_secs,
+/// t1_secs]` (ruling R85). Mirrors `idl_rs`'s private `slice_channel_by_time`
+/// boundary convention exactly — round each end to microseconds, then
+/// `partition_point` for `< t0_us` / `<= t1_us` — so `check_none_averaging_
+/// segments`/`effective_rate_hz_from_t_us` see the identical window that
+/// `SessionHandle::slice_by_time` sliced `samples` from; not a core change,
+/// since `t_us` is already `pub` on `Channel` and this performs no DSP, only
+/// the same index-window arithmetic `fetch_fft_via` already relies on.
+fn slice_t_us_by_time(t_us: &[i64], t0_secs: f64, t1_secs: f64) -> Vec<i64> {
+    if t_us.is_empty() || t1_secs < t0_secs {
+        return Vec::new();
+    }
+    let t0_us = (t0_secs * 1e6).round() as i64;
+    let t1_us = (t1_secs * 1e6).round() as i64;
+    let lo = t_us.partition_point(|&t| t < t0_us);
+    let hi = t_us.partition_point(|&t| t <= t1_us);
+    if lo >= hi {
+        return Vec::new();
+    }
+    t_us[lo..hi].to_vec()
 }
 
 /// Fetches one channel's FFT spectrum as `IDLF` v1 bytes (C3 §3.6, ruling
@@ -922,6 +951,120 @@ mod tests {
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
         assert_eq!(err.detail, Some(serde_json::json!({ "segments": 2 })));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Seeds `s1` with an event-driven `Dup` channel whose `t_us` is `[0,
+    /// 100_000, 100_000, 200_000, 300_000]` — a duplicate pair at indices
+    /// 1–2 — plus one `session.json` lap per degenerate window a lap
+    /// boundary could produce (ruling R85): lap 1 is `[0.0, 0.0]` s
+    /// (index 0 only, 1 sample); lap 2 is `[0.1, 0.1]` s (indices 1–2, the
+    /// duplicate-timestamp pair, 2 samples with a single zero-length gap).
+    fn seed_degenerate_lap_windows_for_s1(root: &std::path::Path) {
+        let session = Session {
+            session_id: "s1".to_string(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            config_checksum: None,
+            source_format: SourceFormat::Fit,
+            blob_sha256: "b".repeat(64),
+            channels: vec![Channel {
+                channel_id: "Dup".to_string(),
+                t_us: vec![0, 100_000, 100_000, 200_000, 300_000],
+                t_recorded_us: None,
+                nominal_rate_hz: 0.0,
+                column: RawColumn::F64(vec![0.0, 1.0, 2.0, 3.0, 4.0]),
+                source_kind: "wheel".to_string(),
+                unit: "m/s".to_string(),
+                gaps: Vec::new(),
+            }],
+        };
+        write_session_parquet(root, &session, "0.1.0").unwrap();
+
+        let lap = |n: u32, t: f64| LapJson {
+            lap_number: n,
+            start_timestamp_ms: (t * 1000.0).round() as i64,
+            end_timestamp_ms: (t * 1000.0).round() as i64,
+            raw_elapsed_ms: 0,
+            lap_time_ms: 0,
+            start_time_secs: t,
+            end_time_secs: t,
+            sectors: Vec::new(),
+            neutral_zone_visits: Vec::new(),
+        };
+        let mut doc = empty_session_json("s1");
+        doc.laps = vec![lap(1, 0.0), lap(2, 0.1)];
+        write_session_json(root, "s1", &doc, None).unwrap();
+    }
+
+    #[test]
+    fn fetch_fft_via_lap_window_single_sample_invalid_argument() {
+        // Arrange — lap 1 slices to exactly one sample (index 0); R85: the
+        // rate guard must run on the window's own `t_us`, not the whole
+        // (5-sample, `len() >= 2`) channel's, so this must fail instead of
+        // reaching `welch()`'s Hann weights (which would divide by
+        // `n - 1 == 0`).
+        let root = temp_root();
+        seed_degenerate_lap_windows_for_s1(&root);
+        let params = SpectrogramParams { window_size: 0, hop_size: 0, window: WindowToken::Hann, detrend: DetrendToken::Mean, scaling: ScalingToken::Density };
+
+        // Act
+        let err = fetch_fft_via(&root, "s1", "Dup", Some(1), &params, Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_via_lap_window_two_duplicate_timestamp_samples_invalid_argument() {
+        // Arrange — lap 2 slices to the duplicate-timestamp pair (indices
+        // 1–2, both `t_us == 100_000`): the window's single gap is zero, so
+        // `effective_rate_hz_from_t_us` on the *window's* `t_us` must reject
+        // it, the same way it already rejects a whole duplicate-timestamp
+        // channel.
+        let root = temp_root();
+        seed_degenerate_lap_windows_for_s1(&root);
+        let params = SpectrogramParams { window_size: 0, hop_size: 0, window: WindowToken::Hann, detrend: DetrendToken::Mean, scaling: ScalingToken::Density };
+
+        // Act
+        let err = fetch_fft_via(&root, "s1", "Dup", Some(2), &params, Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_via_lap_window_healthy_multi_sample_output_unchanged_by_r85() {
+        // Arrange — lap 2 of `seed_laps_for_s1` (10 samples, 64 Hz uniform
+        // spacing): its own `t_us` yields the same 64 Hz rate as the whole
+        // channel's, so slicing the rate guard's input (R85) must not move
+        // this healthy window's bytes at all. Cross-checked against a
+        // manual `welch()` call built directly from the handle's own slice
+        // and the window's own derived rate, not just re-run through
+        // `fetch_fft_via` (which would not catch a rate regression).
+        let root = temp_root();
+        seed_session(&root);
+        seed_laps_for_s1(&root);
+
+        // Act
+        let got = fetch_fft_via(&root, "s1", "Speed", Some(2), &fft_params(), Averaging::Mean).unwrap();
+
+        let handle = load_session_handle(&root, "s1").unwrap();
+        let (t0, t1) = resolve_lap_window(&root, "s1", 2).unwrap();
+        let window_samples = handle.slice_by_time("Speed", t0, t1);
+        let want_rate_hz = 64.0;
+        let want = idl_rs::fft::welch(
+            window_samples, want_rate_hz, FftWindow::Hann, 32, 16, Detrend::Mean, Averaging::Mean, Scaling::Density,
+        );
+        let want_bytes = idl_rs::fft_wire::encode_fft_idlf(&want.values, want_rate_hz);
+
+        // Assert
+        assert_eq!(got, want_bytes);
 
         let _ = std::fs::remove_dir_all(&root);
     }
