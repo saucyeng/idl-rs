@@ -598,4 +598,30 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn verify_and_repair_a_malformed_session_json_error_severity_finding_2_not_quarantined() {
+        // Arrange — session.json is unreadable JSON (error-severity #2),
+        // a path shape `is_repairable_finding_path` never matches (it only
+        // matches blob and derived-parquet shapes) — this exercises the
+        // structural guard on an Error-severity finding, unlike the sibling
+        // "missing blob" test above, which is excluded one guard earlier by
+        // being Warning-severity.
+        let root = temp_root();
+        let session_dir = root.join("sessions").join("s1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("session.json"), b"not json").unwrap();
+        let mut ids = fixed_ids("4");
+
+        // Act
+        let (findings, quarantined) = verify_and_repair(&root, &mut ids, 1);
+
+        // Assert
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(quarantined.is_empty());
+        assert!(session_dir.join("session.json").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
