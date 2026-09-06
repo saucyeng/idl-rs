@@ -99,6 +99,116 @@ pub enum Averaging {
     Max,
 }
 
+/// Failures raised validating a [`welch`] request before the transform runs
+/// (ruling R76). Neither variant is raised by `welch()` itself — `welch()`
+/// has no way to signal failure and stays infallible for its existing
+/// callers (`core/src/session/handle.rs`, `core/src/fft_wire.rs`'s tests);
+/// callers that accept `averaging`/`sample_rate_hz` from an untrusted wire
+/// argument (`tauri/src/commands/rasters.rs::fetch_fft_via`) must call
+/// [`check_none_averaging_segments`] and [`effective_rate_hz_from_t_us`]
+/// first and reject on `Err` before calling `welch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FftError {
+    /// `averaging: Averaging::None` was requested but the segmentation
+    /// (`nperseg`/`noverlap` against the record length) produces more than
+    /// one segment; `segments` carries the count that would have been
+    /// produced. `None` takes only the first segment's power (see
+    /// [`Averaging::None`]'s doc comment) — silently accepting more than one
+    /// segment would discard the rest of the record.
+    NoneRequiresOneSegment { segments: usize },
+    /// The channel's effective sample rate could not be derived: fewer than
+    /// two samples (no gap to measure), or every consecutive-sample gap
+    /// non-positive (duplicate or out-of-order timestamps), which would
+    /// otherwise divide by zero in `welch()`'s `Scaling::Density` branch.
+    InvalidSampleRate,
+}
+
+impl std::fmt::Display for FftError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FftError::NoneRequiresOneSegment { segments } => {
+                write!(f, "averaging \"none\" requires exactly one segment, got {segments}")
+            }
+            FftError::InvalidSampleRate => {
+                write!(f, "could not derive a sample rate: fewer than two samples or duplicate timestamps")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FftError {}
+
+/// Number of segments [`stft`]/[`welch`] will produce for a record of length
+/// `n` samples, given `nperseg`/`noverlap` — the same clamping and stepping
+/// [`stft`]'s own loop uses, computed without running the transform. `n == 0`
+/// returns `0` (matching `welch()`'s own empty-input short-circuit).
+pub fn segment_count(nperseg: usize, noverlap: usize, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let seg = resolve_seg(nperseg, n);
+    let overlap = if noverlap >= seg { seg - 1 } else { noverlap };
+    let step = seg - overlap;
+    let mut count = 0;
+    let mut start = 0;
+    while start + seg <= n {
+        count += 1;
+        start += step;
+    }
+    count
+}
+
+/// Validates `averaging: Averaging::None` against the segmentation that
+/// `nperseg`/`noverlap`/`n` would produce (ruling R76): more than one
+/// segment is [`FftError::NoneRequiresOneSegment`]; any other `averaging`,
+/// or `None` with zero or one segment, is `Ok`. Call before [`welch`] — see
+/// [`FftError`]'s doc comment.
+pub fn check_none_averaging_segments(
+    averaging: &Averaging,
+    nperseg: usize,
+    noverlap: usize,
+    n: usize,
+) -> Result<(), FftError> {
+    if matches!(averaging, Averaging::None) {
+        let segments = segment_count(nperseg, noverlap, n);
+        if segments > 1 {
+            return Err(FftError::NoneRequiresOneSegment { segments });
+        }
+    }
+    Ok(())
+}
+
+/// Derives a channel's effective sample rate in Hz from its recorded `t_us`
+/// (microsecond) timestamp axis: `1e6 / median(consecutive-sample gaps in
+/// microseconds)` — never a nominal/configured rate (C1 §3.5: metadata only,
+/// never used to synthesize time). Lives in `core` rather than the Tauri
+/// wrapper that consumes it (ruling R76): it is arithmetic on sample
+/// timestamps, and CLAUDE.md §2's decision rule assigns that to `core`.
+///
+/// Returns [`FftError::InvalidSampleRate`] when there are fewer than two
+/// samples (no gap to measure), or when the derived rate is not finite and
+/// positive (every gap non-positive — duplicate or out-of-order timestamps).
+/// Call before [`welch`] — see [`FftError`]'s doc comment.
+pub fn effective_rate_hz_from_t_us(t_us: &[i64]) -> Result<f64, FftError> {
+    if t_us.len() < 2 {
+        return Err(FftError::InvalidSampleRate);
+    }
+    let mut gaps: Vec<i64> = t_us.windows(2).map(|w| w[1] - w[0]).collect();
+    gaps.sort_unstable();
+    let n = gaps.len();
+    let median_us = if n % 2 == 1 {
+        gaps[n / 2] as f64
+    } else {
+        0.5 * (gaps[n / 2 - 1] + gaps[n / 2]) as f64
+    };
+    let rate_hz = 1e6 / median_us;
+    if rate_hz.is_finite() && rate_hz > 0.0 {
+        Ok(rate_hz)
+    } else {
+        Err(FftError::InvalidSampleRate)
+    }
+}
+
 /// Output units of the spectrum.
 pub enum Scaling {
     /// RMS magnitude in input units (sqrt of mean power). Single-segment,
@@ -665,6 +775,80 @@ mod tests {
         // Assert — does not panic; length is n/2 + 1
         assert_eq!(result.values.len(), 3);
         assert_eq!(result.freqs_hz.len(), 3);
+    }
+
+    #[test]
+    fn check_none_averaging_segments_none_with_two_segments_is_error_with_segment_count() {
+        // Arrange — 128 samples, nperseg 32, noverlap 16 => 7 segments (see
+        // segment_count's own doc comment for the stepping).
+        let averaging = Averaging::None;
+
+        // Act
+        let result = check_none_averaging_segments(&averaging, 32, 16, 128);
+
+        // Assert
+        assert_eq!(result, Err(FftError::NoneRequiresOneSegment { segments: 7 }));
+    }
+
+    #[test]
+    fn check_none_averaging_segments_none_with_one_segment_is_ok() {
+        // Arrange — nperseg 0 => one full-record segment (resolve_seg)
+        let averaging = Averaging::None;
+
+        // Act / Assert
+        assert_eq!(check_none_averaging_segments(&averaging, 0, 0, 128), Ok(()));
+    }
+
+    #[test]
+    fn check_none_averaging_segments_mean_with_many_segments_is_ok() {
+        // Arrange — same multi-segment layout as the None/error case, but
+        // Mean has no single-segment requirement.
+        let averaging = Averaging::Mean;
+
+        // Act / Assert
+        assert_eq!(check_none_averaging_segments(&averaging, 32, 16, 128), Ok(()));
+    }
+
+    #[test]
+    fn effective_rate_hz_from_t_us_uniform_spacing_matches_expected_rate() {
+        // Arrange — 64 Hz spacing, i.e. 15625 us gaps
+        let t_us: Vec<i64> = (0..8).map(|i| i * 15_625).collect();
+
+        // Act
+        let hz = effective_rate_hz_from_t_us(&t_us).unwrap();
+
+        // Assert
+        assert!((hz - 64.0).abs() < 1e-6, "expected ~64 Hz, got {hz}");
+    }
+
+    #[test]
+    fn effective_rate_hz_from_t_us_even_sample_count_uses_mean_of_middle_gaps() {
+        // Arrange — 4 samples (3 gaps, odd) would leave no ambiguity, so use
+        // 5 samples (4 gaps, even): gaps 1000, 1000, 3000, 1000 us sorted as
+        // 1000,1000,1000,3000 -> median = mean(1000, 1000) = 1000 us -> 1 kHz.
+        let t_us: Vec<i64> = vec![0, 1_000, 2_000, 5_000, 6_000];
+
+        // Act
+        let hz = effective_rate_hz_from_t_us(&t_us).unwrap();
+
+        // Assert
+        assert!((hz - 1000.0).abs() < 1e-6, "expected ~1000 Hz, got {hz}");
+    }
+
+    #[test]
+    fn effective_rate_hz_from_t_us_fewer_than_two_samples_is_invalid_sample_rate_error() {
+        // Arrange / Act / Assert
+        assert_eq!(effective_rate_hz_from_t_us(&[]), Err(FftError::InvalidSampleRate));
+        assert_eq!(effective_rate_hz_from_t_us(&[100]), Err(FftError::InvalidSampleRate));
+    }
+
+    #[test]
+    fn effective_rate_hz_from_t_us_duplicate_timestamps_is_invalid_sample_rate_error() {
+        // Arrange — every timestamp identical => every gap is 0 => median 0
+        let t_us = vec![500_i64; 6];
+
+        // Act / Assert
+        assert_eq!(effective_rate_hz_from_t_us(&t_us), Err(FftError::InvalidSampleRate));
     }
 
     #[test]
