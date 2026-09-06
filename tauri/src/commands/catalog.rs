@@ -92,6 +92,50 @@ impl From<catalog_read::ChannelSummary> for ChannelSummary {
     }
 }
 
+/// C3 §3.2 `LapDetail.sectors` element (C1 §6 `laps[].sectors`, C3 §6 item
+/// 11, closed 2026-09-06). Mirrors core's `session_json::SectorJson`
+/// field for field rather than deriving `Serialize` on the core type
+/// directly, matching this module's own idiom (core types never cross the
+/// IPC boundary directly).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LapSector {
+    pub name: String,
+    /// Unix epoch milliseconds.
+    pub start_ms: i64,
+    pub end_ms: i64,
+    /// Seconds, recording-time (t=0-anchored).
+    pub start_time_secs: f64,
+    pub end_time_secs: f64,
+}
+
+impl From<idl_rs::store::session_json::SectorJson> for LapSector {
+    fn from(s: idl_rs::store::session_json::SectorJson) -> Self {
+        Self {
+            name: s.name,
+            start_ms: s.start_ms,
+            end_ms: s.end_ms,
+            start_time_secs: s.start_time_secs,
+            end_time_secs: s.end_time_secs,
+        }
+    }
+}
+
+/// C3 §3.2 `LapDetail.neutral_zone_visits` element (C1 §6
+/// `laps[].neutral_zone_visits`, C3 §6 item 11, closed 2026-09-06).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LapNeutralZoneVisit {
+    pub name: String,
+    /// Unix epoch milliseconds.
+    pub enter_ms: i64,
+    pub exit_ms: i64,
+}
+
+impl From<idl_rs::store::session_json::NeutralZoneVisitJson> for LapNeutralZoneVisit {
+    fn from(v: idl_rs::store::session_json::NeutralZoneVisitJson) -> Self {
+        Self { name: v.name, enter_ms: v.enter_ms, exit_ms: v.exit_ms }
+    }
+}
+
 /// C3 §3.2 `LapDetail` (`session.json`'s own lap shape, distinct from
 /// `LapSummary`).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -103,8 +147,8 @@ pub struct LapDetail {
     pub lap_time_ms: i64,
     pub start_time_secs: f64,
     pub end_time_secs: f64,
-    pub sectors: serde_json::Value,
-    pub neutral_zone_visits: serde_json::Value,
+    pub sectors: Vec<LapSector>,
+    pub neutral_zone_visits: Vec<LapNeutralZoneVisit>,
 }
 
 impl From<catalog_read::LapDetail> for LapDetail {
@@ -117,8 +161,8 @@ impl From<catalog_read::LapDetail> for LapDetail {
             lap_time_ms: l.lap_time_ms,
             start_time_secs: l.start_time_secs,
             end_time_secs: l.end_time_secs,
-            sectors: l.sectors,
-            neutral_zone_visits: l.neutral_zone_visits,
+            sectors: l.sectors.into_iter().map(LapSector::from).collect(),
+            neutral_zone_visits: l.neutral_zone_visits.into_iter().map(LapNeutralZoneVisit::from).collect(),
         }
     }
 }
@@ -779,7 +823,13 @@ mod tests {
                 lap_time_ms: 3_102,
                 start_time_secs: 3.3,
                 end_time_secs: 3.4,
-                sectors: Vec::new(),
+                sectors: vec![SectorJson {
+                    name: "sector-T".to_string(),
+                    start_ms: 3_110,
+                    end_ms: 3_120,
+                    start_time_secs: 3.31,
+                    end_time_secs: 3.32,
+                }],
                 neutral_zone_visits: Vec::new(),
             }],
         }];
@@ -852,11 +902,16 @@ mod tests {
         assert_eq!(lap.lap_time_ms, 1_002);
         assert_eq!(lap.start_time_secs, 1.1);
         assert_eq!(lap.end_time_secs, 2.2);
-        assert_eq!(
-            lap.sectors,
-            serde_json::json!([{ "name": "sector-K", "start_ms": 1_100, "end_ms": 1_200, "start_time_secs": 1.3, "end_time_secs": 1.4 }])
-        );
-        assert_eq!(lap.neutral_zone_visits, serde_json::json!([{ "name": "nz-L", "enter_ms": 1_300, "exit_ms": 1_400 }]));
+        assert_eq!(lap.sectors.len(), 1);
+        assert_eq!(lap.sectors[0].name, "sector-K");
+        assert_eq!(lap.sectors[0].start_ms, 1_100);
+        assert_eq!(lap.sectors[0].end_ms, 1_200);
+        assert_eq!(lap.sectors[0].start_time_secs, 1.3);
+        assert_eq!(lap.sectors[0].end_time_secs, 1.4);
+        assert_eq!(lap.neutral_zone_visits.len(), 1);
+        assert_eq!(lap.neutral_zone_visits[0].name, "nz-L");
+        assert_eq!(lap.neutral_zone_visits[0].enter_ms, 1_300);
+        assert_eq!(lap.neutral_zone_visits[0].exit_ms, 1_400);
 
         assert_eq!(detail.track_visits.len(), 1);
         let visit = &detail.track_visits[0];
@@ -873,6 +928,8 @@ mod tests {
         assert_eq!(nested_lap.lap_time_ms, 3_102);
         assert_eq!(nested_lap.start_time_secs, 3.3);
         assert_eq!(nested_lap.end_time_secs, 3.4);
+        assert_eq!(nested_lap.sectors.len(), 1);
+        assert_eq!(nested_lap.sectors[0].name, "sector-T");
 
         assert_eq!(detail.reference_lap_number, Some(11));
         assert_eq!(detail.ignored_lap_numbers, vec![12, 13]);
@@ -1140,5 +1197,74 @@ mod tests {
         assert_eq!(list_sessions_via(&root).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lap_detail_serialises_sectors_and_neutral_zone_visits_byte_identical_to_the_old_value_path() {
+        // Arrange — the expected JSON is built literally with `json!`, not
+        // by calling any of this module's own code, so this test would
+        // catch a field-name or shape drift the refactor from
+        // `serde_json::Value` introduced.
+        let detail = LapDetail {
+            lap_number: 1,
+            start_timestamp_ms: 1_000,
+            end_timestamp_ms: 2_000,
+            raw_elapsed_ms: 1_000,
+            lap_time_ms: 900,
+            start_time_secs: 1.0,
+            end_time_secs: 2.0,
+            sectors: vec![
+                LapSector { name: "S1".to_string(), start_ms: 1_000, end_ms: 1_500, start_time_secs: 1.0, end_time_secs: 1.5 },
+                LapSector { name: "S2".to_string(), start_ms: 1_500, end_ms: 2_000, start_time_secs: 1.5, end_time_secs: 2.0 },
+            ],
+            neutral_zone_visits: vec![LapNeutralZoneVisit { name: "NZ1".to_string(), enter_ms: 1_100, exit_ms: 1_200 }],
+        };
+
+        // Act
+        let value = serde_json::to_value(&detail).unwrap();
+
+        // Assert
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "lap_number": 1,
+                "start_timestamp_ms": 1_000,
+                "end_timestamp_ms": 2_000,
+                "raw_elapsed_ms": 1_000,
+                "lap_time_ms": 900,
+                "start_time_secs": 1.0,
+                "end_time_secs": 2.0,
+                "sectors": [
+                    { "name": "S1", "start_ms": 1_000, "end_ms": 1_500, "start_time_secs": 1.0, "end_time_secs": 1.5 },
+                    { "name": "S2", "start_ms": 1_500, "end_ms": 2_000, "start_time_secs": 1.5, "end_time_secs": 2.0 }
+                ],
+                "neutral_zone_visits": [
+                    { "name": "NZ1", "enter_ms": 1_100, "exit_ms": 1_200 }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn lap_detail_with_no_sectors_or_neutral_zone_visits_serialises_empty_arrays_not_null() {
+        // Arrange
+        let detail = LapDetail {
+            lap_number: 1,
+            start_timestamp_ms: 0,
+            end_timestamp_ms: 0,
+            raw_elapsed_ms: 0,
+            lap_time_ms: 0,
+            start_time_secs: 0.0,
+            end_time_secs: 0.0,
+            sectors: Vec::new(),
+            neutral_zone_visits: Vec::new(),
+        };
+
+        // Act
+        let value = serde_json::to_value(&detail).unwrap();
+
+        // Assert
+        assert_eq!(value["sectors"], serde_json::json!([]));
+        assert_eq!(value["neutral_zone_visits"], serde_json::json!([]));
     }
 }

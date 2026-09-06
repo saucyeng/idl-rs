@@ -21,7 +21,9 @@ use std::path::Path;
 
 use crate::store::catalog::{open_catalog, rebuild_catalog, CatalogError, CatalogErrorKind, RebuildReport};
 use crate::store::parquet::{read_session_metadata, read_session_parquet};
-use crate::store::session_json::{read_session_json, LapJson, OverlayLapKeyJson, TrackVisitJson};
+use crate::store::session_json::{
+    read_session_json, LapJson, NeutralZoneVisitJson, OverlayLapKeyJson, SectorJson, TrackVisitJson,
+};
 use crate::track_artifact::read::read_track;
 
 /// One row of the catalog `sessions` table (C4 §5), mirrored field for
@@ -122,11 +124,14 @@ pub struct LapDetail {
     /// Seconds, recording-time (t=0-anchored).
     pub start_time_secs: f64,
     pub end_time_secs: f64,
-    /// C1 §6 does not fix the element shape beyond "array" (C3 §3.2 open
-    /// question 11) — opaque on the Rust side, verbatim from `session.json`.
-    pub sectors: serde_json::Value,
-    /// As [`LapDetail::sectors`], opaque.
-    pub neutral_zone_visits: serde_json::Value,
+    /// C1 §6 `laps[].sectors` — re-exports `session_json`'s landed
+    /// [`SectorJson`], which pins C3 §6 item 11 (closed 2026-09-06): the
+    /// element shape is whatever `session.json` actually contains, not
+    /// IDL0_SPEC §15.2's illustrative `sector_name`/`sector_time_ms` guess.
+    pub sectors: Vec<SectorJson>,
+    /// C1 §6 `laps[].neutral_zone_visits` — re-exports the landed
+    /// [`NeutralZoneVisitJson`] (C3 §6 item 11).
+    pub neutral_zone_visits: Vec<NeutralZoneVisitJson>,
 }
 
 /// One visit to a track-library entry, with its own cached laps (C1 §6).
@@ -343,10 +348,9 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
     })
 }
 
-/// `session.json`'s `LapJson` -> this module's opaque-`sectors`/
-/// `neutral_zone_visits` [`LapDetail`] (C3 §3.2 open question 11: the
-/// element shape isn't fixed by any contract, so it crosses verbatim as
-/// JSON rather than a typed Rust shape).
+/// `session.json`'s `LapJson` -> this module's [`LapDetail`] — a plain
+/// field copy now that `sectors`/`neutral_zone_visits` are typed (C3 §6
+/// item 11, closed 2026-09-06).
 fn lap_json_to_detail(lap: &LapJson) -> LapDetail {
     LapDetail {
         lap_number: lap.lap_number,
@@ -356,9 +360,8 @@ fn lap_json_to_detail(lap: &LapJson) -> LapDetail {
         lap_time_ms: lap.lap_time_ms,
         start_time_secs: lap.start_time_secs,
         end_time_secs: lap.end_time_secs,
-        sectors: serde_json::to_value(&lap.sectors).unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
-        neutral_zone_visits: serde_json::to_value(&lap.neutral_zone_visits)
-            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+        sectors: lap.sectors.clone(),
+        neutral_zone_visits: lap.neutral_zone_visits.clone(),
     }
 }
 
@@ -620,6 +623,48 @@ mod tests {
         assert_eq!(ch.channel_kind, "fixed-rate");
         assert_eq!(ch.sample_count, 3);
         assert_eq!(detail.source_format, "idl0");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_session_lap_with_sectors_and_a_neutral_zone_visit_carries_typed_fields_through() {
+        // Arrange
+        let root = temp_root();
+        let mut doc = empty_session_json("s1");
+        doc.laps = vec![LapJson {
+            lap_number: 1,
+            start_timestamp_ms: 0,
+            end_timestamp_ms: 1_000,
+            raw_elapsed_ms: 1_000,
+            lap_time_ms: 900,
+            start_time_secs: 0.0,
+            end_time_secs: 1.0,
+            sectors: vec![
+                SectorJson { name: "S1".to_string(), start_ms: 0, end_ms: 500, start_time_secs: 0.0, end_time_secs: 0.5 },
+                SectorJson { name: "S2".to_string(), start_ms: 500, end_ms: 1_000, start_time_secs: 0.5, end_time_secs: 1.0 },
+            ],
+            neutral_zone_visits: vec![NeutralZoneVisitJson { name: "NZ1".to_string(), enter_ms: 200, exit_ms: 300 }],
+        }];
+        write_full_session(&root, "s1", 0, &doc);
+
+        // Act
+        let detail = get_session(&root, "s1").unwrap();
+
+        // Assert
+        assert_eq!(detail.laps.len(), 1);
+        let lap = &detail.laps[0];
+        assert_eq!(lap.sectors.len(), 2);
+        assert_eq!(lap.sectors[0].name, "S1");
+        assert_eq!(lap.sectors[0].start_ms, 0);
+        assert_eq!(lap.sectors[0].end_ms, 500);
+        assert_eq!(lap.sectors[0].start_time_secs, 0.0);
+        assert_eq!(lap.sectors[0].end_time_secs, 0.5);
+        assert_eq!(lap.sectors[1].name, "S2");
+        assert_eq!(lap.neutral_zone_visits.len(), 1);
+        assert_eq!(lap.neutral_zone_visits[0].name, "NZ1");
+        assert_eq!(lap.neutral_zone_visits[0].enter_ms, 200);
+        assert_eq!(lap.neutral_zone_visits[0].exit_ms, 300);
 
         let _ = std::fs::remove_dir_all(&root);
     }
