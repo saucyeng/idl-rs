@@ -268,12 +268,12 @@ fn identity_overlay_ctx(main_lap_number: Option<u32>, window: (f64, f64)) -> Mat
         main_lap_bounds: vec![window],
         main_sectors: Vec::new(),
         main_lap_number,
-        overlay: Some(MathOverlay {
+        overlay: vec![MathOverlay {
             lookup: Arc::new(straight_east_lap()),
             lap_start_ms: 0.0,
             lap_end_ms: 9000.0,
             lap_start_uniform_sec: 0.0,
-        }),
+        }],
         baseline_row: None,
     }
 }

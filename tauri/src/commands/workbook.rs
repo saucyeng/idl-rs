@@ -141,8 +141,10 @@ pub struct LapContext {
     /// read. `None` designates no main lap.
     pub main_lap: Option<u32>,
     /// Laps `variance_time(ch)`/`variance_dist(ch)` compare the main lap
-    /// against. Same session only in wave 2 (R64.1); a future amendment
-    /// carries a `{ session_id, lap }[]` shape for cross-session overlay.
+    /// against — every entry drives its own comparison, folded into one
+    /// result by their elementwise mean (R73). Same session only in wave 2
+    /// (R64.1); a future amendment carries a `{ session_id, lap }[]` shape
+    /// for cross-session overlay.
     pub overlay_laps: Vec<u32>,
 }
 
@@ -326,11 +328,10 @@ fn empty_session_handle() -> SessionHandle {
 /// override. `lap_context = Some(lc)` is a per-call UI selection (R41) that
 /// must resolve against that same `laps[]` — `lc.main_lap`/
 /// `lc.overlay_laps` naming a lap absent from `laps[]` rejects
-/// `invalid_argument` with `detail: { lap }` (C3 §3.4). `laps[]` is always
-/// empty today (lap indexing has not landed), so every non-empty selection
-/// rejects in practice — see [`crate::session_source::load_lap_context`]'s
-/// doc comment for the full resolution, including the same-session
-/// `overlay` construction (R64.1).
+/// `invalid_argument` with `detail: { lap }` (C3 §3.4) — see
+/// [`crate::session_source::load_lap_context`]'s doc comment for the full
+/// resolution, including the same-session `overlay` construction (R64.1)
+/// and its multi-overlay fold (R73).
 fn eval_workbook_via(
     data_dir: &Path,
     id: &str,
@@ -1398,9 +1399,8 @@ mod tests {
 
     #[test]
     fn eval_workbook_via_lap_context_main_lap_absent_from_session_json_laps_command_level_invalid_argument() {
-        // Arrange — session.json's laps[] is always empty today (lap
-        // indexing has not landed, C3 §3.4's "Note"), so any non-null
-        // `main_lap` is unresolvable.
+        // Arrange — this session's own session.json has an empty laps[], so
+        // any non-null `main_lap` is unresolvable.
         let root = temp_root();
         seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
         write_session_json(&root, "s1", &empty_session_json("s1"), None).unwrap();

@@ -187,8 +187,12 @@ pub struct MathLapContext {
     pub main_sectors: Vec<(f64, f64)>,
     /// 1-based designated main lap, or `None`.
     pub main_lap_number: Option<u32>,
-    /// Overlay session for `variance_*`. `None` when no overlay is designated.
-    pub overlay: Option<MathOverlay>,
+    /// Overlay laps for `variance_*`, in `overlay_laps` order. Empty when no
+    /// overlay lap is designated. `variance_time`/`variance_dist` fold across
+    /// every entry (the elementwise mean of each entry's delta series, see
+    /// [`mean_across_overlays`]) — a rider comparing against several ghost
+    /// laps at once gets the average deviation, not just the first one (R73).
+    pub overlay: Vec<MathOverlay>,
     /// Row index the table's `main({col[]})` function reads from (the Main
     /// lap's row). `None` outside the table-cell path — `main()` then yields
     /// `NaN`, so it never crosses into channel math (the firewall).
@@ -204,7 +208,7 @@ impl MathLapContext {
             main_lap_bounds: Vec::new(),
             main_sectors: Vec::new(),
             main_lap_number: None,
-            overlay: None,
+            overlay: Vec::new(),
             baseline_row: None,
         }
     }
@@ -661,6 +665,37 @@ fn main_lap_window(lap_ctx: &MathLapContext) -> (f64, f64) {
         }
         None => (0.0, 0.0),
     }
+}
+
+/// Folds one delta series per overlay lap into a single series: the
+/// elementwise mean of the non-`NaN` values at each sample index. `variance_time`/
+/// `variance_dist` gate every entry to the same main-lap window (R73), so a
+/// `NaN` usually means "outside the window" for every entry at once; a `NaN`
+/// from just one entry (e.g. its own projection missed) is excluded from the
+/// mean rather than poisoning the combined result. `NaN` only when every
+/// entry is `NaN` at that index. `series` is never empty (callers only reach
+/// this once `lap_ctx.overlay` is non-empty) and every entry shares
+/// `main_samples`' length, since each came from the same main channel.
+fn mean_across_overlays(series: &[Vec<f64>]) -> Vec<f64> {
+    let len = series.first().map(Vec::len).unwrap_or(0);
+    (0..len)
+        .map(|i| {
+            let mut sum = 0.0;
+            let mut n = 0u32;
+            for s in series {
+                let v = s[i];
+                if !v.is_nan() {
+                    sum += v;
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                f64::NAN
+            } else {
+                sum / f64::from(n)
+            }
+        })
+        .collect()
 }
 
 // Resolves the per-sample time base for lap-aware functions as a closed-form
@@ -1149,56 +1184,81 @@ fn call_function(
             Ok(channel(out, rate, Arc::from(&[] as &[i64])))
         }
 
-        // ---- B2: variance (overlay second handle) ----
+        // ---- B2: variance (overlay second handle(s)) ----
+        // Both fold: with N overlay laps designated, each contributes its own
+        // delta series (main vs that one overlay) and the cell's value is the
+        // elementwise mean across all N (mean_across_overlays, R73) — a rider
+        // comparing against several ghosts sees the average deviation, not
+        // just the first ghost's.
         "variance_time" => {
             require_arg_count(name, &args, 1)?;
-            let overlay = lap_ctx
-                .overlay
-                .as_ref()
-                .filter(|_| lap_ctx.main_lap_number.is_some())
-                .ok_or_else(|| {
-                    err(
-                        MathEvalErrorKind::NoLapContext,
-                        "variance_time(): requires a main lap AND an overlay lap to be designated. \
-                         Pick both in the Analyze lap table.",
-                    )
-                })?;
+            if lap_ctx.overlay.is_empty() || lap_ctx.main_lap_number.is_none() {
+                return Err(err(
+                    MathEvalErrorKind::NoLapContext,
+                    "variance_time(): requires a main lap AND at least one overlay lap to be \
+                     designated. Pick both in the Analyze lap table.",
+                ));
+            }
             let (main_samples, main_rate, main_t_us, channel_id) =
                 require_ref_channel(&args[0], "variance_time")?;
-            crate::math::variance_geom::eval_variance_time(
-                &main_samples,
-                main_rate,
-                &main_t_us,
-                &channel_id,
-                lookup,
-                overlay,
-                main_lap_window(lap_ctx),
-            )
+            let window = main_lap_window(lap_ctx);
+            let mut series = Vec::with_capacity(lap_ctx.overlay.len());
+            for overlay in &lap_ctx.overlay {
+                let v = crate::math::variance_geom::eval_variance_time(
+                    &main_samples,
+                    main_rate,
+                    &main_t_us,
+                    &channel_id,
+                    lookup,
+                    overlay,
+                    window,
+                )?;
+                match v {
+                    Value::Channel(c) => series.push(c.samples.to_vec()),
+                    _ => unreachable!("eval_variance_time always returns a Channel"),
+                }
+            }
+            Ok(Value::Channel(ChannelValue {
+                samples: Arc::from(mean_across_overlays(&series)),
+                sample_rate_hz: main_rate,
+                channel_id: None,
+                t_us: main_t_us,
+            }))
         }
         "variance_dist" => {
             require_arg_count(name, &args, 1)?;
-            let overlay = lap_ctx
-                .overlay
-                .as_ref()
-                .filter(|_| lap_ctx.main_lap_number.is_some())
-                .ok_or_else(|| {
-                    err(
-                        MathEvalErrorKind::NoLapContext,
-                        "variance_dist(): requires a main lap AND an overlay lap to be designated. \
-                         Pick both in the Analyze lap table.",
-                    )
-                })?;
+            if lap_ctx.overlay.is_empty() || lap_ctx.main_lap_number.is_none() {
+                return Err(err(
+                    MathEvalErrorKind::NoLapContext,
+                    "variance_dist(): requires a main lap AND at least one overlay lap to be \
+                     designated. Pick both in the Analyze lap table.",
+                ));
+            }
             let (main_samples, main_rate, main_t_us, channel_id) =
                 require_ref_channel(&args[0], "variance_dist")?;
-            crate::math::variance_geom::eval_variance_dist(
-                &main_samples,
-                main_rate,
-                &main_t_us,
-                &channel_id,
-                lookup,
-                overlay,
-                main_lap_window(lap_ctx),
-            )
+            let window = main_lap_window(lap_ctx);
+            let mut series = Vec::with_capacity(lap_ctx.overlay.len());
+            for overlay in &lap_ctx.overlay {
+                let v = crate::math::variance_geom::eval_variance_dist(
+                    &main_samples,
+                    main_rate,
+                    &main_t_us,
+                    &channel_id,
+                    lookup,
+                    overlay,
+                    window,
+                )?;
+                match v {
+                    Value::Channel(c) => series.push(c.samples.to_vec()),
+                    _ => unreachable!("eval_variance_dist always returns a Channel"),
+                }
+            }
+            Ok(Value::Channel(ChannelValue {
+                samples: Arc::from(mean_across_overlays(&series)),
+                sample_rate_hz: main_rate,
+                channel_id: None,
+                t_us: main_t_us,
+            }))
         }
 
         // ---- Vector & rotation primitives (math::vector, SPEC §19) ----
@@ -1350,7 +1410,7 @@ mod tests {
         assert!(ctx.main_lap_bounds.is_empty());
         assert!(ctx.main_sectors.is_empty());
         assert_eq!(ctx.main_lap_number, None);
-        assert!(ctx.overlay.is_none());
+        assert!(ctx.overlay.is_empty());
     }
 
     #[test]
@@ -2007,7 +2067,7 @@ mod tests {
             main_lap_bounds: bounds,
             main_sectors: Vec::new(),
             main_lap_number: None,
-            overlay: None,
+            overlay: Vec::new(),
             baseline_row: None,
         }
     }
@@ -2110,12 +2170,12 @@ mod tests {
             main_lap_bounds: vec![(0.0, 9.0)],
             main_sectors: Vec::new(),
             main_lap_number: Some(1),
-            overlay: Some(MathOverlay {
+            overlay: vec![MathOverlay {
                 lookup: std::sync::Arc::new(overlay),
                 lap_start_ms: 0.0,
                 lap_end_ms: 9000.0,
                 lap_start_uniform_sec: 0.0,
-            }),
+            }],
             baseline_row: None,
         };
 
@@ -2123,7 +2183,9 @@ mod tests {
         let v = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &main, &ctx)
             .unwrap();
 
-        // Assert — identity main==overlay → diff ≈ 0 inside the lap window.
+        // Assert — identity main==overlay, single-entry overlay_laps: diff ≈ 0
+        // inside the lap window, matching the pre-Vec (`Option<MathOverlay>`)
+        // behaviour byte for byte (a single-entry fold is a no-op mean).
         match v {
             Value::Channel(c) => {
                 let inside: Vec<f64> = c.samples.iter().copied().filter(|x| !x.is_nan()).collect();
@@ -2134,6 +2196,145 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn variance_time_two_overlays_folds_to_their_mean() {
+        // Arrange — main and both overlays share one straight-east GPS track
+        // (so every sample position/time matches exactly, isolating the fold
+        // from the geometry). Main channel = 2*i; overlay A = i (delta = i);
+        // overlay B = 3*i (delta = -i). A first-entry-only implementation
+        // would return `i` (overlay A alone); the correct mean is 0.
+        let lon: Vec<f64> = (0..10).map(|i| i as f64 * 0.001).collect();
+        let lat = vec![0.0; 10];
+        let epoch: Vec<f64> = (0..10).map(|i| (i * 1000) as f64).collect();
+        let idx: Vec<f64> = (0..10).map(|i| i as f64).collect();
+
+        let track = |chan: Vec<f64>| {
+            lookup(&[
+                ("GPS_Latitude", lat.clone(), 1.0),
+                ("GPS_Longitude", lon.clone(), 1.0),
+                ("GPS_EpochMs", epoch.clone(), 1.0),
+                ("LapTime", chan, 1.0),
+            ])
+        };
+        let main = track(idx.iter().map(|i| i * 2.0).collect());
+        let overlay_a = track(idx.clone());
+        let overlay_b = track(idx.iter().map(|i| i * 3.0).collect());
+        let ctx = MathLapContext {
+            main_lap_bounds: vec![(0.0, 9.0)],
+            main_sectors: Vec::new(),
+            main_lap_number: Some(1),
+            overlay: vec![
+                MathOverlay {
+                    lookup: std::sync::Arc::new(overlay_a),
+                    lap_start_ms: 0.0,
+                    lap_end_ms: 9000.0,
+                    lap_start_uniform_sec: 0.0,
+                },
+                MathOverlay {
+                    lookup: std::sync::Arc::new(overlay_b),
+                    lap_start_ms: 0.0,
+                    lap_end_ms: 9000.0,
+                    lap_start_uniform_sec: 0.0,
+                },
+            ],
+            baseline_row: None,
+        };
+
+        // Act
+        let v = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &main, &ctx)
+            .unwrap();
+
+        // Assert — mean of (+i, -i) is ~0 in-window, not the first entry's `i`.
+        match v {
+            Value::Channel(c) => {
+                let inside: Vec<f64> = c.samples.iter().copied().filter(|x| !x.is_nan()).collect();
+                assert!(!inside.is_empty(), "expected some in-window samples");
+                for x in inside {
+                    assert!(x.abs() < 1e-3, "expected ~0 (mean of +i/-i), got {x}");
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn variance_dist_two_overlays_folds_to_their_mean() {
+        // Arrange — same construction as the variance_time fold test, for
+        // variance_dist's arc-length-matched path.
+        let lon: Vec<f64> = (0..10).map(|i| i as f64 * 0.001).collect();
+        let lat = vec![0.0; 10];
+        let epoch: Vec<f64> = (0..10).map(|i| (i * 1000) as f64).collect();
+        let idx: Vec<f64> = (0..10).map(|i| i as f64).collect();
+
+        let track = |chan: Vec<f64>| {
+            lookup(&[
+                ("GPS_Latitude", lat.clone(), 1.0),
+                ("GPS_Longitude", lon.clone(), 1.0),
+                ("GPS_EpochMs", epoch.clone(), 1.0),
+                ("LapTime", chan, 1.0),
+            ])
+        };
+        let main = track(idx.iter().map(|i| i * 2.0).collect());
+        let overlay_a = track(idx.clone());
+        let overlay_b = track(idx.iter().map(|i| i * 3.0).collect());
+        let ctx = MathLapContext {
+            main_lap_bounds: vec![(0.0, 9.0)],
+            main_sectors: Vec::new(),
+            main_lap_number: Some(1),
+            overlay: vec![
+                MathOverlay {
+                    lookup: std::sync::Arc::new(overlay_a),
+                    lap_start_ms: 0.0,
+                    lap_end_ms: 9000.0,
+                    lap_start_uniform_sec: 0.0,
+                },
+                MathOverlay {
+                    lookup: std::sync::Arc::new(overlay_b),
+                    lap_start_ms: 0.0,
+                    lap_end_ms: 9000.0,
+                    lap_start_uniform_sec: 0.0,
+                },
+            ],
+            baseline_row: None,
+        };
+
+        // Act
+        let v = eval(&crate::math::parse::parse("variance_dist([LapTime])").unwrap(), &main, &ctx)
+            .unwrap();
+
+        // Assert — mean of (+i, -i) is ~0 in-window, not the first entry's `i`.
+        match v {
+            Value::Channel(c) => {
+                let inside: Vec<f64> = c.samples.iter().copied().filter(|x| !x.is_nan()).collect();
+                assert!(!inside.is_empty(), "expected some in-window samples");
+                for x in inside {
+                    assert!(x.abs() < 1e-3, "expected ~0 (mean of +i/-i), got {x}");
+                }
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn variance_time_empty_overlay_laps_is_no_lap_context() {
+        // Arrange — main lap designated but no overlay laps at all.
+        let lk = lookup(&[("LapTime", vec![0.0, 1.0], 1.0)]);
+        let ctx = MathLapContext {
+            main_lap_bounds: vec![(0.0, 2.0)],
+            main_sectors: Vec::new(),
+            main_lap_number: Some(1),
+            overlay: Vec::new(),
+            baseline_row: None,
+        };
+
+        // Act
+        let err = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &lk, &ctx)
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::NoLapContext);
     }
 
     // ---- Vector & rotation primitives (parser-level integration) ----
