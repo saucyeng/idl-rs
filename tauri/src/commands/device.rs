@@ -300,13 +300,29 @@ type ConnectionMap<T> = StdMutex<HashMap<String, Arc<tokio::sync::Mutex<T>>>>;
 /// off an existing live connection, and matches "last caller wins" for a
 /// UI-driven Connect button. The outer lock is held only for the
 /// synchronous `insert`, never across an `.await`.
+///
+/// **Superseded-connection teardown (Task 7 lead ruling, review-task6
+/// note):** whether `btleplug`'s `Drop` tears down a GATT link on this
+/// platform is unverified, so a replaced entry's transport is explicitly
+/// `.disconnect()`ed here rather than left to drop — best effort: a
+/// disconnect failure on the *old* connection is logged and does not fail
+/// the new `connect_device` call, since the new connection already
+/// succeeded by this point.
 async fn connect_device_via<T: BleTransport>(
     connections: &ConnectionMap<T>,
     mut ble: T,
     device_id: &str,
 ) -> Result<ConnectionInfo, IpcError> {
     let info = ble.connect(device_id).await.map_err(IpcError::from)?;
-    connections.lock().unwrap().insert(device_id.to_string(), Arc::new(tokio::sync::Mutex::new(ble)));
+    let superseded = {
+        let mut map = connections.lock().unwrap();
+        map.insert(device_id.to_string(), Arc::new(tokio::sync::Mutex::new(ble)))
+    };
+    if let Some(old) = superseded {
+        if let Err(e) = old.lock().await.disconnect().await {
+            eprintln!("connect_device: disconnecting superseded connection for {device_id} failed (best effort, new connection is unaffected): {e}");
+        }
+    }
     Ok(info.into())
 }
 
@@ -468,6 +484,155 @@ async fn push_config_via(ble: &impl BleTransport, config_json: &str) -> Result<(
     ble.push_config(config_json.as_bytes()).await.map_err(IpcError::from)
 }
 
+/// Maps `device_control`'s `command` argument (C3 §3.8) onto the
+/// `ControlCommand` byte to write and the status-field check that observes
+/// the transition's completion — checked before any transport call, so an
+/// unrecognised `command` never reaches `send_command`. Unknown strings are
+/// `invalid_argument` (a caller-side mistake, not a device-side rejection).
+fn control_command_and_expectation(
+    command: &str,
+) -> Result<(ControlCommand, fn(&idl_transport::ble_status::DeviceStatus) -> bool), IpcError> {
+    match command {
+        "start_recording" => Ok((ControlCommand::StartLogging, |s| s.logging == Some(true))),
+        "stop_recording" => Ok((ControlCommand::StopLogging, |s| s.logging == Some(false))),
+        "wifi_on" => Ok((ControlCommand::WifiOn, |s| s.wifi_on == Some(true))),
+        "wifi_off" => Ok((ControlCommand::WifiOff, |s| s.wifi_on == Some(false))),
+        other => Err(IpcError::new(IpcErrorKind::InvalidArgument, format!("unknown device_control command: {other}"))),
+    }
+}
+
+/// Writes `cmd` to Control, then polls `read_status` (reusing
+/// `WIFI_ON_POLL_ATTEMPTS`/`WIFI_ON_POLL_INTERVAL` — this task's own
+/// judgment call: the same 10-attempts/200 ms-apart budget
+/// `switch_to_wifi_mode` already uses fits every transition here too, C3
+/// §3.8 fixes no distinct duration per transition, and SPEC §14a leaves BLE
+/// timeouts unfixed generally) until `expect_field` matches the newly read
+/// status. Unlike `switch_to_wifi_mode`, exhausting the poll budget is
+/// **not** an error here — C3 §3.8's own wording: "a timeout returns the
+/// last status read rather than failing" (this command's own DTO mapping,
+/// not `switch_to_wifi_mode`'s `()`, is what a caller gets back either way).
+async fn send_command_and_poll_via(
+    ble: &impl BleTransport,
+    cmd: ControlCommand,
+    expect_field: fn(&idl_transport::ble_status::DeviceStatus) -> bool,
+) -> Result<DeviceStatus, IpcError> {
+    // TODO(idl0): once idl-transport exposes a real AckCode from
+    // send_command (a future transport-lane task, out of this lane's scope
+    // per CLAUDE.md §7 — this lane does not change idl_transport's public
+    // trait), map AckCode::{Busy, Precondition, WriteNotPermitted} to
+    // IpcError::with_detail(IpcErrorKind::DeviceRejected, ..., json!({"ack":
+    // ...})) here; until then, every send_command failure maps to
+    // IpcErrorKind::Ble via IpcError::from (R63/R63.1) — btleplug's desktop
+    // backends never surface the raw ACK byte (see
+    // `idl_transport::ble_transport::BtleplugBle::send_command`'s doc
+    // comment), so this branch is unreachable from this code today.
+    ble.send_command(cmd).await.map_err(IpcError::from)?;
+
+    let mut status = ble.read_status().await.map_err(IpcError::from)?;
+    for _ in 0..WIFI_ON_POLL_ATTEMPTS {
+        if expect_field(&status) {
+            break;
+        }
+        tokio::time::sleep(WIFI_ON_POLL_INTERVAL).await;
+        status = ble.read_status().await.map_err(IpcError::from)?;
+    }
+    Ok(status.into())
+}
+
+/// Transport-agnostic core of `device_control` (C3 §3.8): resolves
+/// `device_id`'s connection the same way `device_status_via` does — the
+/// managed entry from `state::Connections` when one exists (never
+/// disconnected by this call, since it didn't open it), otherwise a fresh
+/// transport that's connected, acted on, and disconnected here.
+async fn device_control_via<T, F, Fut>(
+    connections: &ConnectionMap<T>,
+    device_id: &str,
+    new_ble: F,
+    cmd: ControlCommand,
+    expect_field: fn(&idl_transport::ble_status::DeviceStatus) -> bool,
+) -> Result<DeviceStatus, IpcError>
+where
+    T: BleTransport,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, TransportError>>,
+{
+    let managed = connections.lock().unwrap().get(device_id).cloned();
+    if let Some(ble) = managed {
+        let ble = ble.lock().await;
+        send_command_and_poll_via(&*ble, cmd, expect_field).await
+    } else {
+        let mut ble = new_ble().await.map_err(IpcError::from)?;
+        ble.connect(device_id).await.map_err(IpcError::from)?;
+        let result = send_command_and_poll_via(&ble, cmd, expect_field).await;
+        let _ = ble.disconnect().await;
+        result
+    }
+}
+
+/// `device_control_via`'s string-argument entry point: parses `command`
+/// (`invalid_argument` before any connection resolution or transport call)
+/// then delegates.
+async fn device_control_str_via<T, F, Fut>(
+    connections: &ConnectionMap<T>,
+    device_id: &str,
+    new_ble: F,
+    command: &str,
+) -> Result<DeviceStatus, IpcError>
+where
+    T: BleTransport,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, TransportError>>,
+{
+    let (cmd, expect_field) = control_command_and_expectation(command)?;
+    device_control_via(connections, device_id, new_ble, cmd, expect_field).await
+}
+
+/// Transport-agnostic core of `pull_config` (C3 §3.8): resolves the
+/// connection the same way as `device_control_via`, drives `read_config`
+/// (already frames `ControlCommand::ConfigReadBegin` + the FF06 reassembly
+/// loop internally), then decodes the returned bytes as UTF-8.
+///
+/// Invalid UTF-8 is this layer's own decode failure (`internal`), not a
+/// device-side rejection. `config` (lead ruling R64.3: "a device-reported
+/// config error on read (0x81) maps to the config kind... transport
+/// failures stay ble") stays reserved for that device-reported case — no
+/// extra mapping code is added here for it, because the existing blanket
+/// `impl From<TransportError> for IpcError` (`error.rs`) already maps
+/// `TransportErrorKind::Config` to `IpcErrorKind::Config`, so R64.3's rule
+/// is satisfied automatically the moment `read_config` ever tags that case
+/// with `TransportErrorKind::Config`. As landed today it does not:
+/// `read_config` (and the `send_command(ConfigReadBegin)` it calls
+/// internally) construct every failure, including SPEC §7.2's `0x81` "no
+/// config file" ACK, via this crate's `ble_error()` helper, which always
+/// uses `TransportErrorKind::Ble` — the same platform limitation
+/// `device_rejected` hits (`send_command` never surfaces the raw ACK byte
+/// on `btleplug`'s desktop backends), so `config` is unreachable from this
+/// command today, same as `device_rejected` is from `device_control`. See
+/// this task's report for the flag to the lead.
+async fn pull_config_via<T, F, Fut>(
+    connections: &ConnectionMap<T>,
+    device_id: &str,
+    new_ble: F,
+) -> Result<String, IpcError>
+where
+    T: BleTransport,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, TransportError>>,
+{
+    let managed = connections.lock().unwrap().get(device_id).cloned();
+    let bytes = if let Some(ble) = managed {
+        ble.lock().await.read_config().await.map_err(IpcError::from)?
+    } else {
+        let mut ble = new_ble().await.map_err(IpcError::from)?;
+        ble.connect(device_id).await.map_err(IpcError::from)?;
+        let result = ble.read_config().await;
+        let _ = ble.disconnect().await;
+        result.map_err(IpcError::from)?
+    };
+    String::from_utf8(bytes)
+        .map_err(|e| IpcError::new(IpcErrorKind::Internal, format!("device returned non-UTF-8 config bytes: {e}")))
+}
+
 /// Scans for `uuids::SERVICE` BLE devices for `timeout_ms`, streaming a
 /// `DeviceDiscovered` message per device found; resolves with no value when
 /// the scan window ends (C3 §3.8). Explicit user action on the Device tab —
@@ -567,6 +732,33 @@ pub async fn push_config(device_id: String, config_json: String) -> Result<(), I
     result
 }
 
+/// Sends `command` (`"start_recording"`/`"stop_recording"`/`"wifi_on"`/
+/// `"wifi_off"`) to `device_id`'s Control characteristic and polls status
+/// until the corresponding transition is observed or a bounded poll budget
+/// expires (C3 §3.8) — uses the managed connection from `state::Connections`
+/// when one exists, otherwise connects, acts, and disconnects. Returns the
+/// last status read either way; never times out to an error.
+#[tauri::command]
+pub async fn device_control(
+    connections: tauri::State<'_, Connections>,
+    device_id: String,
+    command: String,
+) -> Result<DeviceStatus, IpcError> {
+    device_control_str_via(&connections.0, &device_id, || async { BtleplugBle::new().await }, &command).await
+}
+
+/// Reads `device_id`'s live `idl0_config.json` back over BLE (C3 §3.8),
+/// driving `ControlCommand::ConfigReadBegin` and the FF06 reassembly loop —
+/// uses the managed connection from `state::Connections` when one exists,
+/// otherwise connects, reads, and disconnects.
+#[tauri::command]
+pub async fn pull_config(
+    connections: tauri::State<'_, Connections>,
+    device_id: String,
+) -> Result<String, IpcError> {
+    pull_config_via(&connections.0, &device_id, || async { BtleplugBle::new().await }).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,15 +785,23 @@ mod tests {
         /// One entry consumed per `read_status` call; the last entry repeats
         /// once the queue is drained. Ignored once `status_override` is `Some`.
         wifi_on_reads: StdMutex<VecDeque<Option<bool>>>,
+        /// Same convention as `wifi_on_reads`, for `device_control`'s
+        /// `logging`-flip tests (start/stop recording).
+        logging_reads: StdMutex<VecDeque<Option<bool>>>,
         /// When `Some`, `read_status` returns this directly instead of
-        /// consulting `wifi_on_reads` — the managed-connection `device_status`
-        /// tests need a full `DeviceStatus`, not just `wifi_on`.
+        /// consulting `wifi_on_reads`/`logging_reads` — the managed-connection
+        /// `device_status` tests need a full `DeviceStatus`, not just one field.
         status_override: StdMutex<Option<DeviceStatus>>,
+        /// `read_config`'s canned result (Task 7's `pull_config` tests).
+        read_config_result: Result<Vec<u8>, TransportError>,
         /// `Arc`-shared so a test can hold a clone after a `StubBle` built
         /// inside a `device_status_via` factory closure is moved and dropped.
         connect_calls: Arc<AtomicUsize>,
         disconnect_calls: Arc<AtomicUsize>,
         send_command_calls: AtomicUsize,
+        /// The most recent `ControlCommand` passed to `send_command`, for
+        /// `device_control`'s command-mapping tests.
+        last_command: StdMutex<Option<ControlCommand>>,
     }
 
     impl Default for StubBle {
@@ -615,10 +815,13 @@ mod tests {
                     "StubBle::push_config not configured",
                 )),
                 wifi_on_reads: StdMutex::new(VecDeque::new()),
+                logging_reads: StdMutex::new(VecDeque::new()),
                 status_override: StdMutex::new(None),
+                read_config_result: Err(TransportError::new(TransportErrorKind::Ble, "StubBle::read_config not configured")),
                 connect_calls: Arc::new(AtomicUsize::new(0)),
                 disconnect_calls: Arc::new(AtomicUsize::new(0)),
                 send_command_calls: AtomicUsize::new(0),
+                last_command: StdMutex::new(None),
             }
         }
     }
@@ -646,17 +849,24 @@ mod tests {
             if let Some(status) = self.status_override.lock().unwrap().clone() {
                 return Ok(status);
             }
-            let mut q = self.wifi_on_reads.lock().unwrap();
-            let wifi_on = if q.len() > 1 { q.pop_front().unwrap() } else { q.front().copied().flatten() };
-            Ok(DeviceStatus { wifi_on, ..DeviceStatus::default() })
+            let wifi_on = {
+                let mut q = self.wifi_on_reads.lock().unwrap();
+                if q.len() > 1 { q.pop_front().unwrap() } else { q.front().copied().flatten() }
+            };
+            let logging = {
+                let mut q = self.logging_reads.lock().unwrap();
+                if q.len() > 1 { q.pop_front().unwrap() } else { q.front().copied().flatten() }
+            };
+            Ok(DeviceStatus { wifi_on, logging, ..DeviceStatus::default() })
         }
 
         async fn watch_status(&self) -> Result<mpsc::Receiver<DeviceStatus>, TransportError> {
             Err(TransportError::new(TransportErrorKind::Ble, "StubBle::watch_status not exercised"))
         }
 
-        async fn send_command(&self, _cmd: ControlCommand) -> Result<(), TransportError> {
+        async fn send_command(&self, cmd: ControlCommand) -> Result<(), TransportError> {
             self.send_command_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_command.lock().unwrap() = Some(cmd);
             self.send_command_result.clone()
         }
 
@@ -665,7 +875,7 @@ mod tests {
         }
 
         async fn read_config(&self) -> Result<Vec<u8>, TransportError> {
-            Err(TransportError::new(TransportErrorKind::Ble, "StubBle::read_config not exercised"))
+            self.read_config_result.clone()
         }
     }
 
@@ -843,6 +1053,33 @@ mod tests {
 
         // Assert — this task's own choice: replace, not error or ignore.
         assert_eq!(connections.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn connect_device_via_replacing_an_existing_entry_disconnects_the_superseded_stub() {
+        // Arrange — lead ruling (review-task6 note): explicit disconnect
+        // before dropping the superseded transport, since whether
+        // btleplug's `Drop` tears down the GATT link is unverified.
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        let make_ble = || StubBle {
+            connect_result: Ok(idl_transport::ConnectionInfo {
+                device_id: "AA:BB".to_string(),
+                firmware_version: "1.0.0".to_string(),
+                connected: true,
+            }),
+            ..Default::default()
+        };
+        connect_device_via(&connections, make_ble(), "AA:BB").await.unwrap();
+        let first_entry = connections.lock().unwrap().get("AA:BB").unwrap().clone();
+
+        // Act
+        connect_device_via(&connections, make_ble(), "AA:BB").await.unwrap();
+
+        // Assert — the superseded (first) stub was disconnected once; the
+        // new one now in the map was not (it's still open).
+        assert_eq!(first_entry.lock().await.disconnect_calls.load(Ordering::SeqCst), 1);
+        let second_entry = connections.lock().unwrap().get("AA:BB").unwrap().clone();
+        assert_eq!(second_entry.lock().await.disconnect_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1209,5 +1446,202 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::Config);
+    }
+
+    #[tokio::test]
+    async fn device_control_str_via_maps_every_command_string_to_the_correct_control_command() {
+        // Arrange / Act / Assert — a managed connection per case so the same
+        // `StubBle` instance both receives the command and answers the poll
+        // (status already reports the transition, so the first `read_status`
+        // satisfies `expect_field`), letting the test read back
+        // `last_command` afterward.
+        let cases = [
+            ("start_recording", ControlCommand::StartLogging, Some(true), None),
+            ("stop_recording", ControlCommand::StopLogging, Some(false), None),
+            ("wifi_on", ControlCommand::WifiOn, None, Some(true)),
+            ("wifi_off", ControlCommand::WifiOff, None, Some(false)),
+        ];
+
+        for (command, expected_cmd, logging, wifi_on) in cases {
+            let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+            let ble = Arc::new(tokio::sync::Mutex::new(StubBle {
+                status_override: StdMutex::new(Some(DeviceStatus { logging, wifi_on, ..DeviceStatus::default() })),
+                ..Default::default()
+            }));
+            connections.lock().unwrap().insert("AA:BB".to_string(), ble.clone());
+
+            let status = device_control_str_via(
+                &connections,
+                "AA:BB",
+                || async { Err(TransportError::new(TransportErrorKind::Ble, "new_ble must not be called for a managed connection")) },
+                command,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(status.logging, logging, "command={command}");
+            assert_eq!(status.wifi_on, wifi_on, "command={command}");
+            assert_eq!(ble.lock().await.last_command.lock().unwrap().clone(), Some(expected_cmd), "command={command}");
+        }
+    }
+
+    #[tokio::test]
+    async fn device_control_str_via_unrecognised_command_is_invalid_argument_before_any_transport_call() {
+        // Arrange
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+
+        // Act — `new_ble` errors if actually called, failing this test.
+        let err = device_control_str_via(
+            &connections,
+            "AA:BB",
+            || async { Err(TransportError::new(TransportErrorKind::Ble, "new_ble must not be called")) },
+            "reboot",
+        )
+        .await
+        .unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn device_control_via_polls_until_the_expected_field_flips_then_returns_that_status() {
+        // Arrange
+        let ble = Arc::new(tokio::sync::Mutex::new(StubBle {
+            logging_reads: StdMutex::new(VecDeque::from([Some(false), Some(false), Some(true)])),
+            ..Default::default()
+        }));
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        connections.lock().unwrap().insert("AA:BB".to_string(), ble.clone());
+
+        // Act
+        let status = device_control_via(
+            &connections,
+            "AA:BB",
+            || async { Err(TransportError::new(TransportErrorKind::Ble, "unused")) },
+            ControlCommand::StartLogging,
+            |s| s.logging == Some(true),
+        )
+        .await
+        .unwrap();
+
+        // Assert
+        assert_eq!(status.logging, Some(true));
+        assert_eq!(ble.lock().await.send_command_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn device_control_via_exhausts_poll_budget_without_flip_returns_ok_with_last_status_read() {
+        // Arrange — `logging` never reports `true`; C3 §3.8: a timeout
+        // returns the last status read rather than failing.
+        let ble = Arc::new(tokio::sync::Mutex::new(StubBle {
+            logging_reads: StdMutex::new(VecDeque::from([Some(false)])),
+            ..Default::default()
+        }));
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        connections.lock().unwrap().insert("AA:BB".to_string(), ble.clone());
+
+        // Act
+        let status = device_control_via(
+            &connections,
+            "AA:BB",
+            || async { Err(TransportError::new(TransportErrorKind::Ble, "unused")) },
+            ControlCommand::StartLogging,
+            |s| s.logging == Some(true),
+        )
+        .await;
+
+        // Assert
+        let status = status.unwrap();
+        assert_eq!(status.logging, Some(false));
+    }
+
+    #[tokio::test]
+    async fn device_control_via_send_command_failure_maps_to_ble_ipc_error() {
+        // Arrange
+        let ble = Arc::new(tokio::sync::Mutex::new(StubBle {
+            send_command_result: Err(TransportError::new(TransportErrorKind::Ble, "GATT write failed")),
+            ..Default::default()
+        }));
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        connections.lock().unwrap().insert("AA:BB".to_string(), ble.clone());
+
+        // Act
+        let err = device_control_via(
+            &connections,
+            "AA:BB",
+            || async { Err(TransportError::new(TransportErrorKind::Ble, "unused")) },
+            ControlCommand::StartLogging,
+            |s| s.logging == Some(true),
+        )
+        .await
+        .unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::Ble);
+    }
+
+    #[tokio::test]
+    async fn pull_config_via_known_bytes_returns_the_exact_string_back() {
+        // Arrange
+        let ble = Arc::new(tokio::sync::Mutex::new(StubBle {
+            read_config_result: Ok(br#"{"config_version":1}"#.to_vec()),
+            ..Default::default()
+        }));
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        connections.lock().unwrap().insert("AA:BB".to_string(), ble.clone());
+
+        // Act
+        let config = pull_config_via(&connections, "AA:BB", || async {
+            Err(TransportError::new(TransportErrorKind::Ble, "unused"))
+        })
+        .await
+        .unwrap();
+
+        // Assert
+        assert_eq!(config, r#"{"config_version":1}"#);
+    }
+
+    #[tokio::test]
+    async fn pull_config_via_invalid_utf8_bytes_maps_to_internal() {
+        // Arrange
+        let ble = Arc::new(tokio::sync::Mutex::new(StubBle {
+            read_config_result: Ok(vec![0xff, 0xfe, 0xfd]),
+            ..Default::default()
+        }));
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        connections.lock().unwrap().insert("AA:BB".to_string(), ble.clone());
+
+        // Act
+        let err = pull_config_via(&connections, "AA:BB", || async {
+            Err(TransportError::new(TransportErrorKind::Ble, "unused"))
+        })
+        .await
+        .unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::Internal);
+    }
+
+    #[tokio::test]
+    async fn pull_config_via_transport_failure_maps_to_ble_not_config() {
+        // Arrange — `read_config` as landed always tags failures (including
+        // SPEC §7.2's `0x81` "no config file" ACK) as `TransportErrorKind::Ble`.
+        let ble = Arc::new(tokio::sync::Mutex::new(StubBle {
+            read_config_result: Err(TransportError::new(TransportErrorKind::Ble, "Config TX read failed")),
+            ..Default::default()
+        }));
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        connections.lock().unwrap().insert("AA:BB".to_string(), ble.clone());
+
+        // Act
+        let err = pull_config_via(&connections, "AA:BB", || async {
+            Err(TransportError::new(TransportErrorKind::Ble, "unused"))
+        })
+        .await
+        .unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::Ble);
     }
 }
