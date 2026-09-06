@@ -1,9 +1,10 @@
 //! The `.idl0` import pipeline (blob write → parse → base-channel synthesis
 //! → `data.parquet` → `session.json`), ruling R18: this belongs in core, not
 //! the CLI, so both the CLI and (later) L5's Tauri `import_file` command
-//! share one implementation. Does **not** touch the catalog — refreshing it
-//! is the caller's job (C4 §5's rebuild is cheap and idempotent; incremental
-//! catalog indexing does not exist yet).
+//! share one implementation. Also updates `catalog.sqlite` for this one
+//! session, incrementally, when a catalog already exists (C4 §5's
+//! `index_session`, task L2b T4) — it never creates a catalog itself; a
+//! bare data root stays catalog-less until something rebuilds one.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use crate::import::ImporterError;
 use crate::session::handle::SessionHandle;
 use crate::session::{ParseError, Session};
 use crate::store::blob::{self, BlobStoreError};
+use crate::store::catalog::{index_session, open_catalog};
 use crate::store::lap_index::{index_laps, LapIndexReport};
 use crate::store::parquet::{read_session_metadata, write_session_parquet, ParquetStoreError, SessionParquetMetadata};
 use crate::store::session_json::{empty_session_json, write_session_json, SessionJsonError};
@@ -220,6 +222,13 @@ pub struct ImportReport {
     /// and [`Self::lap_index`] are never both `Some`). Recoverable by
     /// `idl-rs rescan`.
     pub lap_index_warning: Option<String>,
+    /// Set to [`crate::store::catalog::CatalogError`]'s `Display` when
+    /// `catalog.sqlite` exists but [`crate::store::catalog::index_session`]
+    /// failed for this session (C4 §5, task L2b T4) — the import itself
+    /// still succeeds; the catalog just falls behind until the next
+    /// successful import or a `rebuild_catalog`. Always `None` when no
+    /// catalog exists yet, since this pipeline never creates one.
+    pub catalog_index_warning: Option<String>,
 }
 
 /// Imports one `.idl0` buffer into `data_root` (contract C4 §2 layout):
@@ -379,6 +388,23 @@ fn finish_import(
         Err(e) => (None, Some(e.to_string())),
     };
 
+    // Incremental catalog update (C4 §5, task L2b T4), non-fatal like the
+    // lap-index step above: only when `catalog.sqlite` already exists —
+    // this pipeline never creates one (a bare `<data>` stays catalog-less
+    // until something runs `rebuild_catalog`, per the catalog's own
+    // "deletable, rebuildable, never synced" contract). A missing catalog
+    // is therefore not a warning either; it's simply not this function's
+    // concern.
+    let catalog_path = data_root.join("catalog.sqlite");
+    let catalog_index_warning = if catalog_path.is_file() {
+        match open_catalog(&catalog_path).and_then(|conn| index_session(&conn, data_root, &session_id)) {
+            Ok(_) => None,
+            Err(e) => Some(e.to_string()),
+        }
+    } else {
+        None
+    };
+
     Ok(ImportReport {
         session_id,
         blob_sha256,
@@ -389,6 +415,7 @@ fn finish_import(
         import_warnings: warnings,
         lap_index,
         lap_index_warning,
+        catalog_index_warning,
     })
 }
 
@@ -987,6 +1014,47 @@ mod tests {
         // Assert
         assert!(matches!(result, Err(ImportError { kind: ImportErrorKind::ImportNotUtf8, .. })));
         assert!(!crate::store::blob::blob_exists(&root, &would_be_digest));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_file_into_a_root_with_an_existing_catalog_indexes_laps_without_a_rebuild() {
+        // Arrange — a catalog already exists (built on the empty tree,
+        // before this session's blob ever existed) so `finish_import`'s
+        // `index_session` call must insert this session's own `blobs` row
+        // itself (ruling R84) rather than rely on a prior `rebuild_catalog`
+        // scan of the CAS.
+        let root = temp_root();
+        crate::store::catalog::rebuild_catalog(&root).unwrap();
+        write_track(&root, &circuit_track_fixture("loop-1")).unwrap();
+        let bytes = gpx_three_lap_bytes();
+
+        // Act
+        let report = import_file(&root, "gpx", &bytes).unwrap();
+
+        // Assert — no error/warning recording a failed catalog update, and
+        // the laps are queryable immediately, with no intervening
+        // `rebuild_catalog` call.
+        assert!(report.catalog_index_warning.is_none());
+        let laps = crate::store::catalog_read::list_laps(&root, &report.session_id).unwrap();
+        assert_eq!(laps.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_file_into_a_root_with_no_catalog_succeeds_and_creates_none() {
+        // Arrange — no `catalog.sqlite` at all under `root`.
+        let root = temp_root();
+        let bytes = minimal_gpx_with_warning();
+
+        // Act
+        let report = import_file(&root, "gpx", &bytes).unwrap();
+
+        // Assert — this pipeline never creates a catalog as a side effect.
+        assert!(report.catalog_index_warning.is_none());
+        assert!(!root.join("catalog.sqlite").is_file());
 
         let _ = std::fs::remove_dir_all(&root);
     }
