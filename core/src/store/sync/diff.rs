@@ -8,7 +8,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
-use super::manifest::{DataParquetEntry, Manifest, ProfileEntry, SessionEntry, TrackEntry, WorkbookEntry};
+use super::manifest::{DataParquetEntry, Manifest, ProfileEntry, SessionEntry, SkippedEntry, TrackEntry, WorkbookEntry};
 
 /// One unit of work a sync run performs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +73,12 @@ pub enum SyncNoteReason {
     /// rule, so the pair cannot be compared. Neither side is authoritative;
     /// nothing transfers for this session's `data.parquet` (ruling R89).
     IncomparableDataParquetVersion { local: VersionPair, remote: VersionPair },
+    /// This item's local copy is a path `build_manifest` skipped as
+    /// malformed (ruling R90) — it never appears in `local`'s manifest at
+    /// all, so nothing here may pull a peer's copy over it or push it as
+    /// if it were a good local copy, until a human resolves it. `path` and
+    /// `reason` are copied from the matching [`SkippedEntry`].
+    LocalFileSkipped { path: String, reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -87,7 +93,19 @@ pub struct SyncPlan {
 /// transfers the missing copy (no deletion is ever propagated by this
 /// function) or, for `data.parquet`/workbook/`session.json` present on both
 /// sides, applies that class's own conflict rule.
-pub fn plan_sync(local: &Manifest, remote: &Manifest) -> SyncPlan {
+///
+/// `local_skipped` names every path `build_manifest` omitted from `local`
+/// as malformed (ruling R90). Each one is "do not touch": this function
+/// never plans a pull that would overwrite it or a push that would claim
+/// it, and instead emits a [`SyncNoteReason::LocalFileSkipped`] note.
+/// Recognised so far (ruling R90's own two named cases):
+/// `sessions/<id>/session.json` and `workbooks/<file_name>.idl1wb` — the
+/// workbook case is keyed by matching `file_name` against the peer's
+/// manifest entry, since a workbook that failed to parse locally has no
+/// recoverable `workbook_id` of its own. A path matching neither shape
+/// produces no note yet — this function has no other class's path
+/// convention to recognise it by until a later task extends it.
+pub fn plan_sync(local: &Manifest, remote: &Manifest, local_skipped: &[SkippedEntry]) -> SyncPlan {
     let mut actions = Vec::new();
     let mut notes = Vec::new();
 
@@ -140,10 +158,56 @@ pub fn plan_sync(local: &Manifest, remote: &Manifest) -> SyncPlan {
         }
     }
 
+    apply_local_skips(local, remote, local_skipped, &mut actions, &mut notes);
+
     actions.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
     notes.sort_by(|a, b| (class_rank(a.class), a.key.as_str()).cmp(&(class_rank(b.class), b.key.as_str())));
 
     SyncPlan { actions, notes }
+}
+
+/// Ruling R90: drops any planned action for a locally skipped item and
+/// records why. See [`plan_sync`]'s doc comment for the two path shapes
+/// this recognises.
+fn apply_local_skips(local: &Manifest, remote: &Manifest, skipped: &[SkippedEntry], actions: &mut Vec<SyncAction>, notes: &mut Vec<SyncNote>) {
+    for entry in skipped {
+        let note_reason = || SyncNoteReason::LocalFileSkipped { path: entry.path.clone(), reason: entry.reason.clone() };
+        if let Some(session_id) = session_json_id_from_skip_path(&entry.path) {
+            actions.retain(|a| !(item_of(a).class == SyncClass::SessionJson && item_of(a).key == session_id));
+            notes.push(SyncNote { class: SyncClass::SessionJson, key: session_id, reason: note_reason() });
+        } else if let Some(file_name) = workbook_file_name_from_skip_path(&entry.path) {
+            let workbook_id = remote
+                .workbooks
+                .iter()
+                .find(|w| w.file_name == file_name)
+                .or_else(|| local.workbooks.iter().find(|w| w.file_name == file_name))
+                .map(|w| w.workbook_id.clone());
+            if let Some(id) = &workbook_id {
+                actions.retain(|a| !(item_of(a).class == SyncClass::Workbook && item_of(a).key == *id));
+            }
+            let key = workbook_id.unwrap_or_else(|| file_name.clone());
+            notes.push(SyncNote { class: SyncClass::Workbook, key, reason: note_reason() });
+        }
+    }
+}
+
+/// `sessions/<id>/session.json` → `Some(id)`; anything else `None`.
+fn session_json_id_from_skip_path(path: &str) -> Option<String> {
+    let mut parts = path.split('/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("sessions"), Some(id), Some("session.json"), None) => Some(id.to_string()),
+        _ => None,
+    }
+}
+
+/// `workbooks/<file_name>.idl1wb` → `Some(file_name)`; anything else
+/// `None`.
+fn workbook_file_name_from_skip_path(path: &str) -> Option<String> {
+    let mut parts = path.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("workbooks"), Some(file), None) => file.strip_suffix(".idl1wb").map(|s| s.to_string()),
+        _ => None,
+    }
 }
 
 fn find_session<'a>(m: &'a Manifest, session_id: &str) -> Option<&'a SessionEntry> {
@@ -465,7 +529,7 @@ mod tests {
         local.blobs.push(BlobEntry { sha256: "l".repeat(64), size_bytes: 20 });
 
         // Act
-        let plan = plan_sync(&local, &remote);
+        let plan = plan_sync(&local, &remote, &[]);
 
         // Assert
         assert_eq!(plan.actions.len(), 2);
@@ -486,7 +550,7 @@ mod tests {
         });
 
         // Act
-        let plan = plan_sync(&m, &m);
+        let plan = plan_sync(&m, &m, &[]);
 
         // Assert
         assert!(plan.actions.is_empty());
@@ -502,7 +566,7 @@ mod tests {
         remote.sessions.push(SessionEntry { session_id: "s1".to_string(), data_parquet: Some(dp("h2", "0.3.0", "v1")), derived: Vec::new(), session_json: None });
 
         // Act
-        let plan = plan_sync(&local, &remote);
+        let plan = plan_sync(&local, &remote, &[]);
 
         // Assert
         assert!(plan.actions.is_empty());
@@ -518,7 +582,7 @@ mod tests {
         remote.sessions.push(SessionEntry { session_id: "s1".to_string(), data_parquet: Some(dp("h2", "0.2.0", "v1")), derived: Vec::new(), session_json: None });
 
         // Act
-        let plan = plan_sync(&local, &remote);
+        let plan = plan_sync(&local, &remote, &[]);
 
         // Assert — importer newer wins regardless of seam (ruling R89).
         assert_eq!(
@@ -537,7 +601,7 @@ mod tests {
         remote.sessions.push(SessionEntry { session_id: "s1".to_string(), data_parquet: Some(dp("h2", "0.1.0", "v2")), derived: Vec::new(), session_json: None });
 
         // Act
-        let plan = plan_sync(&local, &remote);
+        let plan = plan_sync(&local, &remote, &[]);
 
         // Assert
         assert_eq!(
@@ -561,7 +625,7 @@ mod tests {
         });
 
         // Act
-        let plan = plan_sync(&local, &remote);
+        let plan = plan_sync(&local, &remote, &[]);
 
         // Assert
         assert!(plan.actions.is_empty());
@@ -587,7 +651,7 @@ mod tests {
         remote.sessions.push(SessionEntry { session_id: "s1".to_string(), data_parquet: Some(dp("h1", "0.1.0", "v1")), derived: Vec::new(), session_json: None });
 
         // Act
-        let plan = plan_sync(&local, &remote);
+        let plan = plan_sync(&local, &remote, &[]);
 
         // Assert
         assert!(plan.actions.is_empty());
@@ -613,7 +677,7 @@ mod tests {
         });
 
         // Act
-        let plan = plan_sync(&local, &remote);
+        let plan = plan_sync(&local, &remote, &[]);
 
         // Assert
         assert_eq!(
@@ -642,7 +706,7 @@ mod tests {
         });
 
         // Act
-        let plan = plan_sync(&local, &remote);
+        let plan = plan_sync(&local, &remote, &[]);
 
         // Assert
         assert_eq!(
@@ -673,7 +737,7 @@ mod tests {
         });
 
         // Act
-        let plan = plan_sync(&local, &remote);
+        let plan = plan_sync(&local, &remote, &[]);
 
         // Assert
         assert!(plan.actions.is_empty());
@@ -692,7 +756,7 @@ mod tests {
         remote.tracks.push(TrackEntry { track_id: "t-tie".to_string(), sha256: "r".to_string(), size_bytes: 6, updated_at_ms: 9 });
 
         // Act
-        let plan = plan_sync(&local, &remote);
+        let plan = plan_sync(&local, &remote, &[]);
 
         // Assert
         assert_eq!(plan.actions.len(), 2);
@@ -731,7 +795,7 @@ mod tests {
         remote.sessions.push(SessionEntry { session_id: "s2".to_string(), data_parquet: None, derived: Vec::new(), session_json: None });
 
         // Act
-        let plan = plan_sync(&local, &remote);
+        let plan = plan_sync(&local, &remote, &[]);
 
         // Assert — the same sha256 appears once per session, each tagged
         // with its own session_id, not merged into one item.
@@ -761,8 +825,8 @@ mod tests {
         remote.tracks.push(TrackEntry { track_id: "t1".to_string(), sha256: "r".to_string(), size_bytes: 4, updated_at_ms: 2 });
 
         // Act
-        let forward = plan_sync(&local, &remote);
-        let backward = plan_sync(&remote, &local);
+        let forward = plan_sync(&local, &remote, &[]);
+        let backward = plan_sync(&remote, &local, &[]);
 
         // Assert
         assert_eq!(forward.actions.len(), backward.actions.len());
@@ -787,10 +851,102 @@ mod tests {
         remote.tracks.push(TrackEntry { track_id: "t1".to_string(), sha256: "r".to_string(), size_bytes: 2, updated_at_ms: 2 });
 
         // Act
-        let first = plan_sync(&local, &remote);
-        let second = plan_sync(&local, &remote);
+        let first = plan_sync(&local, &remote, &[]);
+        let second = plan_sync(&local, &remote, &[]);
 
         // Assert
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn plan_sync_a_skipped_local_session_json_no_merge_or_pull_item_for_it_plus_warning() {
+        // Arrange — local's session.json failed to parse (build_manifest
+        // omits it, ruling R90's fix); remote has a good copy, which
+        // without R90 would look like a plain "remote only" Pull.
+        let mut local = empty_manifest();
+        let mut remote = empty_manifest();
+        local.sessions.push(SessionEntry { session_id: "s1".to_string(), data_parquet: None, derived: Vec::new(), session_json: None });
+        remote.sessions.push(SessionEntry {
+            session_id: "s1".to_string(),
+            data_parquet: None,
+            derived: Vec::new(),
+            session_json: Some(SessionJsonEntry { sha256: "r".to_string(), size_bytes: 2, updated_at_ms: 2 }),
+        });
+        let skipped = vec![SkippedEntry { path: "sessions/s1/session.json".to_string(), reason: "unparseable JSON".to_string() }];
+
+        // Act
+        let plan = plan_sync(&local, &remote, &skipped);
+
+        // Assert
+        assert!(plan.actions.is_empty());
+        assert_eq!(
+            plan.notes,
+            vec![SyncNote {
+                class: SyncClass::SessionJson,
+                key: "s1".to_string(),
+                reason: SyncNoteReason::LocalFileSkipped { path: "sessions/s1/session.json".to_string(), reason: "unparseable JSON".to_string() },
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_sync_a_skipped_local_workbook_no_merge_or_pull_item_for_it_plus_warning() {
+        // Arrange — local's workbook failed to parse (no workbook_id
+        // recoverable, so it has no manifest entry at all); remote holds a
+        // workbook at the same file_name, which without R90 would look
+        // like a plain "remote only" Pull that would overwrite the local
+        // file at install time.
+        let local = empty_manifest();
+        let mut remote = empty_manifest();
+        remote.workbooks.push(WorkbookEntry {
+            workbook_id: "w1".to_string(),
+            file_name: "fork-tuning".to_string(),
+            sha256: "r".to_string(),
+            size_bytes: 2,
+            updated_at_ms: 2,
+        });
+        let skipped = vec![SkippedEntry { path: "workbooks/fork-tuning.idl1wb".to_string(), reason: "front matter parse failure".to_string() }];
+
+        // Act
+        let plan = plan_sync(&local, &remote, &skipped);
+
+        // Assert
+        assert!(plan.actions.is_empty());
+        assert_eq!(
+            plan.notes,
+            vec![SyncNote {
+                class: SyncClass::Workbook,
+                key: "w1".to_string(),
+                reason: SyncNoteReason::LocalFileSkipped {
+                    path: "workbooks/fork-tuning.idl1wb".to_string(),
+                    reason: "front matter parse failure".to_string(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_sync_a_skipped_local_workbook_with_no_matching_peer_entry_still_carries_the_warning() {
+        // Arrange — the workbook is unknown to both sides under its
+        // file_name (e.g. it never got past front matter parsing anywhere),
+        // so there is no workbook_id to key the action-suppression on; the
+        // note must still surface using the file_name as a stand-in key.
+        let local = empty_manifest();
+        let remote = empty_manifest();
+        let skipped = vec![SkippedEntry { path: "workbooks/orphan.idl1wb".to_string(), reason: "front matter did not parse".to_string() }];
+
+        // Act
+        let plan = plan_sync(&local, &remote, &skipped);
+
+        // Assert
+        assert!(plan.actions.is_empty());
+        assert_eq!(
+            plan.notes,
+            vec![SyncNote {
+                class: SyncClass::Workbook,
+                key: "orphan".to_string(),
+                reason: SyncNoteReason::LocalFileSkipped { path: "workbooks/orphan.idl1wb".to_string(), reason: "front matter did not parse".to_string() },
+            }]
+        );
     }
 }

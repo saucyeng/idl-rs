@@ -120,6 +120,19 @@ pub struct ProfileEntry {
     pub updated_at_ms: i64,
 }
 
+/// A local file the manifest walk could not include, with why. Never part
+/// of the wire manifest (C4 §6 is unchanged) — this is local-only
+/// diagnostic information: it feeds `sync_status`'s warnings and
+/// `plan_sync` (ruling R90), which must never pull-overwrite or
+/// push-claim a path recorded here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedEntry {
+    /// Path relative to `data_root`, `/`-separated regardless of platform.
+    pub path: String,
+    /// Human-readable reason this file was omitted.
+    pub reason: String,
+}
+
 /// The full sync manifest (C4 §6) — the exact body `GET /idl1/v1/manifest`
 /// answers, so its field names are the wire contract, not an internal
 /// convenience shape. Every entry list is sorted by its own identity key
@@ -173,31 +186,46 @@ impl std::error::Error for SyncError {}
 /// A malformed individual file (unreadable, or missing the metadata its
 /// class requires) never aborts the walk — it is simply omitted from the
 /// manifest (a session's `data_parquet`/`session_json` becomes `None`; a
-/// malformed workbook/track/profile file does not appear in its list) so
-/// the rest of the tree still syncs. [`SyncError`] is reserved for a
-/// failure that makes the whole walk meaningless, such as `data_root`
-/// existing but not being readable as a directory at all.
-pub fn build_manifest(data_root: &Path, now_ms: i64) -> Result<Manifest, SyncError> {
+/// malformed workbook/track/profile file does not appear in its list) and
+/// recorded, path and reason, in the returned [`SkippedEntry`] list (ruling
+/// R90) so the rest of the tree still syncs and the omission is visible
+/// locally rather than silent. [`SyncError`] is reserved for a failure that
+/// makes the whole walk meaningless, such as `data_root` existing but not
+/// being readable as a directory at all.
+pub fn build_manifest(data_root: &Path, now_ms: i64) -> Result<(Manifest, Vec<SkippedEntry>), SyncError> {
     if data_root.exists() && !data_root.is_dir() {
         return Err(SyncError { kind: SyncErrorKind::Io, message: format!("{}: not a directory", data_root.display()) });
     }
 
+    let mut skipped = Vec::new();
+
     let mut blobs = collect_blobs(data_root);
     blobs.sort_by(|a, b| a.sha256.cmp(&b.sha256));
 
-    let mut sessions = collect_sessions(data_root);
+    let (mut sessions, session_skipped) = collect_sessions(data_root);
     sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    skipped.extend(session_skipped);
 
-    let mut workbooks = collect_workbooks(data_root);
+    let (mut workbooks, workbook_skipped) = collect_workbooks(data_root);
     workbooks.sort_by(|a, b| a.workbook_id.cmp(&b.workbook_id));
+    skipped.extend(workbook_skipped);
 
-    let mut tracks = collect_tracks(data_root);
+    let (mut tracks, track_skipped) = collect_tracks(data_root);
     tracks.sort_by(|a, b| a.track_id.cmp(&b.track_id));
+    skipped.extend(track_skipped);
 
-    let mut profiles = collect_profiles(data_root);
+    let (mut profiles, profile_skipped) = collect_profiles(data_root);
     profiles.sort_by(|a, b| a.profile_id.cmp(&b.profile_id));
+    skipped.extend(profile_skipped);
 
-    Ok(Manifest { schema_version: 1, generated_at_ms: now_ms, blobs, sessions, workbooks, tracks, profiles })
+    let manifest = Manifest { schema_version: 1, generated_at_ms: now_ms, blobs, sessions, workbooks, tracks, profiles };
+    Ok((manifest, skipped))
+}
+
+/// `path` relative to `data_root`, `/`-separated regardless of platform
+/// (the form [`SkippedEntry::path`] uses).
+fn relative_path_str(data_root: &Path, path: &Path) -> String {
+    path.strip_prefix(data_root).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
 /// Last-modified time of `meta`, milliseconds since the Unix epoch. `0` if
@@ -209,15 +237,26 @@ fn file_mtime_ms(meta: &std::fs::Metadata) -> i64 {
     meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// Lists blobs by the hash their CAS path already names (`blobs/sha256/<2
+/// hex shard>/<62 hex>`, C4 §2) rather than re-hashing every file's bytes —
+/// `store::blob::write_blob`'s own doc comment establishes that convention
+/// ("the same hash can only mean the same bytes... trusted without
+/// re-reading"), and a corrupted blob (path hash ≠ content hash) is
+/// `verify_data_dir`'s finding to make, not this walk's (ruling R90).
 fn collect_blobs(data_root: &Path) -> Vec<BlobEntry> {
     let mut out = Vec::new();
     let shards_dir = data_root.join("blobs").join("sha256");
     let Ok(shards) = std::fs::read_dir(&shards_dir) else { return out };
     for shard in shards.flatten() {
+        let shard_name = shard.file_name().to_string_lossy().into_owned();
         let Ok(entries) = std::fs::read_dir(shard.path()) else { continue };
         for entry in entries.flatten() {
-            let Ok(bytes) = std::fs::read(entry.path()) else { continue };
-            out.push(BlobEntry { sha256: sha256_hex(&bytes), size_bytes: bytes.len() as u64 });
+            let Ok(meta) = std::fs::metadata(entry.path()) else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            out.push(BlobEntry { sha256: format!("{shard_name}{file_name}"), size_bytes: meta.len() });
         }
     }
     out
@@ -227,10 +266,10 @@ fn collect_blobs(data_root: &Path) -> Vec<BlobEntry> {
 /// three fields the manifest needs. `None` on any read/parse failure or a
 /// missing key — the caller treats that as "session malformed, omit
 /// `data_parquet`" rather than aborting the walk. A separate reader from
-/// `store::catalog::read_data_parquet_session_fields` (whose fields this
-/// module has no access to — they are private to that module, and its
-/// field set differs) rather than widening that struct's visibility for a
-/// three-field subset.
+/// `store::catalog::read_data_parquet_session_fields` (whose fields —
+/// `importer_version`, `seam_correction_version`, `engine_version` — are
+/// private, not the function itself, and its field set differs) rather
+/// than widening that struct's visibility for a three-field subset.
 fn read_data_parquet_manifest_fields(path: &Path) -> Option<(String, String, String)> {
     let file = std::fs::File::open(path).ok()?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
@@ -239,10 +278,11 @@ fn read_data_parquet_manifest_fields(path: &Path) -> Option<(String, String, Str
     Some((get("importer_version")?, get("seam_correction_version")?, get("engine_version")?))
 }
 
-fn collect_sessions(data_root: &Path) -> Vec<SessionEntry> {
+fn collect_sessions(data_root: &Path) -> (Vec<SessionEntry>, Vec<SkippedEntry>) {
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     let sessions_dir = data_root.join("sessions");
-    let Ok(entries) = std::fs::read_dir(&sessions_dir) else { return out };
+    let Ok(entries) = std::fs::read_dir(&sessions_dir) else { return (out, skipped) };
     for entry in entries.flatten() {
         let session_dir = entry.path();
         if !session_dir.is_dir() {
@@ -262,13 +302,23 @@ fn collect_sessions(data_root: &Path) -> Vec<SessionEntry> {
                 }),
                 // Missing/unparseable metadata — malformed, omitted; the
                 // rest of this session (and every other session) still
-                // builds (this task's brief, "Key logic").
-                _ => None,
+                // builds (this task's brief, "Key logic"), and the path is
+                // recorded so the omission is visible (ruling R90).
+                _ => {
+                    skipped.push(SkippedEntry {
+                        path: relative_path_str(data_root, &dp_path),
+                        reason: "data.parquet: missing or unparseable importer metadata".to_string(),
+                    });
+                    None
+                }
             }
         } else {
             None
         };
 
+        // `sessions/<id>/derived/<sha256>.parquet` is content-addressed by
+        // its own file name (C4 §6), same convention as blobs — trusted
+        // from the name, not re-hashed (ruling R90).
         let mut derived = Vec::new();
         let derived_dir = session_dir.join("derived");
         if let Ok(derived_entries) = std::fs::read_dir(&derived_dir) {
@@ -277,8 +327,9 @@ fn collect_sessions(data_root: &Path) -> Vec<SessionEntry> {
                 if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
                     continue;
                 }
-                let Ok(bytes) = std::fs::read(&path) else { continue };
-                derived.push(DerivedEntry { sha256: sha256_hex(&bytes), size_bytes: bytes.len() as u64 });
+                let Ok(meta) = std::fs::metadata(&path) else { continue };
+                let sha256 = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                derived.push(DerivedEntry { sha256, size_bytes: meta.len() });
             }
         }
         derived.sort_by(|a, b| a.sha256.cmp(&b.sha256));
@@ -286,12 +337,18 @@ fn collect_sessions(data_root: &Path) -> Vec<SessionEntry> {
         let sj_path = session_dir.join("session.json");
         let session_json = if sj_path.is_file() {
             match (std::fs::read(&sj_path), std::fs::metadata(&sj_path)) {
-                (Ok(bytes), Ok(meta)) => Some(SessionJsonEntry {
+                (Ok(bytes), Ok(meta)) if crate::store::session_json::parse_session_json(&bytes).is_ok() => Some(SessionJsonEntry {
                     sha256: sha256_hex(&bytes),
                     size_bytes: bytes.len() as u64,
                     updated_at_ms: file_mtime_ms(&meta),
                 }),
-                _ => None,
+                // Unreadable, or bytes that don't parse as `session.json`
+                // (C1 §6) — malformed, omitted; the path is recorded so
+                // the omission is visible (ruling R90).
+                _ => {
+                    skipped.push(SkippedEntry { path: relative_path_str(data_root, &sj_path), reason: "session.json: unreadable or does not parse".to_string() });
+                    None
+                }
             }
         } else {
             None
@@ -299,7 +356,7 @@ fn collect_sessions(data_root: &Path) -> Vec<SessionEntry> {
 
         out.push(SessionEntry { session_id, data_parquet, derived, session_json });
     }
-    out
+    (out, skipped)
 }
 
 /// `true` for a workbooks-directory entry name that must be skipped
@@ -310,10 +367,11 @@ fn is_dot_name(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|s| s.starts_with('.'))
 }
 
-fn collect_workbooks(data_root: &Path) -> Vec<WorkbookEntry> {
+fn collect_workbooks(data_root: &Path) -> (Vec<WorkbookEntry>, Vec<SkippedEntry>) {
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     let dir = data_root.join("workbooks");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return (out, skipped) };
     for entry in entries.flatten() {
         if is_dot_name(&entry.file_name()) {
             continue; // workbooks/.sync-base/ and any other dotfile/dot-dir
@@ -322,13 +380,26 @@ fn collect_workbooks(data_root: &Path) -> Vec<WorkbookEntry> {
         if path.extension().and_then(|e| e.to_str()) != Some("idl1wb") {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let Ok(markdown) = std::str::from_utf8(&bytes) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else {
+            skipped.push(SkippedEntry { path: relative_path_str(data_root, &path), reason: "workbook: could not read file".to_string() });
+            continue;
+        };
+        let Ok(markdown) = std::str::from_utf8(&bytes) else {
+            skipped.push(SkippedEntry { path: relative_path_str(data_root, &path), reason: "workbook: not valid UTF-8".to_string() });
+            continue;
+        };
         // A workbook whose front matter will not parse is skipped, not
         // silently dropped from the walk's overall result — the rest of
-        // the manifest still builds (this task's brief, "Key logic").
-        let Ok((front_matter, _)) = parse_front_matter(markdown) else { continue };
-        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        // the manifest still builds (this task's brief, "Key logic"), and
+        // the path is recorded so the omission is visible (ruling R90).
+        let Ok((front_matter, _)) = parse_front_matter(markdown) else {
+            skipped.push(SkippedEntry { path: relative_path_str(data_root, &path), reason: "workbook: front matter did not parse".to_string() });
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            skipped.push(SkippedEntry { path: relative_path_str(data_root, &path), reason: "workbook: could not read metadata".to_string() });
+            continue;
+        };
         let file_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
         out.push(WorkbookEntry {
             workbook_id: front_matter.id,
@@ -338,24 +409,39 @@ fn collect_workbooks(data_root: &Path) -> Vec<WorkbookEntry> {
             updated_at_ms: file_mtime_ms(&meta),
         });
     }
-    out
+    (out, skipped)
 }
 
-fn collect_tracks(data_root: &Path) -> Vec<TrackEntry> {
+fn collect_tracks(data_root: &Path) -> (Vec<TrackEntry>, Vec<SkippedEntry>) {
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     let dir = data_root.join("tracks");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return (out, skipped) };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("idl0t") {
             continue;
         }
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-        let Ok(track) = read_track(&path) else { continue };
+        let Ok(track) = read_track(&path) else {
+            skipped.push(SkippedEntry { path: relative_path_str(data_root, &path), reason: "track: could not parse".to_string() });
+            continue;
+        };
         if track.id != stem {
-            continue; // filename/content-id mismatch — malformed, omitted
+            // Filename/content-id mismatch — malformed, omitted. Unlike
+            // `WorkbookEntry`, `TrackEntry` carries no `file_name` field to
+            // record a rename against, so this class fails closed rather
+            // than keying on the embedded id (this task's review, Minor #1: covered by the test below).
+            skipped.push(SkippedEntry {
+                path: relative_path_str(data_root, &path),
+                reason: "track: file name does not match the track's own id".to_string(),
+            });
+            continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else {
+            skipped.push(SkippedEntry { path: relative_path_str(data_root, &path), reason: "track: could not read file".to_string() });
+            continue;
+        };
         out.push(TrackEntry {
             track_id: stem,
             sha256: sha256_hex(&bytes),
@@ -363,23 +449,37 @@ fn collect_tracks(data_root: &Path) -> Vec<TrackEntry> {
             updated_at_ms: track.updated_at_ms,
         });
     }
-    out
+    (out, skipped)
 }
 
-fn collect_profiles(data_root: &Path) -> Vec<ProfileEntry> {
+fn collect_profiles(data_root: &Path) -> (Vec<ProfileEntry>, Vec<SkippedEntry>) {
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     let dir = data_root.join("profiles");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return (out, skipped) };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("idl0p") {
             continue;
         }
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let Ok(profile) = serde_json::from_slice::<crate::store::profile::BikeProfile>(&bytes) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else {
+            skipped.push(SkippedEntry { path: relative_path_str(data_root, &path), reason: "profile: could not read file".to_string() });
+            continue;
+        };
+        let Ok(profile) = serde_json::from_slice::<crate::store::profile::BikeProfile>(&bytes) else {
+            skipped.push(SkippedEntry { path: relative_path_str(data_root, &path), reason: "profile: could not parse".to_string() });
+            continue;
+        };
         if profile.profile_id != stem {
-            continue; // filename/content-id mismatch — malformed, omitted
+            // Filename/content-id mismatch — malformed, omitted. Same
+            // fail-closed rule as tracks (this task's review, Minor #1):
+            // `ProfileEntry` carries no `file_name` field either.
+            skipped.push(SkippedEntry {
+                path: relative_path_str(data_root, &path),
+                reason: "profile: file name does not match the profile's own id".to_string(),
+            });
+            continue;
         }
         out.push(ProfileEntry {
             profile_id: stem,
@@ -388,7 +488,7 @@ fn collect_profiles(data_root: &Path) -> Vec<ProfileEntry> {
             updated_at_ms: profile.updated_at_ms,
         });
     }
-    out
+    (out, skipped)
 }
 
 #[cfg(test)]
@@ -441,7 +541,7 @@ mod tests {
         let root = temp_root();
 
         // Act
-        let manifest = build_manifest(&root, 1000).unwrap();
+        let (manifest, skipped) = build_manifest(&root, 1000).unwrap();
 
         // Assert
         assert_eq!(manifest.schema_version, 1);
@@ -451,6 +551,7 @@ mod tests {
         assert!(manifest.workbooks.is_empty());
         assert!(manifest.tracks.is_empty());
         assert!(manifest.profiles.is_empty());
+        assert!(skipped.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -464,7 +565,7 @@ mod tests {
         write_full_session(&root, "s1", blob_sha256);
 
         // Act
-        let manifest = build_manifest(&root, 2000).unwrap();
+        let (manifest, skipped) = build_manifest(&root, 2000).unwrap();
 
         // Assert
         assert_eq!(manifest.blobs.len(), 1);
@@ -485,6 +586,54 @@ mod tests {
         let sj_bytes = std::fs::read(root.join("sessions").join("s1").join("session.json")).unwrap();
         assert_eq!(sj.sha256, sha256_hex(&sj_bytes));
         assert_eq!(sj.size_bytes, sj_bytes.len() as u64);
+        assert!(skipped.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_manifest_a_blob_whose_bytes_were_tampered_still_lists_under_its_path_hash() {
+        // Arrange — write a real blob, then corrupt its bytes in place. A
+        // content re-hash would report the corrupted content's hash (or
+        // silently drop it); the manifest must still list it under the path
+        // hash, since finding the mismatch is `verify_data_dir`'s job, not
+        // this walk's (ruling R90).
+        let root = temp_root();
+        let blob_sha256 = write_blob(&root, b"raw bytes").unwrap();
+        std::fs::write(crate::store::blob::blob_path(&root, &blob_sha256), b"tampered bytes").unwrap();
+
+        // Act
+        let (manifest, skipped) = build_manifest(&root, 1).unwrap();
+
+        // Assert
+        assert_eq!(manifest.blobs.len(), 1);
+        assert_eq!(manifest.blobs[0].sha256, blob_sha256);
+        assert_eq!(manifest.blobs[0].size_bytes, b"tampered bytes".len() as u64);
+        assert!(skipped.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_manifest_a_derived_parquet_named_by_its_sha256_lists_under_its_file_name_not_a_content_rehash() {
+        // Arrange
+        let root = temp_root();
+        let blob_sha256 = write_blob(&root, b"raw bytes").unwrap();
+        write_full_session(&root, "s1", blob_sha256);
+        let derived_dir = root.join("sessions").join("s1").join("derived");
+        std::fs::create_dir_all(&derived_dir).unwrap();
+        let derived_sha256 = "d".repeat(64);
+        std::fs::write(derived_dir.join(format!("{derived_sha256}.parquet")), b"anything at all").unwrap();
+
+        // Act
+        let (manifest, skipped) = build_manifest(&root, 1).unwrap();
+
+        // Assert
+        let session = manifest.sessions.iter().find(|s| s.session_id == "s1").unwrap();
+        assert_eq!(session.derived.len(), 1);
+        assert_eq!(session.derived[0].sha256, derived_sha256);
+        assert_eq!(session.derived[0].size_bytes, b"anything at all".len() as u64);
+        assert!(skipped.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -500,7 +649,7 @@ mod tests {
         std::fs::write(root.join("tmp").join("quarantine").join("leftover"), b"x").unwrap();
 
         // Act
-        let manifest = build_manifest(&root, 1).unwrap();
+        let (manifest, skipped) = build_manifest(&root, 1).unwrap();
 
         // Assert — every class stays empty; catalog/tmp are simply never
         // walked by this module (unlike `store::verify`, this walk has no
@@ -510,6 +659,7 @@ mod tests {
         assert!(manifest.workbooks.is_empty());
         assert!(manifest.tracks.is_empty());
         assert!(manifest.profiles.is_empty());
+        assert!(skipped.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -529,10 +679,11 @@ mod tests {
         std::fs::write(sync_base_dir.join(format!("{id}.idl1wb")), render_front_matter(&workbook_front_matter(&id, "Base"))).unwrap();
 
         // Act
-        let manifest = build_manifest(&root, 1).unwrap();
+        let (manifest, skipped) = build_manifest(&root, 1).unwrap();
 
         // Assert
         assert!(manifest.workbooks.is_empty());
+        assert!(skipped.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -547,12 +698,13 @@ mod tests {
         std::fs::write(workbooks_dir.join("fork-tuning.idl1wb"), render_front_matter(&workbook_front_matter(&id, "Fork tuning"))).unwrap();
 
         // Act
-        let manifest = build_manifest(&root, 1).unwrap();
+        let (manifest, skipped) = build_manifest(&root, 1).unwrap();
 
         // Assert
         assert_eq!(manifest.workbooks.len(), 1);
         assert_eq!(manifest.workbooks[0].workbook_id, id);
         assert_eq!(manifest.workbooks[0].file_name, "fork-tuning");
+        assert!(skipped.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -572,7 +724,7 @@ mod tests {
         std::fs::write(s2_dir.join("data.parquet"), b"not a real parquet file").unwrap();
 
         // Act
-        let manifest = build_manifest(&root, 1).unwrap();
+        let (manifest, skipped) = build_manifest(&root, 1).unwrap();
 
         // Assert
         assert_eq!(manifest.sessions.len(), 2);
@@ -580,6 +732,106 @@ mod tests {
         let s2 = manifest.sessions.iter().find(|s| s.session_id == "s2").unwrap();
         assert!(s1.data_parquet.is_some());
         assert!(s2.data_parquet.is_none());
+        assert_eq!(skipped, vec![SkippedEntry {
+            path: "sessions/s2/data.parquet".to_string(),
+            reason: "data.parquet: missing or unparseable importer metadata".to_string(),
+        }]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_manifest_a_workbook_whose_front_matter_will_not_parse_is_listed_in_skipped_with_a_reason() {
+        // Arrange
+        let root = temp_root();
+        let workbooks_dir = root.join("workbooks");
+        std::fs::create_dir_all(&workbooks_dir).unwrap();
+        std::fs::write(workbooks_dir.join("broken.idl1wb"), b"not front matter at all").unwrap();
+
+        // Act
+        let (manifest, skipped) = build_manifest(&root, 1).unwrap();
+
+        // Assert
+        assert!(manifest.workbooks.is_empty());
+        assert_eq!(
+            skipped,
+            vec![SkippedEntry { path: "workbooks/broken.idl1wb".to_string(), reason: "workbook: front matter did not parse".to_string() }]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_manifest_a_session_json_that_does_not_parse_is_listed_in_skipped_with_a_reason() {
+        // Arrange
+        let root = temp_root();
+        let session_dir = root.join("sessions").join("s1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("session.json"), b"not valid session.json content").unwrap();
+
+        // Act
+        let (manifest, skipped) = build_manifest(&root, 1).unwrap();
+
+        // Assert
+        let s1 = manifest.sessions.iter().find(|s| s.session_id == "s1").unwrap();
+        assert!(s1.session_json.is_none());
+        assert_eq!(
+            skipped,
+            vec![SkippedEntry { path: "sessions/s1/session.json".to_string(), reason: "session.json: unreadable or does not parse".to_string() }]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_manifest_a_track_file_name_that_does_not_match_its_own_id_is_excluded_and_listed_in_skipped() {
+        // Arrange
+        let root = temp_root();
+        let track = Track {
+            id: "actual-id".to_string(),
+            name: "A-Line".to_string(),
+            venue: "Whistler".to_string(),
+            timing: None,
+            sector_gates: Vec::new(),
+            neutral_zones: Vec::new(),
+            reference_polyline: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        write_track(&root, &track).unwrap();
+        std::fs::rename(root.join("tracks").join("actual-id.idl0t"), root.join("tracks").join("renamed.idl0t")).unwrap();
+
+        // Act
+        let (manifest, skipped) = build_manifest(&root, 1).unwrap();
+
+        // Assert
+        assert!(manifest.tracks.is_empty());
+        assert_eq!(
+            skipped,
+            vec![SkippedEntry { path: "tracks/renamed.idl0t".to_string(), reason: "track: file name does not match the track's own id".to_string() }]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_manifest_a_profile_file_name_that_does_not_match_its_own_id_is_excluded_and_listed_in_skipped() {
+        // Arrange
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("profiles")).unwrap();
+        let profile =
+            BikeProfile { profile_id: "actual-id".to_string(), profile_name: "Bike".to_string(), created_at_ms: 1, updated_at_ms: 2, config: serde_json::json!({}) };
+        std::fs::write(root.join("profiles").join("renamed.idl0p"), serde_json::to_vec(&profile).unwrap()).unwrap();
+
+        // Act
+        let (manifest, skipped) = build_manifest(&root, 1).unwrap();
+
+        // Assert
+        assert!(manifest.profiles.is_empty());
+        assert_eq!(
+            skipped,
+            vec![SkippedEntry { path: "profiles/renamed.idl0p".to_string(), reason: "profile: file name does not match the profile's own id".to_string() }]
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -612,11 +864,13 @@ mod tests {
         std::fs::write(root.join("profiles").join("p-1.idl0p"), serde_json::to_vec(&profile).unwrap()).unwrap();
 
         // Act
-        let m1 = build_manifest(&root, 42).unwrap();
-        let m2 = build_manifest(&root, 42).unwrap();
+        let (m1, skipped1) = build_manifest(&root, 42).unwrap();
+        let (m2, skipped2) = build_manifest(&root, 42).unwrap();
 
         // Assert
         assert_eq!(serde_json::to_string(&m1).unwrap(), serde_json::to_string(&m2).unwrap());
+        assert_eq!(skipped1, skipped2);
+        assert!(skipped1.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }
