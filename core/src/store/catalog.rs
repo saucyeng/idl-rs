@@ -837,6 +837,23 @@ pub fn upsert_track(conn: &Connection, track: &crate::track_artifact::Track, ful
     Ok(())
 }
 
+/// Deletes `track_id`'s row from `tracks` (ruling R86, `delete_track` C3
+/// §3.2). `laps.track_id` is `REFERENCES tracks(track_id) ON DELETE SET
+/// NULL` (this file's `DDL`), and `open_catalog` enables `PRAGMA
+/// foreign_keys = ON` per connection, so this single `DELETE` also nulls
+/// out `track_id` on every lap row that named this track — the tauri
+/// command layer (`idl-rs-tauri`'s `delete_track`) calls this after removing
+/// `<data>/tracks/<track_id>.idl0t` from disk. Deliberately a single
+/// targeted `DELETE`, not a `rebuild_catalog` call, matching
+/// [`delete_session`]'s own R68 reasoning.
+///
+/// Returns `true` if a `tracks` row existed and was removed, `false` if
+/// `track_id` had no row (a no-op, not an error).
+pub fn delete_track(conn: &Connection, track_id: &str) -> Result<bool, CatalogError> {
+    let rows_deleted = conn.execute("DELETE FROM tracks WHERE track_id = ?1", rusqlite::params![track_id])?;
+    Ok(rows_deleted > 0)
+}
+
 fn io_err(e: std::io::Error) -> CatalogError {
     CatalogError { kind: CatalogErrorKind::Io, message: e.to_string() }
 }

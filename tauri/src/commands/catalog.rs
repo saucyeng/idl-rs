@@ -744,6 +744,65 @@ pub fn save_track(track: TrackDraft, data_dir: tauri::State<'_, DataDir>) -> Res
     save_track_via(&data_dir.0, track, now_ms, &new_id)
 }
 
+/// C3 §3.2 `DeleteTrackReport` — `delete_track`'s return.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeleteTrackReport {
+    pub track_id: String,
+    /// Sessions whose `track_visits_library_hash` no longer matches the
+    /// library after the delete — their cached visits may name this track.
+    /// The UI offers `rescan_tracks` per id; nothing is rewritten here.
+    pub stale_session_ids: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Transport-agnostic core of `delete_track` (C3 §3.2, ruling R86).
+/// Deliberately does **not** rewrite any `session.json`: idl0 left stale
+/// `TrackVisit` references behind a delete too
+/// (`track_provider.dart`'s `deleteTrack` note, SPEC §12.3), the hierarchy
+/// view already skips visits whose `track_id` no longer resolves, and
+/// "Rescan tracks" is the user-driven repair. Rewriting every session
+/// inside a delete would be unbounded work behind one button; this command
+/// instead returns `stale_session_ids` for the UI to offer that rescan.
+///
+/// An absent `tracks/<id>.idl0t` is `not_found`, checked **first** — before
+/// any catalog work — matching `delete_session_via`. `store::track_artifact::
+/// write::delete_track` removes the artifact; then, only when
+/// `catalog.sqlite` is a file, the one `tracks` row is deleted
+/// (`store::catalog::delete_track`). `laps.track_id` is already `REFERENCES
+/// tracks(track_id) ON DELETE SET NULL` (C4 §5), so lap rows survive
+/// unattributed — this function deletes no `laps` rows itself. A catalog
+/// failure is folded into `warnings`, never fails the call, mirroring
+/// `save_track_via`.
+fn delete_track_via(data_dir: &Path, track_id: &str) -> Result<DeleteTrackReport, IpcError> {
+    let removed = idl_rs::track_artifact::delete_track(data_dir, track_id).map_err(map_track_write_error)?;
+    if !removed {
+        return Err(IpcError::new(IpcErrorKind::NotFound, format!("track {track_id} not found")));
+    }
+
+    let mut warnings = Vec::new();
+    let catalog_path = data_dir.join("catalog.sqlite");
+    if catalog_path.is_file() {
+        let deleted = idl_rs::store::catalog::open_catalog(&catalog_path)
+            .map_err(|e| e.to_string())
+            .and_then(|conn| idl_rs::store::catalog::delete_track(&conn, track_id).map_err(|e| e.to_string()));
+        if let Err(e) = deleted {
+            warnings.push(e);
+        }
+    }
+
+    let (library, _library_warnings) = idl_rs::store::lap_index::load_track_library(data_dir)?;
+    let current_hash = idl_rs::store::lap_index::track_library_hash(&library);
+    let stale = stale_session_ids(data_dir, &current_hash, &mut warnings);
+
+    Ok(DeleteTrackReport { track_id: track_id.to_string(), stale_session_ids: stale, warnings })
+}
+
+/// C3 §3.2 `delete_track(track_id)`.
+#[tauri::command]
+pub fn delete_track(track_id: String, data_dir: tauri::State<'_, DataDir>) -> Result<DeleteTrackReport, IpcError> {
+    delete_track_via(&data_dir.0, &track_id)
+}
+
 /// C3 §3.2 `rescan_tracks`'s return (IDL0_SPEC §17.4 "Rescan Tracks").
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RescanReport {
@@ -1852,6 +1911,180 @@ mod tests {
 
             // Assert
             assert_eq!(result.track.created_at_ms, 1_000);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    // ---- delete_track (Task 5, L8x) ---------------------------------------
+
+    mod delete_track {
+        use super::*;
+        use idl_rs::store::session_json::TrackVisitJson;
+        use idl_rs::track_artifact::{write_track, Track};
+
+        fn minimal_track(id: &str, name: &str) -> Track {
+            Track {
+                id: id.to_string(),
+                name: name.to_string(),
+                venue: "Whistler".to_string(),
+                timing: None,
+                sector_gates: Vec::new(),
+                neutral_zones: Vec::new(),
+                reference_polyline: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 1,
+            }
+        }
+
+        #[test]
+        fn delete_track_via_an_existing_track_the_artifact_is_gone_and_ok() {
+            // Arrange
+            let root = temp_root();
+            write_track(&root, &minimal_track("t-1", "A-Line")).unwrap();
+
+            // Act
+            let result = delete_track_via(&root, "t-1").unwrap();
+
+            // Assert
+            assert_eq!(result.track_id, "t-1");
+            assert!(!root.join("tracks").join("t-1.idl0t").exists());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn delete_track_via_an_unknown_id_not_found_and_nothing_is_removed() {
+            // Arrange
+            let root = temp_root();
+            write_track(&root, &minimal_track("t-1", "A-Line")).unwrap();
+
+            // Act
+            let err = delete_track_via(&root, "no-such-track").unwrap_err();
+
+            // Assert
+            assert_eq!(err.kind, crate::error::IpcErrorKind::NotFound);
+            assert!(root.join("tracks").join("t-1.idl0t").exists());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn delete_track_via_with_a_catalog_the_tracks_row_is_gone_and_a_lap_row_that_referenced_it_survives_with_a_null_track_id() {
+            // Arrange
+            let root = temp_root();
+            write_track(&root, &minimal_track("t-1", "A-Line")).unwrap();
+            let session_id = "sess-visit";
+            let mut doc = empty_session_json(session_id);
+            doc.laps = vec![LapJson {
+                lap_number: 1,
+                start_timestamp_ms: 1_000,
+                end_timestamp_ms: 1_500,
+                raw_elapsed_ms: 500,
+                lap_time_ms: 500,
+                start_time_secs: 0.0,
+                end_time_secs: 0.5,
+                sectors: Vec::new(),
+                neutral_zone_visits: Vec::new(),
+            }];
+            doc.track_visits = vec![TrackVisitJson {
+                visit_id: "v-1".to_string(),
+                track_id: "t-1".to_string(),
+                start_timestamp_ms: 500,
+                end_timestamp_ms: 2_000,
+                laps: Vec::new(),
+            }];
+            write_full_session_seeded(&root, session_id, b"raw bytes for sess-visit", &doc);
+            {
+                let conn = idl_rs::store::catalog::open_catalog(&root.join("catalog.sqlite")).unwrap();
+                let track_id: Option<String> = conn
+                    .query_row("SELECT track_id FROM laps WHERE session_id = ?1 AND lap_number = 1", [session_id], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(track_id.as_deref(), Some("t-1"), "fixture setup: lap must start out naming the track");
+            }
+
+            // Act
+            delete_track_via(&root, "t-1").unwrap();
+
+            // Assert — the `tracks` row is gone…
+            let conn = idl_rs::store::catalog::open_catalog(&root.join("catalog.sqlite")).unwrap();
+            let track_count: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE track_id = 't-1'", [], |r| r.get(0)).unwrap();
+            assert_eq!(track_count, 0);
+            // …but the lap row survives, with `track_id` nulled by the FK cascade.
+            let track_id: Option<String> = conn
+                .query_row("SELECT track_id FROM laps WHERE session_id = ?1 AND lap_number = 1", [session_id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(track_id, None, "laps.track_id must be NULL after the ON DELETE SET NULL cascade");
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn delete_track_via_no_catalog_sqlite_ok_and_no_catalog_is_created() {
+            // Arrange
+            let root = temp_root();
+            write_track(&root, &minimal_track("t-1", "A-Line")).unwrap();
+
+            // Act
+            let result = delete_track_via(&root, "t-1").unwrap();
+
+            // Assert
+            assert!(result.warnings.is_empty());
+            assert!(!root.join("catalog.sqlite").is_file());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn delete_track_via_a_session_whose_stamp_names_the_deleted_library_is_stale_and_its_session_json_is_untouched() {
+            // Arrange — a session stamped against the library as it stood
+            // *with* t-1 present; deleting t-1 changes the library hash, so
+            // this session must come back stale, and its `session.json`
+            // bytes must be byte-identical afterwards (delete_track never
+            // rewrites it).
+            let root = temp_root();
+            let track = minimal_track("t-1", "A-Line");
+            write_track(&root, &track).unwrap();
+            let with_track_hash = idl_rs::store::lap_index::track_library_hash(std::slice::from_ref(&track));
+            let mut doc = empty_session_json("s-stamped");
+            doc.track_visits_library_hash = Some(with_track_hash);
+            write_session_json(&root, "s-stamped", &doc, None).unwrap();
+            let sj_path = root.join("sessions").join("s-stamped").join("session.json");
+            let before = std::fs::read(&sj_path).unwrap();
+
+            // Act
+            let result = delete_track_via(&root, "t-1").unwrap();
+
+            // Assert
+            assert_eq!(result.stale_session_ids, vec!["s-stamped".to_string()]);
+            let after = std::fs::read(&sj_path).unwrap();
+            assert_eq!(before, after, "delete_track must never rewrite session.json");
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn delete_track_via_an_id_containing_a_path_separator_is_not_found_or_io_and_a_decoy_file_outside_tracks_survives() {
+            // Arrange — a decoy file that a naive path join could reach via
+            // `../decoy`, sitting just outside `tracks/`.
+            let root = temp_root();
+            std::fs::create_dir_all(root.join("tracks")).unwrap();
+            std::fs::write(root.join("decoy"), b"do not touch").unwrap();
+
+            // Act
+            let err = delete_track_via(&root, "../decoy").unwrap_err();
+
+            // Assert
+            assert!(
+                err.kind == crate::error::IpcErrorKind::NotFound || err.kind == crate::error::IpcErrorKind::Io,
+                "expected not_found or io, got {:?}",
+                err.kind
+            );
+            assert!(root.join("decoy").exists());
 
             let _ = std::fs::remove_dir_all(&root);
         }
