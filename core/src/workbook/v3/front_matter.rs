@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::error::{self, WorkbookError};
 
@@ -11,7 +11,7 @@ use super::error::{self, WorkbookError};
 /// editor UI (L6) for axis-label/number-format suggestions — has no effect
 /// on parsing or evaluation. Defaults to [`Self::Si`] when the `units` key
 /// is absent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UnitsPref {
     /// Metric (m, m/s, kg, …) — the default.
@@ -60,6 +60,26 @@ impl<'de> Deserialize<'de> for ConstantRaw {
                     "constant value '{text}' is neither a bare number nor a '<number> <unit>' string"
                 ))),
             },
+        }
+    }
+}
+
+/// Serialises the inverse of [`ConstantRaw`]'s custom `Deserialize` impl: a
+/// bare number stays a YAML number, `WithUnit` becomes the `"<value>
+/// <unit>"` string [`parse_unit_suffix`] accepts back. `value`'s `Display`
+/// formatting (Rust's default `f64` formatter) never emits a value
+/// `parse_unit_suffix`'s grammar rejects, so this round-trips through
+/// [`parse_front_matter`] for every value this type can hold.
+impl Serialize for ConstantRaw {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            ConstantRaw::Number(value) => serializer.serialize_f64(*value),
+            ConstantRaw::WithUnit { value, unit_display } => {
+                serializer.serialize_str(&format!("{value} {unit_display}"))
+            }
         }
     }
 }
@@ -133,7 +153,7 @@ fn default_version() -> u32 {
 /// when the YAML key is absent — an explicit `version: 2` survives here
 /// unmodified; [`super::parse_workbook`] is where a non-`3` value becomes
 /// [`WorkbookErrorKind::UnsupportedWorkbookVersion`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FrontMatter {
     /// Stable workbook identity (C2 §1) — required to be a UUIDv4 string;
     /// checked by [`parse_front_matter`], not by this struct's own
@@ -142,8 +162,12 @@ pub struct FrontMatter {
     /// Display name.
     pub name: String,
     /// Named scalars for math-cell literal substitution (C2 §1, §3.1); empty
-    /// when the `constants` key is absent.
-    #[serde(default)]
+    /// when the `constants` key is absent. Omitted entirely by
+    /// [`render_front_matter`] when empty, rather than written as `{}`, to
+    /// keep a freshly created workbook's front matter minimal (C2 §1 lists
+    /// `constants` as optional with a `{}` default either way, so an absent
+    /// key and an explicit empty map parse identically).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub constants: HashMap<String, ConstantRaw>,
     /// Editor unit-system preference; defaults to SI.
     #[serde(default)]
@@ -185,6 +209,21 @@ pub fn parse_front_matter(markdown: &str) -> Result<(FrontMatter, &str), Workboo
     }
 
     Ok((front_matter, body))
+}
+
+/// Renders `fm` as a `.idl1wb` front-matter block (C2 §1's `front_matter ::=
+/// "---\n" yaml_block "---\n"`) — the inverse of [`parse_front_matter`] (R75:
+/// front matter is serialised by core, never hand-built in `tauri`).
+/// `serde_yaml_ng` quotes/escapes any YAML-significant byte in `fm.name`
+/// (a colon-space, a leading `#`/`-`/`&`/`*`/`!`/`%`/`@`, embedded quotes, a
+/// newline, leading/trailing spaces, …) itself, so the result always
+/// round-trips through [`parse_front_matter`] back to the same `FrontMatter`
+/// — that round-trip, not the exact bytes emitted, is this function's
+/// contract; `serde_yaml_ng` is free to choose block, quoted, or literal
+/// scalar style for any given string.
+pub fn render_front_matter(fm: &FrontMatter) -> String {
+    let yaml_block = serde_yaml_ng::to_string(fm).expect("FrontMatter has no non-serialisable field");
+    format!("---\n{yaml_block}---\n")
 }
 
 #[cfg(test)]
@@ -272,5 +311,111 @@ mod tests {
 
         // Assert
         assert_eq!(fm.constants.get("g"), Some(&ConstantRaw::Number(9.80665)));
+    }
+
+    /// A minimal, freshly-minted [`FrontMatter`] with the given `name` —
+    /// mirrors `create_workbook_via`'s call shape (`constants` empty, `units`
+    /// defaulted, `version: 3`).
+    fn fresh(name: &str) -> FrontMatter {
+        FrontMatter {
+            id: VALID_ID.to_string(),
+            name: name.to_string(),
+            constants: HashMap::new(),
+            units: UnitsPref::Si,
+            version: 3,
+        }
+    }
+
+    /// Renders `fm`, re-parses the result, and returns the round-tripped
+    /// [`FrontMatter`] — the shared shape of every `render_front_matter`
+    /// round-trip test below.
+    fn round_trip(fm: &FrontMatter) -> FrontMatter {
+        let markdown = render_front_matter(fm);
+        parse_front_matter(&markdown).unwrap().0
+    }
+
+    #[test]
+    fn render_front_matter_a_name_with_a_colon_space_round_trips_byte_for_byte() {
+        // Arrange
+        let fm = fresh("Wheel: front");
+
+        // Act
+        let round_tripped = round_trip(&fm);
+
+        // Assert
+        assert_eq!(round_tripped.name, "Wheel: front");
+    }
+
+    #[test]
+    fn render_front_matter_a_name_with_a_space_then_hash_round_trips_byte_for_byte() {
+        // Arrange
+        let fm = fresh("Test #1");
+
+        // Act
+        let round_tripped = round_trip(&fm);
+
+        // Assert
+        assert_eq!(round_tripped.name, "Test #1");
+    }
+
+    #[test]
+    fn render_front_matter_a_name_with_double_quotes_round_trips_byte_for_byte() {
+        // Arrange
+        let fm = fresh("Lap \"the good one\"");
+
+        // Act
+        let round_tripped = round_trip(&fm);
+
+        // Assert
+        assert_eq!(round_tripped.name, "Lap \"the good one\"");
+    }
+
+    #[test]
+    fn render_front_matter_a_name_with_single_quotes_round_trips_byte_for_byte() {
+        // Arrange
+        let fm = fresh("Rider's setup");
+
+        // Act
+        let round_tripped = round_trip(&fm);
+
+        // Assert
+        assert_eq!(round_tripped.name, "Rider's setup");
+    }
+
+    #[test]
+    fn render_front_matter_a_name_with_an_embedded_newline_round_trips_byte_for_byte() {
+        // Arrange
+        let fm = fresh("Fork tuning\nsecond line");
+
+        // Act
+        let round_tripped = round_trip(&fm);
+
+        // Assert
+        assert_eq!(round_tripped.name, "Fork tuning\nsecond line");
+    }
+
+    #[test]
+    fn render_front_matter_a_name_with_leading_and_trailing_spaces_round_trips_byte_for_byte() {
+        // Arrange
+        let fm = fresh("  Fork tuning  ");
+
+        // Act
+        let round_tripped = round_trip(&fm);
+
+        // Assert
+        assert_eq!(round_tripped.name, "  Fork tuning  ");
+    }
+
+    #[test]
+    fn render_front_matter_version_3_and_id_round_trip() {
+        // Arrange
+        let fm = fresh("Fork tuning");
+
+        // Act
+        let round_tripped = round_trip(&fm);
+
+        // Assert
+        assert_eq!(round_tripped.version, 3);
+        assert_eq!(round_tripped.id, VALID_ID);
     }
 }

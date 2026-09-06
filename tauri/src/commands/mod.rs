@@ -1,5 +1,6 @@
 //! `#[tauri::command]` handlers. Thin: convert, call the engine, return.
 
+pub mod app;
 pub mod catalog;
 pub mod cursor;
 pub mod device;

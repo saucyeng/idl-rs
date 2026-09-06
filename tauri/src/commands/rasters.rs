@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use idl_rs::fft::{Detrend, FftWindow, Scaling};
+use idl_rs::fft::{Averaging, Detrend, FftWindow, Scaling};
 use idl_rs::raster::{
     build_histogram2d_raster_bytes, build_spectrogram_raster_bytes, histogram2d_raster_meta,
     spectrogram_raster_meta, RasterMeta as CoreRasterMeta,
@@ -75,6 +75,31 @@ impl From<ScalingToken> for Scaling {
         match t {
             ScalingToken::Magnitude => Scaling::Magnitude,
             ScalingToken::Density => Scaling::Density,
+        }
+    }
+}
+
+/// `fetch_fft`'s `averaging` argument (C3 §3.6) — `idl_rs::fft::Averaging`'s
+/// four tokens, snake_case on the wire. Ruling R63 (3): the enum was
+/// extended with `None`/`Max` to close the gap C3's own text used to call
+/// out (a two-variant engine enum against a four-token wire union) — every
+/// token maps directly now, none rejected.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AveragingToken {
+    None,
+    Mean,
+    Median,
+    Max,
+}
+
+impl From<AveragingToken> for Averaging {
+    fn from(t: AveragingToken) -> Self {
+        match t {
+            AveragingToken::None => Averaging::None,
+            AveragingToken::Mean => Averaging::Mean,
+            AveragingToken::Median => Averaging::Median,
+            AveragingToken::Max => Averaging::Max,
         }
     }
 }
@@ -407,6 +432,94 @@ pub fn fetch_raster_meta(
     fetch_raster_meta_via(&data_dir.0, &session_id, &channel, &kind, width, height, &params)
 }
 
+/// Maps [`idl_rs::fft::FftError`] to the IPC `invalid_argument` shape
+/// (ruling R76). Both variants are checked before `welch()` runs, so no
+/// partial or `NaN`/`Infinity` bytes are ever produced on this path.
+fn map_fft_error(e: idl_rs::fft::FftError) -> IpcError {
+    match e {
+        idl_rs::fft::FftError::NoneRequiresOneSegment { segments } => IpcError::with_detail(
+            IpcErrorKind::InvalidArgument,
+            format!("averaging \"none\" requires exactly one segment, got {segments}"),
+            serde_json::json!({ "segments": segments }),
+        ),
+        idl_rs::fft::FftError::InvalidSampleRate => IpcError::new(
+            IpcErrorKind::InvalidArgument,
+            "channel has too few samples or duplicate timestamps to derive a sample rate",
+        ),
+    }
+}
+
+/// Builds the [`IpcErrorKind::InvalidArgument`] `fetch_fft` returns for any
+/// non-null `lap` (C3 §3.6: "`lap` must be `null` in practice until lap
+/// indexing lands"). `fetch_fft`'s `lap` argument is a plain `Option<u32>`,
+/// not a `LapContext` (contrast `eval_workbook`'s
+/// [`crate::session_source::load_lap_context`]), so this gate is this
+/// command's own — not a call into Task 9's helper. Task 9's gate only fires
+/// when `session.json` exists with a non-matching `laps[]`; since
+/// `session.json` may be entirely absent, that helper alone would silently
+/// accept a non-null `lap` here, so this command rejects unconditionally
+/// instead (matching C3's own "always" wording). Note for the lead: once lap
+/// indexing lands and Task 9's helper resolves real bounds, this duplication
+/// should be reconciled — likely by widening `load_lap_context` (or a new
+/// sibling) to also serve a single-lap sample-window lookup.
+fn reject_non_null_lap(lap: Option<u32>) -> Result<(), IpcError> {
+    match lap {
+        None => Ok(()),
+        Some(n) => Err(IpcError::with_detail(
+            IpcErrorKind::InvalidArgument,
+            format!("lap {n} not supported: lap indexing has not landed"),
+            serde_json::json!({ "lap": n }),
+        )),
+    }
+}
+
+/// Transport-agnostic core of `fetch_fft` (C3 §3.6, ruling R63 (3), R76).
+/// Loads the channel's samples via [`load_session`]/[`find_channel`],
+/// validates `averaging: none` against the request's segmentation (see
+/// `idl_rs::fft::check_none_averaging_segments`), derives `sample_rate_hz`
+/// from the channel's recorded `t_us` axis (see
+/// `idl_rs::fft::effective_rate_hz_from_t_us`), and only then calls
+/// `idl_rs::fft::welch` — both core validations run before any FFT executes.
+/// `not_found`: unknown `session_id` or `channel`. `invalid_argument`: a
+/// non-null `lap` (see [`reject_non_null_lap`]), `params` that fail
+/// [`resolve_spectrogram_params`]'s validation, `averaging: none` with more
+/// than one segment (`detail: { "segments": n }`), or a channel with too few
+/// samples/duplicate timestamps to derive a sample rate.
+pub fn fetch_fft_via(
+    data_dir: &Path,
+    session_id: &str,
+    channel: &str,
+    lap: Option<u32>,
+    params: &SpectrogramParams,
+    averaging: Averaging,
+) -> Result<Vec<u8>, IpcError> {
+    reject_non_null_lap(lap)?;
+    let session = load_session(data_dir, session_id)?;
+    let ch = find_channel(&session, channel)?;
+    let (window, detrend, scaling, window_size, noverlap) = resolve_spectrogram_params(params)?;
+    let samples = ch.materialize();
+    idl_rs::fft::check_none_averaging_segments(&averaging, window_size, noverlap, samples.len())
+        .map_err(map_fft_error)?;
+    let sample_rate_hz = idl_rs::fft::effective_rate_hz_from_t_us(&ch.t_us).map_err(map_fft_error)?;
+    let result = idl_rs::fft::welch(samples, sample_rate_hz, window, window_size, noverlap, detrend, averaging, scaling);
+    Ok(idl_rs::fft_wire::encode_fft_idlf(&result.values, sample_rate_hz))
+}
+
+/// Fetches one channel's FFT spectrum as `IDLF` v1 bytes (C3 §3.6, ruling
+/// R63 (3)). `lap` must be `null` today — see [`reject_non_null_lap`].
+#[tauri::command]
+pub fn fetch_fft(
+    session_id: String,
+    channel: String,
+    lap: Option<u32>,
+    params: SpectrogramParams,
+    averaging: AveragingToken,
+    data_dir: tauri::State<'_, DataDir>,
+) -> Result<tauri::ipc::Response, IpcError> {
+    let bytes = fetch_fft_via(&data_dir.0, &session_id, &channel, lap, &params, averaging.into())?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,6 +812,182 @@ mod tests {
         assert_eq!(meta.x_label, "Speed (m/s)");
         assert_eq!(meta.y_label, "Cadence (rpm)");
         assert!(meta.transparent_zero);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn fft_params() -> SpectrogramParams {
+        SpectrogramParams { window_size: 32, hop_size: 16, window: WindowToken::Hann, detrend: DetrendToken::Mean, scaling: ScalingToken::Density }
+    }
+
+    #[test]
+    fn fetch_fft_via_lap_some_invalid_argument_regardless_of_n() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root);
+
+        // Act
+        let err = fetch_fft_via(&root, "s1", "Speed", Some(7), &fft_params(), Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(err.detail, Some(serde_json::json!({ "lap": 7 })));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_via_unknown_session_not_found() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let err = fetch_fft_via(&root, "nope", "Speed", None, &fft_params(), Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_via_unknown_channel_not_found() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root);
+
+        // Act
+        let err = fetch_fft_via(&root, "s1", "NopeChannel", None, &fft_params(), Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_via_averaging_none_full_record_window_and_max_succeed_and_produce_well_formed_idlf_bytes() {
+        // Arrange — "Speed" has 128 samples; None needs a window covering
+        // the whole record (ruling R76) so window_size/hop_size = 128 here,
+        // distinct from Max's window_size: 32 (Max has no segment-count limit).
+        let root = temp_root();
+        seed_session(&root);
+        let none_params = SpectrogramParams { window_size: 128, hop_size: 128, window: WindowToken::Hann, detrend: DetrendToken::Mean, scaling: ScalingToken::Density };
+
+        // Act
+        let none_bytes = fetch_fft_via(&root, "s1", "Speed", None, &none_params, Averaging::None).unwrap();
+        let max_bytes = fetch_fft_via(&root, "s1", "Speed", None, &fft_params(), Averaging::Max).unwrap();
+
+        // Assert — well-formed IDLF header on both; the whole point of R63 (3)
+        // is that these no longer reject.
+        for bytes in [&none_bytes, &max_bytes] {
+            assert_eq!(&bytes[0..4], b"IDLF");
+            assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 1);
+            let bin_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            assert_eq!(bytes.len(), 16 + bin_count * 4);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_via_averaging_none_with_multi_segment_window_invalid_argument_with_segment_count() {
+        // Arrange — "Speed" has 128 samples; fft_params()'s window_size: 32,
+        // hop_size: 16 (noverlap 16) segments it into 7 windows, so
+        // averaging: none must be rejected rather than silently keeping
+        // only the first segment's power (ruling R76).
+        let root = temp_root();
+        seed_session(&root);
+
+        // Act
+        let err = fetch_fft_via(&root, "s1", "Speed", None, &fft_params(), Averaging::None).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(err.detail, Some(serde_json::json!({ "segments": 7 })));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_via_channel_with_one_sample_invalid_argument() {
+        // Arrange — a single-sample channel has no gap to derive a rate from
+        let root = temp_root();
+        let session = Session {
+            session_id: "s2".to_string(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            config_checksum: None,
+            source_format: SourceFormat::Fit,
+            blob_sha256: "b".repeat(64),
+            channels: vec![Channel {
+                channel_id: "Speed".to_string(),
+                t_us: vec![0],
+                t_recorded_us: None,
+                nominal_rate_hz: 64.0,
+                column: RawColumn::F64(vec![1.0]),
+                source_kind: "wheel".to_string(),
+                unit: "m/s".to_string(),
+                gaps: Vec::new(),
+            }],
+        };
+        write_session_parquet(&root, &session, "0.1.0").unwrap();
+
+        // Act
+        let err = fetch_fft_via(&root, "s2", "Speed", None, &fft_params(), Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_via_channel_with_duplicate_timestamps_invalid_argument() {
+        // Arrange — every sample stamped at the same t_us => every gap is 0
+        let root = temp_root();
+        let n = 4usize;
+        let session = Session {
+            session_id: "s3".to_string(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            config_checksum: None,
+            source_format: SourceFormat::Fit,
+            blob_sha256: "c".repeat(64),
+            channels: vec![Channel {
+                channel_id: "Speed".to_string(),
+                t_us: vec![0; n],
+                t_recorded_us: None,
+                nominal_rate_hz: 64.0,
+                column: RawColumn::F64(vec![1.0; n]),
+                source_kind: "wheel".to_string(),
+                unit: "m/s".to_string(),
+                gaps: Vec::new(),
+            }],
+        };
+        write_session_parquet(&root, &session, "0.1.0").unwrap();
+
+        // Act
+        let err = fetch_fft_via(&root, "s3", "Speed", None, &fft_params(), Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_via_malformed_params_zero_window_size_invalid_argument() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root);
+        let bad_params = SpectrogramParams { window_size: 0, hop_size: 0, window: WindowToken::Hann, detrend: DetrendToken::Mean, scaling: ScalingToken::Density };
+
+        // Act
+        let err = fetch_fft_via(&root, "s1", "Speed", None, &bad_params, Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
 
         let _ = std::fs::remove_dir_all(&root);
     }

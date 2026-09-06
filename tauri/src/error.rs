@@ -113,6 +113,24 @@ pub enum IpcErrorKind {
     /// `Conflict` itself — because this is not an optimistic-concurrency
     /// failure (C3 §2 `import_collision`).
     ImportCollision,
+    /// C3 §2 (added post-sign, 2026-09-05, lead ruling R59, extended by R63):
+    /// a device refused a control transition by returning a non-success
+    /// `AckCode` over the Control characteristic (SPEC §7.2) — distinct from
+    /// a transport-level failure (`Ble`), which covers "the write/read
+    /// itself didn't complete". **Platform-limited today** (R63/R63.1):
+    /// `btleplug`'s desktop backends surface only `Result<(), TransportError>`
+    /// from a Control write, never the raw ACK byte
+    /// (`idl_transport::ble_transport::BtleplugBle::send_command`'s own doc
+    /// comment) — so no call site in `idl-rs-tauri` can construct this kind
+    /// from a real `AckCode` yet. Device: `device_control` (see the
+    /// `// TODO(idl0):` at its `send_command` call site).
+    DeviceRejected,
+    /// `ConfigErrorKind::Parse` — Device: `preview_channel_registry` (C3 §3.8,
+    /// malformed `idl0_config.json` JSON or a required field missing).
+    ConfigParse,
+    /// `ConfigErrorKind::UnsupportedVersion` — Device: `preview_channel_registry`
+    /// (C3 §3.8, `config_version` exceeds `DeviceConfig::SUPPORTED_VERSION`).
+    ConfigUnsupportedVersion,
 }
 
 /// One JSON error crossing every fallible command (C3 §2). `detail`'s shape
