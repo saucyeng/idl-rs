@@ -17,4 +17,5 @@ pub mod profile;
 pub mod quarantine;
 pub mod session_json;
 pub mod settings;
+pub mod sync;
 pub mod verify;
