@@ -89,6 +89,14 @@ pub enum Averaging {
     Mean,
     /// Per-bin median — robust to transient spikes (impacts, chain slap).
     Median,
+    /// No cross-segment fold — takes the first segment's own per-bin power
+    /// verbatim. With `nperseg: 0` (one full-record segment, [`resolve_seg`]),
+    /// this is the only segment there is, so `welch()` reproduces a single
+    /// periodogram exactly (ruling R63 (3)).
+    None,
+    /// Per-bin maximum across segments — surfaces the loudest transient at
+    /// each frequency rather than smoothing it away (ruling R63 (3)).
+    Max,
 }
 
 /// Output units of the spectrum.
@@ -307,6 +315,12 @@ pub fn welch(
                 let mut col: Vec<f64> = seg_powers.iter().map(|p| p[k]).collect();
                 col.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 *slot = median_sorted(&col);
+            }
+            Averaging::None => {
+                *slot = seg_powers[0][k];
+            }
+            Averaging::Max => {
+                *slot = seg_powers.iter().map(|p| p[k]).fold(f64::NEG_INFINITY, f64::max);
             }
         }
     }
@@ -559,6 +573,82 @@ mod tests {
             median.values[0] < mean.values[0],
             "median {} not below mean {}", median.values[0], mean.values[0],
         );
+    }
+
+    #[test]
+    fn welch_averaging_none_single_segment_matches_averaging_mean_single_segment() {
+        // Arrange — 256-sample tone; nperseg: 0 forces one full-record
+        // segment for both calls, so None's "take the only segment" and
+        // Mean's "average of one value" must produce identical output.
+        let n = 256_usize;
+        let fs = 256.0_f64;
+        let data: Vec<f64> = (0..n)
+            .map(|i| (2.0 * std::f64::consts::PI * 10.0 * i as f64 / fs).sin())
+            .collect();
+
+        // Act
+        let none = welch(
+            data.clone(), fs, FftWindow::Hann, 0, 0,
+            Detrend::Mean, Averaging::None, Scaling::Density,
+        );
+        let mean = welch(
+            data, fs, FftWindow::Hann, 0, 0,
+            Detrend::Mean, Averaging::Mean, Scaling::Density,
+        );
+
+        // Assert — parity, bin for bin
+        assert_eq!(none.values.len(), mean.values.len());
+        for (got, want) in none.values.iter().zip(mean.values.iter()) {
+            assert_relative_eq!(*got, *want, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn welch_max_picks_spiked_segment_over_others() {
+        // Arrange — same three-segment layout as the median test: two clean
+        // segments plus one spiked in the middle, no overlap.
+        let seg = 64_usize;
+        let fs = 64.0_f64;
+        let mut data: Vec<f64> = Vec::new();
+        let mut spiked_segment: Vec<f64> = Vec::new();
+        for s in 0..3 {
+            for i in 0..seg {
+                let mut v = (2.0 * std::f64::consts::PI * 8.0 * i as f64 / fs).sin();
+                if s == 1 && i == 0 {
+                    v += 1000.0; // transient spike in the middle segment only
+                }
+                data.push(v);
+                if s == 1 {
+                    spiked_segment.push(v);
+                }
+            }
+        }
+
+        // Act — the spiked segment's own single-periodogram value (Magnitude
+        // scaling, one full-record segment: `Averaging::None`'s reduction is
+        // "the only segment there is") is the independently-derived expected
+        // value for what `Max` should pick at bin 0.
+        let spiked_alone = welch(
+            spiked_segment, fs, FftWindow::Rectangular, 0, 0,
+            Detrend::None, Averaging::None, Scaling::Magnitude,
+        );
+        let max = welch(
+            data.clone(), fs, FftWindow::Rectangular, seg, 0,
+            Detrend::None, Averaging::Max, Scaling::Magnitude,
+        );
+        let mean = welch(
+            data, fs, FftWindow::Rectangular, seg, 0,
+            Detrend::None, Averaging::Mean, Scaling::Magnitude,
+        );
+
+        // Assert — Max diverges from Mean at the spiked bin and matches the
+        // spiked segment's own value exactly.
+        assert!(
+            max.values[0] != mean.values[0],
+            "expected Max to diverge from Mean at the spiked bin, both were {}",
+            max.values[0],
+        );
+        assert_relative_eq!(max.values[0], spiked_alone.values[0], epsilon = 1e-9);
     }
 
     #[test]

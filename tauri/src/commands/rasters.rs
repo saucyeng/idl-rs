@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use idl_rs::fft::{Detrend, FftWindow, Scaling};
+use idl_rs::fft::{Averaging, Detrend, FftWindow, Scaling};
 use idl_rs::raster::{
     build_histogram2d_raster_bytes, build_spectrogram_raster_bytes, histogram2d_raster_meta,
     spectrogram_raster_meta, RasterMeta as CoreRasterMeta,
@@ -75,6 +75,31 @@ impl From<ScalingToken> for Scaling {
         match t {
             ScalingToken::Magnitude => Scaling::Magnitude,
             ScalingToken::Density => Scaling::Density,
+        }
+    }
+}
+
+/// `fetch_fft`'s `averaging` argument (C3 §3.6) — `idl_rs::fft::Averaging`'s
+/// four tokens, snake_case on the wire. Ruling R63 (3): the enum was
+/// extended with `None`/`Max` to close the gap C3's own text used to call
+/// out (a two-variant engine enum against a four-token wire union) — every
+/// token maps directly now, none rejected.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AveragingToken {
+    None,
+    Mean,
+    Median,
+    Max,
+}
+
+impl From<AveragingToken> for Averaging {
+    fn from(t: AveragingToken) -> Self {
+        match t {
+            AveragingToken::None => Averaging::None,
+            AveragingToken::Mean => Averaging::Mean,
+            AveragingToken::Median => Averaging::Median,
+            AveragingToken::Max => Averaging::Max,
         }
     }
 }
@@ -407,6 +432,97 @@ pub fn fetch_raster_meta(
     fetch_raster_meta_via(&data_dir.0, &session_id, &channel, &kind, width, height, &params)
 }
 
+/// Derives a channel's effective sample rate in Hz from its recorded `t_us`
+/// axis: `1e6 / median(consecutive-sample gaps in microseconds)` — never
+/// `nominal_rate_hz` (C1 §3.5: metadata only, never used to synthesize
+/// time). No existing "effective rate from t_us" helper was found under
+/// `core/src/session/` as of this task's writing (`grep -rn
+/// "effective_rate|derive.*rate" core/src/session` — no hits); this is this
+/// wrapper's own derivation, not a call into a pre-existing helper. Fewer
+/// than two samples has no gap to measure and returns `0.0`.
+fn effective_rate_hz_from_t_us(t_us: &[i64]) -> f64 {
+    if t_us.len() < 2 {
+        return 0.0;
+    }
+    let mut gaps: Vec<i64> = t_us.windows(2).map(|w| w[1] - w[0]).collect();
+    gaps.sort_unstable();
+    let n = gaps.len();
+    let median_us = if n % 2 == 1 {
+        gaps[n / 2] as f64
+    } else {
+        0.5 * (gaps[n / 2 - 1] + gaps[n / 2]) as f64
+    };
+    if median_us <= 0.0 {
+        0.0
+    } else {
+        1e6 / median_us
+    }
+}
+
+/// Builds the [`IpcErrorKind::InvalidArgument`] `fetch_fft` returns for any
+/// non-null `lap` (C3 §3.6: "`lap` must be `null` in practice until lap
+/// indexing lands"). `fetch_fft`'s `lap` argument is a plain `Option<u32>`,
+/// not a `LapContext` (contrast `eval_workbook`'s
+/// [`crate::session_source::load_lap_context`]), so this gate is this
+/// command's own — not a call into Task 9's helper. Task 9's gate only fires
+/// when `session.json` exists with a non-matching `laps[]`; since
+/// `session.json` may be entirely absent, that helper alone would silently
+/// accept a non-null `lap` here, so this command rejects unconditionally
+/// instead (matching C3's own "always" wording). Note for the lead: once lap
+/// indexing lands and Task 9's helper resolves real bounds, this duplication
+/// should be reconciled — likely by widening `load_lap_context` (or a new
+/// sibling) to also serve a single-lap sample-window lookup.
+fn reject_non_null_lap(lap: Option<u32>) -> Result<(), IpcError> {
+    match lap {
+        None => Ok(()),
+        Some(n) => Err(IpcError::with_detail(
+            IpcErrorKind::InvalidArgument,
+            format!("lap {n} not supported: lap indexing has not landed"),
+            serde_json::json!({ "lap": n }),
+        )),
+    }
+}
+
+/// Transport-agnostic core of `fetch_fft` (C3 §3.6, ruling R63 (3)). Loads
+/// the channel's samples via [`load_session`]/[`find_channel`], derives
+/// `sample_rate_hz` from the channel's recorded `t_us` axis (see
+/// [`effective_rate_hz_from_t_us`]), and calls `idl_rs::fft::welch`.
+/// `not_found`: unknown `session_id` or `channel`. `invalid_argument`: a
+/// non-null `lap` (see [`reject_non_null_lap`]), or `params` that fail
+/// [`resolve_spectrogram_params`]'s validation.
+pub fn fetch_fft_via(
+    data_dir: &Path,
+    session_id: &str,
+    channel: &str,
+    lap: Option<u32>,
+    params: &SpectrogramParams,
+    averaging: Averaging,
+) -> Result<Vec<u8>, IpcError> {
+    reject_non_null_lap(lap)?;
+    let session = load_session(data_dir, session_id)?;
+    let ch = find_channel(&session, channel)?;
+    let (window, detrend, scaling, window_size, noverlap) = resolve_spectrogram_params(params)?;
+    let samples = ch.materialize();
+    let sample_rate_hz = effective_rate_hz_from_t_us(&ch.t_us);
+    let result = idl_rs::fft::welch(samples, sample_rate_hz, window, window_size, noverlap, detrend, averaging, scaling);
+    Ok(idl_rs::fft_wire::encode_fft_idlf(&result.values, sample_rate_hz))
+}
+
+/// Fetches one channel's FFT spectrum as `IDLF` v1 bytes (C3 §3.6, ruling
+/// R63 (3)). `lap` must be `null` today — see [`reject_non_null_lap`].
+#[tauri::command]
+pub fn fetch_fft(
+    session_id: String,
+    channel: String,
+    lap: Option<u32>,
+    params: SpectrogramParams,
+    averaging: AveragingToken,
+    data_dir: tauri::State<'_, DataDir>,
+) -> Result<tauri::ipc::Response, IpcError> {
+    let bytes = fetch_fft_via(&data_dir.0, &session_id, &channel, lap, &params, averaging.into())?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,6 +815,112 @@ mod tests {
         assert_eq!(meta.x_label, "Speed (m/s)");
         assert_eq!(meta.y_label, "Cadence (rpm)");
         assert!(meta.transparent_zero);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn fft_params() -> SpectrogramParams {
+        SpectrogramParams { window_size: 32, hop_size: 16, window: WindowToken::Hann, detrend: DetrendToken::Mean, scaling: ScalingToken::Density }
+    }
+
+    #[test]
+    fn effective_rate_hz_from_t_us_uniform_spacing_matches_expected_rate() {
+        // Arrange — 64 Hz spacing, i.e. 15625 us gaps
+        let t_us: Vec<i64> = (0..8).map(|i| i * 15_625).collect();
+
+        // Act
+        let hz = effective_rate_hz_from_t_us(&t_us);
+
+        // Assert
+        assert!((hz - 64.0).abs() < 1e-6, "expected ~64 Hz, got {hz}");
+    }
+
+    #[test]
+    fn effective_rate_hz_from_t_us_fewer_than_two_samples_returns_zero() {
+        // Arrange / Act / Assert
+        assert_eq!(effective_rate_hz_from_t_us(&[]), 0.0);
+        assert_eq!(effective_rate_hz_from_t_us(&[100]), 0.0);
+    }
+
+    #[test]
+    fn fetch_fft_via_lap_some_invalid_argument_regardless_of_n() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root);
+
+        // Act
+        let err = fetch_fft_via(&root, "s1", "Speed", Some(7), &fft_params(), Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(err.detail, Some(serde_json::json!({ "lap": 7 })));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_via_unknown_session_not_found() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let err = fetch_fft_via(&root, "nope", "Speed", None, &fft_params(), Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_via_unknown_channel_not_found() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root);
+
+        // Act
+        let err = fetch_fft_via(&root, "s1", "NopeChannel", None, &fft_params(), Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_via_averaging_none_and_max_succeed_and_produce_well_formed_idlf_bytes() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root);
+
+        // Act
+        let none_bytes = fetch_fft_via(&root, "s1", "Speed", None, &fft_params(), Averaging::None).unwrap();
+        let max_bytes = fetch_fft_via(&root, "s1", "Speed", None, &fft_params(), Averaging::Max).unwrap();
+
+        // Assert — well-formed IDLF header on both; the whole point of R63 (3)
+        // is that these no longer reject.
+        for bytes in [&none_bytes, &max_bytes] {
+            assert_eq!(&bytes[0..4], b"IDLF");
+            assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 1);
+            let bin_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            assert_eq!(bytes.len(), 16 + bin_count * 4);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_via_malformed_params_zero_window_size_invalid_argument() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root);
+        let bad_params = SpectrogramParams { window_size: 0, hop_size: 0, window: WindowToken::Hann, detrend: DetrendToken::Mean, scaling: ScalingToken::Density };
+
+        // Act
+        let err = fetch_fft_via(&root, "s1", "Speed", None, &bad_params, Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -13,6 +13,7 @@ pub mod cursor;
 pub mod estimate;
 pub mod export;
 pub mod fft;
+pub mod fft_wire;
 pub mod filters;
 pub mod gps;
 pub mod histogram;
