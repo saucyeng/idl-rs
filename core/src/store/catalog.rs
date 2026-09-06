@@ -14,7 +14,7 @@ use rusqlite::Connection;
 use uuid::Uuid;
 
 use crate::store::atomic::{sha256_hex, write_atomic_with_retry};
-use crate::store::blob::verify_blob;
+use crate::store::blob::{blob_path, verify_blob};
 use crate::store::session_json::{read_session_json, LapJson, TrackVisitJson};
 use crate::track_artifact::read::read_track;
 
@@ -261,119 +261,10 @@ pub fn rebuild_catalog(data_root: &Path) -> Result<RebuildReport, CatalogError> 
                 continue;
             }
             let session_id = entry.file_name().to_string_lossy().into_owned();
-            let sj_path = dir.join("session.json");
-            if !sj_path.is_file() {
-                continue; // transient import-in-progress state, not corruption (C4 §2)
-            }
-            let doc = match read_session_json(&sj_path) {
-                Ok(doc) => doc,
-                Err(e) => {
-                    report.skipped.push(format!("{}: {e}", sj_path.display()));
-                    continue;
-                }
-            };
-            let dp_path = dir.join("data.parquet");
-            if !dp_path.is_file() {
-                continue; // transient import-in-progress state, not corruption (C4 §2)
-            }
-            // `data.parquet`'s own file-level metadata (C1 §4.3) is the
-            // canonical source for the `sessions` row's provenance columns —
-            // read here without materializing any column (same technique as
-            // [`index_lap_summary`]'s `timestamp_utc_ms` read below).
-            let fields = match read_data_parquet_session_fields(&dp_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    report.skipped.push(format!("{}: {e}", dp_path.display()));
-                    continue;
-                }
-            };
-            // Session length = the actual recorded span of `data.parquet`'s
-            // `t` column (µs), not any epoch-scale lap timestamp — mirrors
-            // `Channel::duration_ms` (`session/mod.rs`) exactly.
-            let duration_ms = match read_data_parquet_duration_ms(&dp_path) {
-                Ok(d) => d,
-                Err(e) => {
-                    report.skipped.push(format!("{}: {e}", dp_path.display()));
-                    continue;
-                }
-            };
-            let lap_count = doc.laps.len() as i64;
-            // TODO(idl0): C1 §6 has no imported_at_ms field; created_at_ms
-            // cannot mean "import time" across rebuilds until C1 grows one
-            // (runs/2026-09-03/decisions.md R14 item 3). Interim value:
-            // `session.json`'s own filesystem mtime.
-            let sj_meta = std::fs::metadata(&sj_path).map_err(io_err)?;
-            let created_at_ms = file_mtime_ms(&sj_meta);
-            let inserted = conn.execute(
-                "INSERT OR IGNORE INTO sessions (session_id, blob_sha256, source_format, device_id, config_checksum, importer_version, seam_correction_version, engine_version, timestamp_utc_ms, created_at_ms, rider, bike, venue_name, event_name, event_session, short_comment, tag, lap_count, duration_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-                rusqlite::params![
-                    session_id,
-                    fields.blob_sha256,
-                    fields.source_format,
-                    fields.device_id,
-                    fields.config_checksum,
-                    fields.importer_version,
-                    fields.seam_correction_version,
-                    fields.engine_version,
-                    fields.timestamp_utc_ms,
-                    created_at_ms,
-                    doc.rider,
-                    doc.bike,
-                    doc.venue_name,
-                    doc.event_name,
-                    doc.event_session,
-                    doc.short_comment,
-                    doc.tag,
-                    lap_count,
-                    duration_ms
-                ],
-            );
-            // Insert-order dependency (C4 §5 scan order): `sessions.blob_sha256`
-            // `REFERENCES blobs(sha256)` under `PRAGMA foreign_keys = ON` — a
-            // session whose blob is missing from step 1's scan is rejected by
-            // the constraint itself and lands here as a reported finding, not
-            // a dangling reference (C4 §5's own stated mechanism).
-            match inserted {
-                Ok(_) => {
-                    report.sessions_indexed += 1;
-                    for lap in &doc.laps {
-                        // `track_id` from the session's track visits (C4 §5
-                        // step 4): the first visit containing the lap, or
-                        // deliberately NULL if none does (a session with
-                        // visits recorded for only part of it, or none —
-                        // not corruption).
-                        let track_id = match lap_track_id(lap, &doc.track_visits) {
-                            Some(tid) => {
-                                // `laps.track_id REFERENCES tracks(track_id)`
-                                // would reject the insert under `PRAGMA
-                                // foreign_keys = ON` if `tid` isn't already
-                                // in `tracks` (inserted in step 2) — check
-                                // first so the lap row itself still lands.
-                                let exists = conn
-                                    .query_row("SELECT 1 FROM tracks WHERE track_id = ?1", rusqlite::params![tid], |_| Ok(()))
-                                    .is_ok();
-                                if exists {
-                                    Some(tid)
-                                } else {
-                                    report.skipped.push(format!(
-                                        "{session_id} lap {}: track_id {tid} not in tracks/",
-                                        lap.lap_number
-                                    ));
-                                    None
-                                }
-                            }
-                            None => None,
-                        };
-                        conn.execute(
-                            "INSERT INTO laps (session_id, lap_number, lap_time_ms, track_id) VALUES (?1,?2,?3,?4)",
-                            rusqlite::params![session_id, lap.lap_number, lap.lap_time_ms, track_id],
-                        )?;
-                        report.laps_indexed += 1;
-                    }
-                    index_lap_summary(&conn, &dir, &session_id, fields.timestamp_utc_ms, &doc.laps, &mut report)?;
-                }
-                Err(e) => report.skipped.push(format!("{}: {e}", sj_path.display())),
+            match index_session_body(&conn, &dir, &session_id, &mut report.laps_indexed, &mut report.lap_summary_indexed, &mut report.skipped)?
+            {
+                SessionBodyOutcome::Indexed => report.sessions_indexed += 1,
+                SessionBodyOutcome::TransientNoData | SessionBodyOutcome::Skipped => {}
             }
         }
     }
@@ -408,6 +299,279 @@ pub fn rebuild_catalog(data_root: &Path) -> Result<RebuildReport, CatalogError> 
     Ok(report)
 }
 
+/// What [`index_session_body`] did with one session directory — the caller
+/// (either [`rebuild_catalog`]'s loop or [`index_session`]) decides what
+/// each outcome means for its own report shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionBodyOutcome {
+    /// A `sessions` row (and its `laps`/`lap_summary` rows, if any) was
+    /// inserted.
+    Indexed,
+    /// `session.json` or `data.parquet` doesn't exist yet under this
+    /// directory — a transient import-in-progress state (C4 §2), not
+    /// corruption; nothing was inserted and nothing was reported.
+    TransientNoData,
+    /// A parse failure or a rejected `sessions` insert (e.g. its blob is
+    /// missing from `blobs`) — reported into `skipped`; nothing was
+    /// inserted.
+    Skipped,
+}
+
+/// C4 §5 steps 3–5 for exactly one session directory: reads `session.json`
+/// and `data.parquet`'s file metadata, inserts the `sessions` row, then each
+/// `laps` row and its `lap_summary` rows. Lifted out of [`rebuild_catalog`]'s
+/// per-session loop body (task L2b T4) so [`index_session`] (incremental,
+/// one session) and `rebuild_catalog` (full tree walk) share one
+/// implementation — the loop's own observable behaviour is unchanged, since
+/// this is the same code that used to run inline. `laps_indexed` and
+/// `lap_summary_indexed` are incremented in place rather than returned,
+/// matching how the two call sites already carry running totals
+/// ([`RebuildReport`]'s fields, or [`SessionIndexReport`]'s).
+fn index_session_body(
+    conn: &Connection,
+    dir: &Path,
+    session_id: &str,
+    laps_indexed: &mut usize,
+    lap_summary_indexed: &mut usize,
+    skipped: &mut Vec<String>,
+) -> Result<SessionBodyOutcome, CatalogError> {
+    let sj_path = dir.join("session.json");
+    if !sj_path.is_file() {
+        return Ok(SessionBodyOutcome::TransientNoData);
+    }
+    let doc = match read_session_json(&sj_path) {
+        Ok(doc) => doc,
+        Err(e) => {
+            skipped.push(format!("{}: {e}", sj_path.display()));
+            return Ok(SessionBodyOutcome::Skipped);
+        }
+    };
+    let dp_path = dir.join("data.parquet");
+    if !dp_path.is_file() {
+        return Ok(SessionBodyOutcome::TransientNoData);
+    }
+    // `data.parquet`'s own file-level metadata (C1 §4.3) is the canonical
+    // source for the `sessions` row's provenance columns — read here
+    // without materializing any column (same technique as
+    // [`index_lap_summary`]'s `timestamp_utc_ms` read below).
+    let fields = match read_data_parquet_session_fields(&dp_path) {
+        Ok(f) => f,
+        Err(e) => {
+            skipped.push(format!("{}: {e}", dp_path.display()));
+            return Ok(SessionBodyOutcome::Skipped);
+        }
+    };
+    // Session length = the actual recorded span of `data.parquet`'s `t`
+    // column (µs), not any epoch-scale lap timestamp — mirrors
+    // `Channel::duration_ms` (`session/mod.rs`) exactly.
+    let duration_ms = match read_data_parquet_duration_ms(&dp_path) {
+        Ok(d) => d,
+        Err(e) => {
+            skipped.push(format!("{}: {e}", dp_path.display()));
+            return Ok(SessionBodyOutcome::Skipped);
+        }
+    };
+    let lap_count = doc.laps.len() as i64;
+    // TODO(idl0): C1 §6 has no imported_at_ms field; created_at_ms cannot
+    // mean "import time" across rebuilds until C1 grows one
+    // (runs/2026-09-03/decisions.md R14 item 3). Interim value:
+    // `session.json`'s own filesystem mtime.
+    let sj_meta = std::fs::metadata(&sj_path).map_err(io_err)?;
+    let created_at_ms = file_mtime_ms(&sj_meta);
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO sessions (session_id, blob_sha256, source_format, device_id, config_checksum, importer_version, seam_correction_version, engine_version, timestamp_utc_ms, created_at_ms, rider, bike, venue_name, event_name, event_session, short_comment, tag, lap_count, duration_ms) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+        rusqlite::params![
+            session_id,
+            fields.blob_sha256,
+            fields.source_format,
+            fields.device_id,
+            fields.config_checksum,
+            fields.importer_version,
+            fields.seam_correction_version,
+            fields.engine_version,
+            fields.timestamp_utc_ms,
+            created_at_ms,
+            doc.rider,
+            doc.bike,
+            doc.venue_name,
+            doc.event_name,
+            doc.event_session,
+            doc.short_comment,
+            doc.tag,
+            lap_count,
+            duration_ms
+        ],
+    );
+    // Insert-order dependency (C4 §5 scan order): `sessions.blob_sha256`
+    // `REFERENCES blobs(sha256)` under `PRAGMA foreign_keys = ON` — a
+    // session whose blob is missing from `blobs` is rejected by the
+    // constraint itself and lands here as a reported finding, not a
+    // dangling reference (C4 §5's own stated mechanism). `rebuild_catalog`
+    // guarantees this by running its own blobs scan (step 1) first;
+    // `index_session` guarantees it by inserting this session's own blob
+    // row itself before calling this function (ruling R84).
+    match inserted {
+        Ok(_) => {
+            for lap in &doc.laps {
+                // `track_id` from the session's track visits (C4 §5 step
+                // 4): the first visit containing the lap, or deliberately
+                // NULL if none does (a session with visits recorded for
+                // only part of it, or none — not corruption).
+                let track_id = match lap_track_id(lap, &doc.track_visits) {
+                    Some(tid) => {
+                        // `laps.track_id REFERENCES tracks(track_id)` would
+                        // reject the insert under `PRAGMA foreign_keys = ON`
+                        // if `tid` isn't already in `tracks` (inserted in
+                        // step 2) — check first so the lap row itself still
+                        // lands.
+                        let exists = conn
+                            .query_row("SELECT 1 FROM tracks WHERE track_id = ?1", rusqlite::params![tid], |_| Ok(()))
+                            .is_ok();
+                        if exists {
+                            Some(tid)
+                        } else {
+                            skipped.push(format!("{session_id} lap {}: track_id {tid} not in tracks/", lap.lap_number));
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                conn.execute(
+                    "INSERT INTO laps (session_id, lap_number, lap_time_ms, track_id) VALUES (?1,?2,?3,?4)",
+                    rusqlite::params![session_id, lap.lap_number, lap.lap_time_ms, track_id],
+                )?;
+                *laps_indexed += 1;
+            }
+            index_lap_summary(conn, dir, session_id, fields.timestamp_utc_ms, &doc.laps, lap_summary_indexed, skipped)?;
+            Ok(SessionBodyOutcome::Indexed)
+        }
+        Err(e) => {
+            skipped.push(format!("{}: {e}", sj_path.display()));
+            Ok(SessionBodyOutcome::Skipped)
+        }
+    }
+}
+
+/// Outcome of [`index_session`] — counts plus non-fatal per-entity problems,
+/// the same shape [`RebuildReport`] uses for its own steps 3–5 fields.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionIndexReport {
+    pub laps_indexed: usize,
+    /// Rows inserted into `lap_summary` (C4 §5 step 5).
+    pub lap_summary_indexed: usize,
+    pub skipped: Vec<String>,
+}
+
+/// Indexes (or re-indexes) exactly one session into an already-open
+/// `catalog.sqlite` (C4 §5 steps 3–5): the `sessions` row and its `laps` /
+/// `lap_summary` rows. Idempotent — any existing rows for `session_id` are
+/// removed first (deleting the `sessions` row cascades to `laps`, and
+/// `laps`' own cascade takes `lap_summary` with it, per this file's `DDL`),
+/// so calling this twice in a row leaves the same state rather than
+/// duplicating or erroring on a primary-key conflict. `tracks` rows are NOT
+/// touched — step 2 is the track library's own concern, and a lap whose
+/// visit names a `track_id` not yet in `tracks` simply gets a NULL
+/// `laps.track_id` (`ON DELETE SET NULL` already covers a track deleted
+/// later).
+///
+/// Also inserts this session's own `blobs` row if it isn't already there
+/// (ruling R84): unlike [`rebuild_catalog`], which always runs its step 1
+/// blobs scan before reaching any session, an incremental caller (import)
+/// may be indexing a session whose blob was written to the CAS just now and
+/// has never been scanned into `blobs` — without this, `sessions.blob_sha256
+/// REFERENCES blobs(sha256)` would reject the insert under `PRAGMA
+/// foreign_keys = ON` on every first-time import into an existing catalog.
+///
+/// The delete, the blob upsert, and the steps-3–5 insert all run in one
+/// transaction, so a failure partway through cannot leave this session
+/// half-indexed.
+///
+/// Errors with [`CatalogErrorKind::NotFound`] if `session_id` has no
+/// `sessions/<session_id>/session.json` or no `data.parquet` yet — unlike
+/// `rebuild_catalog`'s tree walk (which treats a mid-import directory as
+/// transient and silently skips it while scanning everything else),
+/// `index_session` names one specific, already-known session_id, so "there
+/// is nothing to index yet" is reported to that specific caller rather than
+/// swallowed.
+pub fn index_session(conn: &Connection, data_root: &Path, session_id: &str) -> Result<SessionIndexReport, CatalogError> {
+    let dir = data_root.join("sessions").join(session_id);
+    if !dir.join("session.json").is_file() {
+        return Err(CatalogError {
+            kind: CatalogErrorKind::NotFound,
+            message: format!("{session_id}: no session.json under {}", dir.display()),
+        });
+    }
+    if !dir.join("data.parquet").is_file() {
+        return Err(CatalogError {
+            kind: CatalogErrorKind::NotFound,
+            message: format!("{session_id}: no data.parquet under {}", dir.display()),
+        });
+    }
+    let fields = read_data_parquet_session_fields(&dir.join("data.parquet"))?;
+
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = index_session_inner(conn, data_root, &dir, session_id, &fields.blob_sha256);
+    if result.is_ok() {
+        conn.execute_batch("COMMIT;")?;
+    } else {
+        // Best-effort — if the transaction is already gone (e.g. the error
+        // came from a prior statement failure that SQLite itself aborted),
+        // there is nothing left to roll back.
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    result
+}
+
+/// The transactional body of [`index_session`], factored out so the
+/// `BEGIN`/`COMMIT`/`ROLLBACK` wrapper above has one `Result` to branch on
+/// regardless of which step inside fails.
+fn index_session_inner(
+    conn: &Connection,
+    data_root: &Path,
+    dir: &Path,
+    session_id: &str,
+    blob_sha256: &str,
+) -> Result<SessionIndexReport, CatalogError> {
+    // Idempotence: remove this session's existing rows before re-inserting.
+    // `laps`/`lap_summary` cascade from this single delete (see the DDL).
+    conn.execute("DELETE FROM sessions WHERE session_id = ?1", rusqlite::params![session_id])?;
+
+    ensure_blob_row(conn, data_root, blob_sha256)?;
+
+    let mut report = SessionIndexReport::default();
+    match index_session_body(conn, dir, session_id, &mut report.laps_indexed, &mut report.lap_summary_indexed, &mut report.skipped)? {
+        SessionBodyOutcome::Indexed => {}
+        // Both already checked by `index_session` before opening the
+        // transaction — reaching either here would mean the files were
+        // removed concurrently, which this pipeline's own write-once
+        // contracts (C4 §2/§3) don't allow for a session mid-index.
+        SessionBodyOutcome::TransientNoData | SessionBodyOutcome::Skipped => {
+            return Err(CatalogError {
+                kind: CatalogErrorKind::Sql,
+                message: format!("{session_id}: session.json/data.parquet became unreadable during indexing"),
+            });
+        }
+    }
+    Ok(report)
+}
+
+/// Inserts `sha256`'s row into `blobs` if it isn't already there — the one
+/// piece of C4 §5 step 1 [`index_session`] needs (ruling R84). Verifies the
+/// blob's own bytes first (same check step 1's scan makes), rather than
+/// trusting the caller's claim that this hash is the file's real digest.
+fn ensure_blob_row(conn: &Connection, data_root: &Path, sha256: &str) -> Result<(), CatalogError> {
+    verify_blob(data_root, sha256).map_err(|e| CatalogError { kind: CatalogErrorKind::Sql, message: e.to_string() })?;
+    let path = blob_path(data_root, sha256);
+    let meta = std::fs::metadata(&path).map_err(io_err)?;
+    let mtime_ms = file_mtime_ms(&meta);
+    conn.execute(
+        "INSERT OR IGNORE INTO blobs (sha256, size_bytes, mtime_ms) VALUES (?1, ?2, ?3)",
+        rusqlite::params![sha256, meta.len() as i64, mtime_ms],
+    )?;
+    Ok(())
+}
+
 /// C4 §5 step 5: for every `derived/<hash>.parquet` under `session_dir`, for
 /// every channel column in the file and every already-inserted lap, compute
 /// `(min, max, mean)` over that lap's time window and insert one
@@ -424,7 +588,8 @@ fn index_lap_summary(
     session_id: &str,
     timestamp_utc_ms: i64,
     laps: &[LapJson],
-    report: &mut RebuildReport,
+    lap_summary_indexed: &mut usize,
+    skipped: &mut Vec<String>,
 ) -> Result<(), CatalogError> {
     if laps.is_empty() {
         return Ok(());
@@ -443,7 +608,7 @@ fn index_lap_summary(
         let (t_us, channels) = match read_derived_channels(&path) {
             Ok(v) => v,
             Err(e) => {
-                report.skipped.push(format!("{}: {e}", path.display()));
+                skipped.push(format!("{}: {e}", path.display()));
                 continue;
             }
         };
@@ -473,7 +638,7 @@ fn index_lap_summary(
                     "INSERT OR REPLACE INTO lap_summary (session_id, lap_number, channel_id, derived_hash, min_value, max_value, mean_value) VALUES (?1,?2,?3,?4,?5,?6,?7)",
                     rusqlite::params![session_id, lap.lap_number, channel_id, derived_hash, min, max, mean],
                 )?;
-                report.lap_summary_indexed += 1;
+                *lap_summary_indexed += 1;
             }
         }
     }
@@ -1271,6 +1436,176 @@ mod tests {
         let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
         let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(user_version, CATALOG_SCHEMA_VERSION);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A minimal, valid lap over `[start_ms, end_ms]`, no sectors/neutral
+    /// zones — the shape `index_session`'s own tests need without pulling
+    /// in `laps::detect_laps`'s real detection pipeline.
+    fn simple_lap(lap_number: u32, start_ms: i64, end_ms: i64) -> LapJson {
+        LapJson {
+            lap_number,
+            start_timestamp_ms: start_ms,
+            end_timestamp_ms: end_ms,
+            raw_elapsed_ms: end_ms - start_ms,
+            lap_time_ms: end_ms - start_ms,
+            start_time_secs: start_ms as f64 / 1000.0,
+            end_time_secs: end_ms as f64 / 1000.0,
+            sectors: Vec::new(),
+            neutral_zone_visits: Vec::new(),
+        }
+    }
+
+    /// An already-open, freshly-created (empty) catalog at `<root>/catalog.sqlite`
+    /// — the fixture `index_session`'s own tests use when they want a catalog
+    /// present but call `index_session` directly rather than through
+    /// `rebuild_catalog` or `finish_import`.
+    fn empty_catalog(root: &Path) -> Connection {
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+        create_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn index_session_three_laps_indexes_three_lap_rows_and_sets_lap_count() {
+        // Arrange
+        let root = temp_root();
+        let session_id = "sess-idx";
+        let mut doc = empty_session_json(session_id);
+        doc.laps = vec![simple_lap(1, 0, 500), simple_lap(2, 500, 1000), simple_lap(3, 1000, 1500)];
+        write_full_session(&root, session_id, 0, &doc);
+        let conn = empty_catalog(&root);
+
+        // Act
+        let report = index_session(&conn, &root, session_id).unwrap();
+
+        // Assert
+        assert_eq!(report.laps_indexed, 3);
+        assert!(report.skipped.is_empty());
+        let lap_count: Option<i64> =
+            conn.query_row("SELECT lap_count FROM sessions WHERE session_id = ?1", rusqlite::params![session_id], |r| r.get(0)).unwrap();
+        assert_eq!(lap_count, Some(3));
+        let laps_rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM laps WHERE session_id = ?1", rusqlite::params![session_id], |r| r.get(0)).unwrap();
+        assert_eq!(laps_rows, 3);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_session_called_twice_is_idempotent_no_primary_key_error() {
+        // Arrange
+        let root = temp_root();
+        let session_id = "sess-idem";
+        let mut doc = empty_session_json(session_id);
+        doc.laps = vec![simple_lap(1, 0, 500)];
+        write_full_session(&root, session_id, 0, &doc);
+        let conn = empty_catalog(&root);
+
+        // Act
+        index_session(&conn, &root, session_id).unwrap();
+        let second = index_session(&conn, &root, session_id).unwrap();
+
+        // Assert
+        assert_eq!(second.laps_indexed, 1);
+        let laps_rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM laps WHERE session_id = ?1", rusqlite::params![session_id], |r| r.get(0)).unwrap();
+        assert_eq!(laps_rows, 1);
+        let sessions_rows: i64 = conn.query_row("SELECT COUNT(*) FROM sessions WHERE session_id = ?1", rusqlite::params![session_id], |r| r.get(0)).unwrap();
+        assert_eq!(sessions_rows, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_session_after_laps_shrink_from_three_to_two_drops_the_stale_lap_and_its_summary() {
+        // Arrange — three laps, one derived channel spanning all three, so
+        // lap 3 gets a `lap_summary` row that must disappear along with the
+        // `laps` row once `session.json` is rewritten down to two laps.
+        let root = temp_root();
+        let session_id = "sess-shrink";
+        let mut doc = empty_session_json(session_id);
+        doc.laps = vec![simple_lap(1, 0, 500), simple_lap(2, 500, 1000), simple_lap(3, 1000, 1500)];
+        write_full_session(&root, session_id, 0, &doc);
+        let outputs = vec![DerivedOutput {
+            channel_id: "Roll (deg)".to_string(),
+            t_us: vec![0, 500_000, 1_000_000, 1_500_000],
+            values: vec![1.0, 2.0, 3.0, 4.0],
+            nominal_rate_hz: 2.0,
+            unit: "deg".to_string(),
+        }];
+        write_derived_parquet(&root, session_id, "test_kind", &[], &serde_json::json!({}), &outputs, 0).unwrap();
+        let conn = empty_catalog(&root);
+        index_session(&conn, &root, session_id).unwrap();
+        let lap3_summary_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM lap_summary WHERE session_id = ?1 AND lap_number = 3", rusqlite::params![session_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(lap3_summary_before, 1);
+
+        // Act — rewrite session.json with only laps 1-2, re-index.
+        let sj_path = root.join("sessions").join(session_id).join("session.json");
+        let current_hash = sha256_hex(&std::fs::read(&sj_path).unwrap());
+        doc.laps = vec![simple_lap(1, 0, 500), simple_lap(2, 500, 1000)];
+        write_session_json(&root, session_id, &doc, Some(&current_hash)).unwrap();
+        let report = index_session(&conn, &root, session_id).unwrap();
+
+        // Assert
+        assert_eq!(report.laps_indexed, 2);
+        let laps_rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM laps WHERE session_id = ?1", rusqlite::params![session_id], |r| r.get(0)).unwrap();
+        assert_eq!(laps_rows, 2);
+        let lap3_rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM laps WHERE session_id = ?1 AND lap_number = 3", rusqlite::params![session_id], |r| r.get(0))
+                .unwrap();
+        assert_eq!(lap3_rows, 0);
+        let lap3_summary_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM lap_summary WHERE session_id = ?1 AND lap_number = 3", rusqlite::params![session_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(lap3_summary_after, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_session_unknown_session_id_is_not_found() {
+        // Arrange
+        let root = temp_root();
+        let conn = empty_catalog(&root);
+
+        // Act
+        let err = index_session(&conn, &root, "does-not-exist").unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, CatalogErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_session_inserts_its_own_missing_blob_row_before_the_session_row() {
+        // Arrange — ruling R84: a catalog created before this session's blob
+        // ever existed (as `rebuild_catalog` would leave it on an earlier,
+        // empty tree) has no `blobs` row for it; `index_session` must
+        // insert one itself rather than fail the `sessions.blob_sha256`
+        // foreign key.
+        let root = temp_root();
+        let conn = empty_catalog(&root); // catalog exists before the session does
+        let session_id = "sess-blob";
+        let doc = empty_session_json(session_id);
+        write_full_session(&root, session_id, 0, &doc);
+        let blobs_before: i64 = conn.query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0)).unwrap();
+        assert_eq!(blobs_before, 0);
+
+        // Act
+        let report = index_session(&conn, &root, session_id).unwrap();
+
+        // Assert
+        assert!(report.skipped.is_empty());
+        let sessions_rows: i64 = conn.query_row("SELECT COUNT(*) FROM sessions WHERE session_id = ?1", rusqlite::params![session_id], |r| r.get(0)).unwrap();
+        assert_eq!(sessions_rows, 1);
+        let blobs_after: i64 = conn.query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0)).unwrap();
+        assert_eq!(blobs_after, 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

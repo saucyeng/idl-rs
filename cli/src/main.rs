@@ -30,6 +30,7 @@ use idl_rs::laps::model::Lap;
 use idl_rs::math::MathLapContext;
 use idl_rs::session::handle::{ChannelMeta, SessionHandle, SessionMeta};
 use idl_rs::session::Channel;
+use idl_rs::store::lap_index::{self, LapIndexErrorKind};
 use idl_rs::store::{catalog, import, verify};
 use idl_rs::track_artifact::{self, Track};
 use idl_rs::tracks::{detect_visits, VisitParams, VisitWindow};
@@ -303,6 +304,20 @@ enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// IDL0_SPEC §17.4's "Rescan Tracks": re-runs lap indexing for one
+    /// already-imported session, rebuilding its handle from `data.parquet`
+    /// and always recomputing (`force = true`) so newly-added or
+    /// newly-edited tracks take effect immediately.
+    Rescan {
+        /// Data directory root (contract C4 §1's `<data>`).
+        data_root: PathBuf,
+        /// The session id to rescan (its `sessions/<id>/data.parquet` must
+        /// already exist).
+        #[arg(long)]
+        session: String,
+        #[arg(long, value_enum, default_value_t = OutFormat::Text)]
+        format: OutFormat,
+    },
 }
 
 /// Output format for the structured inspect commands (`info`, `channels`,
@@ -553,6 +568,11 @@ fn main() -> ExitCode {
             older_than,
             confirm,
         } => cmd_prune(&data_dir, older_than, confirm),
+        Command::Rescan {
+            data_root,
+            session,
+            format,
+        } => emit_structured("rescan", cmd_rescan(&data_root, &session, format)),
     }
 }
 
@@ -681,6 +701,59 @@ fn cmd_visits(file: &Path, tracks: &[PathBuf], format: OutFormat) -> Result<Stru
                 warnings: truncation_warnings(&meta),
             })
         }
+    }
+}
+
+impl From<lap_index::LapIndexError> for CliError {
+    fn from(e: lap_index::LapIndexError) -> Self {
+        let kind = match e.kind {
+            LapIndexErrorKind::Io => ErrorKind::Io,
+            // Currently unreached (`LapIndexErrorKind::Track`'s own doc
+            // comment) — kept for a future fatal-track-load case, same
+            // "present but unusable" family as the engine's other
+            // `invalid_input` mappings.
+            LapIndexErrorKind::Track => ErrorKind::InvalidInput,
+        };
+        CliError::new(kind, e.message)
+    }
+}
+
+/// Builds `rescan`'s `data.rescan` JSON object from a [`lap_index::LapIndexReport`].
+fn rescan_report_json(report: &lap_index::LapIndexReport) -> Value {
+    json!({
+        "session_id": report.session_id,
+        "visits_indexed": report.visits_indexed,
+        "laps_indexed": report.laps_indexed,
+        "skipped_up_to_date": report.skipped_up_to_date,
+        "flags_cleared": report.flags_cleared,
+        "warnings": report.warnings,
+    })
+}
+
+/// `rescan` — IDL0_SPEC §17.4's "Rescan Tracks": re-runs lap indexing for a
+/// session already imported into `data_root`, via [`lap_index::reindex_laps`]
+/// (always `force = true`).
+fn cmd_rescan(data_root: &Path, session_id: &str, format: OutFormat) -> Result<Structured, CliError> {
+    let report = lap_index::reindex_laps(data_root, session_id)?;
+    match format {
+        OutFormat::Text => {
+            if report.skipped_up_to_date {
+                println!("rescan {}: up to date, nothing recomputed", report.session_id);
+            } else {
+                println!("rescan {}: {} visits, {} laps", report.session_id, report.visits_indexed, report.laps_indexed);
+            }
+            if !report.flags_cleared.is_empty() {
+                println!("  cleared: {}", report.flags_cleared.join(", "));
+            }
+            for w in &report.warnings {
+                println!("  warning: {w}");
+            }
+            Ok(Structured::Text)
+        }
+        OutFormat::Json => Ok(Structured::Json {
+            data: json!({ "rescan": rescan_report_json(&report) }),
+            warnings: Vec::new(),
+        }),
     }
 }
 
@@ -1423,7 +1496,12 @@ fn display_or_dash(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use idl_rs::gps::GpsFix;
+    use idl_rs::laps::model::{Gate, LapTiming};
     use idl_rs::session::handle::{ChannelInput, SessionMetaInput};
+    use idl_rs::session::{RawColumn, Session, SourceFormat};
+    use idl_rs::store::parquet::write_session_parquet;
+    use idl_rs::track_artifact::write_track;
     use idl_rs::workbook::ChannelApplyResult;
     use std::path::PathBuf;
 
@@ -1781,5 +1859,115 @@ mod tests {
         );
         assert_eq!(FitSport::from(SportArg::Running), FitSport::Running);
         assert_eq!(FitSport::from(SportArg::Generic), FitSport::Generic);
+    }
+
+    // ---- rescan tests -----------------------------------------------------
+    //
+    // Fixtures duplicated minimally from `idl-rs`'s own `store::lap_index`/
+    // `store::import` test modules (private `#[cfg(test)]` items, not
+    // reachable from this crate) rather than reached into.
+
+    fn temp_data_root() -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("idl-rs-cli-test-rescan-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A there-and-back-and-there GPS session: 3 legs of 100 one-second
+    /// fixes, lat sweeping 0.000→0.099→0.000→0.099, crossing lat 0.05 three
+    /// times.
+    fn three_lap_session(session_id: &str) -> Session {
+        let mut fixes: Vec<GpsFix> = Vec::new();
+        for (leg, up) in [(0i64, true), (1, false), (2, true)] {
+            for i in 0..100i64 {
+                let lat = if up { i as f64 * 0.001 } else { 0.099 - i as f64 * 0.001 };
+                fixes.push(GpsFix { timestamp_ms: leg * 100_000 + i * 1000, lat, lon: 0.0005 });
+            }
+        }
+        let lat: Vec<f64> = fixes.iter().map(|f| f.lat).collect();
+        let lon: Vec<f64> = fixes.iter().map(|f| f.lon).collect();
+        let epoch: Vec<f64> = fixes.iter().map(|f| f.timestamp_ms as f64).collect();
+        let ch = |id: &str, s: Vec<f64>| {
+            let t_us: Vec<i64> = (0..s.len() as i64).map(|i| i * 1_000_000).collect();
+            Channel {
+                channel_id: id.to_string(),
+                t_us,
+                t_recorded_us: None,
+                nominal_rate_hz: 1.0,
+                column: RawColumn::F64(s),
+                source_kind: id.to_lowercase(),
+                unit: String::new(),
+                gaps: Vec::new(),
+            }
+        };
+        Session {
+            session_id: session_id.to_string(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            config_checksum: None,
+            source_format: SourceFormat::Gpx,
+            blob_sha256: String::new(),
+            channels: vec![ch("GPS_Latitude", lat), ch("GPS_Longitude", lon), ch("GPS_EpochMs", epoch)],
+        }
+    }
+
+    fn circuit_track(id: &str) -> Track {
+        let polyline: Vec<GpsFix> =
+            (0..=100).map(|i| GpsFix { timestamp_ms: i * 1000, lat: i as f64 * 0.001, lon: 0.0005 }).collect();
+        Track {
+            id: id.to_string(),
+            name: "Loop".to_string(),
+            venue: String::new(),
+            timing: Some(LapTiming::Circuit { start_finish: Gate { lat1: 0.05, lon1: -0.001, lat2: 0.05, lon2: 0.001 } }),
+            sector_gates: Vec::new(),
+            neutral_zones: Vec::new(),
+            reference_polyline: polyline,
+            created_at_ms: 0,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn cmd_rescan_json_maps_lap_index_report_into_the_rescan_envelope() {
+        // Arrange — a data root with data.parquet + a track library already
+        // in place, no session.json yet.
+        let root = temp_data_root();
+        write_track(&root, &circuit_track("loop-1")).unwrap();
+        let session = three_lap_session("s1");
+        write_session_parquet(&root, &session, "0.1.0").unwrap();
+
+        // Act
+        let result = cmd_rescan(&root, "s1", OutFormat::Json);
+
+        // Assert
+        let Structured::Json { data, warnings } = result.unwrap() else {
+            panic!("expected Structured::Json");
+        };
+        assert!(warnings.is_empty());
+        let rescan = &data["rescan"];
+        assert_eq!(rescan["session_id"], "s1");
+        assert_eq!(rescan["visits_indexed"], 1);
+        assert_eq!(rescan["laps_indexed"], 3);
+        assert_eq!(rescan["skipped_up_to_date"], false);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cmd_rescan_missing_data_parquet_maps_to_io_error() {
+        // Arrange — a data root with no `sessions/` at all.
+        let root = temp_data_root();
+
+        // Act
+        let result = cmd_rescan(&root, "nope", OutFormat::Text);
+
+        // Assert
+        let Err(err) = result else { panic!("expected an error") };
+        assert_eq!(err.kind, ErrorKind::Io);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

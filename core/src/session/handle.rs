@@ -891,17 +891,41 @@ impl SessionHandle {
 /// Empty when the window is inverted, the data is empty, or no sample falls
 /// inside.
 fn slice_channel_by_time(c: &Channel, t0: f64, t1: f64) -> Vec<f64> {
-    if c.is_empty() || t1 < t0 {
+    if c.is_empty() {
         return Vec::new();
     }
-    let t0_us = (t0 * 1e6).round() as i64;
-    let t1_us = (t1 * 1e6).round() as i64;
-    let lo = c.t_us.partition_point(|&t| t < t0_us);
-    let hi = c.t_us.partition_point(|&t| t <= t1_us);
+    let (lo, hi) = time_window_index_range(&c.t_us, t0, t1);
     if lo >= hi {
         return Vec::new();
     }
     c.column.materialize_range(lo, hi)
+}
+
+/// Half-open index window `[lo, hi)` into a strictly increasing `t_us`
+/// (microseconds) slice covering the inclusive time window `[t0, t1]`
+/// (seconds). Converts `t0`/`t1` to whole microseconds (`round()`) and
+/// binary-searches (`partition_point`) for the boundary indices —
+/// `t_us` must already be sorted ascending (contract C1 §2/§3.5 invariant
+/// 1). `(0, 0)` when `t_us` is empty, the window is inverted (`t1 < t0`),
+/// or the window covers no sample. Shared boundary math between
+/// [`slice_channel_by_time`] (which widens the resulting window into
+/// materialized `f64` samples) and `idl-rs-tauri`'s `fetch_fft` lap
+/// slicing, which needs the raw `t_us` entries in the same window to
+/// derive an effective sample rate (ruling R85) — pulled out here so both
+/// call sites share one boundary-math implementation instead of each
+/// reimplementing the `round`/`partition_point` arithmetic.
+pub fn time_window_index_range(t_us: &[i64], t0: f64, t1: f64) -> (usize, usize) {
+    if t_us.is_empty() || t1 < t0 {
+        return (0, 0);
+    }
+    let t0_us = (t0 * 1e6).round() as i64;
+    let t1_us = (t1 * 1e6).round() as i64;
+    let lo = t_us.partition_point(|&t| t < t0_us);
+    let hi = t_us.partition_point(|&t| t <= t1_us);
+    if lo >= hi {
+        return (0, 0);
+    }
+    (lo, hi)
 }
 
 /// Maps one epoch-ms `target` to uniform-Time seconds via a bracketing binary
@@ -2360,5 +2384,40 @@ mod gps_channel_values_tests {
 
         // Act + Assert — no fixes → empty result.
         assert!(h.gps_channel_values("Fork").is_empty());
+    }
+
+    #[test]
+    fn time_window_index_range_matches_slice_by_time_window() {
+        // Arrange — 10 Hz, samples 0..10 (sample i at i/10 s), same window
+        // `slice_by_time_fixed_rate_returns_samples_in_window_inclusive`
+        // exercises end to end.
+        let t_us: Vec<i64> = (0..10i64).map(|i| i * 100_000).collect();
+
+        // Act — window [0.2, 0.5] s → indices 2..=5, half-open [2, 6).
+        let (lo, hi) = time_window_index_range(&t_us, 0.2, 0.5);
+
+        // Assert
+        assert_eq!((lo, hi), (2, 6));
+    }
+
+    #[test]
+    fn time_window_index_range_inverted_window_is_empty() {
+        // Arrange
+        let t_us: Vec<i64> = (0..10i64).map(|i| i * 100_000).collect();
+
+        // Act
+        let (lo, hi) = time_window_index_range(&t_us, 0.5, 0.2);
+
+        // Assert
+        assert_eq!((lo, hi), (0, 0));
+    }
+
+    #[test]
+    fn time_window_index_range_empty_t_us_is_empty() {
+        // Act
+        let (lo, hi) = time_window_index_range(&[], 0.0, 1.0);
+
+        // Assert
+        assert_eq!((lo, hi), (0, 0));
     }
 }

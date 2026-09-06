@@ -188,6 +188,25 @@ impl From<idl_rs::store::catalog::CatalogError> for IpcError {
     }
 }
 
+/// C3 §3.2 `rescan_tracks`. `idl_rs::store::lap_index::LapIndexError` — `Io`
+/// (a filesystem failure reading `tracks/` or `data.parquet`) maps to
+/// `IpcErrorKind::Io`; `Track` (a track artifact malformed badly enough to
+/// stop the whole library load, currently unreached — see the variant's own
+/// doc comment) folds into the cross-cutting `Internal`, the same bucket
+/// `CatalogErrorKind::Sql` uses for "a genuine failure, not the caller's
+/// fault, not merely missing data" (ruling R46 precedent) — not a dedicated
+/// C3 §2 row, since no code path constructs it today.
+impl From<idl_rs::store::lap_index::LapIndexError> for IpcError {
+    fn from(e: idl_rs::store::lap_index::LapIndexError) -> Self {
+        use idl_rs::store::lap_index::LapIndexErrorKind;
+        let kind = match e.kind {
+            LapIndexErrorKind::Io => IpcErrorKind::Io,
+            LapIndexErrorKind::Track => IpcErrorKind::Internal,
+        };
+        IpcError::new(kind, e.message)
+    }
+}
+
 /// C3 §3.4 (Workbook). `idl_rs::math::MathEvalError` (evaluation-time,
 /// per-definition failures, C2 §3.5.B) — every variant gets its own
 /// `math_*` `IpcErrorKind` (C3 §2's naming rule: prefix every source enum's
@@ -349,6 +368,38 @@ mod tests {
             json,
             r#"{"kind":"conflict","message":"workbooks/w1.idl1wb changed since it was read","detail":{"expected":"h0","found":"h1"}}"#
         );
+    }
+
+    #[test]
+    fn lap_index_error_io_kind_converts_to_io() {
+        // Arrange
+        let e = idl_rs::store::lap_index::LapIndexError {
+            kind: idl_rs::store::lap_index::LapIndexErrorKind::Io,
+            message: "reading data.parquet: not found".to_string(),
+        };
+
+        // Act
+        let ie: IpcError = e.into();
+
+        // Assert
+        assert_eq!(ie.kind, IpcErrorKind::Io);
+        assert_eq!(ie.message, "reading data.parquet: not found");
+    }
+
+    #[test]
+    fn lap_index_error_track_kind_folds_into_internal() {
+        // Arrange — currently unreached in practice (see the variant's own
+        // doc comment); the conversion still must be total.
+        let e = idl_rs::store::lap_index::LapIndexError {
+            kind: idl_rs::store::lap_index::LapIndexErrorKind::Track,
+            message: "malformed track artifact".to_string(),
+        };
+
+        // Act
+        let ie: IpcError = e.into();
+
+        // Assert
+        assert_eq!(ie.kind, IpcErrorKind::Internal);
     }
 
     #[test]

@@ -92,6 +92,50 @@ impl From<catalog_read::ChannelSummary> for ChannelSummary {
     }
 }
 
+/// C3 §3.2 `LapDetail.sectors` element (C1 §6 `laps[].sectors`, C3 §6 item
+/// 11, closed 2026-09-06). Mirrors core's `session_json::SectorJson`
+/// field for field rather than deriving `Serialize` on the core type
+/// directly, matching this module's own idiom (core types never cross the
+/// IPC boundary directly).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LapSector {
+    pub name: String,
+    /// Unix epoch milliseconds.
+    pub start_ms: i64,
+    pub end_ms: i64,
+    /// Seconds, recording-time (t=0-anchored).
+    pub start_time_secs: f64,
+    pub end_time_secs: f64,
+}
+
+impl From<idl_rs::store::session_json::SectorJson> for LapSector {
+    fn from(s: idl_rs::store::session_json::SectorJson) -> Self {
+        Self {
+            name: s.name,
+            start_ms: s.start_ms,
+            end_ms: s.end_ms,
+            start_time_secs: s.start_time_secs,
+            end_time_secs: s.end_time_secs,
+        }
+    }
+}
+
+/// C3 §3.2 `LapDetail.neutral_zone_visits` element (C1 §6
+/// `laps[].neutral_zone_visits`, C3 §6 item 11, closed 2026-09-06).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LapNeutralZoneVisit {
+    pub name: String,
+    /// Unix epoch milliseconds.
+    pub enter_ms: i64,
+    pub exit_ms: i64,
+}
+
+impl From<idl_rs::store::session_json::NeutralZoneVisitJson> for LapNeutralZoneVisit {
+    fn from(v: idl_rs::store::session_json::NeutralZoneVisitJson) -> Self {
+        Self { name: v.name, enter_ms: v.enter_ms, exit_ms: v.exit_ms }
+    }
+}
+
 /// C3 §3.2 `LapDetail` (`session.json`'s own lap shape, distinct from
 /// `LapSummary`).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -103,8 +147,8 @@ pub struct LapDetail {
     pub lap_time_ms: i64,
     pub start_time_secs: f64,
     pub end_time_secs: f64,
-    pub sectors: serde_json::Value,
-    pub neutral_zone_visits: serde_json::Value,
+    pub sectors: Vec<LapSector>,
+    pub neutral_zone_visits: Vec<LapNeutralZoneVisit>,
 }
 
 impl From<catalog_read::LapDetail> for LapDetail {
@@ -117,8 +161,8 @@ impl From<catalog_read::LapDetail> for LapDetail {
             lap_time_ms: l.lap_time_ms,
             start_time_secs: l.start_time_secs,
             end_time_secs: l.end_time_secs,
-            sectors: l.sectors,
-            neutral_zone_visits: l.neutral_zone_visits,
+            sectors: l.sectors.into_iter().map(LapSector::from).collect(),
+            neutral_zone_visits: l.neutral_zone_visits.into_iter().map(LapNeutralZoneVisit::from).collect(),
         }
     }
 }
@@ -421,6 +465,74 @@ pub fn list_tracks(data_dir: tauri::State<'_, DataDir>) -> Result<Vec<TrackSumma
 #[tauri::command]
 pub fn get_track(track_id: String, data_dir: tauri::State<'_, DataDir>) -> Result<TrackDetail, IpcError> {
     get_track_via(&data_dir.0, &track_id)
+}
+
+/// C3 §3.2 `rescan_tracks`'s return (IDL0_SPEC §17.4 "Rescan Tracks").
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RescanReport {
+    pub session_id: String,
+    pub visits_indexed: u32,
+    pub laps_indexed: u32,
+    /// Lap-flag fields cleared because their lap number no longer exists
+    /// after renumbering (PLAN Q3) — the UI warns the rider that a starred
+    /// or ignored lap was dropped.
+    pub flags_cleared: Vec<String>,
+    pub warnings: Vec<String>,
+    pub elapsed_ms: u32,
+}
+
+/// Transport-agnostic core of `rescan_tracks`: re-runs visit/lap detection
+/// for one session against the current track library
+/// (`idl_rs::store::lap_index::reindex_laps`, which always recomputes) and,
+/// when `catalog.sqlite` already exists, re-indexes that session's catalog
+/// rows (`idl_rs::store::catalog::index_session`) — mirroring
+/// `store::import::finish_import`'s own catalog rule (Task 4): a bare data
+/// root that has never had `rebuild_catalog` run against it stays
+/// catalog-less, and this call is not the thing that creates one. A
+/// catalog-indexing failure is folded into `warnings` rather than failing
+/// the call, for the same reason: the lap rescan itself already succeeded
+/// and `rebuild_catalog` remains the recovery path. An unknown `session_id`
+/// (no `sessions/<id>/` directory) is `IpcErrorKind::NotFound`, matching
+/// `get_session`/`list_laps`, checked before `reindex_laps` runs so a
+/// missing session never surfaces as the less specific `io` a missing
+/// `data.parquet` would otherwise produce.
+fn rescan_tracks_via(data_dir: &Path, session_id: &str) -> Result<RescanReport, IpcError> {
+    let start = std::time::Instant::now();
+
+    let session_dir = data_dir.join("sessions").join(session_id);
+    if !session_dir.is_dir() {
+        return Err(IpcError::new(IpcErrorKind::NotFound, format!("session {session_id} not found")));
+    }
+
+    let report = idl_rs::store::lap_index::reindex_laps(data_dir, session_id)?;
+
+    let mut warnings = report.warnings;
+    let catalog_path = data_dir.join("catalog.sqlite");
+    if catalog_path.is_file() {
+        let indexed = idl_rs::store::catalog::open_catalog(&catalog_path)
+            .and_then(|conn| idl_rs::store::catalog::index_session(&conn, data_dir, session_id));
+        if let Err(e) = indexed {
+            warnings.push(e.to_string());
+        }
+    }
+
+    Ok(RescanReport {
+        session_id: session_id.to_string(),
+        visits_indexed: report.visits_indexed as u32,
+        laps_indexed: report.laps_indexed as u32,
+        flags_cleared: report.flags_cleared,
+        warnings,
+        elapsed_ms: start.elapsed().as_millis() as u32,
+    })
+}
+
+/// C3 §3.2 `rescan_tracks(session_id)` — IDL0_SPEC §17.4's "Rescan Tracks".
+/// Re-runs visit and lap detection for one session against the current
+/// track library, rewrites its `session.json`, and re-indexes its catalog
+/// rows when a catalog exists.
+#[tauri::command]
+pub fn rescan_tracks(session_id: String, data_dir: tauri::State<'_, DataDir>) -> Result<RescanReport, IpcError> {
+    rescan_tracks_via(&data_dir.0, &session_id)
 }
 
 /// C3 §3.2 `SessionMetadataPatch` — `save_session_metadata`'s argument. A
@@ -779,7 +891,13 @@ mod tests {
                 lap_time_ms: 3_102,
                 start_time_secs: 3.3,
                 end_time_secs: 3.4,
-                sectors: Vec::new(),
+                sectors: vec![SectorJson {
+                    name: "sector-T".to_string(),
+                    start_ms: 3_110,
+                    end_ms: 3_120,
+                    start_time_secs: 3.31,
+                    end_time_secs: 3.32,
+                }],
                 neutral_zone_visits: Vec::new(),
             }],
         }];
@@ -852,11 +970,16 @@ mod tests {
         assert_eq!(lap.lap_time_ms, 1_002);
         assert_eq!(lap.start_time_secs, 1.1);
         assert_eq!(lap.end_time_secs, 2.2);
-        assert_eq!(
-            lap.sectors,
-            serde_json::json!([{ "name": "sector-K", "start_ms": 1_100, "end_ms": 1_200, "start_time_secs": 1.3, "end_time_secs": 1.4 }])
-        );
-        assert_eq!(lap.neutral_zone_visits, serde_json::json!([{ "name": "nz-L", "enter_ms": 1_300, "exit_ms": 1_400 }]));
+        assert_eq!(lap.sectors.len(), 1);
+        assert_eq!(lap.sectors[0].name, "sector-K");
+        assert_eq!(lap.sectors[0].start_ms, 1_100);
+        assert_eq!(lap.sectors[0].end_ms, 1_200);
+        assert_eq!(lap.sectors[0].start_time_secs, 1.3);
+        assert_eq!(lap.sectors[0].end_time_secs, 1.4);
+        assert_eq!(lap.neutral_zone_visits.len(), 1);
+        assert_eq!(lap.neutral_zone_visits[0].name, "nz-L");
+        assert_eq!(lap.neutral_zone_visits[0].enter_ms, 1_300);
+        assert_eq!(lap.neutral_zone_visits[0].exit_ms, 1_400);
 
         assert_eq!(detail.track_visits.len(), 1);
         let visit = &detail.track_visits[0];
@@ -873,6 +996,8 @@ mod tests {
         assert_eq!(nested_lap.lap_time_ms, 3_102);
         assert_eq!(nested_lap.start_time_secs, 3.3);
         assert_eq!(nested_lap.end_time_secs, 3.4);
+        assert_eq!(nested_lap.sectors.len(), 1);
+        assert_eq!(nested_lap.sectors[0].name, "sector-T");
 
         assert_eq!(detail.reference_lap_number, Some(11));
         assert_eq!(detail.ignored_lap_numbers, vec![12, 13]);
@@ -1140,5 +1265,271 @@ mod tests {
         assert_eq!(list_sessions_via(&root).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lap_detail_serialises_sectors_and_neutral_zone_visits_byte_identical_to_the_old_value_path() {
+        // Arrange — the expected JSON is built literally with `json!`, not
+        // by calling any of this module's own code, so this test would
+        // catch a field-name or shape drift the refactor from
+        // `serde_json::Value` introduced.
+        let detail = LapDetail {
+            lap_number: 1,
+            start_timestamp_ms: 1_000,
+            end_timestamp_ms: 2_000,
+            raw_elapsed_ms: 1_000,
+            lap_time_ms: 900,
+            start_time_secs: 1.0,
+            end_time_secs: 2.0,
+            sectors: vec![
+                LapSector { name: "S1".to_string(), start_ms: 1_000, end_ms: 1_500, start_time_secs: 1.0, end_time_secs: 1.5 },
+                LapSector { name: "S2".to_string(), start_ms: 1_500, end_ms: 2_000, start_time_secs: 1.5, end_time_secs: 2.0 },
+            ],
+            neutral_zone_visits: vec![LapNeutralZoneVisit { name: "NZ1".to_string(), enter_ms: 1_100, exit_ms: 1_200 }],
+        };
+
+        // Act
+        let value = serde_json::to_value(&detail).unwrap();
+
+        // Assert
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "lap_number": 1,
+                "start_timestamp_ms": 1_000,
+                "end_timestamp_ms": 2_000,
+                "raw_elapsed_ms": 1_000,
+                "lap_time_ms": 900,
+                "start_time_secs": 1.0,
+                "end_time_secs": 2.0,
+                "sectors": [
+                    { "name": "S1", "start_ms": 1_000, "end_ms": 1_500, "start_time_secs": 1.0, "end_time_secs": 1.5 },
+                    { "name": "S2", "start_ms": 1_500, "end_ms": 2_000, "start_time_secs": 1.5, "end_time_secs": 2.0 }
+                ],
+                "neutral_zone_visits": [
+                    { "name": "NZ1", "enter_ms": 1_100, "exit_ms": 1_200 }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn lap_detail_with_no_sectors_or_neutral_zone_visits_serialises_empty_arrays_not_null() {
+        // Arrange
+        let detail = LapDetail {
+            lap_number: 1,
+            start_timestamp_ms: 0,
+            end_timestamp_ms: 0,
+            raw_elapsed_ms: 0,
+            lap_time_ms: 0,
+            start_time_secs: 0.0,
+            end_time_secs: 0.0,
+            sectors: Vec::new(),
+            neutral_zone_visits: Vec::new(),
+        };
+
+        // Act
+        let value = serde_json::to_value(&detail).unwrap();
+
+        // Assert
+        assert_eq!(value["sectors"], serde_json::json!([]));
+        assert_eq!(value["neutral_zone_visits"], serde_json::json!([]));
+    }
+
+    // ---- rescan_tracks (Task 8) ------------------------------------------
+
+    mod rescan_tracks {
+        use super::*;
+        use idl_rs::gps::GpsFix;
+        use idl_rs::laps::model::{Gate, LapTiming};
+        use idl_rs::track_artifact::{write_track, Track};
+
+        /// A there-and-back-and-there GPS track: 3 legs of 100 one-second
+        /// fixes, lat sweeping 0.000→0.099→0.000→0.099 at a fixed longitude,
+        /// crossing a gate at lat 0.05 three times. Mirrors
+        /// `store::lap_index`'s own `three_lap_fixes` fixture (not reachable
+        /// from here — that module's test fixtures are private).
+        fn three_lap_fixes() -> Vec<GpsFix> {
+            let mut fixes = Vec::new();
+            let leg = |t0: i64, up: bool| -> Vec<GpsFix> {
+                (0..100)
+                    .map(|i| {
+                        let lat = if up { i as f64 * 0.001 } else { 0.099 - i as f64 * 0.001 };
+                        GpsFix { timestamp_ms: t0 + i * 1000, lat, lon: 0.0005 }
+                    })
+                    .collect()
+            };
+            fixes.extend(leg(0, true));
+            fixes.extend(leg(100_000, false));
+            fixes.extend(leg(200_000, true));
+            fixes
+        }
+
+        /// A track whose reference polyline covers the same lat range/
+        /// longitude as [`three_lap_fixes`], with a circuit start/finish
+        /// gate at lat 0.05.
+        fn circuit_track(id: &str) -> Track {
+            let polyline: Vec<GpsFix> =
+                (0..=100).map(|i| GpsFix { timestamp_ms: i * 1000, lat: i as f64 * 0.001, lon: 0.0005 }).collect();
+            Track {
+                id: id.to_string(),
+                name: "Loop".to_string(),
+                venue: String::new(),
+                timing: Some(LapTiming::Circuit { start_finish: Gate { lat1: 0.05, lon1: -0.001, lat2: 0.05, lon2: 0.001 } }),
+                sector_gates: Vec::new(),
+                neutral_zones: Vec::new(),
+                reference_polyline: polyline,
+                created_at_ms: 0,
+                updated_at_ms: 1,
+            }
+        }
+
+        /// Writes a GPS-only session's `data.parquet` (a real blob, not an
+        /// empty `blob_sha256`, which `store::blob::blob_path` cannot turn
+        /// into a path, so `core_rebuild_catalog`/`index_session` can run
+        /// against this fixture) — no `session.json`, left to the caller so
+        /// a test can seed one with non-default fields first.
+        fn write_gps_parquet(root: &Path, session_id: &str, fixes: &[GpsFix]) {
+            let lat: Vec<f64> = fixes.iter().map(|f| f.lat).collect();
+            let lon: Vec<f64> = fixes.iter().map(|f| f.lon).collect();
+            let epoch: Vec<f64> = fixes.iter().map(|f| f.timestamp_ms as f64).collect();
+            let ch = |id: &str, s: Vec<f64>| {
+                let t_us: Vec<i64> = (0..s.len() as i64).map(|i| i * 1_000_000).collect();
+                Channel {
+                    channel_id: id.to_string(),
+                    t_us,
+                    t_recorded_us: None,
+                    nominal_rate_hz: 1.0,
+                    column: RawColumn::F64(s),
+                    source_kind: id.to_lowercase(),
+                    unit: String::new(),
+                    gaps: Vec::new(),
+                }
+            };
+            let blob_sha256 = idl_rs::store::blob::write_blob(root, format!("raw bytes for {session_id}").as_bytes()).unwrap();
+            let session = Session {
+                session_id: session_id.to_string(),
+                device_id: None,
+                timestamp_utc_ms: 0,
+                config_checksum: None,
+                source_format: SourceFormat::Gpx,
+                blob_sha256,
+                channels: vec![ch("GPS_Latitude", lat), ch("GPS_Longitude", lon), ch("GPS_EpochMs", epoch)],
+            };
+            write_session_parquet(root, &session, "test-importer").unwrap();
+        }
+
+        /// [`write_gps_parquet`] plus a fresh, empty `session.json` — the
+        /// no-track-library-yet, first-ever-rescan scenario Q8 exists for.
+        fn write_gps_session(root: &Path, session_id: &str, fixes: &[GpsFix]) {
+            write_gps_parquet(root, session_id, fixes);
+            write_session_json(root, session_id, &empty_session_json(session_id), None).unwrap();
+        }
+
+        #[test]
+        fn rescan_tracks_via_track_added_after_import_indexes_laps() {
+            // Arrange -- session imported with no track library at all, and
+            // a catalog already built (so `rescan_tracks` re-indexes it and
+            // `list_laps` can see the result).
+            let root = temp_root();
+            let session_id = "s1";
+            write_gps_session(&root, session_id, &three_lap_fixes());
+            core_rebuild_catalog(&root).unwrap();
+
+            // A track shows up only now, after import.
+            write_track(&root, &circuit_track("loop-1")).unwrap();
+
+            // Act
+            let report = rescan_tracks_via(&root, session_id).unwrap();
+
+            // Assert
+            assert_eq!(report.session_id, session_id);
+            assert_eq!(report.visits_indexed, 1);
+            assert_eq!(report.laps_indexed, 3);
+            assert!(report.flags_cleared.is_empty());
+            assert!(report.warnings.is_empty());
+
+            let laps = list_laps_via(&root, session_id).unwrap();
+            assert_eq!(laps.len(), 3);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn rescan_tracks_via_twice_is_idempotent_with_no_duplicate_catalog_rows() {
+            // Arrange
+            let root = temp_root();
+            let session_id = "s1";
+            write_gps_session(&root, session_id, &three_lap_fixes());
+            write_track(&root, &circuit_track("loop-1")).unwrap();
+            core_rebuild_catalog(&root).unwrap();
+
+            // Act -- rescan twice.
+            let first = rescan_tracks_via(&root, session_id).unwrap();
+            let second = rescan_tracks_via(&root, session_id).unwrap();
+
+            // Assert -- same counts both times, and only one row per lap.
+            assert_eq!(first.laps_indexed, 3);
+            assert_eq!(second.laps_indexed, 3);
+            let laps = list_laps_via(&root, session_id).unwrap();
+            assert_eq!(laps.len(), 3);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn rescan_tracks_via_unknown_session_id_is_not_found() {
+            // Arrange
+            let root = temp_root();
+
+            // Act
+            let err = rescan_tracks_via(&root, "nope").unwrap_err();
+
+            // Assert
+            assert_eq!(err.kind, crate::error::IpcErrorKind::NotFound);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn rescan_tracks_via_no_catalog_sqlite_is_ok_and_creates_none() {
+            // Arrange -- no `catalog.sqlite` anywhere under root.
+            let root = temp_root();
+            let session_id = "s1";
+            write_gps_session(&root, session_id, &three_lap_fixes());
+            write_track(&root, &circuit_track("loop-1")).unwrap();
+
+            // Act
+            let report = rescan_tracks_via(&root, session_id).unwrap();
+
+            // Assert
+            assert_eq!(report.laps_indexed, 3);
+            assert!(!root.join("catalog.sqlite").is_file());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn rescan_tracks_via_clears_a_now_invalid_main_lap_number() {
+            // Arrange -- session.json already carries a starred lap number
+            // that renumbering (track added late) will not reproduce.
+            let root = temp_root();
+            let session_id = "s1";
+            write_gps_parquet(&root, session_id, &three_lap_fixes());
+            let mut doc = empty_session_json(session_id);
+            doc.main_lap_number = Some(99);
+            write_session_json(&root, session_id, &doc, None).unwrap();
+            write_track(&root, &circuit_track("loop-1")).unwrap();
+
+            // Act
+            let report = rescan_tracks_via(&root, session_id).unwrap();
+
+            // Assert
+            assert_eq!(report.flags_cleared, vec!["main_lap_number".to_string()]);
+            let after = get_session_via(&root, session_id).unwrap();
+            assert_eq!(after.main_lap_number, None);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }
