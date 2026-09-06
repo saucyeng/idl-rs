@@ -474,6 +474,33 @@ mod merge_tests {
     }
 
     #[test]
+    fn merge_a_const_line_changed_via_conflict_outcome_constants_map_reflects_the_merged_value() {
+        // Arrange — same cell edited on both sides to different `const k`
+        // values: a Conflict outcome keeps local's cell content (`k = 2`)
+        // and appends peer's as a fresh conflict cell (`k = 3`) below it.
+        // `recompute_derived_fields` must derive `constants["k"]` from the
+        // *merged* cell set, not from either side's stale pre-merge value.
+        let base = wb(&format!("{}```math id=aaaaaaaa\nconst k = 1\n```\n", front("")));
+        let local = wb(&format!("{}```math id=aaaaaaaa\nconst k = 2\n```\n", front("")));
+        let peer = wb(&format!("{}```math id=aaaaaaaa\nconst k = 3\n```\n", front("")));
+
+        // Act
+        let merged = merge(&local, &peer, &base, "peer-laptop").unwrap();
+
+        // Assert
+        assert_eq!(merged.conflicts, 1);
+        // The surviving (non-conflict-copy) cell is local's — its `k = 2`
+        // is the one `merge_constants` should have folded into the map,
+        // since a duplicate `k` from the conflict-copy cell is dropped by
+        // `merge_constants`'s own duplicate handling, not by this test's
+        // logic.
+        assert_eq!(merged.doc.constants.get("k"), Some(&2.0));
+        assert_eq!(merged.doc.const_lines.len(), 2);
+        assert!(merged.doc.const_lines.iter().any(|l| l.name == "k" && l.value == 2.0));
+        assert!(merged.doc.const_lines.iter().any(|l| l.name == "k" && l.value == 3.0));
+    }
+
+    #[test]
     fn merge_merging_twice_identical_output_idempotent() {
         // Arrange — no conflicts, so no randomly-minted id makes two runs
         // diverge.
