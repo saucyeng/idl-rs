@@ -23,7 +23,12 @@ tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "io-ut
 # btleplug's `Uuid`-typed `Characteristic::uuid` field (already resolved in
 # the workspace lockfile via btleplug's own dependency on uuid 1.26.0 — this
 # just names it directly rather than relying on a transitive re-export).
-uuid = "1"
+# L11 Task 7 adds the "v4" feature: `Uuid::new_v4()` mints the pairing code
+# (PLAN Q2 — no `rand` dependency) and the per-peer token and staging
+# filenames for the peer file's atomic write. Not a new crate, no new
+# entry — the existing pinned `uuid` line gains a feature it did not
+# previously need.
+uuid = { version = "1", features = ["v4"] }
 # Task 7: needed for `StreamExt::next` to drain btleplug's `CentralEvent`/
 # `ValueNotification` streams and reqwest's `bytes_stream()` — already
 # resolved in the workspace lockfile (both btleplug and reqwest depend on
