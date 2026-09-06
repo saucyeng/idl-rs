@@ -220,26 +220,22 @@ pub struct TrackSummary {
     pub updated_at_ms: i64,
 }
 
-/// The full `.idl0t` artifact content (C3 §3.2). The four fields C3 leaves
-/// `unknown` are opaque `serde_json::Value`, lifted verbatim from the
-/// artifact's own JSON — no contract has fixed their element shape yet
-/// (open question 10).
-#[derive(Debug, Clone, PartialEq)]
+/// The full `.idl0t` artifact content (C3 §3.2), decimal-degree domain
+/// types throughout — C3 §6 open question 10 (closed 2026-09-06, ruling
+/// R86): the four fields that used to be lifted as opaque `serde_json::Value`
+/// are now `crate::laps::model`/`crate::gps` types, taken from the same
+/// parsed [`Track`](crate::track_artifact::model::Track) as the scalars.
+#[derive(Debug, Clone)]
 pub struct TrackDetail {
     pub track_id: String,
     pub name: String,
     pub venue_name: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    /// `Value::Null` when the artifact has no `lap_timing` key — sealed
-    /// union (`Circuit` | `PointToPoint`, IDL0_SPEC §16.2a).
-    pub lap_timing: serde_json::Value,
-    /// `Value::Array(vec![])` when the artifact has no `neutral_zones` key.
-    pub neutral_zones: serde_json::Value,
-    /// `Value::Array(vec![])` when the artifact has no `sector_gates` key.
-    pub sector_gates: serde_json::Value,
-    /// `Value::Array(vec![])` when the artifact has no `reference_polyline` key.
-    pub reference_polyline: serde_json::Value,
+    pub lap_timing: Option<crate::laps::model::LapTiming>,
+    pub neutral_zones: Vec<crate::laps::model::NeutralZone>,
+    pub sector_gates: Vec<crate::laps::model::SectorGate>,
+    pub reference_polyline: Vec<crate::gps::GpsFix>,
 }
 
 /// A not-found-shaped [`CatalogError`] (ruling R46).
@@ -454,23 +450,17 @@ pub fn list_tracks(data_root: &Path) -> Result<Vec<TrackSummary>, CatalogError> 
 }
 
 /// C3 §3.2 `get_track(track_id)` — the full `<data>/tracks/<track_id>.idl0t`
-/// artifact, read from disk (never on a hot path, C3 §4). Scalars come from
-/// the parsed domain [`Track`](crate::track_artifact::model::Track); the
-/// four opaque fields are lifted verbatim from the same bytes as JSON
-/// (`serde_json::Value`), since no contract fixes their element shape yet.
+/// artifact, read from disk (never on a hot path, C3 §4). Every field comes
+/// from the one parsed domain [`Track`](crate::track_artifact::model::Track)
+/// — `track_artifact::read` already converts the file's degrees-x1e7 wire
+/// scale to decimal degrees, so nothing here re-lifts or re-scales.
 pub fn get_track(data_root: &Path, track_id: &str) -> Result<TrackDetail, CatalogError> {
     let path = data_root.join("tracks").join(format!("{track_id}.idl0t"));
     if !path.is_file() {
         return Err(not_found(format!("track {track_id} not found")));
     }
 
-    let bytes = std::fs::read(&path).map_err(io_like)?;
     let track = read_track(&path).map_err(io_like)?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(io_like)?;
-    let track_obj = json.get("track");
-    let opt_or_null = |key: &str| track_obj.and_then(|t| t.get(key)).cloned().unwrap_or(serde_json::Value::Null);
-    let opt_or_empty_array =
-        |key: &str| track_obj.and_then(|t| t.get(key)).cloned().unwrap_or(serde_json::Value::Array(Vec::new()));
 
     Ok(TrackDetail {
         track_id: track.id,
@@ -478,10 +468,10 @@ pub fn get_track(data_root: &Path, track_id: &str) -> Result<TrackDetail, Catalo
         venue_name: track.venue,
         created_at_ms: track.created_at_ms,
         updated_at_ms: track.updated_at_ms,
-        lap_timing: opt_or_null("lap_timing"),
-        neutral_zones: opt_or_empty_array("neutral_zones"),
-        sector_gates: opt_or_empty_array("sector_gates"),
-        reference_polyline: opt_or_empty_array("reference_polyline"),
+        lap_timing: track.timing,
+        neutral_zones: track.neutral_zones,
+        sector_gates: track.sector_gates,
+        reference_polyline: track.reference_polyline,
     })
 }
 
@@ -808,15 +798,15 @@ mod tests {
     }
 
     #[test]
-    fn get_track_seeded_artifact_scalars_and_opaque_fields() {
-        // Arrange
+    fn get_track_seeded_artifact_with_circuit_timing_lap_timing_is_circuit_with_decimal_degree_endpoints() {
+        // Arrange — the wire holds degrees x1e7; 501163000 / 1e7 == 50.1163.
         let root = temp_root();
         let tracks_dir = root.join("tracks");
         std::fs::create_dir_all(&tracks_dir).unwrap();
         let json = r#"{"track_artifact_version":1,"track":{"track_id":"t-1","name":"A-Line","venue_name":"Whistler",
-            "lap_timing":{"kind":"circuit","name":"S/F","start_finish":{"lat1_deg":1,"lon1_deg":2,"lat2_deg":3,"lon2_deg":4,"name":""}},
-            "sector_gates":[{"name":"S1","gate":{"lat1_deg":1,"lon1_deg":2,"lat2_deg":3,"lon2_deg":4,"name":""}}],
-            "neutral_zones":[],"reference_polyline":[{"timestamp_ms":0,"latitude_deg":1,"longitude_deg":2}],
+            "lap_timing":{"kind":"circuit","name":"S/F","start_finish":{"lat1_deg":501163000,"lon1_deg":-1229574000,"lat2_deg":10,"lon2_deg":20,"name":""}},
+            "sector_gates":[{"name":"S1","gate":{"lat1_deg":10,"lon1_deg":20,"lat2_deg":30,"lon2_deg":40,"name":""}}],
+            "neutral_zones":[],"reference_polyline":[{"timestamp_ms":0,"latitude_deg":10,"longitude_deg":20}],
             "created_at_ms":1111,"updated_at_ms":2222}}"#;
         std::fs::write(tracks_dir.join("t-1.idl0t"), json).unwrap();
 
@@ -829,10 +819,114 @@ mod tests {
         assert_eq!(detail.venue_name, "Whistler");
         assert_eq!(detail.created_at_ms, 1111);
         assert_eq!(detail.updated_at_ms, 2222);
-        assert!(detail.lap_timing.is_object());
-        assert_eq!(detail.sector_gates.as_array().unwrap().len(), 1);
-        assert!(detail.neutral_zones.as_array().unwrap().is_empty());
-        assert_eq!(detail.reference_polyline.as_array().unwrap().len(), 1);
+        match detail.lap_timing {
+            Some(crate::laps::model::LapTiming::Circuit { start_finish }) => {
+                assert_eq!(start_finish.lat1, 50.1163);
+                assert_eq!(start_finish.lon1, -122.9574);
+            }
+            other => panic!("expected Circuit, got {other:?}"),
+        }
+        assert_eq!(detail.sector_gates.len(), 1);
+        assert!(detail.neutral_zones.is_empty());
+        assert_eq!(detail.reference_polyline.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_track_point_to_point_timing_both_gates_decode() {
+        // Arrange
+        let root = temp_root();
+        let tracks_dir = root.join("tracks");
+        std::fs::create_dir_all(&tracks_dir).unwrap();
+        let json = r#"{"track_artifact_version":1,"track":{"track_id":"t-2","name":"Point","venue_name":"",
+            "lap_timing":{"kind":"point_to_point",
+                "start":{"lat1_deg":10,"lon1_deg":20,"lat2_deg":30,"lon2_deg":40,"name":""},
+                "finish":{"lat1_deg":50,"lon1_deg":60,"lat2_deg":70,"lon2_deg":80,"name":""}},
+            "created_at_ms":1,"updated_at_ms":2}}"#;
+        std::fs::write(tracks_dir.join("t-2.idl0t"), json).unwrap();
+
+        // Act
+        let detail = get_track(&root, "t-2").unwrap();
+
+        // Assert
+        match detail.lap_timing {
+            Some(crate::laps::model::LapTiming::PointToPoint { start, finish }) => {
+                assert_eq!(start.lat1, 0.000001);
+                assert_eq!(finish.lat1, 0.000005);
+            }
+            other => panic!("expected PointToPoint, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_track_no_lap_timing_is_none() {
+        // Arrange
+        let root = temp_root();
+        let tracks_dir = root.join("tracks");
+        std::fs::create_dir_all(&tracks_dir).unwrap();
+        let json = r#"{"track_artifact_version":1,"track":{"track_id":"t-3","name":"Bare","venue_name":"",
+            "created_at_ms":1,"updated_at_ms":2}}"#;
+        std::fs::write(tracks_dir.join("t-3.idl0t"), json).unwrap();
+
+        // Act
+        let detail = get_track(&root, "t-3").unwrap();
+
+        // Assert
+        assert!(detail.lap_timing.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_track_sector_gates_and_neutral_zones_names_and_gates_survive() {
+        // Arrange
+        let root = temp_root();
+        let tracks_dir = root.join("tracks");
+        std::fs::create_dir_all(&tracks_dir).unwrap();
+        let json = r#"{"track_artifact_version":1,"track":{"track_id":"t-4","name":"Sectored","venue_name":"",
+            "sector_gates":[{"name":"S1","gate":{"lat1_deg":10,"lon1_deg":20,"lat2_deg":30,"lon2_deg":40,"name":""}}],
+            "neutral_zones":[{"name":"Pit","enter":{"lat1_deg":1,"lon1_deg":2,"lat2_deg":3,"lon2_deg":4,"name":""},
+                "exit":{"lat1_deg":5,"lon1_deg":6,"lat2_deg":7,"lon2_deg":8,"name":""}}],
+            "created_at_ms":1,"updated_at_ms":2}}"#;
+        std::fs::write(tracks_dir.join("t-4.idl0t"), json).unwrap();
+
+        // Act
+        let detail = get_track(&root, "t-4").unwrap();
+
+        // Assert
+        assert_eq!(detail.sector_gates.len(), 1);
+        assert_eq!(detail.sector_gates[0].name, "S1");
+        assert_eq!(detail.sector_gates[0].gate.lat1, 0.000001);
+        assert_eq!(detail.neutral_zones.len(), 1);
+        assert_eq!(detail.neutral_zones[0].name, "Pit");
+        assert_eq!(detail.neutral_zones[0].enter.lat1, 0.0000001);
+        assert_eq!(detail.neutral_zones[0].exit.lat1, 0.0000005);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_track_reference_polyline_timestamp_lat_lon_decode() {
+        // Arrange
+        let root = temp_root();
+        let tracks_dir = root.join("tracks");
+        std::fs::create_dir_all(&tracks_dir).unwrap();
+        let json = r#"{"track_artifact_version":1,"track":{"track_id":"t-5","name":"Poly","venue_name":"",
+            "reference_polyline":[{"timestamp_ms":9000,"latitude_deg":501163000,"longitude_deg":-1229574000}],
+            "created_at_ms":1,"updated_at_ms":2}}"#;
+        std::fs::write(tracks_dir.join("t-5.idl0t"), json).unwrap();
+
+        // Act
+        let detail = get_track(&root, "t-5").unwrap();
+
+        // Assert
+        assert_eq!(detail.reference_polyline.len(), 1);
+        assert_eq!(detail.reference_polyline[0].timestamp_ms, 9000);
+        assert_eq!(detail.reference_polyline[0].lat, 50.1163);
+        assert_eq!(detail.reference_polyline[0].lon, -122.9574);
 
         let _ = std::fs::remove_dir_all(&root);
     }

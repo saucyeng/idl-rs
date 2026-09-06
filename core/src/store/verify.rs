@@ -217,6 +217,63 @@ fn is_lower_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Runs [`verify`] and then repairs C4 §7's two auto-repairable findings —
+/// a corrupted blob (#1) or a corrupted derived parquet (#5) — by moving
+/// each into quarantine via [`crate::store::quarantine::quarantine_file`].
+/// `verify` itself is unchanged and stays read-only; this is the only
+/// caller of quarantine's repair path (C4 §7, ruling R86 Q1/Q8 —
+/// `verify_data_dir(repair: true)`, C3 §3.10). `ids` mints one `entry_id`
+/// per repair and `now_ms` timestamps every repair; both are injected so
+/// this function has no clock and no randomness of its own — core never
+/// generates uuids or reads the clock (CLAUDE.md §2, this lane's brief).
+///
+/// Findings #2, #3, #4, #7, #8, #9, #10 are never quarantined here — C4 §7
+/// names them surfaced-only (structured content, a missing file, a stale
+/// catalog row, or a bystander path) where an automatic move risks losing
+/// information a human or a migration tool needs. Which findings are #1/#5
+/// is decided structurally, from each finding's own path shape (the same
+/// C4 §2 shapes [`matches_layout`] already knows), not by matching message
+/// text, so a look-alike message on an unrelated path can never be
+/// mis-repaired.
+pub fn verify_and_repair(
+    data_root: &Path,
+    ids: &mut dyn FnMut() -> String,
+    now_ms: i64,
+) -> (Vec<Finding>, Vec<crate::store::quarantine::QuarantineEntry>) {
+    let findings = verify(data_root);
+    let mut quarantined = Vec::new();
+
+    for finding in &findings {
+        if finding.severity != Severity::Error || !is_repairable_finding_path(data_root, &finding.path) {
+            continue;
+        }
+        let entry_id = ids();
+        if let Ok(entry) = crate::store::quarantine::quarantine_file(data_root, &finding.path, &finding.message, &entry_id, now_ms)
+        {
+            quarantined.push(entry);
+        }
+        // A failed repair (e.g. the path was already moved by an earlier
+        // finding on the same file) is not surfaced as a second error here
+        // — the finding itself, already in `findings`, is the report.
+    }
+
+    (findings, quarantined)
+}
+
+/// Whether `path` (absolute, taken from a [`Finding`]) is one of C4 §7's
+/// two auto-repairable shapes: a blob under `blobs/sha256/<2 hex>/<62
+/// hex>` (finding #1) or a `sessions/<id>/derived/<64 hex>.parquet`
+/// (finding #5).
+fn is_repairable_finding_path(data_root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(data_root) else { return false };
+    let parts: Vec<&str> = rel.iter().map(|c| c.to_str().unwrap_or("")).collect();
+    match parts.as_slice() {
+        ["blobs", "sha256", shard, name] => is_lower_hex(shard, 2) && is_lower_hex(name, 62),
+        ["sessions", _id, "derived", name] => name.strip_suffix(".parquet").is_some_and(|stem| is_lower_hex(stem, 64)),
+        _ => false,
+    }
+}
+
 fn check_unexpected_paths(data_root: &Path, out: &mut Vec<Finding>) {
     walk_unexpected(data_root, data_root, out);
 }
@@ -466,6 +523,104 @@ mod tests {
         // Assert
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Error);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Deterministic `ids` closure for [`verify_and_repair`] tests: hands
+    /// out fixed, distinguishable ids of the same 36-char length a real
+    /// uuid has (core mints neither uuids nor clock reads on its own — the
+    /// caller injects both).
+    fn fixed_ids(seed: &'static str) -> impl FnMut() -> String {
+        let mut n = 0;
+        move || {
+            n += 1;
+            format!("{seed}{n:0>35}")
+        }
+    }
+
+    #[test]
+    fn verify_and_repair_a_blob_whose_bytes_do_not_match_its_path_the_blob_is_quarantined_and_the_finding_is_still_returned(
+    ) {
+        // Arrange
+        let root = temp_root();
+        let digest = write_blob(&root, b"original").unwrap();
+        let blob_path = crate::store::blob::blob_path(&root, &digest);
+        std::fs::write(&blob_path, b"corrupted").unwrap();
+        let mut ids = fixed_ids("1");
+
+        // Act
+        let (findings, quarantined) = verify_and_repair(&root, &mut ids, 42);
+
+        // Assert
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert_eq!(quarantined.len(), 1);
+        assert!(!blob_path.exists());
+        assert_eq!(quarantined[0].quarantined_at_ms, 42);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_and_repair_a_healthy_tree_no_quarantine_entries_and_the_directory_stays_empty() {
+        // Arrange
+        let root = temp_root();
+        write_blob(&root, b"clean blob").unwrap();
+        let mut ids = fixed_ids("2");
+
+        // Act
+        let (findings, quarantined) = verify_and_repair(&root, &mut ids, 1);
+
+        // Assert
+        assert!(findings.is_empty());
+        assert!(quarantined.is_empty());
+        assert!(crate::store::quarantine::list_quarantine(&root).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_and_repair_a_missing_blob_finding_3_not_quarantined() {
+        // Arrange — session.json + data.parquet exist, but the blob its
+        // data.parquet names was never written (warning-severity #3).
+        let root = temp_root();
+        write_full_session_with_blob(&root, "s1", "0".repeat(64));
+        let mut ids = fixed_ids("3");
+
+        // Act
+        let (findings, quarantined) = verify_and_repair(&root, &mut ids, 1);
+
+        // Assert
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(quarantined.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_and_repair_a_malformed_session_json_error_severity_finding_2_not_quarantined() {
+        // Arrange — session.json is unreadable JSON (error-severity #2),
+        // a path shape `is_repairable_finding_path` never matches (it only
+        // matches blob and derived-parquet shapes) — this exercises the
+        // structural guard on an Error-severity finding, unlike the sibling
+        // "missing blob" test above, which is excluded one guard earlier by
+        // being Warning-severity.
+        let root = temp_root();
+        let session_dir = root.join("sessions").join("s1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("session.json"), b"not json").unwrap();
+        let mut ids = fixed_ids("4");
+
+        // Act
+        let (findings, quarantined) = verify_and_repair(&root, &mut ids, 1);
+
+        // Assert
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert!(quarantined.is_empty());
+        assert!(session_dir.join("session.json").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -284,6 +284,29 @@ impl From<idl_rs::store::import::ImportError> for IpcError {
     }
 }
 
+/// C3 §3.2 (`list_quarantine`/`resolve_quarantine`), C3 §3.10
+/// (`verify_data_dir`). `idl_rs::store::quarantine::QuarantineError` folds
+/// four ways (ruling R86): `NotFound` (unknown `entry_id`, or nowhere to
+/// restore) maps to `IpcErrorKind::NotFound`; `Occupied` (a `"restore"`
+/// destination already exists) maps to `IpcErrorKind::InvalidArgument` —
+/// the caller can free the path and retry, so this is not an I/O failure;
+/// `Io` maps to `IpcErrorKind::Io`; `Encode` (the sidecar JSON could not be
+/// encoded/decoded) folds into the cross-cutting `Internal`, the same
+/// bucket `CatalogErrorKind::Sql` uses (R46 precedent) — no new
+/// `IpcErrorKind` variant is added here.
+impl From<idl_rs::store::quarantine::QuarantineError> for IpcError {
+    fn from(e: idl_rs::store::quarantine::QuarantineError) -> Self {
+        use idl_rs::store::quarantine::QuarantineErrorKind;
+        let kind = match e.kind {
+            QuarantineErrorKind::NotFound => IpcErrorKind::NotFound,
+            QuarantineErrorKind::Occupied => IpcErrorKind::InvalidArgument,
+            QuarantineErrorKind::Io => IpcErrorKind::Io,
+            QuarantineErrorKind::Encode => IpcErrorKind::Internal,
+        };
+        IpcError::new(kind, e.message)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +416,52 @@ mod tests {
         let e = idl_rs::store::lap_index::LapIndexError {
             kind: idl_rs::store::lap_index::LapIndexErrorKind::Track,
             message: "malformed track artifact".to_string(),
+        };
+
+        // Act
+        let ie: IpcError = e.into();
+
+        // Assert
+        assert_eq!(ie.kind, IpcErrorKind::Internal);
+    }
+
+    #[test]
+    fn quarantine_error_not_found_kind_converts_to_not_found() {
+        // Arrange
+        let e = idl_rs::store::quarantine::QuarantineError {
+            kind: idl_rs::store::quarantine::QuarantineErrorKind::NotFound,
+            message: "no quarantine entry".to_string(),
+        };
+
+        // Act
+        let ie: IpcError = e.into();
+
+        // Assert
+        assert_eq!(ie.kind, IpcErrorKind::NotFound);
+    }
+
+    #[test]
+    fn quarantine_error_occupied_kind_converts_to_invalid_argument_not_io() {
+        // Arrange — the caller can free the path and retry; this is not an
+        // I/O failure (ruling R86).
+        let e = idl_rs::store::quarantine::QuarantineError {
+            kind: idl_rs::store::quarantine::QuarantineErrorKind::Occupied,
+            message: "destination already exists".to_string(),
+        };
+
+        // Act
+        let ie: IpcError = e.into();
+
+        // Assert
+        assert_eq!(ie.kind, IpcErrorKind::InvalidArgument);
+    }
+
+    #[test]
+    fn quarantine_error_encode_kind_folds_into_internal() {
+        // Arrange — same bucket CatalogErrorKind::Sql uses (R46 precedent).
+        let e = idl_rs::store::quarantine::QuarantineError {
+            kind: idl_rs::store::quarantine::QuarantineErrorKind::Encode,
+            message: "bad sidecar json".to_string(),
         };
 
         // Act

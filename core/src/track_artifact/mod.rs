@@ -5,8 +5,10 @@
 
 pub mod model;
 pub mod read;
+pub mod validate;
 pub mod write;
 
 pub use model::{Track, SUPPORTED_TRACK_ARTIFACT_VERSION};
 pub use read::{parse_track, read_track};
-pub use write::write_track;
+pub use validate::{validate_track, TrackValidationError, TrackValidationErrorKind};
+pub use write::{delete_track, write_track};

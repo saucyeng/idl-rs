@@ -348,9 +348,127 @@ impl From<catalog_read::TrackSummary> for TrackSummary {
     }
 }
 
-/// C3 §3.2 `TrackDetail` — `get_track`'s return. The four fields C3 leaves
-/// `unknown` cross as raw JSON, exactly as `idl_rs::store::catalog_read`
-/// already lifted them.
+/// C3 §3.2 `Gate` — decimal degrees. The `.idl0t` file stores degrees x1e7
+/// (SPEC §17b.1); that scaling is a wire detail of the file, never of the
+/// IPC surface — core's `laps::model::Gate` is already decimal degrees
+/// (ruling R27). `Deserialize` (added Task 4) lets this double as
+/// `TrackDraft`'s wire mirror — `save_track`'s input needs the same shape
+/// `get_track` returns, just read instead of written.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GateWire {
+    pub lat1: f64,
+    pub lon1: f64,
+    pub lat2: f64,
+    pub lon2: f64,
+}
+
+impl From<&idl_rs::laps::model::Gate> for GateWire {
+    fn from(g: &idl_rs::laps::model::Gate) -> Self {
+        Self { lat1: g.lat1, lon1: g.lon1, lat2: g.lat2, lon2: g.lon2 }
+    }
+}
+
+/// Inverse of `From<&Gate> for GateWire` — the wire is already decimal
+/// degrees (no x1e7 rescale; that only happens at the `.idl0t` file
+/// boundary in `track_artifact::model`), so this is a plain field copy.
+impl From<&GateWire> for idl_rs::laps::model::Gate {
+    fn from(g: &GateWire) -> Self {
+        Self { lat1: g.lat1, lon1: g.lon1, lat2: g.lat2, lon2: g.lon2 }
+    }
+}
+
+/// C3 §3.2 `SectorGate`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SectorGateWire {
+    pub name: String,
+    pub gate: GateWire,
+}
+
+impl From<&idl_rs::laps::model::SectorGate> for SectorGateWire {
+    fn from(s: &idl_rs::laps::model::SectorGate) -> Self {
+        Self { name: s.name.clone(), gate: (&s.gate).into() }
+    }
+}
+
+impl From<&SectorGateWire> for idl_rs::laps::model::SectorGate {
+    fn from(s: &SectorGateWire) -> Self {
+        Self { name: s.name.clone(), gate: (&s.gate).into() }
+    }
+}
+
+/// C3 §3.2 `NeutralZone`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NeutralZoneWire {
+    pub name: String,
+    pub enter: GateWire,
+    pub exit: GateWire,
+}
+
+impl From<&idl_rs::laps::model::NeutralZone> for NeutralZoneWire {
+    fn from(z: &idl_rs::laps::model::NeutralZone) -> Self {
+        Self { name: z.name.clone(), enter: (&z.enter).into(), exit: (&z.exit).into() }
+    }
+}
+
+impl From<&NeutralZoneWire> for idl_rs::laps::model::NeutralZone {
+    fn from(z: &NeutralZoneWire) -> Self {
+        Self { name: z.name.clone(), enter: (&z.enter).into(), exit: (&z.exit).into() }
+    }
+}
+
+/// C3 §3.2 `GpsFix`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GpsFixWire {
+    pub timestamp_ms: i64,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+impl From<&idl_rs::gps::GpsFix> for GpsFixWire {
+    fn from(f: &idl_rs::gps::GpsFix) -> Self {
+        Self { timestamp_ms: f.timestamp_ms, lat: f.lat, lon: f.lon }
+    }
+}
+
+impl From<&GpsFixWire> for idl_rs::gps::GpsFix {
+    fn from(f: &GpsFixWire) -> Self {
+        Self { timestamp_ms: f.timestamp_ms, lat: f.lat, lon: f.lon }
+    }
+}
+
+/// C3 §3.2 `LapTiming` — a sealed union, `kind: "circuit" | "point_to_point"`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LapTimingWire {
+    Circuit { start_finish: GateWire },
+    PointToPoint { start: GateWire, finish: GateWire },
+}
+
+impl From<&idl_rs::laps::model::LapTiming> for LapTimingWire {
+    fn from(t: &idl_rs::laps::model::LapTiming) -> Self {
+        match t {
+            idl_rs::laps::model::LapTiming::Circuit { start_finish } => {
+                LapTimingWire::Circuit { start_finish: start_finish.into() }
+            }
+            idl_rs::laps::model::LapTiming::PointToPoint { start, finish } => {
+                LapTimingWire::PointToPoint { start: start.into(), finish: finish.into() }
+            }
+        }
+    }
+}
+
+impl From<&LapTimingWire> for idl_rs::laps::model::LapTiming {
+    fn from(t: &LapTimingWire) -> Self {
+        match t {
+            LapTimingWire::Circuit { start_finish } => Self::Circuit { start_finish: start_finish.into() },
+            LapTimingWire::PointToPoint { start, finish } => Self::PointToPoint { start: start.into(), finish: finish.into() },
+        }
+    }
+}
+
+/// C3 §3.2 `TrackDetail` — `get_track`'s return. **REVISED (2026-09-06, L8x,
+/// ruling R86)** — the four fields C3 §6 open question 10 left `unknown` are
+/// now typed, decimal degrees on the wire.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TrackDetail {
     pub track_id: String,
@@ -358,10 +476,10 @@ pub struct TrackDetail {
     pub venue_name: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    pub lap_timing: serde_json::Value,
-    pub neutral_zones: serde_json::Value,
-    pub sector_gates: serde_json::Value,
-    pub reference_polyline: serde_json::Value,
+    pub lap_timing: Option<LapTimingWire>,
+    pub neutral_zones: Vec<NeutralZoneWire>,
+    pub sector_gates: Vec<SectorGateWire>,
+    pub reference_polyline: Vec<GpsFixWire>,
 }
 
 impl From<catalog_read::TrackDetail> for TrackDetail {
@@ -372,10 +490,10 @@ impl From<catalog_read::TrackDetail> for TrackDetail {
             venue_name: t.venue_name,
             created_at_ms: t.created_at_ms,
             updated_at_ms: t.updated_at_ms,
-            lap_timing: t.lap_timing,
-            neutral_zones: t.neutral_zones,
-            sector_gates: t.sector_gates,
-            reference_polyline: t.reference_polyline,
+            lap_timing: t.lap_timing.as_ref().map(Into::into),
+            neutral_zones: t.neutral_zones.iter().map(Into::into).collect(),
+            sector_gates: t.sector_gates.iter().map(Into::into).collect(),
+            reference_polyline: t.reference_polyline.iter().map(Into::into).collect(),
         }
     }
 }
@@ -465,6 +583,224 @@ pub fn list_tracks(data_dir: tauri::State<'_, DataDir>) -> Result<Vec<TrackSumma
 #[tauri::command]
 pub fn get_track(track_id: String, data_dir: tauri::State<'_, DataDir>) -> Result<TrackDetail, IpcError> {
     get_track_via(&data_dir.0, &track_id)
+}
+
+/// C3 §3.2 `TrackDraft` — `save_track`'s argument (ruling R86). `track_id:
+/// None` creates (the command mints a UUID v4 and both timestamps); `Some`
+/// edits an existing track, preserving `created_at_ms` and bumping
+/// `updated_at_ms` to now.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TrackDraft {
+    pub track_id: Option<String>,
+    pub name: String,
+    pub venue_name: String,
+    pub lap_timing: Option<LapTimingWire>,
+    pub neutral_zones: Vec<NeutralZoneWire>,
+    pub sector_gates: Vec<SectorGateWire>,
+    pub reference_polyline: Vec<GpsFixWire>,
+}
+
+/// C3 §3.2 `SaveTrackResult` — `save_track`'s return.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SaveTrackResult {
+    pub track: TrackDetail,
+    /// Sessions whose `track_visits_library_hash` no longer matches the
+    /// library after this write. The UI offers `rescan_tracks` per id.
+    pub stale_session_ids: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Maps a [`idl_rs::track_artifact::write::TrackWriteError`] to `IpcError`.
+/// `Io` (a filesystem failure, including exhausting C4 §4's atomic-write
+/// retry) maps straight through; `Encode` (the track failed to serialise to
+/// JSON — a programmer-error condition, never a caller mistake) folds into
+/// the cross-cutting `Internal`, matching `CatalogErrorKind::Sql`'s own
+/// precedent (ruling R46) for "a genuine failure, not the caller's fault".
+/// No new `IpcErrorKind` (this task's `Do not`).
+fn map_track_write_error(e: idl_rs::track_artifact::write::TrackWriteError) -> IpcError {
+    use idl_rs::track_artifact::write::TrackWriteErrorKind;
+    match e.kind {
+        TrackWriteErrorKind::Io => IpcError::new(IpcErrorKind::Io, e.message),
+        TrackWriteErrorKind::Encode => IpcError::new(IpcErrorKind::Internal, e.message),
+    }
+}
+
+/// Converts a [`TrackDraft`] into the core domain `Track`, given the id and
+/// both timestamps the caller (`save_track_via`) has already resolved. The
+/// wire mirrors are already decimal degrees (no x1e7 rescale — that only
+/// happens at the `.idl0t` file boundary in `track_artifact::model`), so
+/// every field conversion here is a plain, unscaled copy via the `From<&*
+/// Wire>` impls above.
+fn draft_into_track(draft: &TrackDraft, id: String, created_at_ms: i64, updated_at_ms: i64) -> idl_rs::track_artifact::Track {
+    idl_rs::track_artifact::Track {
+        id,
+        name: draft.name.clone(),
+        venue: draft.venue_name.clone(),
+        timing: draft.lap_timing.as_ref().map(Into::into),
+        sector_gates: draft.sector_gates.iter().map(Into::into).collect(),
+        neutral_zones: draft.neutral_zones.iter().map(Into::into).collect(),
+        reference_polyline: draft.reference_polyline.iter().map(Into::into).collect(),
+        created_at_ms,
+        updated_at_ms,
+    }
+}
+
+/// Every `sessions/<id>/session.json` whose `track_visits_library_hash`
+/// stamp no longer matches `current_hash` (C3 §3.2 `SaveTrackResult.
+/// stale_session_ids`). A session with no stamp yet (`None` — never
+/// rescanned against any track library) is not counted stale: there is no
+/// prior lap/visit computation for this write to have invalidated. A
+/// `session.json` that fails to read is folded into `warnings`, not a
+/// failure of the whole call (mirrors `rescan_tracks_via`'s own catalog-
+/// failure handling).
+fn stale_session_ids(data_dir: &Path, current_hash: &str, warnings: &mut Vec<String>) -> Vec<String> {
+    let sessions_dir = data_dir.join("sessions");
+    let mut stale = Vec::new();
+    for dir in std::fs::read_dir(&sessions_dir).into_iter().flatten().filter_map(|e| e.ok()).map(|e| e.path()) {
+        if !dir.is_dir() {
+            continue;
+        }
+        let session_id = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        let sj_path = dir.join("session.json");
+        match idl_rs::store::session_json::read_session_json(&sj_path) {
+            Ok(doc) => {
+                if let Some(stamp) = &doc.track_visits_library_hash {
+                    if stamp != current_hash {
+                        stale.push(session_id);
+                    }
+                }
+            }
+            Err(e) => warnings.push(format!("{}: {e}", sj_path.display())),
+        }
+    }
+    stale
+}
+
+/// Transport-agnostic core of `save_track` (C3 §3.2, ruling R86). One
+/// command for create and edit (PLAN Q4): `draft.track_id: None` mints `id`
+/// from `new_id` (a UUID v4 in canonical form, minted by the
+/// `#[tauri::command]` wrapper) and stamps both timestamps from `now_ms`;
+/// `Some(id)` requires the artifact to already exist (`not_found` otherwise),
+/// keeps its `created_at_ms` verbatim, and bumps only `updated_at_ms`. Never
+/// lets the caller set either timestamp directly. Validates before any
+/// filesystem write (`invalid_argument`, carrying the failed field in
+/// `detail`), then writes through the already-landed `write_track` (C4 §4
+/// atomic write, last-write-wins — no `conflict` kind, consistent with
+/// ruling R59 Q1(a)). When `catalog.sqlite` already exists, upserts the one
+/// `tracks` row afterward (`store::catalog::upsert_track`); a catalog
+/// failure is folded into `warnings`, never fails the call. Does not call
+/// `rescan_tracks` (PLAN §4) — instead recomputes `track_library_hash` over
+/// the post-write library and returns every stale session id for the UI to
+/// offer a rescan.
+fn save_track_via(data_dir: &Path, draft: TrackDraft, now_ms: i64, new_id: &str) -> Result<SaveTrackResult, IpcError> {
+    let (id, created_at_ms) = match &draft.track_id {
+        None => (new_id.to_string(), now_ms),
+        Some(existing_id) => {
+            let existing = catalog_read::get_track(data_dir, existing_id)?;
+            (existing_id.clone(), existing.created_at_ms)
+        }
+    };
+
+    let track = draft_into_track(&draft, id.clone(), created_at_ms, now_ms);
+
+    idl_rs::track_artifact::validate_track(&track).map_err(|e| {
+        IpcError::with_detail(IpcErrorKind::InvalidArgument, e.message, serde_json::json!({ "field": e.field }))
+    })?;
+
+    let written_path = idl_rs::track_artifact::write_track(data_dir, &track).map_err(map_track_write_error)?;
+
+    let mut warnings = Vec::new();
+    let catalog_path = data_dir.join("catalog.sqlite");
+    if catalog_path.is_file() {
+        let upserted = std::fs::read_to_string(&written_path)
+            .map_err(|e| e.to_string())
+            .and_then(|full_json| {
+                idl_rs::store::catalog::open_catalog(&catalog_path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|conn| idl_rs::store::catalog::upsert_track(&conn, &track, &full_json).map_err(|e| e.to_string()))
+            });
+        if let Err(e) = upserted {
+            warnings.push(e);
+        }
+    }
+
+    let (library, _library_warnings) = idl_rs::store::lap_index::load_track_library(data_dir)?;
+    let current_hash = idl_rs::store::lap_index::track_library_hash(&library);
+    let stale = stale_session_ids(data_dir, &current_hash, &mut warnings);
+
+    Ok(SaveTrackResult { track: catalog_read::get_track(data_dir, &id)?.into(), stale_session_ids: stale, warnings })
+}
+
+/// C3 §3.2 `save_track(track)`. Mints the UUID v4 and `now_ms` here (the
+/// only impure inputs `save_track_via` needs), keeping every core/command
+/// function underneath deterministic and testable without a clock.
+#[tauri::command]
+pub fn save_track(track: TrackDraft, data_dir: tauri::State<'_, DataDir>) -> Result<SaveTrackResult, IpcError> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let new_id = uuid::Uuid::new_v4().to_string();
+    save_track_via(&data_dir.0, track, now_ms, &new_id)
+}
+
+/// C3 §3.2 `DeleteTrackReport` — `delete_track`'s return.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeleteTrackReport {
+    pub track_id: String,
+    /// Sessions whose `track_visits_library_hash` no longer matches the
+    /// library after the delete — their cached visits may name this track.
+    /// The UI offers `rescan_tracks` per id; nothing is rewritten here.
+    pub stale_session_ids: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Transport-agnostic core of `delete_track` (C3 §3.2, ruling R86).
+/// Deliberately does **not** rewrite any `session.json`: idl0 left stale
+/// `TrackVisit` references behind a delete too
+/// (`track_provider.dart`'s `deleteTrack` note, SPEC §12.3), the hierarchy
+/// view already skips visits whose `track_id` no longer resolves, and
+/// "Rescan tracks" is the user-driven repair. Rewriting every session
+/// inside a delete would be unbounded work behind one button; this command
+/// instead returns `stale_session_ids` for the UI to offer that rescan.
+///
+/// An absent `tracks/<id>.idl0t` is `not_found`, checked **first** — before
+/// any catalog work — matching `delete_session_via`. `store::track_artifact::
+/// write::delete_track` removes the artifact; then, only when
+/// `catalog.sqlite` is a file, the one `tracks` row is deleted
+/// (`store::catalog::delete_track`). `laps.track_id` is already `REFERENCES
+/// tracks(track_id) ON DELETE SET NULL` (C4 §5), so lap rows survive
+/// unattributed — this function deletes no `laps` rows itself. A catalog
+/// failure is folded into `warnings`, never fails the call, mirroring
+/// `save_track_via`.
+fn delete_track_via(data_dir: &Path, track_id: &str) -> Result<DeleteTrackReport, IpcError> {
+    let removed = idl_rs::track_artifact::delete_track(data_dir, track_id).map_err(map_track_write_error)?;
+    if !removed {
+        return Err(IpcError::new(IpcErrorKind::NotFound, format!("track {track_id} not found")));
+    }
+
+    let mut warnings = Vec::new();
+    let catalog_path = data_dir.join("catalog.sqlite");
+    if catalog_path.is_file() {
+        let deleted = idl_rs::store::catalog::open_catalog(&catalog_path)
+            .map_err(|e| e.to_string())
+            .and_then(|conn| idl_rs::store::catalog::delete_track(&conn, track_id).map_err(|e| e.to_string()));
+        if let Err(e) = deleted {
+            warnings.push(e);
+        }
+    }
+
+    let (library, _library_warnings) = idl_rs::store::lap_index::load_track_library(data_dir)?;
+    let current_hash = idl_rs::store::lap_index::track_library_hash(&library);
+    let stale = stale_session_ids(data_dir, &current_hash, &mut warnings);
+
+    Ok(DeleteTrackReport { track_id: track_id.to_string(), stale_session_ids: stale, warnings })
+}
+
+/// C3 §3.2 `delete_track(track_id)`.
+#[tauri::command]
+pub fn delete_track(track_id: String, data_dir: tauri::State<'_, DataDir>) -> Result<DeleteTrackReport, IpcError> {
+    delete_track_via(&data_dir.0, &track_id)
 }
 
 /// C3 §3.2 `rescan_tracks`'s return (IDL0_SPEC §17.4 "Rescan Tracks").
@@ -1099,6 +1435,42 @@ mod tests {
         // Assert
         assert_eq!(detail.track_id, "t-1");
         assert_eq!(detail.name, "A-Line");
+        assert!(detail.lap_timing.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_track_via_serialised_track_detail_field_names_match_c3() {
+        // Arrange — a circuit-timed track with one sector gate, one neutral
+        // zone, and one reference-polyline fix, wire degrees x1e7.
+        let root = temp_root();
+        let tracks_dir = root.join("tracks");
+        std::fs::create_dir_all(&tracks_dir).unwrap();
+        let json = r#"{"track_artifact_version":1,"track":{"track_id":"t-1","name":"A-Line","venue_name":"Whistler",
+            "lap_timing":{"kind":"circuit","name":"S/F","start_finish":{"lat1_deg":501163000,"lon1_deg":-1229574000,"lat2_deg":10,"lon2_deg":20,"name":""}},
+            "sector_gates":[{"name":"S1","gate":{"lat1_deg":10,"lon1_deg":20,"lat2_deg":30,"lon2_deg":40,"name":""}}],
+            "neutral_zones":[{"name":"Pit","enter":{"lat1_deg":1,"lon1_deg":2,"lat2_deg":3,"lon2_deg":4,"name":""},"exit":{"lat1_deg":5,"lon1_deg":6,"lat2_deg":7,"lon2_deg":8,"name":""}}],
+            "reference_polyline":[{"timestamp_ms":9000,"latitude_deg":501163000,"longitude_deg":-1229574000}],
+            "created_at_ms":1111,"updated_at_ms":2222}}"#;
+        std::fs::write(tracks_dir.join("t-1.idl0t"), json).unwrap();
+
+        // Act
+        let detail = get_track_via(&root, "t-1").unwrap();
+        let value = serde_json::to_value(&detail).unwrap();
+
+        // Assert — field names and the sealed-union tag match C3 §3.2.
+        assert_eq!(value["lap_timing"]["kind"], serde_json::json!("circuit"));
+        assert_eq!(value["lap_timing"]["start_finish"]["lat1"], serde_json::json!(50.1163));
+        assert_eq!(value["lap_timing"]["start_finish"]["lon1"], serde_json::json!(-122.9574));
+        assert_eq!(value["sector_gates"][0]["name"], serde_json::json!("S1"));
+        assert_eq!(value["sector_gates"][0]["gate"]["lat1"], serde_json::json!(0.000001));
+        assert_eq!(value["neutral_zones"][0]["name"], serde_json::json!("Pit"));
+        assert_eq!(value["neutral_zones"][0]["enter"]["lat1"], serde_json::json!(0.0000001));
+        assert_eq!(value["neutral_zones"][0]["exit"]["lat1"], serde_json::json!(0.0000005));
+        assert_eq!(value["reference_polyline"][0]["timestamp_ms"], serde_json::json!(9000));
+        assert_eq!(value["reference_polyline"][0]["lat"], serde_json::json!(50.1163));
+        assert_eq!(value["reference_polyline"][0]["lon"], serde_json::json!(-122.9574));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1334,6 +1706,388 @@ mod tests {
         // Assert
         assert_eq!(value["sectors"], serde_json::json!([]));
         assert_eq!(value["neutral_zone_visits"], serde_json::json!([]));
+    }
+
+    // ---- save_track (Task 4, L8x) -----------------------------------------
+
+    mod save_track {
+        use super::*;
+        use idl_rs::track_artifact::read_track;
+
+        fn empty_draft(name: &str) -> TrackDraft {
+            TrackDraft {
+                track_id: None,
+                name: name.to_string(),
+                venue_name: "Whistler".to_string(),
+                lap_timing: None,
+                neutral_zones: Vec::new(),
+                sector_gates: Vec::new(),
+                reference_polyline: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn save_track_via_no_track_id_mints_the_id_both_timestamps_writes_the_artifact_returns_it() {
+            // Arrange
+            let root = temp_root();
+
+            // Act
+            let result = save_track_via(&root, empty_draft("A-Line"), 1_000, "new-id-1").unwrap();
+
+            // Assert
+            assert_eq!(result.track.track_id, "new-id-1");
+            assert_eq!(result.track.name, "A-Line");
+            assert_eq!(result.track.created_at_ms, 1_000);
+            assert_eq!(result.track.updated_at_ms, 1_000);
+            let on_disk = read_track(&root.join("tracks").join("new-id-1.idl0t")).unwrap();
+            assert_eq!(on_disk.created_at_ms, 1_000);
+            assert_eq!(on_disk.updated_at_ms, 1_000);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn save_track_via_an_existing_id_preserves_created_at_ms_and_bumps_updated_at_ms() {
+            // Arrange
+            let root = temp_root();
+            save_track_via(&root, empty_draft("A-Line"), 1_000, "t-1").unwrap();
+            let mut edit = empty_draft("A-Line-Renamed");
+            edit.track_id = Some("t-1".to_string());
+
+            // Act
+            let result = save_track_via(&root, edit, 2_000, "unused-id").unwrap();
+
+            // Assert
+            assert_eq!(result.track.track_id, "t-1");
+            assert_eq!(result.track.name, "A-Line-Renamed");
+            assert_eq!(result.track.created_at_ms, 1_000);
+            assert_eq!(result.track.updated_at_ms, 2_000);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn save_track_via_an_unknown_id_is_not_found_and_nothing_is_written() {
+            // Arrange
+            let root = temp_root();
+            let mut draft = empty_draft("A-Line");
+            draft.track_id = Some("no-such-track".to_string());
+
+            // Act
+            let err = save_track_via(&root, draft, 1_000, "unused").unwrap_err();
+
+            // Assert
+            assert_eq!(err.kind, crate::error::IpcErrorKind::NotFound);
+            assert!(!root.join("tracks").exists());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn save_track_via_an_empty_name_is_invalid_argument_and_nothing_is_written() {
+            // Arrange
+            let root = temp_root();
+            let draft = empty_draft("   ");
+
+            // Act
+            let err = save_track_via(&root, draft, 1_000, "new-id-1").unwrap_err();
+
+            // Assert
+            assert_eq!(err.kind, crate::error::IpcErrorKind::InvalidArgument);
+            assert!(!root.join("tracks").exists());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn save_track_via_no_catalog_sqlite_is_ok_and_creates_none() {
+            // Arrange
+            let root = temp_root();
+
+            // Act
+            let result = save_track_via(&root, empty_draft("A-Line"), 1_000, "new-id-1").unwrap();
+
+            // Assert
+            assert!(result.warnings.is_empty());
+            assert!(!root.join("catalog.sqlite").is_file());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn save_track_via_with_a_catalog_the_tracks_row_matches_and_a_second_save_updates_it() {
+            // Arrange
+            let root = temp_root();
+            core_rebuild_catalog(&root).unwrap();
+            save_track_via(&root, empty_draft("A-Line"), 1_000, "t-1").unwrap();
+            {
+                let conn = idl_rs::store::catalog::open_catalog(&root.join("catalog.sqlite")).unwrap();
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0)).unwrap();
+                assert_eq!(count, 1);
+                let name: String =
+                    conn.query_row("SELECT name FROM tracks WHERE track_id = 't-1'", [], |r| r.get(0)).unwrap();
+                assert_eq!(name, "A-Line");
+            }
+            let mut edit = empty_draft("A-Line-Renamed");
+            edit.track_id = Some("t-1".to_string());
+
+            // Act — a second save of the same id.
+            save_track_via(&root, edit, 2_000, "unused").unwrap();
+
+            // Assert — updated in place, not duplicated.
+            let conn = idl_rs::store::catalog::open_catalog(&root.join("catalog.sqlite")).unwrap();
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0)).unwrap();
+            assert_eq!(count, 1);
+            let name: String = conn.query_row("SELECT name FROM tracks WHERE track_id = 't-1'", [], |r| r.get(0)).unwrap();
+            assert_eq!(name, "A-Line-Renamed");
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn save_track_via_a_session_stamped_with_the_old_library_hash_is_in_stale_session_ids() {
+            // Arrange — a session already stamped against the *empty*
+            // library, before this track existed.
+            let root = temp_root();
+            let empty_hash = idl_rs::store::lap_index::track_library_hash(&[]);
+            let mut doc = empty_session_json("s-old");
+            doc.track_visits_library_hash = Some(empty_hash);
+            write_session_json(&root, "s-old", &doc, None).unwrap();
+
+            // Act
+            let result = save_track_via(&root, empty_draft("A-Line"), 1_000, "t-1").unwrap();
+
+            // Assert
+            assert_eq!(result.stale_session_ids, vec!["s-old".to_string()]);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn save_track_via_a_session_stamped_with_the_post_write_hash_is_not_stale() {
+            // Arrange — the stamp this session already carries is exactly
+            // the hash the library will have *after* this save (computed
+            // independently here, not by calling `save_track_via` first).
+            let root = temp_root();
+            let track = idl_rs::track_artifact::Track {
+                id: "t-1".to_string(),
+                name: "A-Line".to_string(),
+                venue: "Whistler".to_string(),
+                timing: None,
+                sector_gates: Vec::new(),
+                neutral_zones: Vec::new(),
+                reference_polyline: Vec::new(),
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            };
+            let post_write_hash = idl_rs::store::lap_index::track_library_hash(std::slice::from_ref(&track));
+            let mut doc = empty_session_json("s-fresh");
+            doc.track_visits_library_hash = Some(post_write_hash);
+            write_session_json(&root, "s-fresh", &doc, None).unwrap();
+
+            // Act
+            let result = save_track_via(&root, empty_draft("A-Line"), 1_000, "t-1").unwrap();
+
+            // Assert
+            assert!(result.stale_session_ids.is_empty());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn save_track_via_a_caller_supplied_created_at_ms_field_in_the_raw_json_is_ignored() {
+            // Arrange — `TrackDraft` is a typed struct, not a JSON bag
+            // (matching `SessionMetadataPatch`'s own idiom); C3's
+            // `TrackDraft` has no `created_at_ms` field at all, so one
+            // present in raw JSON is silently dropped by serde's default
+            // unknown-field handling and never reaches this function's body.
+            let json = r#"{"track_id":null,"name":"A-Line","venue_name":"Whistler","lap_timing":null,
+                "neutral_zones":[],"sector_gates":[],"reference_polyline":[],"created_at_ms":999999}"#;
+            let draft: TrackDraft = serde_json::from_str(json).unwrap();
+            let root = temp_root();
+
+            // Act
+            let result = save_track_via(&root, draft, 1_000, "new-id-1").unwrap();
+
+            // Assert
+            assert_eq!(result.track.created_at_ms, 1_000);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    // ---- delete_track (Task 5, L8x) ---------------------------------------
+
+    mod delete_track {
+        use super::*;
+        use idl_rs::store::session_json::TrackVisitJson;
+        use idl_rs::track_artifact::{write_track, Track};
+
+        fn minimal_track(id: &str, name: &str) -> Track {
+            Track {
+                id: id.to_string(),
+                name: name.to_string(),
+                venue: "Whistler".to_string(),
+                timing: None,
+                sector_gates: Vec::new(),
+                neutral_zones: Vec::new(),
+                reference_polyline: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 1,
+            }
+        }
+
+        #[test]
+        fn delete_track_via_an_existing_track_the_artifact_is_gone_and_ok() {
+            // Arrange
+            let root = temp_root();
+            write_track(&root, &minimal_track("t-1", "A-Line")).unwrap();
+
+            // Act
+            let result = delete_track_via(&root, "t-1").unwrap();
+
+            // Assert
+            assert_eq!(result.track_id, "t-1");
+            assert!(!root.join("tracks").join("t-1.idl0t").exists());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn delete_track_via_an_unknown_id_not_found_and_nothing_is_removed() {
+            // Arrange
+            let root = temp_root();
+            write_track(&root, &minimal_track("t-1", "A-Line")).unwrap();
+
+            // Act
+            let err = delete_track_via(&root, "no-such-track").unwrap_err();
+
+            // Assert
+            assert_eq!(err.kind, crate::error::IpcErrorKind::NotFound);
+            assert!(root.join("tracks").join("t-1.idl0t").exists());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn delete_track_via_with_a_catalog_the_tracks_row_is_gone_and_a_lap_row_that_referenced_it_survives_with_a_null_track_id() {
+            // Arrange
+            let root = temp_root();
+            write_track(&root, &minimal_track("t-1", "A-Line")).unwrap();
+            let session_id = "sess-visit";
+            let mut doc = empty_session_json(session_id);
+            doc.laps = vec![LapJson {
+                lap_number: 1,
+                start_timestamp_ms: 1_000,
+                end_timestamp_ms: 1_500,
+                raw_elapsed_ms: 500,
+                lap_time_ms: 500,
+                start_time_secs: 0.0,
+                end_time_secs: 0.5,
+                sectors: Vec::new(),
+                neutral_zone_visits: Vec::new(),
+            }];
+            doc.track_visits = vec![TrackVisitJson {
+                visit_id: "v-1".to_string(),
+                track_id: "t-1".to_string(),
+                start_timestamp_ms: 500,
+                end_timestamp_ms: 2_000,
+                laps: Vec::new(),
+            }];
+            write_full_session_seeded(&root, session_id, b"raw bytes for sess-visit", &doc);
+            {
+                let conn = idl_rs::store::catalog::open_catalog(&root.join("catalog.sqlite")).unwrap();
+                let track_id: Option<String> = conn
+                    .query_row("SELECT track_id FROM laps WHERE session_id = ?1 AND lap_number = 1", [session_id], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(track_id.as_deref(), Some("t-1"), "fixture setup: lap must start out naming the track");
+            }
+
+            // Act
+            delete_track_via(&root, "t-1").unwrap();
+
+            // Assert — the `tracks` row is gone…
+            let conn = idl_rs::store::catalog::open_catalog(&root.join("catalog.sqlite")).unwrap();
+            let track_count: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE track_id = 't-1'", [], |r| r.get(0)).unwrap();
+            assert_eq!(track_count, 0);
+            // …but the lap row survives, with `track_id` nulled by the FK cascade.
+            let track_id: Option<String> = conn
+                .query_row("SELECT track_id FROM laps WHERE session_id = ?1 AND lap_number = 1", [session_id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(track_id, None, "laps.track_id must be NULL after the ON DELETE SET NULL cascade");
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn delete_track_via_no_catalog_sqlite_ok_and_no_catalog_is_created() {
+            // Arrange
+            let root = temp_root();
+            write_track(&root, &minimal_track("t-1", "A-Line")).unwrap();
+
+            // Act
+            let result = delete_track_via(&root, "t-1").unwrap();
+
+            // Assert
+            assert!(result.warnings.is_empty());
+            assert!(!root.join("catalog.sqlite").is_file());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn delete_track_via_a_session_whose_stamp_names_the_deleted_library_is_stale_and_its_session_json_is_untouched() {
+            // Arrange — a session stamped against the library as it stood
+            // *with* t-1 present; deleting t-1 changes the library hash, so
+            // this session must come back stale, and its `session.json`
+            // bytes must be byte-identical afterwards (delete_track never
+            // rewrites it).
+            let root = temp_root();
+            let track = minimal_track("t-1", "A-Line");
+            write_track(&root, &track).unwrap();
+            let with_track_hash = idl_rs::store::lap_index::track_library_hash(std::slice::from_ref(&track));
+            let mut doc = empty_session_json("s-stamped");
+            doc.track_visits_library_hash = Some(with_track_hash);
+            write_session_json(&root, "s-stamped", &doc, None).unwrap();
+            let sj_path = root.join("sessions").join("s-stamped").join("session.json");
+            let before = std::fs::read(&sj_path).unwrap();
+
+            // Act
+            let result = delete_track_via(&root, "t-1").unwrap();
+
+            // Assert
+            assert_eq!(result.stale_session_ids, vec!["s-stamped".to_string()]);
+            let after = std::fs::read(&sj_path).unwrap();
+            assert_eq!(before, after, "delete_track must never rewrite session.json");
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn delete_track_via_an_id_containing_a_path_separator_is_not_found_or_io_and_a_decoy_file_outside_tracks_survives() {
+            // Arrange — a decoy file that a naive path join could reach via
+            // `../decoy`, sitting just outside `tracks/`.
+            let root = temp_root();
+            std::fs::create_dir_all(root.join("tracks")).unwrap();
+            std::fs::write(root.join("decoy"), b"do not touch").unwrap();
+
+            // Act
+            let err = delete_track_via(&root, "../decoy").unwrap_err();
+
+            // Assert
+            assert!(
+                err.kind == crate::error::IpcErrorKind::NotFound || err.kind == crate::error::IpcErrorKind::Io,
+                "expected not_found or io, got {:?}",
+                err.kind
+            );
+            assert!(root.join("decoy").exists());
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     // ---- rescan_tracks (Task 8) ------------------------------------------
