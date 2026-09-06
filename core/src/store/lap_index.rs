@@ -38,7 +38,9 @@ pub enum LapIndexErrorKind {
 /// Error from [`load_track_library`]. Never `Err(String)` (CLAUDE.md §5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LapIndexError {
+    /// Discriminant.
     pub kind: LapIndexErrorKind,
+    /// Human-readable detail, including the offending path where relevant.
     pub message: String,
 }
 
@@ -120,9 +122,16 @@ pub fn visit_id(track_id: &str, start_ms: i64, end_ms: i64) -> String {
 /// non-fatal warnings (a visit whose track could not be resolved, or whose
 /// track has no lap timing).
 pub struct LapIndex {
+    /// Each visited track's window and its own per-visit-numbered laps.
     pub track_visits: Vec<TrackVisitJson>,
+    /// The top-level, session-wide-renumbered lap list (per-visit numbers
+    /// live only on [`Self::track_visits`]).
     pub laps: Vec<LapJson>,
+    /// [`track_library_hash`]'s stamp over the `tracks` slice this was
+    /// resolved against.
     pub track_library_hash: String,
+    /// Non-fatal messages — a visit whose track could not be resolved, or
+    /// whose track has no lap timing.
     pub warnings: Vec<String>,
 }
 
@@ -481,9 +490,9 @@ mod tests {
         // Act
         let hash = track_library_hash(&[]);
 
-        // Assert -- sha256("") with the "sha256:" prefix, independently computed.
-        let expected = format!("sha256:{:x}", Sha256::digest(b""));
-        assert_eq!(hash, expected);
+        // Assert -- the well-known SHA-256 digest of the empty byte string,
+        // an independent oracle rather than a second call to `Sha256::digest`.
+        assert_eq!(hash, "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     }
 
     #[test]
