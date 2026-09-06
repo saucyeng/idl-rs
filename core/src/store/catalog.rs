@@ -815,6 +815,28 @@ pub fn delete_session(conn: &Connection, session_id: &str) -> Result<bool, Catal
     Ok(rows_deleted > 0)
 }
 
+/// Upserts one `tracks` row for `track` (C4 §5, ruling R86 §4 — `save_track`
+/// calls this only when `catalog.sqlite` already exists). `full_json` is the
+/// exact `.idl0t` file text just written by
+/// [`write_track`](crate::track_artifact::write::write_track), matching
+/// `rebuild_catalog`'s own `full_json` column verbatim.
+///
+/// Deliberately `INSERT ... ON CONFLICT(track_id) DO UPDATE`, never a
+/// delete-then-insert: `laps.track_id` is `REFERENCES tracks(track_id) ON
+/// DELETE SET NULL` (this file's `DDL`), so deleting an existing `tracks`
+/// row — even to immediately reinsert it — would null out every lap that
+/// already names this track. `ON CONFLICT DO UPDATE` never deletes the row,
+/// so that cascade never fires on an edit.
+pub fn upsert_track(conn: &Connection, track: &crate::track_artifact::Track, full_json: &str) -> Result<(), CatalogError> {
+    conn.execute(
+        "INSERT INTO tracks (track_id, name, venue_name, created_at_ms, updated_at_ms, full_json) VALUES (?1,?2,?3,?4,?5,?6) \
+         ON CONFLICT(track_id) DO UPDATE SET name = excluded.name, venue_name = excluded.venue_name, \
+         created_at_ms = excluded.created_at_ms, updated_at_ms = excluded.updated_at_ms, full_json = excluded.full_json",
+        rusqlite::params![track.id, track.name, track.venue, track.created_at_ms, track.updated_at_ms, full_json],
+    )?;
+    Ok(())
+}
+
 fn io_err(e: std::io::Error) -> CatalogError {
     CatalogError { kind: CatalogErrorKind::Io, message: e.to_string() }
 }
@@ -1124,6 +1146,109 @@ mod tests {
         assert!(!deleted);
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Minimal domain `Track` for [`upsert_track`] tests — `store::catalog`
+    /// has no reason to exercise gate/timing fields, only the five scalar
+    /// columns `upsert_track` writes.
+    fn minimal_track(id: &str, name: &str) -> crate::track_artifact::Track {
+        crate::track_artifact::Track {
+            id: id.to_string(),
+            name: name.to_string(),
+            venue: "Whistler".to_string(),
+            timing: None,
+            sector_gates: Vec::new(),
+            neutral_zones: Vec::new(),
+            reference_polyline: Vec::new(),
+            created_at_ms: 111,
+            updated_at_ms: 222,
+        }
+    }
+
+    #[test]
+    fn upsert_track_on_an_empty_catalog_inserts_the_row() {
+        // Arrange
+        let root = temp_root();
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+        create_schema(&conn).unwrap();
+        let track = minimal_track("t-1", "A-Line");
+
+        // Act
+        upsert_track(&conn, &track, "{}").unwrap();
+
+        // Assert
+        let (name, venue, created, updated, full_json): (String, String, i64, i64, String) = conn
+            .query_row(
+                "SELECT name, venue_name, created_at_ms, updated_at_ms, full_json FROM tracks WHERE track_id = ?1",
+                rusqlite::params!["t-1"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "A-Line");
+        assert_eq!(venue, "Whistler");
+        assert_eq!(created, 111);
+        assert_eq!(updated, 222);
+        assert_eq!(full_json, "{}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upsert_track_called_twice_updates_the_row_rather_than_duplicating_it() {
+        // Arrange
+        let root = temp_root();
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+        create_schema(&conn).unwrap();
+        upsert_track(&conn, &minimal_track("t-1", "A-Line"), "{}").unwrap();
+
+        // Act
+        let mut edited = minimal_track("t-1", "B-Line");
+        edited.updated_at_ms = 333;
+        upsert_track(&conn, &edited, "{\"edited\":true}").unwrap();
+
+        // Assert
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+        let (name, updated): (String, i64) =
+            conn.query_row("SELECT name, updated_at_ms FROM tracks WHERE track_id = ?1", rusqlite::params!["t-1"], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            }).unwrap();
+        assert_eq!(name, "B-Line");
+        assert_eq!(updated, 333);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn upsert_track_updating_a_track_with_an_existing_lap_reference_does_not_null_it_out() {
+        // Arrange — `laps.track_id` is `ON DELETE SET NULL`; a naive
+        // delete-then-insert upsert would fire that cascade on every edit of
+        // an already-visited track. This is the regression test for using
+        // `ON CONFLICT ... DO UPDATE` instead.
+        let root = temp_root();
+        let session_id = "s1";
+        write_full_session(&root, session_id, 0, &empty_session_json(session_id));
+        rebuild_catalog(&root).unwrap();
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+        upsert_track(&conn, &minimal_track("t-1", "A-Line"), "{}").unwrap();
+        conn.execute(
+            "INSERT INTO laps (session_id, lap_number, lap_time_ms, track_id) VALUES (?1, 1, 1000, ?2)",
+            rusqlite::params![session_id, "t-1"],
+        )
+        .unwrap();
+
+        // Act
+        upsert_track(&conn, &minimal_track("t-1", "A-Line-Renamed"), "{}").unwrap();
+
+        // Assert
+        let track_id: Option<String> = conn
+            .query_row("SELECT track_id FROM laps WHERE session_id = ?1 AND lap_number = 1", rusqlite::params![session_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(track_id.as_deref(), Some("t-1"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
