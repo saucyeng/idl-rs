@@ -12,7 +12,7 @@ use idl_rs::session::handle::SessionHandle;
 use idl_rs::session::synthesis::synthesize_base_channels;
 use idl_rs::session::Session;
 use idl_rs::store::parquet::read_session_parquet;
-use idl_rs::store::session_json::{read_session_json, LapJson};
+use idl_rs::store::session_json::{empty_session_json, read_session_json, LapJson, SessionJson};
 
 use crate::commands::workbook::LapContext;
 use crate::error::{IpcError, IpcErrorKind};
@@ -59,6 +59,35 @@ fn unknown_lap(lap: u32) -> IpcError {
     )
 }
 
+/// Reads `session_id`'s `session.json`, `Err(())` if it is absent or fails
+/// to parse. The one place [`load_lap_context`] and [`resolve_lap_window`]
+/// both call to reach the file, so a path change or a parse-library swap
+/// only has one call site to update (each caller still decides its own
+/// meaning for "unreadable" — they are not required to agree).
+fn try_read_session_json(data_dir: &Path, session_id: &str) -> Result<SessionJson, ()> {
+    let path = session_dir(data_dir, session_id).join("session.json");
+    read_session_json(&path).map_err(|_| ())
+}
+
+/// Resolves one lap number to its recording-time window, seconds, from
+/// `session_id`'s `session.json` `laps[]` (C3 §3.6 `fetch_fft`). Shares
+/// [`unknown_lap`]'s error shape with [`load_lap_context`] so a bad lap
+/// number reports identically wherever it is named (C3 §3.4's
+/// `invalid_argument` + `detail: { "lap": n }`). A missing or unparsable
+/// `session.json` has no `laps[]` to resolve against — treated as zero
+/// known laps, so every `lap` number is [`unknown_lap`], not a distinct
+/// error (this function has no "no lap context" answer to give back, unlike
+/// [`load_lap_context`]'s `Ok(MathLapContext::empty())`: a window is either
+/// resolved or it is an error).
+pub fn resolve_lap_window(data_root: &Path, session_id: &str, lap: u32) -> Result<(f64, f64), IpcError> {
+    let doc = try_read_session_json(data_root, session_id).unwrap_or_else(|_| empty_session_json(session_id));
+    doc.laps
+        .iter()
+        .find(|l| l.lap_number == lap)
+        .map(|l| (l.start_time_secs, l.end_time_secs))
+        .ok_or_else(|| unknown_lap(lap))
+}
+
 /// Builds a [`MathLapContext`] from `session_id`'s `session.json` `laps[]`,
 /// optionally validated and overridden by a caller-supplied `selection`
 /// (C3 §3.4 `lap_context`, ruling R52 Q5; same-session `overlay_laps` per
@@ -94,8 +123,7 @@ pub fn load_lap_context(
     handle: &SessionHandle,
     selection: Option<&LapContext>,
 ) -> Result<MathLapContext, IpcError> {
-    let path = session_dir(data_dir, session_id).join("session.json");
-    let Ok(doc) = read_session_json(&path) else {
+    let Ok(doc) = try_read_session_json(data_dir, session_id) else {
         return Ok(MathLapContext::empty());
     };
 
@@ -332,6 +360,86 @@ mod tests {
         assert_eq!(no_selection.main_lap_number, empty_selection.main_lap_number);
         assert!(no_selection.overlay.is_none());
         assert!(empty_selection.overlay.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_lap_window_known_lap_number_its_two_seconds_values() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let mut doc = empty_session_json("s1");
+        doc.laps = vec![
+            LapJson {
+                lap_number: 1,
+                start_timestamp_ms: 0,
+                end_timestamp_ms: 1_000,
+                raw_elapsed_ms: 1_000,
+                lap_time_ms: 1_000,
+                start_time_secs: 0.0,
+                end_time_secs: 1.0,
+                sectors: Vec::new(),
+                neutral_zone_visits: Vec::new(),
+            },
+            LapJson {
+                lap_number: 2,
+                start_timestamp_ms: 1_000,
+                end_timestamp_ms: 2_500,
+                raw_elapsed_ms: 1_500,
+                lap_time_ms: 1_500,
+                start_time_secs: 1.0,
+                end_time_secs: 2.5,
+                sectors: Vec::new(),
+                neutral_zone_visits: Vec::new(),
+            },
+        ];
+        write_session_json(&root, "s1", &doc, None).unwrap();
+
+        // Act
+        let window = resolve_lap_window(&root, "s1", 2).unwrap();
+
+        // Assert
+        assert_eq!(window, (1.0, 2.5));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_lap_window_unknown_lap_number_unknown_lap_with_detail() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let doc = empty_session_json("s1");
+        write_session_json(&root, "s1", &doc, None).unwrap();
+
+        // Act
+        let err = resolve_lap_window(&root, "s1", 99).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(err.detail, Some(serde_json::json!({ "lap": 99 })));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_lap_window_missing_session_json_unknown_lap_same_as_load_lap_context_mapping() {
+        // Arrange — no `write_session_json` call at all: the file is absent,
+        // same state `load_lap_context_no_session_json_empty_context`
+        // exercises for its own `Ok(empty)` answer. `resolve_lap_window` has
+        // no "no context" answer to give back, so an absent file behaves as
+        // zero known laps: any `lap` number is `unknown_lap`, not a distinct
+        // `not_found`/`io` error.
+        let root = temp_root();
+        seed_session(&root, "s1");
+
+        // Act
+        let err = resolve_lap_window(&root, "s1", 1).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(err.detail, Some(serde_json::json!({ "lap": 1 })));
 
         let _ = std::fs::remove_dir_all(&root);
     }
