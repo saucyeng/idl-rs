@@ -18,10 +18,12 @@
 use crate::config::VersionedConfig;
 
 /// One predicted SPEC §5.2 registry row, derived from config alone (no
-/// device I/O). Field-for-field mirror of
+/// device I/O). Shares field *names* with
 /// [`crate::session::ChannelRegistryEntry`] (the *wire* registry read off a
-/// recorded file) but a distinct type: this row is a *prediction*, never
-/// read from or written to a session.
+/// recorded file) but is a distinct type with different field types on the
+/// wire (`channel_id: u8`, `data_type: u8` code there vs. `u16`/`&'static str`
+/// here, matching C3 §3.8's `RegistryRow` interface instead): this row is a
+/// *prediction*, never read from or written to a session.
 pub struct RegistryPreviewRow {
     /// Matches SPEC §5.2's `channel_id` column for this row's channel.
     pub channel_id: u16,
