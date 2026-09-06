@@ -90,6 +90,16 @@ pub struct SessionJson {
     /// [`SessionJson::track_visits`], if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track_visits_library_hash: Option<String>,
+    /// The `store::lap_index::LAP_DETECTOR_VERSION` stamped by whichever
+    /// import/rescan last wrote [`SessionJson::laps`]/
+    /// [`SessionJson::track_visits`], if any. Additive C1 §6 field (ruling
+    /// R83 Q2) — an older file with no `lap_detector_version` parses
+    /// unchanged (`None`), and a mismatch against the running build's
+    /// `LAP_DETECTOR_VERSION` (or a track library whose
+    /// `track_visits_library_hash` no longer matches) marks the cached laps
+    /// stale, triggering a re-index on next import or an explicit rescan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lap_detector_version: Option<String>,
 }
 
 impl VersionedConfig for SessionJson {
@@ -304,6 +314,7 @@ pub fn empty_session_json(session_id: impl Into<String>) -> SessionJson {
         starred_lap_number: None,
         track_visits: Vec::new(),
         track_visits_library_hash: None,
+        lap_detector_version: None,
     }
 }
 

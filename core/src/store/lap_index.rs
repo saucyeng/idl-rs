@@ -5,6 +5,7 @@
 //! from disk — no filesystem access, no clock, no RNG, no writes.
 //! `store::import`/a future `reindex_laps` (Task 2) own the I/O around this.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -13,7 +14,12 @@ use sha2::{Digest, Sha256};
 
 use crate::laps::{detect_laps, renumber_session_laps};
 use crate::session::handle::SessionHandle;
-use crate::store::session_json::{LapJson, NeutralZoneVisitJson, SectorJson, TrackVisitJson};
+use crate::store::atomic::sha256_hex;
+use crate::store::parquet::read_session_parquet;
+use crate::store::session_json::{
+    empty_session_json, parse_session_json, write_session_json, LapJson, NeutralZoneVisitJson, SectorJson,
+    TrackVisitJson,
+};
 use crate::track_artifact::{read_track, Track};
 use crate::tracks::detect_visits;
 
@@ -162,6 +168,168 @@ pub fn compute_lap_index(handle: &SessionHandle, tracks: &[Track], ignored_lap_n
     LapIndex { track_visits, laps, track_library_hash: hash, warnings }
 }
 
+/// Bumped whenever a change to the detection algorithm alters its output
+/// enough that already-cached `session.json` entries must be recomputed even
+/// though [`track_library_hash`] has not changed. Stamped into
+/// `session.json.lap_detector_version` (C1 §6, additive field, ruling R83
+/// Q2) by [`index_laps`]; a mismatch (including a file with no stamp at all)
+/// marks the cache stale exactly like a changed [`track_library_hash`].
+pub const LAP_DETECTOR_VERSION: &str = "1";
+
+/// Outcome of one [`index_laps`]/[`reindex_laps`] call.
+#[derive(Debug)]
+pub struct LapIndexReport {
+    /// The session indexed.
+    pub session_id: String,
+    /// `track_visits[]` length written this call. `0` when
+    /// [`Self::skipped_up_to_date`] is true (nothing was recomputed, so
+    /// nothing was written).
+    pub visits_indexed: usize,
+    /// Top-level `laps[]` length written this call. `0` when
+    /// [`Self::skipped_up_to_date`] is true.
+    pub laps_indexed: usize,
+    /// True when the stamp was already current and nothing was recomputed —
+    /// `session.json` is left byte-for-byte untouched.
+    pub skipped_up_to_date: bool,
+    /// Lap-flag fields cleared because their lap number no longer exists
+    /// after renumbering (ruling R83 Q3): any of `"main_lap_number"`,
+    /// `"reference_lap_number"`, `"starred_lap_number"`, or
+    /// `"ignored_lap_numbers"` (the last when at least one of its entries
+    /// was dropped). `overlay_lap_key` is never in this list — it names a
+    /// lap in *another* session, which this session's own renumbering
+    /// cannot invalidate.
+    pub flags_cleared: Vec<String>,
+    /// Non-fatal warnings from [`load_track_library`]/[`compute_lap_index`].
+    /// Empty when [`Self::skipped_up_to_date`] is true (neither ran).
+    pub warnings: Vec<String>,
+}
+
+/// Indexes laps for a session whose [`SessionHandle`] the caller already
+/// holds (the import path, `store::import::finish_import`) and merges the
+/// result into `session.json` (C1 §6). Never touches `data.parquet`;
+/// [`reindex_laps`] is the entry point that rebuilds `handle` from disk
+/// first.
+///
+/// **Staleness.** Recomputes when `force`, or when the freshly-loaded track
+/// library's hash differs from the stamped `track_visits_library_hash`, or
+/// when the stamped `lap_detector_version` differs from
+/// [`LAP_DETECTOR_VERSION`] (including a file with no stamp at all).
+/// Otherwise returns early with `skipped_up_to_date: true` and **writes
+/// nothing**.
+///
+/// **Missing `session.json`.** Starts from [`empty_session_json`] rather
+/// than erroring — `finish_import` may run before or after this call.
+///
+/// **Merge.** Only `track_visits`, `laps`, `track_visits_library_hash`,
+/// `lap_detector_version`, and the lap-flag fields reconciled below are
+/// overwritten; every other field (rider, bike, comments, gates,
+/// `bike_profile_snapshot`) is carried through by value. `ignored_lap_numbers`
+/// is read *before* reconciliation and passed to [`compute_lap_index`],
+/// since `renumber_session_laps` takes it as an input to renumbering itself.
+///
+/// **Flag reconciliation (ruling R83 Q3).** After the new `laps[]` is built,
+/// `main_lap_number`/`reference_lap_number`/`starred_lap_number` are cleared
+/// to `None` when they name a lap number no longer present, and
+/// `ignored_lap_numbers` is filtered to the surviving numbers.
+pub fn index_laps(
+    data_root: &Path,
+    session_id: &str,
+    handle: &SessionHandle,
+    force: bool,
+) -> Result<LapIndexReport, LapIndexError> {
+    let sj_path = data_root.join("sessions").join(session_id).join("session.json");
+    let (mut doc, based_on_hash) = if sj_path.is_file() {
+        let bytes = fs::read(&sj_path)
+            .map_err(|e| LapIndexError::new(LapIndexErrorKind::Io, format!("reading {}: {e}", sj_path.display())))?;
+        let doc = parse_session_json(&bytes)
+            .map_err(|e| LapIndexError::new(LapIndexErrorKind::Io, format!("parsing {}: {e}", sj_path.display())))?;
+        (doc, Some(sha256_hex(&bytes)))
+    } else {
+        (empty_session_json(session_id), None)
+    };
+
+    let (tracks, mut warnings) = load_track_library(data_root)?;
+    let fresh_hash = track_library_hash(&tracks);
+
+    let stale = force
+        || doc.track_visits_library_hash.as_deref() != Some(fresh_hash.as_str())
+        || doc.lap_detector_version.as_deref() != Some(LAP_DETECTOR_VERSION);
+
+    if !stale {
+        return Ok(LapIndexReport {
+            session_id: session_id.to_string(),
+            visits_indexed: 0,
+            laps_indexed: 0,
+            skipped_up_to_date: true,
+            flags_cleared: Vec::new(),
+            warnings: Vec::new(),
+        });
+    }
+
+    let index = compute_lap_index(handle, &tracks, &doc.ignored_lap_numbers);
+    warnings.extend(index.warnings);
+
+    let valid: HashSet<u32> = index.laps.iter().map(|l| l.lap_number).collect();
+    let mut flags_cleared: Vec<String> = Vec::new();
+
+    if matches!(doc.main_lap_number, Some(n) if !valid.contains(&n)) {
+        doc.main_lap_number = None;
+        flags_cleared.push("main_lap_number".to_string());
+    }
+    if matches!(doc.reference_lap_number, Some(n) if !valid.contains(&n)) {
+        doc.reference_lap_number = None;
+        flags_cleared.push("reference_lap_number".to_string());
+    }
+    if matches!(doc.starred_lap_number, Some(n) if !valid.contains(&n)) {
+        doc.starred_lap_number = None;
+        flags_cleared.push("starred_lap_number".to_string());
+    }
+    let ignored_before = doc.ignored_lap_numbers.len();
+    doc.ignored_lap_numbers.retain(|n| valid.contains(n));
+    if doc.ignored_lap_numbers.len() != ignored_before {
+        flags_cleared.push("ignored_lap_numbers".to_string());
+    }
+    // `overlay_lap_key` names a lap in another session's own numbering —
+    // this session's renumbering cannot invalidate it, so it is left alone.
+
+    doc.laps = index.laps;
+    doc.track_visits = index.track_visits;
+    doc.track_visits_library_hash = Some(index.track_library_hash);
+    doc.lap_detector_version = Some(LAP_DETECTOR_VERSION.to_string());
+
+    let visits_indexed = doc.track_visits.len();
+    let laps_indexed = doc.laps.len();
+
+    write_session_json(data_root, session_id, &doc, based_on_hash.as_deref())
+        .map_err(|e| LapIndexError::new(LapIndexErrorKind::Io, e.to_string()))?;
+
+    Ok(LapIndexReport {
+        session_id: session_id.to_string(),
+        visits_indexed,
+        laps_indexed,
+        skipped_up_to_date: false,
+        flags_cleared,
+        warnings,
+    })
+}
+
+/// IDL0_SPEC §17.4's "Rescan Tracks": rebuilds the handle from
+/// `sessions/<id>/data.parquet` (so a rescan sees the same signal data
+/// import saw, without re-parsing the original source blob), then calls
+/// [`index_laps`] with `force = true` so a rescan always recomputes even
+/// when the stamp still matches — the whole point of an explicit rescan is
+/// to let the rider confirm newly-added or newly-edited tracks took effect.
+/// A missing `data.parquet` is [`LapIndexErrorKind::Io`] with the path in
+/// the message, never a panic.
+pub fn reindex_laps(data_root: &Path, session_id: &str) -> Result<LapIndexReport, LapIndexError> {
+    let data_parquet_path = data_root.join("sessions").join(session_id).join("data.parquet");
+    let session = read_session_parquet(&data_parquet_path).map_err(|e| {
+        LapIndexError::new(LapIndexErrorKind::Io, format!("reading {}: {e}", data_parquet_path.display()))
+    })?;
+    let handle = SessionHandle::from_session(session);
+    index_laps(data_root, session_id, &handle, true)
+}
+
 /// Resolves one detected visit window against the track library: finds its
 /// `Track` by id and, if found with lap timing configured, detects its laps.
 /// A window whose `track_id` has no match in `tracks` (structurally
@@ -249,6 +417,21 @@ mod tests {
     use crate::laps::model::{Gate, LapTiming};
     use crate::session::handle::{ChannelInput, SessionMetaInput};
     use crate::gps::GpsFix;
+    use crate::session::{Channel, RawColumn, Session, SourceFormat};
+    use crate::store::parquet::write_session_parquet;
+    use crate::store::session_json::{read_session_json, OverlayLapKeyJson};
+    use crate::track_artifact::write_track;
+    use uuid::Uuid;
+
+    fn temp_root() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("idl-rs-test-lapidx-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sj_path(root: &Path, session_id: &str) -> std::path::PathBuf {
+        root.join("sessions").join(session_id).join("session.json")
+    }
 
     fn track_stub(id: &str, updated_at_ms: i64) -> Track {
         Track {
@@ -369,6 +552,38 @@ mod tests {
             ChannelInput { channel_id: id.to_string(), sample_rate_hz: 1.0, samples: s, t_us, source_kind: id.to_lowercase() }
         };
         SessionHandle::from_channels(meta, vec![ch("GPS_Latitude", lat), ch("GPS_Longitude", lon), ch("GPS_EpochMs", epoch)])
+    }
+
+    /// Same fixture as [`handle_from_fixes`], but as an on-disk-writable
+    /// [`Session`] (for [`write_session_parquet`]) rather than a
+    /// [`SessionHandle`] — used by `reindex_laps`'s tests, which need a real
+    /// `data.parquet` to read back.
+    fn session_from_fixes(session_id: &str, fixes: &[GpsFix]) -> Session {
+        let lat: Vec<f64> = fixes.iter().map(|f| f.lat).collect();
+        let lon: Vec<f64> = fixes.iter().map(|f| f.lon).collect();
+        let epoch: Vec<f64> = fixes.iter().map(|f| f.timestamp_ms as f64).collect();
+        let ch = |id: &str, s: Vec<f64>| {
+            let t_us: Vec<i64> = (0..s.len() as i64).map(|i| i * 1_000_000).collect();
+            Channel {
+                channel_id: id.to_string(),
+                t_us,
+                t_recorded_us: None,
+                nominal_rate_hz: 1.0,
+                column: RawColumn::F64(s),
+                source_kind: id.to_lowercase(),
+                unit: String::new(),
+                gaps: Vec::new(),
+            }
+        };
+        Session {
+            session_id: session_id.to_string(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            config_checksum: None,
+            source_format: SourceFormat::Gpx,
+            blob_sha256: String::new(),
+            channels: vec![ch("GPS_Latitude", lat), ch("GPS_Longitude", lon), ch("GPS_EpochMs", epoch)],
+        }
     }
 
     /// A there-and-back-and-there GPS track: 3 legs of 100 one-second fixes,
@@ -526,5 +741,243 @@ mod tests {
         let visit_b = index.track_visits.iter().find(|v| v.track_id == "track-b").unwrap();
         assert_eq!(visit_b.laps.len(), 1);
         assert_eq!(visit_b.laps[0].lap_number, 1);
+    }
+
+    #[test]
+    fn index_laps_fresh_session_no_session_json_writes_one_with_laps_and_stamps() {
+        // Arrange -- one circuit track, lapped three times, no session.json yet.
+        let root = temp_root();
+        let session_id = "s1";
+        write_track(&root, &circuit_track("loop-1")).unwrap();
+        let handle = handle_from_fixes(&three_lap_fixes());
+
+        // Act
+        let report = index_laps(&root, session_id, &handle, false).unwrap();
+
+        // Assert
+        assert!(!report.skipped_up_to_date);
+        assert_eq!(report.visits_indexed, 1);
+        assert_eq!(report.laps_indexed, 3);
+        let doc = read_session_json(&sj_path(&root, session_id)).unwrap();
+        assert_eq!(doc.laps.len(), 3);
+        assert!(doc.track_visits_library_hash.is_some());
+        assert_eq!(doc.lap_detector_version.as_deref(), Some(LAP_DETECTOR_VERSION));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_laps_existing_session_json_carries_unrelated_fields_through_verbatim() {
+        // Arrange -- rider/bike/comments already set before indexing runs.
+        let root = temp_root();
+        let session_id = "s1";
+        write_track(&root, &circuit_track("loop-1")).unwrap();
+        let mut doc = empty_session_json(session_id);
+        doc.rider = "Isaac".to_string();
+        doc.bike = "SV650".to_string();
+        doc.bike_comment = "new forks".to_string();
+        write_session_json(&root, session_id, &doc, None).unwrap();
+        let handle = handle_from_fixes(&three_lap_fixes());
+
+        // Act
+        let report = index_laps(&root, session_id, &handle, false).unwrap();
+
+        // Assert -- unrelated fields untouched, laps populated.
+        assert_eq!(report.laps_indexed, 3);
+        let after = read_session_json(&sj_path(&root, session_id)).unwrap();
+        assert_eq!(after.rider, "Isaac");
+        assert_eq!(after.bike, "SV650");
+        assert_eq!(after.bike_comment, "new forks");
+        assert_eq!(after.laps.len(), 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_laps_second_call_unchanged_library_skips_and_leaves_file_untouched() {
+        // Arrange
+        let root = temp_root();
+        let session_id = "s1";
+        write_track(&root, &circuit_track("loop-1")).unwrap();
+        let handle = handle_from_fixes(&three_lap_fixes());
+        index_laps(&root, session_id, &handle, false).unwrap();
+        let path = sj_path(&root, session_id);
+        let bytes_before = fs::read(&path).unwrap();
+
+        // Act -- same library, no force.
+        let report = index_laps(&root, session_id, &handle, false).unwrap();
+
+        // Assert
+        assert!(report.skipped_up_to_date);
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_laps_second_call_after_track_updated_at_ms_changes_recomputes() {
+        // Arrange
+        let root = temp_root();
+        let session_id = "s1";
+        write_track(&root, &circuit_track("loop-1")).unwrap();
+        let handle = handle_from_fixes(&three_lap_fixes());
+        index_laps(&root, session_id, &handle, false).unwrap();
+        let mut bumped = circuit_track("loop-1");
+        bumped.updated_at_ms = 999;
+        write_track(&root, &bumped).unwrap();
+
+        // Act -- the library hash changed, so this recomputes despite force=false.
+        let report = index_laps(&root, session_id, &handle, false).unwrap();
+
+        // Assert
+        assert!(!report.skipped_up_to_date);
+        assert_eq!(report.laps_indexed, 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_laps_second_call_with_stale_detector_version_recomputes() {
+        // Arrange -- the library is unchanged, but the stamped detector
+        // version does not match LAP_DETECTOR_VERSION.
+        let root = temp_root();
+        let session_id = "s1";
+        write_track(&root, &circuit_track("loop-1")).unwrap();
+        let handle = handle_from_fixes(&three_lap_fixes());
+        index_laps(&root, session_id, &handle, false).unwrap();
+        let path = sj_path(&root, session_id);
+        let mut doc = read_session_json(&path).unwrap();
+        doc.lap_detector_version = Some("0".to_string());
+        let based_on = sha256_hex(&fs::read(&path).unwrap());
+        write_session_json(&root, session_id, &doc, Some(&based_on)).unwrap();
+
+        // Act
+        let report = index_laps(&root, session_id, &handle, false).unwrap();
+
+        // Assert
+        assert!(!report.skipped_up_to_date);
+        let after = read_session_json(&path).unwrap();
+        assert_eq!(after.lap_detector_version.as_deref(), Some(LAP_DETECTOR_VERSION));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_laps_force_true_recomputes_even_when_stamp_is_current() {
+        // Arrange
+        let root = temp_root();
+        let session_id = "s1";
+        write_track(&root, &circuit_track("loop-1")).unwrap();
+        let handle = handle_from_fixes(&three_lap_fixes());
+        index_laps(&root, session_id, &handle, false).unwrap();
+
+        // Act
+        let report = index_laps(&root, session_id, &handle, true).unwrap();
+
+        // Assert
+        assert!(!report.skipped_up_to_date);
+        assert_eq!(report.laps_indexed, 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_laps_unresolvable_lap_flags_are_cleared_and_reported() {
+        // Arrange -- main_lap_number names a lap that will not exist once
+        // only 3 laps are detected; ignored_lap_numbers names one that
+        // survives (1) and one that does not (9).
+        let root = temp_root();
+        let session_id = "s1";
+        write_track(&root, &circuit_track("loop-1")).unwrap();
+        let mut doc = empty_session_json(session_id);
+        doc.main_lap_number = Some(9);
+        doc.ignored_lap_numbers = vec![1, 9];
+        write_session_json(&root, session_id, &doc, None).unwrap();
+        let handle = handle_from_fixes(&three_lap_fixes());
+
+        // Act
+        let report = index_laps(&root, session_id, &handle, false).unwrap();
+
+        // Assert
+        assert_eq!(report.laps_indexed, 3);
+        assert!(report.flags_cleared.contains(&"main_lap_number".to_string()));
+        assert!(report.flags_cleared.contains(&"ignored_lap_numbers".to_string()));
+        let after = read_session_json(&sj_path(&root, session_id)).unwrap();
+        assert_eq!(after.main_lap_number, None);
+        assert_eq!(after.ignored_lap_numbers, vec![1]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_laps_overlay_lap_key_survives_untouched() {
+        // Arrange -- overlay_lap_key names a lap in a different session.
+        let root = temp_root();
+        let session_id = "s1";
+        write_track(&root, &circuit_track("loop-1")).unwrap();
+        let mut doc = empty_session_json(session_id);
+        doc.overlay_lap_key = Some(OverlayLapKeyJson { session_id: "other".to_string(), lap_number: 5 });
+        write_session_json(&root, session_id, &doc, None).unwrap();
+        let handle = handle_from_fixes(&three_lap_fixes());
+
+        // Act
+        index_laps(&root, session_id, &handle, false).unwrap();
+
+        // Assert
+        let after = read_session_json(&sj_path(&root, session_id)).unwrap();
+        assert_eq!(after.overlay_lap_key, Some(OverlayLapKeyJson { session_id: "other".to_string(), lap_number: 5 }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_laps_empty_track_library_writes_honest_empty_with_stamps_set() {
+        // Arrange -- no tracks/ directory at all.
+        let root = temp_root();
+        let session_id = "s1";
+        let handle = handle_from_fixes(&three_lap_fixes());
+
+        // Act
+        let report = index_laps(&root, session_id, &handle, false).unwrap();
+
+        // Assert
+        assert!(!report.skipped_up_to_date);
+        assert_eq!(report.visits_indexed, 0);
+        assert_eq!(report.laps_indexed, 0);
+        let doc = read_session_json(&sj_path(&root, session_id)).unwrap();
+        assert!(doc.laps.is_empty());
+        assert!(doc.track_visits.is_empty());
+        assert!(doc.track_visits_library_hash.is_some());
+        assert_eq!(doc.lap_detector_version.as_deref(), Some(LAP_DETECTOR_VERSION));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reindex_laps_reproduces_index_laps_and_errors_typed_on_missing_data_parquet() {
+        // Arrange -- a real data.parquet, read back and re-indexed.
+        let root = temp_root();
+        let session_id = "s1";
+        write_track(&root, &circuit_track("loop-1")).unwrap();
+        let session = session_from_fixes(session_id, &three_lap_fixes());
+        write_session_parquet(&root, &session, "test-importer").unwrap();
+
+        // Act
+        let report = reindex_laps(&root, session_id).unwrap();
+
+        // Assert -- same result compute_lap_index/index_laps produce directly
+        // from the equivalent in-memory handle.
+        assert!(!report.skipped_up_to_date);
+        assert_eq!(report.visits_indexed, 1);
+        assert_eq!(report.laps_indexed, 3);
+
+        // Act -- no data.parquet for this session at all.
+        let err = reindex_laps(&root, "nope").unwrap_err();
+
+        // Assert -- typed Io error naming the path, not a panic.
+        assert_eq!(err.kind, LapIndexErrorKind::Io);
+        assert!(err.message.contains("data.parquet"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
