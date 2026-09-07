@@ -19,7 +19,8 @@ pub enum IpcErrorKind {
     Wifi,
     /// `TransportErrorKind::Config` — device rejected or malformed a pushed config over the wire.
     Config,
-    /// `TransportErrorKind::Sync` — LAN sync (L11, wave 2; no command uses this kind yet).
+    /// `TransportErrorKind::Sync` — LAN sync (L11): `sync_now`, `pair_peer`,
+    /// `start_pairing`, `unpair_peer` and `sync_status` all map to this kind.
     Sync,
     /// Cross-cutting: the named entity (session, workbook, channel, peer…) does not exist.
     NotFound,

@@ -208,6 +208,105 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
     Ok((doc, errors))
 }
 
+/// Renders a [`WorkbookDoc`] back to `.idl1wb` source text (C2 §1's
+/// `document ::= front_matter body` grammar) — the inverse of
+/// [`parse_workbook`], needed by L11 Task 6's sync `install` to write a
+/// merged document to disk (`workbook::merge::merge` only ever produces a
+/// structured [`WorkbookDoc`], never text). Every byte this function emits
+/// already lives verbatim in `doc`'s fields (`raw_fence_body`,
+/// `prose_before`/`prose_after`, `trailing_prose`) — this is pure
+/// reassembly, never a re-derivation of content `parse_workbook` already
+/// captured, so it is exact for any `doc` that came from `parse_workbook` or
+/// from `workbook::merge::merge` (which only ever copies cells verbatim
+/// from one of its three inputs, plus freshly-rendered marker/prose text
+/// built with this same grammar in mind, C2 §7.2/§7.3).
+///
+/// No prior task needed this direction: ordinary editing round-trips the
+/// author's own markdown text unchanged, re-parsing it only for evaluation.
+/// A fence body that does not already end in `\n` gets one inserted before
+/// the closing fence — `parse_workbook`'s own fence-body capture is not
+/// documented as always including that trailing newline (pulldown-cmark's
+/// `Text` event boundary is not part of its stated public contract, C2
+/// §2.2's own cell-id comment makes the same caveat about that crate), so
+/// this guards the one byte a future upgrade could silently drop instead of
+/// asserting a convention this module does not own.
+///
+/// **R103 fixed point (`runs/2026-09-03/decisions.md`):** the closing fence
+/// marker itself is emitted *without* a trailing `\n` — `scan_cells`'s
+/// underlying pulldown-cmark code-block byte range ends right at the
+/// closing `` ``` ``, before that line's own line-ending newline, so that
+/// newline is already the first byte of the following `prose_before` /
+/// `prose_after` / `trailing_prose` span (or, for the very last cell with no
+/// following text at all, simply absent because the source itself has no
+/// trailing newline there). A hard-coded `"```\n"` here used to double that
+/// byte, inserting a spurious blank line around every fence on every
+/// render — `render_workbook(parse_workbook(s))` was therefore never a
+/// fixed point for a document that closes any fence, and C2 §7.2's
+/// `Unchanged`/`Changed` cell classification (byte-identical content) then
+/// misread an untouched cell as edited after a single round trip through
+/// the editor's own save path.
+///
+/// **Front matter is the one deliberate exception**, not part of this
+/// invariant: `front_matter::render_front_matter`'s own doc comment already
+/// states its contract is "round-trips through [`parse_front_matter`] back
+/// to the same `FrontMatter`... not the exact bytes emitted" (`serde_yaml_ng`
+/// picks its own YAML style). This is safe for C2 §7.1's merge, which reads
+/// front matter "per top-level key" as structured values (`id`, `name`,
+/// `units`, `constants`), never as raw YAML bytes — so a reformatted-but
+/// -equivalent front-matter block cannot manufacture the spurious-`Changed`
+/// bug R103 describes, unlike a cell's byte-for-byte-compared body. The
+/// fixed-point invariant this function upholds is therefore: byte-identical
+/// for the whole document whenever the front matter is already in
+/// `render_front_matter`'s own canonical form, and byte-identical for
+/// `body` alone (everything after the front matter's closing `---`) in
+/// every case — see the `tests` module's `render_workbook_is_a_fixed_point_*`
+/// suite.
+pub fn render_workbook(doc: &WorkbookDoc) -> String {
+    let fm = FrontMatter {
+        id: doc.id.clone(),
+        name: doc.name.clone(),
+        constants: doc.constants_raw.clone(),
+        units: doc.units_pref,
+        version: doc.version,
+    };
+    let mut out = front_matter::render_front_matter(&fm);
+
+    if doc.cells.is_empty() {
+        if let Some(prose) = &doc.trailing_prose {
+            out.push_str(prose);
+        }
+        return out;
+    }
+
+    let last_index = doc.cells.len() - 1;
+    for (i, cell) in doc.cells.iter().enumerate() {
+        if let Some(prose_before) = &cell.prose_before {
+            out.push_str(prose_before);
+        }
+        let kind = match cell.kind_token {
+            CellKindToken::Math => "math",
+            CellKindToken::Table => "table",
+            CellKindToken::Js => "js",
+        };
+        out.push_str("```");
+        out.push_str(kind);
+        out.push_str(" id=");
+        out.push_str(&cell.id);
+        out.push('\n');
+        out.push_str(&cell.raw_fence_body);
+        if !cell.raw_fence_body.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("```");
+        if i == last_index {
+            if let Some(prose_after) = &cell.prose_after {
+                out.push_str(prose_after);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests_pipeline;
 
@@ -251,4 +350,169 @@ mod tests {
         assert_eq!(errors[0].kind, WorkbookErrorKind::DuplicateDefinition);
         assert_eq!(errors[0].cell_id, "bbbbbbbb");
     }
+
+    #[test]
+    fn render_workbook_the_c2_5_worked_example_re_parses_to_the_same_cells() {
+        // Arrange
+        let (doc, _errors) = parse_workbook(WORKED_EXAMPLE).unwrap();
+
+        // Act
+        let rendered = render_workbook(&doc);
+        let (back, errors) = parse_workbook(&rendered).unwrap();
+
+        // Assert
+        assert!(errors.is_empty());
+        assert_eq!(back.id, doc.id);
+        assert_eq!(back.name, doc.name);
+        assert_eq!(back.cells.len(), doc.cells.len());
+        assert_eq!(back.cells[0].id, doc.cells[0].id);
+        assert_eq!(back.cells[0].kind_token, doc.cells[0].kind_token);
+        assert_eq!(back.cells[0].raw_fence_body.trim(), doc.cells[0].raw_fence_body.trim());
+        assert_eq!(back.cells[1].id, doc.cells[1].id);
+        assert_eq!(back.trailing_prose, doc.trailing_prose);
+    }
+
+    #[test]
+    fn render_workbook_a_pure_prose_document_round_trips_the_trailing_prose() {
+        // Arrange
+        let markdown = "---\nid: 9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d\nname: Notes\n---\nJust a written note, no cells here.\n";
+        let (doc, _errors) = parse_workbook(markdown).unwrap();
+
+        // Act
+        let rendered = render_workbook(&doc);
+        let (back, errors) = parse_workbook(&rendered).unwrap();
+
+        // Assert
+        assert!(errors.is_empty());
+        assert!(back.cells.is_empty());
+        assert_eq!(back.trailing_prose, doc.trailing_prose);
+    }
+
+    #[test]
+    fn render_workbook_a_cell_with_no_prose_before_or_after_still_parses_back_to_one_cell() {
+        // Arrange
+        let markdown = "---\nid: 9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d\nname: Test\n---\n```math id=aaaaaaaa\nx = 1\n```\n";
+        let (doc, _errors) = parse_workbook(markdown).unwrap();
+
+        // Act
+        let rendered = render_workbook(&doc);
+        let (back, errors) = parse_workbook(&rendered).unwrap();
+
+        // Assert
+        assert!(errors.is_empty());
+        assert_eq!(back.cells.len(), 1);
+        assert_eq!(back.cells[0].id, "aaaaaaaa");
+        assert!(back.cells[0].raw_fence_body.contains("x = 1"));
+    }
+
+    /// R103's fixed-point suite (`runs/2026-09-03/decisions.md`): every
+    /// fixture here asserts `render_workbook(parse_workbook(s)) == s` on
+    /// `body` alone (everything after the front matter's closing `---\n`,
+    /// via [`body_of`]) — the byte range [`render_workbook`]'s doc comment
+    /// promises unconditionally — and, where the fixture's own front matter
+    /// is already in [`front_matter::render_front_matter`]'s canonical
+    /// form (built with [`canonical_doc`]), the *whole* document
+    /// byte-for-byte too.
+    /// Splits `markdown` into `(front_matter_block, body)` on the first
+    /// `\n---\n` after the opening `---\n` — mirrors
+    /// [`front_matter::parse_front_matter`]'s own split, kept independent of
+    /// it so a bug in that function can't also hide a bug in this test.
+    fn body_of(markdown: &str) -> &str {
+        let rest = markdown.strip_prefix("---\n").expect("fixture must open with '---\\n'");
+        let (_yaml, body) = rest.split_once("\n---\n").expect("fixture must have a closing '---\\n'");
+        body
+    }
+
+    /// Builds a document whose front matter is already
+    /// [`front_matter::render_front_matter`]'s own canonical byte form (no
+    /// `constants`, SI units, explicit `version: 3`), so the whole-document
+    /// fixed point holds, not just the `body` slice — used by fixtures that
+    /// don't care about exercising the front-matter grammar itself.
+    fn canonical_doc(body: &str) -> String {
+        let fm = FrontMatter {
+            id: "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d".to_string(),
+            name: "Test".to_string(),
+            constants: HashMap::new(),
+            units: UnitsPref::Si,
+            version: 3,
+        };
+        format!("{}{}", front_matter::render_front_matter(&fm), body)
+    }
+
+    /// Runs one fixed-point assertion: `body_of` matches byte-for-byte
+    /// always; the whole document matches too whenever `markdown`'s front
+    /// matter is already canonical (checked by rendering `doc`'s own front
+    /// matter back and comparing against `markdown`'s own front-matter
+    /// block, so a non-canonical fixture doesn't have to pre-compute
+    /// whether it happens to be canonical).
+    fn assert_fixed_point(markdown: &str) {
+        let (doc, errors) = parse_workbook(markdown).unwrap();
+        assert!(errors.is_empty(), "fixture must parse cleanly: {errors:?}");
+
+        let rendered = render_workbook(&doc);
+
+        assert_eq!(body_of(&rendered), body_of(markdown), "body diverged for {markdown:?}");
+
+        let canonical_front_matter = front_matter::render_front_matter(&FrontMatter {
+            id: doc.id.clone(),
+            name: doc.name.clone(),
+            constants: doc.constants_raw.clone(),
+            units: doc.units_pref,
+            version: doc.version,
+        });
+        if markdown.starts_with(&canonical_front_matter) {
+            assert_eq!(rendered, markdown, "whole document diverged for already-canonical front matter {markdown:?}");
+        }
+    }
+
+    #[test]
+    fn render_workbook_is_a_fixed_point_c2_2_5_worked_example() {
+        assert_fixed_point(WORKED_EXAMPLE);
+    }
+
+    #[test]
+    fn render_workbook_is_a_fixed_point_prose_only_document() {
+        assert_fixed_point(&canonical_doc("Just a written note, no cells here.\n"));
+    }
+
+    #[test]
+    fn render_workbook_is_a_fixed_point_two_adjacent_fences_no_blank_line_between() {
+        assert_fixed_point(&canonical_doc(
+            "```math id=aaaaaaaa\nx = 1\n```\n```js id=bbbbbbbb\ny\n```\n",
+        ));
+    }
+
+    #[test]
+    fn render_workbook_is_a_fixed_point_fence_then_prose_with_two_blank_lines() {
+        assert_fixed_point(&canonical_doc(
+            "```math id=aaaaaaaa\nx = 1\n```\n\n\nTwo blank lines above this line.\n",
+        ));
+    }
+
+    #[test]
+    fn render_workbook_is_a_fixed_point_trailing_whitespace_on_a_prose_line() {
+        assert_fixed_point(&canonical_doc("```math id=aaaaaaaa\nx = 1\n```\n\nTrailing spaces below.   \n"));
+    }
+
+    #[test]
+    fn render_workbook_is_a_fixed_point_no_trailing_newline_at_all() {
+        assert_fixed_point(&canonical_doc("```math id=aaaaaaaa\nx = 1\n```"));
+    }
+
+    #[test]
+    fn render_workbook_is_a_fixed_point_front_matter_with_every_optional_field() {
+        let fm = FrontMatter {
+            id: "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d".to_string(),
+            name: "Fork tuning".to_string(),
+            constants: HashMap::from([
+                ("rider_mass_kg".to_string(), ConstantRaw::WithUnit { value: 82.0, unit_display: "kg".to_string() }),
+                ("gravity_m_s2".to_string(), ConstantRaw::Number(9.80665)),
+            ]),
+            units: UnitsPref::Imperial,
+            version: 3,
+        };
+        let markdown = format!("{}```math id=aaaaaaaa\nx = 1\n```\n", front_matter::render_front_matter(&fm));
+        assert_fixed_point(&markdown);
+    }
 }
+

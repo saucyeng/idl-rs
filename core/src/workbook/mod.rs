@@ -3,6 +3,7 @@
 //! stays in the app.
 
 pub mod apply;
+pub mod merge;
 pub mod model;
 pub mod read;
 pub mod v3;

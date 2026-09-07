@@ -18,12 +18,20 @@ btleplug = "0.13.0"
 # constraint, preserved); "io-util" for `AsyncWriteExt::write_all`, needed to
 # write into `WifiTransport::download`'s generic `sink` (fixed by Task 6's
 # trait signature). See ble_transport.rs::scan for the full reasoning.
-tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "io-util"] }
+# Task 8 adds "net": `SyncServer::start` binds a real `tokio::net::TcpListener`
+# for `axum::serve` (this crate's own runtime rule is unchanged — it never
+# spawns one; it serves on whichever runtime drove `start`).
+tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "io-util", "net"] }
 # Task 7: needed to construct/parse GATT characteristic UUIDs against
 # btleplug's `Uuid`-typed `Characteristic::uuid` field (already resolved in
 # the workspace lockfile via btleplug's own dependency on uuid 1.26.0 — this
 # just names it directly rather than relying on a transitive re-export).
-uuid = "1"
+# L11 Task 7 adds the "v4" feature: `Uuid::new_v4()` mints the pairing code
+# (PLAN Q2 — no `rand` dependency) and the per-peer token and staging
+# filenames for the peer file's atomic write. Not a new crate, no new
+# entry — the existing pinned `uuid` line gains a feature it did not
+# previously need.
+uuid = { version = "1", features = ["v4"] }
 # Task 7: needed for `StreamExt::next` to drain btleplug's `CentralEvent`/
 # `ValueNotification` streams and reqwest's `bytes_stream()` — already
 # resolved in the workspace lockfile (both btleplug and reqwest depend on
@@ -38,11 +46,32 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 # deserialises directly (`PingResponse`, `Vec<DeviceFile>>`); not in Task 6's
 # original feature list because Task 6 only wrote the trait, not its body.
 reqwest = { version = "0.13.4", default-features = false, features = ["stream", "json"] }
+# Task 8: the sync manifest/apply this crate's server calls through are
+# `idl-rs` (PLAN §8 Q1 — sync lives in `idl-transport`, gaining this one
+# dependency; `idl-rs` never depends back on this crate). No merge logic
+# lives here (PLAN §2) — the server only calls `build_manifest`/`install`.
+idl-rs = { path = "../core" }
+# Pinned 2026-09-03 (M0 ecosystem report, `docs/superpowers/specs/
+# 2026-09-02-idl1-m0-ecosystem.md`), ruling R88: the sync server, hand-
+# parsing `Range` itself rather than taking `tower-http` (PLAN §8 Q2).
+axum = "0.8.9"
+# Task 9: `_idl1._tcp` mDNS advertise/browse (PLAN §3, PLAN §8 Q2 — pinned
+# in the M0 ecosystem report, no crate this task chose itself).
+mdns-sd = "0.21.1"
 
 [dev-dependencies]
 serde_json = "1"
+# review-task9 fix: `mdns_sd::Receiver<T>` is `flume::Receiver<T>` (mdns-sd
+# re-exports the type but not a constructor). Already resolved in
+# Cargo.lock as mdns-sd's own dependency — this just names it directly so
+# `sync::discovery`'s tests can build a synthetic event channel and prove
+# `drain_events` exits on receiver-drop without starting a real
+# `ServiceDaemon` (PLAN §7: "no test needs multicast").
+flume = "0.12.0"
 # Task 7: the mock HTTP device server (wifi_transport.rs integration tests)
 # hand-rolls HTTP/1.1 over a raw `tokio::net::TcpListener` rather than adding
 # a server framework — "net" is dev-only (test builds), so it never reaches
 # consumers of this library the way the main [dependencies] tokio entry does.
+# Task 8's sync::server tests reuse this same dev entry via `tokio::test`
+# (already carries "rt"/"macros"); "net"/"io-util" already present.
 tokio = { version = "1.53.1", features = ["net", "rt", "macros", "io-util"] }

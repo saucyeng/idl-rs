@@ -178,10 +178,12 @@ fn check_tracks(data_root: &Path, out: &mut Vec<Finding>) {
 /// (`blobs/sha256/<2 hex>/<62 hex>`, `sessions/<id>/session.json`,
 /// `sessions/<id>/data.parquet`, `sessions/<id>/derived/<64 hex>.parquet`,
 /// `workbooks/*.idl1wb`, `tracks/*.idl0t`, `profiles/*.idl0p`,
-/// `catalog.sqlite(-wal|-shm)`, anything under `tmp/`), or a directory that
-/// is a legitimate ancestor of one (e.g. `sessions`, `sessions/<id>`,
-/// `sessions/<id>/derived`, `blobs/sha256/<2 hex>`). Used only by
-/// [`check_unexpected_paths`] (#10) — never by identity/content checks.
+/// `catalog.sqlite(-wal|-shm)`, anything under `tmp/`, anything under
+/// `workbooks/.sync-base/` — C4 §6's named exception for C2 §7's
+/// last-synced-base cache), or a directory that is a legitimate ancestor of
+/// one (e.g. `sessions`, `sessions/<id>`, `sessions/<id>/derived`,
+/// `blobs/sha256/<2 hex>`). Used only by [`check_unexpected_paths`] (#10) —
+/// never by identity/content checks.
 fn matches_layout(rel: &Path) -> bool {
     let parts: Vec<&str> = rel.iter().map(|c| c.to_str().unwrap_or("")).collect();
     match parts.as_slice() {
@@ -201,6 +203,12 @@ fn matches_layout(rel: &Path) -> bool {
             name.strip_suffix(".parquet").is_some_and(|stem| is_lower_hex(stem, 64))
         }
         ["workbooks"] => true,
+        // C2 §7's last-synced-base cache: never synced, and exempted from
+        // this finding too (C4 §6, added 2026-09-06, ruling R88) — every
+        // merge writes one of these, so without the exemption every merge
+        // would surface a spurious `info` finding on its own cache file.
+        ["workbooks", ".sync-base"] => true,
+        ["workbooks", ".sync-base", _name] => true,
         ["workbooks", name] => name.ends_with(".idl1wb"),
         ["tracks"] => true,
         ["tracks", name] => name.ends_with(".idl0t"),
@@ -384,6 +392,46 @@ mod tests {
         // Arrange
         let root = temp_root();
         std::fs::write(root.join("Thumbs.db"), b"").unwrap();
+
+        // Act
+        let findings = verify(&root);
+
+        // Assert
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Info);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_a_sync_base_cache_file_under_workbooks_is_not_a_finding() {
+        // Arrange — C2 §7's last-synced-base cache, exempted from finding
+        // #10 by C4 §6 (added 2026-09-06, ruling R88): every merge writes
+        // one of these, and without the exemption every merge would surface
+        // a spurious `info` finding on its own cache file.
+        let root = temp_root();
+        let sync_base_dir = root.join("workbooks").join(".sync-base");
+        std::fs::create_dir_all(&sync_base_dir).unwrap();
+        std::fs::write(sync_base_dir.join("9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d.idl1wb"), b"---\n---\n").unwrap();
+
+        // Act
+        let findings = verify(&root);
+
+        // Assert
+        assert!(findings.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_an_unrelated_stray_file_under_workbooks_is_still_finding_10() {
+        // Arrange — control for the `.sync-base` exemption above: a file
+        // under `workbooks/` that is neither a `.idl1wb` workbook nor the
+        // `.sync-base` cache directory is still an unexpected path.
+        let root = temp_root();
+        let workbooks_dir = root.join("workbooks");
+        std::fs::create_dir_all(&workbooks_dir).unwrap();
+        std::fs::write(workbooks_dir.join("Thumbs.db"), b"").unwrap();
 
         // Act
         let findings = verify(&root);

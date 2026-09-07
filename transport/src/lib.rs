@@ -5,8 +5,9 @@
 //! push (SPEC §8), and peer sync on the pit-lane LAN. It never processes
 //! signals — that is `idl-rs` — and `idl-rs` never depends on this crate.
 //!
-//! M0 shipped only the typed error. L4 (this lane) adds the desktop BLE/WiFi
-//! device client; L11 later adds LAN peer sync beside it.
+//! M0 shipped only the typed error. L4 adds the desktop BLE/WiFi device
+//! client. L11 adds LAN peer sync (`sync/`) beside it, starting with wire
+//! DTOs and pairing.
 
 pub mod ble_config;
 pub mod ble_control;
@@ -14,6 +15,7 @@ pub mod ble_status;
 pub mod ble_transport;
 pub mod device;
 pub mod error;
+pub mod sync;
 pub mod wifi_transport;
 
 pub use device::{ConnectionInfo, DeviceFile, DiscoveredDevice};

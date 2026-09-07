@@ -70,5 +70,10 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::maintenance::list_quarantine,
         commands::maintenance::resolve_quarantine,
         commands::maintenance::verify_data_dir,
+        commands::sync::sync_status,
+        commands::sync::sync_now,
+        commands::sync::pair_peer,
+        commands::sync::start_pairing,
+        commands::sync::unpair_peer,
     ]
 }
