@@ -55,6 +55,9 @@ idl-rs = { path = "../core" }
 # 2026-09-02-idl1-m0-ecosystem.md`), ruling R88: the sync server, hand-
 # parsing `Range` itself rather than taking `tower-http` (PLAN §8 Q2).
 axum = "0.8.9"
+# Task 9: `_idl1._tcp` mDNS advertise/browse (PLAN §3, PLAN §8 Q2 — pinned
+# in the M0 ecosystem report, no crate this task chose itself).
+mdns-sd = "0.21.1"
 
 [dev-dependencies]
 serde_json = "1"
