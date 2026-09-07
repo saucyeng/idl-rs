@@ -1061,11 +1061,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_root);
     }
 
-    /// R100 regression: `review-task8`'s Important — `read_body` used to
-    /// call `to_bytes(body, usize::MAX)`, an explicit unlimited cap despite
-    /// its own doc comment's claim otherwise. A `session.json` PUT (this
-    /// route's `MAX_DOCUMENT_BODY_BYTES`, the smaller of the two caps) over
-    /// the limit is now `413`, and nothing is written.
+    /// R100 regression (amended: per-class caps, not one shared cap):
+    /// `review-task8`'s Important — `read_body` used to call
+    /// `to_bytes(body, usize::MAX)`, an explicit unlimited cap despite its
+    /// own doc comment's claim otherwise. One test per cap tier — this one
+    /// covers `MAX_DOCUMENT_BODY_BYTES` via `session.json` PUT; the raw-file
+    /// tier (`MAX_RAW_FILE_BODY_BYTES`) is covered by `blob_put_...` below.
+    /// Exactly one byte over the cap is `413`, and nothing is written.
     #[tokio::test]
     async fn session_json_put_over_the_document_body_cap_is_413_and_nothing_is_written() {
         // Arrange
@@ -1092,6 +1094,44 @@ mod tests {
         // Assert
         assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
         assert!(!data_root.join("sessions").join(session_id).join("session.json").exists());
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// R100 amendment's second cap-tier test: `MAX_RAW_FILE_BODY_BYTES`,
+    /// exercised via `blob` PUT (this crate's largest legitimate body
+    /// class — a device's raw source file, `store::blob`'s own doc
+    /// comment). The digest in the URL never needs to match the (rejected)
+    /// body's real hash — `read_body`'s cap check runs before `install`
+    /// ever sees the bytes, so a shape-valid placeholder is enough to
+    /// reach the route.
+    #[tokio::test]
+    async fn blob_put_over_the_raw_file_body_cap_is_413_and_nothing_is_written() {
+        // Arrange
+        let data_root = temp_data_root();
+        let token = "tok".to_string();
+        let (server, _peers) = start_test_server(
+            data_root.clone(),
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let placeholder_digest = "a".repeat(64);
+        let oversized = vec![b'a'; MAX_RAW_FILE_BODY_BYTES + 1];
+
+        // Act
+        let response = client
+            .put(format!("{}/blob/{placeholder_digest}", base_url(&server)))
+            .bearer_auth(&token)
+            .body(oversized)
+            .send()
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!blob_path(&data_root, &placeholder_digest).is_file());
 
         server.shutdown().await;
         let _ = std::fs::remove_dir_all(&data_root);
