@@ -75,5 +75,6 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::sync::pair_peer,
         commands::sync::start_pairing,
         commands::sync::unpair_peer,
+        commands::sync::set_sync_device_name,
     ]
 }
