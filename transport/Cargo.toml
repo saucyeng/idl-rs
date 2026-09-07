@@ -18,7 +18,10 @@ btleplug = "0.13.0"
 # constraint, preserved); "io-util" for `AsyncWriteExt::write_all`, needed to
 # write into `WifiTransport::download`'s generic `sink` (fixed by Task 6's
 # trait signature). See ble_transport.rs::scan for the full reasoning.
-tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "io-util"] }
+# Task 8 adds "net": `SyncServer::start` binds a real `tokio::net::TcpListener`
+# for `axum::serve` (this crate's own runtime rule is unchanged — it never
+# spawns one; it serves on whichever runtime drove `start`).
+tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "io-util", "net"] }
 # Task 7: needed to construct/parse GATT characteristic UUIDs against
 # btleplug's `Uuid`-typed `Characteristic::uuid` field (already resolved in
 # the workspace lockfile via btleplug's own dependency on uuid 1.26.0 — this
@@ -43,6 +46,15 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 # deserialises directly (`PingResponse`, `Vec<DeviceFile>>`); not in Task 6's
 # original feature list because Task 6 only wrote the trait, not its body.
 reqwest = { version = "0.13.4", default-features = false, features = ["stream", "json"] }
+# Task 8: the sync manifest/apply this crate's server calls through are
+# `idl-rs` (PLAN §8 Q1 — sync lives in `idl-transport`, gaining this one
+# dependency; `idl-rs` never depends back on this crate). No merge logic
+# lives here (PLAN §2) — the server only calls `build_manifest`/`install`.
+idl-rs = { path = "../core" }
+# Pinned 2026-09-03 (M0 ecosystem report, `docs/superpowers/specs/
+# 2026-09-02-idl1-m0-ecosystem.md`), ruling R88: the sync server, hand-
+# parsing `Range` itself rather than taking `tower-http` (PLAN §8 Q2).
+axum = "0.8.9"
 
 [dev-dependencies]
 serde_json = "1"
@@ -50,4 +62,6 @@ serde_json = "1"
 # hand-rolls HTTP/1.1 over a raw `tokio::net::TcpListener` rather than adding
 # a server framework — "net" is dev-only (test builds), so it never reaches
 # consumers of this library the way the main [dependencies] tokio entry does.
+# Task 8's sync::server tests reuse this same dev entry via `tokio::test`
+# (already carries "rt"/"macros"); "net"/"io-util" already present.
 tokio = { version = "1.53.1", features = ["net", "rt", "macros", "io-util"] }
