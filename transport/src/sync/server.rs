@@ -37,6 +37,7 @@ use axum::Router;
 use idl_rs::store::blob::blob_path;
 use idl_rs::store::sync::apply::{install, InstallContext};
 use idl_rs::store::sync::diff::{SyncClass, SyncItem};
+use idl_rs::store::sync::ids::{is_valid_id, safe_join, IdClass};
 use idl_rs::store::sync::manifest::build_manifest;
 
 use crate::error::{TransportError, TransportErrorKind};
@@ -279,12 +280,6 @@ fn is_valid_hash(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// `true` for an id segment with no path separator, no `..`, and not
-/// empty (this task's brief, "Path safety").
-fn is_valid_id(s: &str) -> bool {
-    !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains("..")
-}
-
 /// Serves `path`'s bytes, honouring a single `Range` header (this task's
 /// brief: `Accept-Ranges: bytes`; `206`/`Content-Range` for a valid range;
 /// `416` for an unsatisfiable one). `404` if `path` is not a file — never
@@ -322,13 +317,48 @@ fn serve_file(path: &Path, headers: &HeaderMap) -> Response {
     }
 }
 
-/// Reads the full request body. `413`-free for this crate's scope (LAN
-/// transfers of files already bounded by `<data>`'s own sizes) — no limit
-/// is imposed beyond `axum`'s own default.
-async fn read_body(body: Body) -> Result<Vec<u8>, Response> {
-    match to_bytes(body, usize::MAX).await {
+/// Generous cap for a small syncable document body — `session.json`,
+/// `.idl1wb` workbook, `.idl0t` track, `.idl0p` profile — all plaintext
+/// JSON/markdown-ish, never more than a few hundred KB in real use.
+/// 16 MiB leaves orders-of-magnitude headroom (R100).
+const MAX_DOCUMENT_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Generous cap for a raw/large syncable body — a content-addressed blob
+/// (`store::blob`'s doc comment: "raw source files", i.e. a device's raw
+/// capture), a cached `derived` Parquet, or `data.parquet` itself. IDL0_SPEC
+/// notes a device's SD-card free-space threshold of ~200 MB at peak
+/// logging rate, so a single legitimate session's raw capture can
+/// plausibly be that large; 512 MiB leaves generous headroom above it
+/// while still bounding memory (R100).
+const MAX_RAW_FILE_BODY_BYTES: usize = 512 * 1024 * 1024;
+
+/// Reads the full request body, refusing anything over `max_bytes` with
+/// `413` — R100: `to_bytes(body, usize::MAX)` used to impose no real limit
+/// at all, despite this function's own old doc comment claiming otherwise.
+/// Any other body-read failure (a malformed chunked stream, a client
+/// disconnect mid-upload) is `400`.
+///
+/// Distinguishing "the limit was hit" from "the stream broke some other
+/// way": `to_bytes`'s own doc comment (`axum` 0.8.9, `body/mod.rs`) shows
+/// the canonical way to tell — `std::error::Error::source` on the returned
+/// `axum::Error` is a `http_body_util::LengthLimitError` when the limit was
+/// exceeded. Recognised here by its fixed `Display` text (`"length limit
+/// exceeded"`, `http-body-util` 0.1.5 — pinned by `axum`'s own dependency
+/// tree, already in this workspace's `Cargo.lock`) rather than by naming
+/// the type directly, so this file needs no new direct dependency (and no
+/// `Cargo.lock` line of its own) just to recognise an error it never
+/// constructs or matches structurally.
+async fn read_body(body: Body, max_bytes: usize) -> Result<Vec<u8>, Response> {
+    match to_bytes(body, max_bytes).await {
         Ok(bytes) => Ok(bytes.to_vec()),
-        Err(_) => Err(StatusCode::BAD_REQUEST.into_response()),
+        Err(err) => {
+            let hit_the_limit = std::error::Error::source(&err).is_some_and(|source| source.to_string() == "length limit exceeded");
+            if hit_the_limit {
+                Err(StatusCode::PAYLOAD_TOO_LARGE.into_response())
+            } else {
+                Err(StatusCode::BAD_REQUEST.into_response())
+            }
+        }
     }
 }
 
@@ -361,7 +391,7 @@ async fn handle_blob_put(State(state): State<ServerState>, AxumPath(hash): AxumP
     if !is_valid_hash(&hash) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let bytes = match read_body(request.into_body()).await {
+    let bytes = match read_body(request.into_body(), MAX_RAW_FILE_BODY_BYTES).await {
         Ok(b) => b,
         Err(r) => return r,
     };
@@ -386,10 +416,12 @@ async fn handle_derived_get(
     let Some(hash) = derived_hash_from_file_name(&file_name) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !is_valid_id(&id) {
+    if !is_valid_id(&id, IdClass::Session) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let path = state.data_root.join("sessions").join(&id).join("derived").join(format!("{hash}.parquet"));
+    let Some(path) = safe_join(&state.data_root, &["sessions", &id, "derived", &format!("{hash}.parquet")]) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     serve_file(&path, &headers)
 }
 
@@ -402,10 +434,10 @@ async fn handle_derived_put(
         return StatusCode::NOT_FOUND.into_response();
     };
     let hash = hash.to_string();
-    if !is_valid_id(&id) {
+    if !is_valid_id(&id, IdClass::Session) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let bytes = match read_body(request.into_body()).await {
+    let bytes = match read_body(request.into_body(), MAX_RAW_FILE_BODY_BYTES).await {
         Ok(b) => b,
         Err(r) => return r,
     };
@@ -414,10 +446,12 @@ async fn handle_derived_put(
 }
 
 async fn handle_data_parquet_get(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, headers: HeaderMap) -> Response {
-    if !is_valid_id(&id) {
+    if !is_valid_id(&id, IdClass::Session) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let path = state.data_root.join("sessions").join(&id).join("data.parquet");
+    let Some(path) = safe_join(&state.data_root, &["sessions", &id, "data.parquet"]) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     serve_file(&path, &headers)
 }
 
@@ -425,10 +459,10 @@ async fn handle_data_parquet_get(State(state): State<ServerState>, AxumPath(id):
 /// route from the URL alone, so `install` refuses with its own typed
 /// error until a future task threads manifest-sourced detail through.
 async fn handle_data_parquet_put(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, request: Request) -> Response {
-    if !is_valid_id(&id) {
+    if !is_valid_id(&id, IdClass::Session) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let bytes = match read_body(request.into_body()).await {
+    let bytes = match read_body(request.into_body(), MAX_RAW_FILE_BODY_BYTES).await {
         Ok(b) => b,
         Err(r) => return r,
     };
@@ -437,18 +471,20 @@ async fn handle_data_parquet_put(State(state): State<ServerState>, AxumPath(id):
 }
 
 async fn handle_session_json_get(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, headers: HeaderMap) -> Response {
-    if !is_valid_id(&id) {
+    if !is_valid_id(&id, IdClass::Session) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let path = state.data_root.join("sessions").join(&id).join("session.json");
+    let Some(path) = safe_join(&state.data_root, &["sessions", &id, "session.json"]) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     serve_file(&path, &headers)
 }
 
 async fn handle_session_json_put(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, request: Request) -> Response {
-    if !is_valid_id(&id) {
+    if !is_valid_id(&id, IdClass::Session) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let bytes = match read_body(request.into_body()).await {
+    let bytes = match read_body(request.into_body(), MAX_DOCUMENT_BODY_BYTES).await {
         Ok(b) => b,
         Err(r) => return r,
     };
@@ -465,21 +501,23 @@ fn resolve_workbook_file_name(data_root: &Path, workbook_id: &str) -> Option<Str
 }
 
 async fn handle_workbook_get(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, headers: HeaderMap) -> Response {
-    if !is_valid_id(&id) {
+    if !is_valid_id(&id, IdClass::Uuid) {
         return StatusCode::NOT_FOUND.into_response();
     }
     let Some(file_name) = resolve_workbook_file_name(&state.data_root, &id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let path = state.data_root.join("workbooks").join(format!("{file_name}.idl1wb"));
+    let Some(path) = safe_join(&state.data_root, &["workbooks", &format!("{file_name}.idl1wb")]) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     serve_file(&path, &headers)
 }
 
 async fn handle_workbook_put(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, request: Request) -> Response {
-    if !is_valid_id(&id) {
+    if !is_valid_id(&id, IdClass::Uuid) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let bytes = match read_body(request.into_body()).await {
+    let bytes = match read_body(request.into_body(), MAX_DOCUMENT_BODY_BYTES).await {
         Ok(b) => b,
         Err(r) => return r,
     };
@@ -493,18 +531,20 @@ async fn handle_workbook_put(State(state): State<ServerState>, AxumPath(id): Axu
 }
 
 async fn handle_track_get(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, headers: HeaderMap) -> Response {
-    if !is_valid_id(&id) {
+    if !is_valid_id(&id, IdClass::Uuid) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let path = state.data_root.join("tracks").join(format!("{id}.idl0t"));
+    let Some(path) = safe_join(&state.data_root, &["tracks", &format!("{id}.idl0t")]) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     serve_file(&path, &headers)
 }
 
 async fn handle_track_put(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, request: Request) -> Response {
-    if !is_valid_id(&id) {
+    if !is_valid_id(&id, IdClass::Uuid) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let bytes = match read_body(request.into_body()).await {
+    let bytes = match read_body(request.into_body(), MAX_DOCUMENT_BODY_BYTES).await {
         Ok(b) => b,
         Err(r) => return r,
     };
@@ -513,18 +553,20 @@ async fn handle_track_put(State(state): State<ServerState>, AxumPath(id): AxumPa
 }
 
 async fn handle_profile_get(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, headers: HeaderMap) -> Response {
-    if !is_valid_id(&id) {
+    if !is_valid_id(&id, IdClass::Uuid) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let path = state.data_root.join("profiles").join(format!("{id}.idl0p"));
+    let Some(path) = safe_join(&state.data_root, &["profiles", &format!("{id}.idl0p")]) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     serve_file(&path, &headers)
 }
 
 async fn handle_profile_put(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, request: Request) -> Response {
-    if !is_valid_id(&id) {
+    if !is_valid_id(&id, IdClass::Uuid) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let bytes = match read_body(request.into_body()).await {
+    let bytes = match read_body(request.into_body(), MAX_DOCUMENT_BODY_BYTES).await {
         Ok(b) => b,
         Err(r) => return r,
     };
@@ -950,6 +992,106 @@ mod tests {
         // Assert
         assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
         assert_eq!(known_no_auth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// R100 regression: `review-task8`'s Critical. A colon-prefixed segment
+    /// (`C:evil`) is a legal, unencoded URL path segment that used to reach
+    /// `PathBuf::join` unmodified — on Windows, joining a component with a
+    /// drive prefix but no root **discards the whole base path**, landing
+    /// outside `data_root` entirely. `is_valid_id`'s `IdClass::Uuid` shape
+    /// now rejects it before any path is built.
+    #[tokio::test]
+    async fn track_get_windows_drive_relative_id_is_404_and_nothing_outside_data_root_is_read() {
+        // Arrange
+        let data_root = temp_data_root();
+        let token = "tok".to_string();
+        let (server, _peers) = start_test_server(
+            data_root.clone(),
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        // Act
+        let response = client.get(format!("{}/track/C:evil", base_url(&server))).bearer_auth(&token).send().await.unwrap();
+
+        // Assert
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// R100 regression, the brand-new-workbook write case
+    /// `review-task8` named explicitly: `handle_workbook_put`'s fallback
+    /// (`resolve_workbook_file_name(...).unwrap_or_else(|| id.clone())`)
+    /// used to thread an unvalidated `id` straight into a file name when no
+    /// local workbook existed yet — an authenticated peer could write a
+    /// file outside `data_root/workbooks/`. The id-shape check now runs
+    /// before `install` is ever called.
+    #[tokio::test]
+    async fn workbook_put_brand_new_windows_drive_relative_id_is_404_and_nothing_is_written() {
+        // Arrange
+        let data_root = temp_data_root();
+        let token = "tok".to_string();
+        let (server, _peers) = start_test_server(
+            data_root.clone(),
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        // Act
+        let response = client
+            .put(format!("{}/workbook/C:evil", base_url(&server)))
+            .bearer_auth(&token)
+            .body(b"---\nid: C:evil\nname: Evil\n---\n".to_vec())
+            .send()
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(!data_root.join("workbooks").exists() || std::fs::read_dir(data_root.join("workbooks")).unwrap().next().is_none());
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// R100 regression: `review-task8`'s Important — `read_body` used to
+    /// call `to_bytes(body, usize::MAX)`, an explicit unlimited cap despite
+    /// its own doc comment's claim otherwise. A `session.json` PUT (this
+    /// route's `MAX_DOCUMENT_BODY_BYTES`, the smaller of the two caps) over
+    /// the limit is now `413`, and nothing is written.
+    #[tokio::test]
+    async fn session_json_put_over_the_document_body_cap_is_413_and_nothing_is_written() {
+        // Arrange
+        let data_root = temp_data_root();
+        let token = "tok".to_string();
+        let (server, _peers) = start_test_server(
+            data_root.clone(),
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let session_id = "0123456789abcdef";
+        let oversized = vec![b'a'; MAX_DOCUMENT_BODY_BYTES + 1];
+
+        // Act
+        let response = client
+            .put(format!("{}/session/{session_id}/session.json", base_url(&server)))
+            .bearer_auth(&token)
+            .body(oversized)
+            .send()
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!data_root.join("sessions").join(session_id).join("session.json").exists());
 
         server.shutdown().await;
         let _ = std::fs::remove_dir_all(&data_root);

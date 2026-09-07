@@ -8,5 +8,6 @@
 pub mod apply;
 pub mod base_cache;
 pub mod diff;
+pub mod ids;
 pub mod manifest;
 pub mod session_merge;

@@ -64,9 +64,7 @@ pub fn parse_range(header: Option<&str>, len: u64) -> Result<Option<(u64, u64)>,
 
     if start_str.is_empty() {
         // "bytes=-n": the last n bytes.
-        let suffix_len: u64 = end_str
-            .parse()
-            .map_err(|_| RangeError::new(RangeErrorKind::Malformed, format!("bad suffix length: {end_str}")))?;
+        let suffix_len = parse_range_number(end_str, "suffix length")?;
         if suffix_len == 0 || len == 0 {
             return Err(RangeError::new(RangeErrorKind::Unsatisfiable, "suffix range on an empty resource"));
         }
@@ -74,9 +72,7 @@ pub fn parse_range(header: Option<&str>, len: u64) -> Result<Option<(u64, u64)>,
         return Ok(Some((start, len - 1)));
     }
 
-    let start: u64 = start_str
-        .parse()
-        .map_err(|_| RangeError::new(RangeErrorKind::Malformed, format!("bad start: {start_str}")))?;
+    let start = parse_range_number(start_str, "start")?;
 
     if start >= len {
         return Err(RangeError::new(
@@ -88,9 +84,7 @@ pub fn parse_range(header: Option<&str>, len: u64) -> Result<Option<(u64, u64)>,
     let end = if end_str.is_empty() {
         len - 1
     } else {
-        let end: u64 = end_str
-            .parse()
-            .map_err(|_| RangeError::new(RangeErrorKind::Malformed, format!("bad end: {end_str}")))?;
+        let end = parse_range_number(end_str, "end")?;
         if end < start {
             return Err(RangeError::new(RangeErrorKind::Malformed, format!("end {end} precedes start {start}")));
         }
@@ -98,6 +92,22 @@ pub fn parse_range(header: Option<&str>, len: u64) -> Result<Option<(u64, u64)>,
     };
 
     Ok(Some((start, end)))
+}
+
+/// Parses one `Range` numeric field (`start`, `end`, or a suffix length) as
+/// `u64`. A value that fails to parse *because it overflows `u64`* is
+/// [`RangeErrorKind::Unsatisfiable`], not [`RangeErrorKind::Malformed`]
+/// (review-task8 Minor / R100): every number this large is, by
+/// construction, at or past any real resource's length, so it is the same
+/// class of error as "start past the end" — `416`, not `400`. Any other
+/// parse failure (non-numeric, empty) stays `Malformed` — `400`.
+fn parse_range_number(s: &str, what: &str) -> Result<u64, RangeError> {
+    s.parse::<u64>().map_err(|e| match e.kind() {
+        std::num::IntErrorKind::PosOverflow => {
+            RangeError::new(RangeErrorKind::Unsatisfiable, format!("{what} {s} overflows u64, unsatisfiable by any real resource"))
+        }
+        _ => RangeError::new(RangeErrorKind::Malformed, format!("bad {what}: {s}")),
+    })
 }
 
 #[cfg(test)]
@@ -186,6 +196,30 @@ mod tests {
 
         // Assert
         assert_eq!(result.unwrap_err().kind, RangeErrorKind::Malformed);
+    }
+
+    #[test]
+    fn parse_range_a_start_that_overflows_u64_is_unsatisfiable_not_malformed() {
+        // Arrange: R100 / review-task8 Minor — this exact example.
+        let header = Some("bytes=0-99999999999999999999");
+
+        // Act
+        let result = parse_range(header, 10);
+
+        // Assert
+        assert_eq!(result.unwrap_err().kind, RangeErrorKind::Unsatisfiable);
+    }
+
+    #[test]
+    fn parse_range_a_suffix_length_that_overflows_u64_is_unsatisfiable_not_malformed() {
+        // Arrange
+        let header = Some("bytes=-99999999999999999999");
+
+        // Act
+        let result = parse_range(header, 10);
+
+        // Assert
+        assert_eq!(result.unwrap_err().kind, RangeErrorKind::Unsatisfiable);
     }
 
     #[test]

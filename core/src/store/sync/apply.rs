@@ -33,6 +33,7 @@ use crate::store::session_json::{
 };
 use crate::store::sync::base_cache;
 use crate::store::sync::diff::{SyncClass, SyncItem};
+use crate::store::sync::ids::{is_valid_id, safe_join, IdClass};
 use crate::store::sync::manifest::{SyncError, SyncErrorKind};
 use crate::store::sync::session_merge::merge_session_json;
 use crate::track_artifact::model::Track;
@@ -106,6 +107,25 @@ fn malformed(message: impl Into<String>) -> SyncError {
     SyncError { kind: SyncErrorKind::Malformed, message: message.into() }
 }
 
+/// Validates `id` against `class`'s shape (R100) and returns it, or a typed
+/// `Malformed` error naming which id-addressed field failed — this
+/// function's callers build a filesystem path from `id` immediately
+/// afterwards, so an id that reaches [`safe_join`] here has already passed
+/// the allow-list shape check (belt and braces: [`safe_join`] itself still
+/// re-checks the resulting path independently, see its own doc comment).
+fn validated_id<'a>(id: &'a str, class: IdClass, what: &str) -> Result<&'a str, SyncError> {
+    is_valid_id(id, class).then_some(id).ok_or_else(|| malformed(format!("{what}: id {id:?} is not a valid {class:?}")))
+}
+
+/// [`safe_join`] wrapped as a typed `SyncError` for this module's
+/// `Result`-returning install functions (R100's post-join guard — see
+/// `safe_join`'s own doc comment for why this check exists independently
+/// of `validated_id`).
+fn joined_or_err(data_root: &Path, segments: &[&str]) -> Result<PathBuf, SyncError> {
+    safe_join(data_root, segments)
+        .ok_or_else(|| malformed(format!("path {segments:?} would land outside data_root")))
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test-only hook for the `session.json`/workbook write paths: fired
@@ -171,7 +191,8 @@ fn install_derived(data_root: &Path, item: &SyncItem, bytes: &[u8]) -> Result<In
         return Err(malformed(format!("derived: requested {}, received bytes hash to {digest}", item.key)));
     }
     let session_id = item.session_id.as_deref().ok_or_else(|| malformed("derived: item has no session_id"))?;
-    let path = data_root.join("sessions").join(session_id).join("derived").join(format!("{digest}.parquet"));
+    let session_id = validated_id(session_id, IdClass::Session, "derived")?;
+    let path = joined_or_err(data_root, &["sessions", session_id, "derived", &format!("{digest}.parquet")])?;
     if path.is_file() {
         return Ok(InstallOutcome::Installed);
     }
@@ -207,6 +228,7 @@ fn read_data_parquet_versions_from_bytes(data_root: &Path, bytes: &[u8]) -> Opti
 /// the atomic primitive, bytes as-is (never regenerated, C4 §6/C1 §4.3).
 fn install_data_parquet(data_root: &Path, item: &SyncItem, bytes: &[u8], ctx: &InstallContext) -> Result<InstallOutcome, SyncError> {
     let session_id = item.session_id.as_deref().ok_or_else(|| malformed("data.parquet: item has no session_id"))?;
+    let session_id = validated_id(session_id, IdClass::Session, "data.parquet")?;
     let Some(claimed) = &ctx.claimed_data_parquet_versions else {
         return Err(malformed("data.parquet: install called with no claimed version pair in InstallContext"));
     };
@@ -217,7 +239,7 @@ fn install_data_parquet(data_root: &Path, item: &SyncItem, bytes: &[u8], ctx: &I
             "data.parquet: manifest claimed {claimed:?}, received bytes carry {actual:?}"
         )));
     }
-    let target = data_root.join("sessions").join(session_id).join("data.parquet");
+    let target = joined_or_err(data_root, &["sessions", session_id, "data.parquet"])?;
     let based_on = std::fs::read(&target).ok().map(|b| sha256_hex(&b));
     write_atomic_with_retry(data_root, &target, bytes, based_on.as_deref(), |_current| bytes.to_vec())?;
     Ok(InstallOutcome::Installed)
@@ -233,7 +255,8 @@ fn install_data_parquet(data_root: &Path, item: &SyncItem, bytes: &[u8], ctx: &I
 /// re-merged, not silently lost to a bare conflict error.
 fn install_session_json(data_root: &Path, item: &SyncItem, bytes: &[u8], ctx: &InstallContext) -> Result<InstallOutcome, SyncError> {
     let session_id = item.session_id.as_deref().ok_or_else(|| malformed("session.json: item has no session_id"))?;
-    let target = data_root.join("sessions").join(session_id).join("session.json");
+    let session_id = validated_id(session_id, IdClass::Session, "session.json")?;
+    let target = joined_or_err(data_root, &["sessions", session_id, "session.json"])?;
 
     let (local_doc, local_updated_at_ms, based_on_hash) = match std::fs::metadata(&target) {
         Ok(meta) => {
@@ -341,7 +364,7 @@ fn empty_workbook_doc(workbook_id: &str) -> WorkbookDoc {
 /// [`rederive_workbook_write`] against the freshly re-read bytes, rather
 /// than surfacing a bare conflict and dropping the race loser's edit.
 fn install_workbook(data_root: &Path, item: &SyncItem, bytes: &[u8], peer_name: &str, ctx: &InstallContext) -> Result<InstallOutcome, SyncError> {
-    let workbook_id = &item.key;
+    let workbook_id = validated_id(&item.key, IdClass::Uuid, "workbook")?;
     let peer_text = std::str::from_utf8(bytes).map_err(|e| malformed(format!("workbook: not valid UTF-8: {e}")))?;
     let (peer_doc, _errors) = parse_workbook(peer_text).map_err(|errs| malformed(format!("workbook: peer bytes do not parse: {errs:?}")))?;
 
@@ -354,7 +377,12 @@ fn install_workbook(data_root: &Path, item: &SyncItem, bytes: &[u8], peer_name: 
                 .peer_workbook_file_name
                 .as_deref()
                 .ok_or_else(|| malformed("workbook: install called with no peer_workbook_file_name in InstallContext"))?;
-            let target = data_root.join("workbooks").join(format!("{file_name}.idl1wb"));
+            // `file_name` is free-text (the workbook's display name, not an
+            // id shape), so it is not checked against `is_valid_id` — the
+            // post-join guard (R100 belt-and-braces) is this path's only
+            // defence, and it is sufficient regardless of `file_name`'s
+            // content.
+            let target = joined_or_err(data_root, &["workbooks", &format!("{file_name}.idl1wb")])?;
 
             let outcome = std::cell::Cell::new(InstallOutcome::Installed);
             let last_written = std::cell::RefCell::new(bytes.to_vec());
@@ -379,7 +407,9 @@ fn install_workbook(data_root: &Path, item: &SyncItem, bytes: &[u8], peer_name: 
 
             let local_file_name = local_path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
             let target_file_name = ctx.peer_workbook_file_name.clone().unwrap_or(local_file_name.clone());
-            let target_path = data_root.join("workbooks").join(format!("{target_file_name}.idl1wb"));
+            // See the first-sync branch above: `target_file_name` is
+            // free-text, so the post-join guard is the defence here too.
+            let target_path = joined_or_err(data_root, &["workbooks", &format!("{target_file_name}.idl1wb")])?;
 
             let based_on_hash = if target_path == local_path { Some(sha256_hex(&local_bytes)) } else { None };
 
@@ -439,7 +469,8 @@ fn rederive_workbook_write(data_root: &Path, workbook_id: &str, peer_doc: &Workb
 /// between the manifest fetch and this file's fetch).
 fn install_track(data_root: &Path, bytes: &[u8]) -> Result<InstallOutcome, SyncError> {
     let peer: Track = parse_track(bytes).map_err(|e| malformed(format!("track: {e}")))?;
-    let path = data_root.join("tracks").join(format!("{}.idl0t", peer.id));
+    let track_id = validated_id(&peer.id, IdClass::Uuid, "track")?;
+    let path = joined_or_err(data_root, &["tracks", &format!("{track_id}.idl0t")])?;
     let local_updated_at_ms = crate::track_artifact::read::read_track(&path).ok().map(|t| t.updated_at_ms);
 
     if let Some(local_ms) = local_updated_at_ms {
@@ -455,7 +486,8 @@ fn install_track(data_root: &Path, bytes: &[u8]) -> Result<InstallOutcome, SyncE
 /// ruling R6/R88).
 fn install_profile(data_root: &Path, bytes: &[u8]) -> Result<InstallOutcome, SyncError> {
     let peer: BikeProfile = serde_json::from_slice(bytes).map_err(|e| malformed(format!("profile: {e}")))?;
-    let path = data_root.join("profiles").join(format!("{}.idl0p", peer.profile_id));
+    let profile_id = validated_id(&peer.profile_id, IdClass::Uuid, "profile")?;
+    let path = joined_or_err(data_root, &["profiles", &format!("{profile_id}.idl0p")])?;
     let local_updated_at_ms =
         std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<BikeProfile>(&b).ok()).map(|p| p.updated_at_ms);
 
@@ -527,14 +559,14 @@ mod tests {
         let root = temp_root();
         let bytes = b"anything at all";
         let digest = sha256_hex(bytes);
-        let item = SyncItem { class: SyncClass::Derived, key: digest.clone(), session_id: Some("s1".to_string()), size_bytes: bytes.len() as u64 };
+        let item = SyncItem { class: SyncClass::Derived, key: digest.clone(), session_id: Some("0123456789abcdef".to_string()), size_bytes: bytes.len() as u64 };
 
         // Act
         let outcome = install(&root, &item, bytes, "peer-laptop", 1000, &InstallContext::default()).unwrap();
 
         // Assert
         assert_eq!(outcome, InstallOutcome::Installed);
-        assert_eq!(std::fs::read(root.join("sessions").join("s1").join("derived").join(format!("{digest}.parquet"))).unwrap(), bytes);
+        assert_eq!(std::fs::read(root.join("sessions").join("0123456789abcdef").join("derived").join(format!("{digest}.parquet"))).unwrap(), bytes);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -571,7 +603,7 @@ mod tests {
         let scratch = root.join("scratch.parquet");
         std::fs::create_dir_all(&root).unwrap();
         let bytes = write_test_parquet(&scratch, "0.2.0", "v1");
-        let item = SyncItem { class: SyncClass::DataParquet, key: "s1".to_string(), session_id: Some("s1".to_string()), size_bytes: bytes.len() as u64 };
+        let item = SyncItem { class: SyncClass::DataParquet, key: "0123456789abcdef".to_string(), session_id: Some("0123456789abcdef".to_string()), size_bytes: bytes.len() as u64 };
         let ctx = InstallContext { claimed_data_parquet_versions: Some(("0.9.0".to_string(), "v9".to_string())), ..Default::default() };
 
         // Act
@@ -579,7 +611,7 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, SyncErrorKind::Malformed);
-        assert!(!root.join("sessions").join("s1").join("data.parquet").exists());
+        assert!(!root.join("sessions").join("0123456789abcdef").join("data.parquet").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -591,7 +623,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let scratch = root.join("scratch.parquet");
         let bytes = write_test_parquet(&scratch, "0.2.0", "v1");
-        let item = SyncItem { class: SyncClass::DataParquet, key: "s1".to_string(), session_id: Some("s1".to_string()), size_bytes: bytes.len() as u64 };
+        let item = SyncItem { class: SyncClass::DataParquet, key: "0123456789abcdef".to_string(), session_id: Some("0123456789abcdef".to_string()), size_bytes: bytes.len() as u64 };
         let ctx = InstallContext { claimed_data_parquet_versions: Some(("0.2.0".to_string(), "v1".to_string())), ..Default::default() };
 
         // Act
@@ -599,7 +631,7 @@ mod tests {
 
         // Assert
         assert_eq!(outcome, InstallOutcome::Installed);
-        assert_eq!(std::fs::read(root.join("sessions").join("s1").join("data.parquet")).unwrap(), bytes);
+        assert_eq!(std::fs::read(root.join("sessions").join("0123456789abcdef").join("data.parquet")).unwrap(), bytes);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -765,18 +797,18 @@ mod tests {
     fn install_session_json_a_concurrent_local_edit_lands_between_read_and_write_the_remerged_result_contains_both_changes() {
         // Arrange
         let root = temp_root();
-        let mut initial_local = empty_session_json("s1");
+        let mut initial_local = empty_session_json("0123456789abcdef");
         initial_local.venue_name = "Whistler".to_string();
-        crate::store::session_json::write_session_json(&root, "s1", &initial_local, None).unwrap();
-        let target = root.join("sessions").join("s1").join("session.json");
+        crate::store::session_json::write_session_json(&root, "0123456789abcdef", &initial_local, None).unwrap();
+        let target = root.join("sessions").join("0123456789abcdef").join("session.json");
 
-        let mut peer = empty_session_json("s1");
+        let mut peer = empty_session_json("0123456789abcdef");
         peer.rider = "Isaac".to_string();
         let peer_bytes = serde_json::to_vec(&peer).unwrap();
 
         // A local edit (adds `bike`) lands on `session.json` between
         // `install_session_json`'s read and its write.
-        let mut concurrent_local = empty_session_json("s1");
+        let mut concurrent_local = empty_session_json("0123456789abcdef");
         concurrent_local.venue_name = "Whistler".to_string();
         concurrent_local.bike = "Trek".to_string();
         let fired = std::cell::Cell::new(false);
@@ -788,7 +820,7 @@ mod tests {
             }
         });
 
-        let item = SyncItem { class: SyncClass::SessionJson, key: "s1".to_string(), session_id: Some("s1".to_string()), size_bytes: peer_bytes.len() as u64 };
+        let item = SyncItem { class: SyncClass::SessionJson, key: "0123456789abcdef".to_string(), session_id: Some("0123456789abcdef".to_string()), size_bytes: peer_bytes.len() as u64 };
         let ctx = InstallContext { peer_session_json_updated_at_ms: Some(1000), ..Default::default() };
 
         // Act
@@ -812,11 +844,11 @@ mod tests {
     fn install_session_json_a_persistent_racer_exhausts_retries_typed_error_surfaced() {
         // Arrange
         let root = temp_root();
-        let initial_local = empty_session_json("s1");
-        crate::store::session_json::write_session_json(&root, "s1", &initial_local, None).unwrap();
-        let target = root.join("sessions").join("s1").join("session.json");
+        let initial_local = empty_session_json("0123456789abcdef");
+        crate::store::session_json::write_session_json(&root, "0123456789abcdef", &initial_local, None).unwrap();
+        let target = root.join("sessions").join("0123456789abcdef").join("session.json");
 
-        let mut peer = empty_session_json("s1");
+        let mut peer = empty_session_json("0123456789abcdef");
         peer.rider = "Isaac".to_string();
         let peer_bytes = serde_json::to_vec(&peer).unwrap();
 
@@ -825,12 +857,12 @@ mod tests {
         set_race_hook(move || {
             let n = racer_calls.get() + 1;
             racer_calls.set(n);
-            let mut doc = empty_session_json("s1");
+            let mut doc = empty_session_json("0123456789abcdef");
             doc.bike = format!("racer-{n}");
             std::fs::write(&hook_target, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
         });
 
-        let item = SyncItem { class: SyncClass::SessionJson, key: "s1".to_string(), session_id: Some("s1".to_string()), size_bytes: peer_bytes.len() as u64 };
+        let item = SyncItem { class: SyncClass::SessionJson, key: "0123456789abcdef".to_string(), session_id: Some("0123456789abcdef".to_string()), size_bytes: peer_bytes.len() as u64 };
         let ctx = InstallContext { peer_session_json_updated_at_ms: Some(1000), ..Default::default() };
 
         // Act
@@ -859,7 +891,7 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, SyncErrorKind::Malformed);
-        assert!(!root.join("tracks").join("t-1.idl0t").exists());
+        assert!(!root.join("tracks").join(format!("{TRACK_ID}.idl0t")).exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -881,6 +913,11 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// A UUID (R100 — `IdClass::Uuid` shape) for track-id test fixtures;
+    /// the old plain `"t-1"` fixture no longer passes `install_track`'s
+    /// id validation.
+    const TRACK_ID: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 
     fn sample_track(id: &str, updated_at_ms: i64) -> Track {
         Track {
@@ -905,9 +942,9 @@ mod tests {
     fn install_a_track_older_than_local_keptlocal_the_file_unchanged() {
         // Arrange
         let root = temp_root();
-        let local = sample_track("t-1", 100);
+        let local = sample_track(TRACK_ID, 100);
         write_track(&root, &local).unwrap();
-        let peer = sample_track("t-1", 50);
+        let peer = sample_track(TRACK_ID, 50);
         let bytes = track_bytes(&peer);
         let item = SyncItem { class: SyncClass::Track, key: "t-1".to_string(), session_id: None, size_bytes: bytes.len() as u64 };
 
@@ -916,7 +953,7 @@ mod tests {
 
         // Assert
         assert_eq!(outcome, InstallOutcome::KeptLocal);
-        let back = crate::track_artifact::read::read_track(&root.join("tracks").join("t-1.idl0t")).unwrap();
+        let back = crate::track_artifact::read::read_track(&root.join("tracks").join(format!("{TRACK_ID}.idl0t"))).unwrap();
         assert_eq!(back.updated_at_ms, 100);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -926,9 +963,9 @@ mod tests {
     fn install_a_track_newer_than_local_installed() {
         // Arrange
         let root = temp_root();
-        let local = sample_track("t-1", 50);
+        let local = sample_track(TRACK_ID, 50);
         write_track(&root, &local).unwrap();
-        let peer = sample_track("t-1", 100);
+        let peer = sample_track(TRACK_ID, 100);
         let bytes = track_bytes(&peer);
         let item = SyncItem { class: SyncClass::Track, key: "t-1".to_string(), session_id: None, size_bytes: bytes.len() as u64 };
 
@@ -937,7 +974,7 @@ mod tests {
 
         // Assert
         assert_eq!(outcome, InstallOutcome::Installed);
-        let back = crate::track_artifact::read::read_track(&root.join("tracks").join("t-1.idl0t")).unwrap();
+        let back = crate::track_artifact::read::read_track(&root.join("tracks").join(format!("{TRACK_ID}.idl0t"))).unwrap();
         assert_eq!(back.updated_at_ms, 100);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -954,10 +991,10 @@ mod tests {
         let scratch = root.join("scratch.parquet");
         std::fs::create_dir_all(&root).unwrap();
         let dp_bytes = write_test_parquet(&scratch, "0.1.0", "v1");
-        let dp_item = SyncItem { class: SyncClass::DataParquet, key: "s1".to_string(), session_id: Some("s1".to_string()), size_bytes: dp_bytes.len() as u64 };
+        let dp_item = SyncItem { class: SyncClass::DataParquet, key: "0123456789abcdef".to_string(), session_id: Some("0123456789abcdef".to_string()), size_bytes: dp_bytes.len() as u64 };
         let dp_ctx = InstallContext { claimed_data_parquet_versions: Some(("0.1.0".to_string(), "v1".to_string())), ..Default::default() };
 
-        let track = sample_track("t-1", 100);
+        let track = sample_track(TRACK_ID, 100);
         let track_bytes_v = track_bytes(&track);
         let track_item = SyncItem { class: SyncClass::Track, key: "t-1".to_string(), session_id: None, size_bytes: track_bytes_v.len() as u64 };
 
