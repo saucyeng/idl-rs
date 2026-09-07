@@ -23,7 +23,7 @@ use idl_rs::store::sync::manifest::{build_manifest, Manifest};
 use crate::error::{TransportError, TransportErrorKind};
 use crate::wifi_transport::{parse_content_range, range_header};
 
-use super::wire::{Peer, PROTOCOL_VERSION};
+use super::wire::{PairRequest, PairResponse, Peer, PROTOCOL_VERSION};
 
 /// What one sync run did (C3 §3.9's `SyncResult`, plus what the command
 /// layer needs to report honestly — this task's brief interface). Every
@@ -49,7 +49,15 @@ pub struct SyncRunResult {
     pub conflicts: u32,
     /// Distinct session ids that had at least one successful `data.parquet`,
     /// derived-channel, or `session.json` transfer this run (pull or push).
+    /// Always `sessions_touched.len()` — the two fields can never disagree.
     pub sessions_updated: u32,
+    /// The session ids counted by [`Self::sessions_updated`], sorted. A
+    /// Rust-side detail only (lead ruling R104 addendum): the tauri command
+    /// layer walks this to call `idl_rs::store::catalog::index_session` per
+    /// id (mirroring `rescan_tracks_via`'s own per-session, non-rebuild
+    /// re-index) — it is never forwarded to the frontend; C3 §3.9's
+    /// `SyncResult` wire shape is unchanged by this field.
+    pub sessions_touched: Vec<String>,
     /// Successful `SyncClass::Track` transfers, pull and push combined.
     pub tracks_updated: u32,
     /// Successful `SyncClass::Profile` transfers, pull and push combined.
@@ -225,6 +233,7 @@ pub async fn sync_with_peer(
     }
 
     result.sessions_updated = sessions_touched.len() as u32;
+    result.sessions_touched = sessions_touched.into_iter().collect(); // BTreeSet -> already sorted
     Ok(result)
 }
 
@@ -247,6 +256,41 @@ async fn fetch_manifest(client: &reqwest::Client, base_url: &str, token: &str) -
     }
     let bytes = bounded_bytes(response, MAX_DOCUMENT_BODY_BYTES, "GET /manifest").await?;
     serde_json::from_slice::<Manifest>(&bytes).map_err(|e| sync_error(format!("GET /manifest returned malformed JSON: {e}")))
+}
+
+/// `POST /idl1/v1/pair` (PLAN §3) — the *initiating* side of pairing:
+/// redeems `request.code` against the peer at `addr`, which must be the
+/// peer that is currently displaying/offering that code (ruling R104: the
+/// caller resolves `addr` from a specific chosen [`super::DiscoveredPeer`],
+/// never guessed or broadcast to every peer on the LAN). Unauthenticated —
+/// this is the one route with no bearer token (PLAN §3) — so this function
+/// takes no `token` argument, unlike [`fetch_manifest`]'s sibling calls.
+/// Builds its own short-lived `reqwest::Client`, mirroring
+/// [`sync_with_peer`]'s own top-level entry point rather than taking one as
+/// a parameter, so no caller outside this crate ever needs a `reqwest`
+/// dependency of its own (CLAUDE.md §2 — the wire stays in `idl-transport`).
+///
+/// A non-success status (malformed request body, wrong/expired code, a
+/// protocol mismatch the peer's own `check_protocol_version` rejected) or
+/// an over-cap/malformed response body is a typed [`TransportError`],
+/// naming the status when the server supplied one.
+pub async fn pair_with_peer(addr: SocketAddr, request: &PairRequest) -> Result<PairResponse, TransportError> {
+    let client = reqwest::Client::new();
+    let base_url = format!("http://{addr}/idl1/v1");
+
+    let response = client
+        .post(format!("{base_url}/pair"))
+        .json(request)
+        .send()
+        .await
+        .map_err(|e| sync_error(format!("POST /pair failed: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(sync_error(format!("POST /pair returned status {status}: {body}")));
+    }
+    let bytes = bounded_bytes(response, MAX_DOCUMENT_BODY_BYTES, "POST /pair").await?;
+    serde_json::from_slice::<PairResponse>(&bytes).map_err(|e| sync_error(format!("POST /pair returned malformed JSON: {e}")))
 }
 
 /// Runs one planned action, tallying its outcome into `result`/
@@ -607,6 +651,97 @@ mod tests {
     }
 
     fn no_progress(_p: SyncProgress) {}
+
+    /// Milliseconds since the Unix epoch — this test module's own copy of
+    /// the same clock read `server.rs`'s tests keep locally, needed because
+    /// `handle_pair` redeems against real wall-clock time, so a minted
+    /// offer must be comparable to it.
+    fn test_now_ms() -> i64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn pair_with_peer_a_correct_code_returns_the_offering_peers_identity_and_a_token() {
+        // Arrange
+        let data_root = temp_data_root();
+        let pairing = Arc::new(Mutex::new(PairingState::default()));
+        let offer = pairing.lock().unwrap().offer(test_now_ms());
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let config = SyncServerConfig {
+            data_root: data_root.clone(),
+            port: 0,
+            bind_addr: Ipv4Addr::LOCALHOST.into(),
+            peer_id: "offering-peer".to_string(),
+            name: "Pit Laptop".to_string(),
+        };
+        let server = SyncServer::start(config, pairing, peers).await.unwrap();
+        let addr = server.local_addr();
+        let request = PairRequest { code: offer.code, peer_id: "requesting-peer".to_string(), name: "Pit Tablet".to_string(), protocol_version: PROTOCOL_VERSION };
+
+        // Act
+        let response = pair_with_peer(addr, &request).await;
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&data_root);
+
+        // Assert
+        let response = response.unwrap();
+        assert_eq!(response.peer_id, "offering-peer");
+        assert_eq!(response.name, "Pit Laptop");
+        assert_eq!(response.protocol_version, PROTOCOL_VERSION);
+        assert!(!response.token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pair_with_peer_a_wrong_code_is_a_sync_error_no_token_returned() {
+        // Arrange
+        let data_root = temp_data_root();
+        let pairing = Arc::new(Mutex::new(PairingState::default()));
+        let offer = pairing.lock().unwrap().offer(test_now_ms());
+        let wrong_code = if offer.code == "000000" { "111111".to_string() } else { "000000".to_string() };
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let config = SyncServerConfig {
+            data_root: data_root.clone(),
+            port: 0,
+            bind_addr: Ipv4Addr::LOCALHOST.into(),
+            peer_id: "offering-peer".to_string(),
+            name: "Pit Laptop".to_string(),
+        };
+        let server = SyncServer::start(config, pairing, peers).await.unwrap();
+        let addr = server.local_addr();
+        let request = PairRequest { code: wrong_code, peer_id: "requesting-peer".to_string(), name: "Pit Tablet".to_string(), protocol_version: PROTOCOL_VERSION };
+
+        // Act
+        let result = pair_with_peer(addr, &request).await;
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&data_root);
+
+        // Assert
+        assert_eq!(result.unwrap_err().kind, TransportErrorKind::Sync);
+    }
+
+    #[test]
+    fn tally_success_two_session_scoped_items_for_the_same_session_sessions_touched_names_it_once() {
+        // Arrange — R104 addendum: `SyncRunResult::sessions_touched` is the
+        // id set `sessions_updated`'s count was always derived from,
+        // exposed so `sync_now` can re-index exactly the sessions a run
+        // touched rather than rebuilding the whole catalog.
+        let mut result = SyncRunResult::default();
+        let mut sessions_touched = BTreeSet::new();
+        let data_parquet = SyncItem { class: SyncClass::DataParquet, key: "k".to_string(), session_id: Some("session-a".to_string()), size_bytes: 0 };
+        let session_json = SyncItem { class: SyncClass::SessionJson, key: "session-a".to_string(), session_id: Some("session-a".to_string()), size_bytes: 0 };
+
+        // Act
+        tally_success(&data_parquet, true, None, &mut result, &mut sessions_touched);
+        tally_success(&session_json, true, None, &mut result, &mut sessions_touched);
+        result.sessions_updated = sessions_touched.len() as u32;
+        result.sessions_touched = sessions_touched.into_iter().collect();
+
+        // Assert
+        assert_eq!(result.sessions_updated, 1);
+        assert_eq!(result.sessions_touched, vec!["session-a".to_string()]);
+    }
 
     #[tokio::test]
     async fn sync_with_peer_a_blob_only_on_the_peer_pulled_verified_counted() {

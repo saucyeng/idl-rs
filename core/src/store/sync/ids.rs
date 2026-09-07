@@ -110,6 +110,22 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 /// both sides are lexically normalised). `None` on escape; the caller
 /// answers `404`, never `403` (R100 — nothing about what exists outside
 /// `data_root` should leak).
+///
+/// **Boundary (ruling R101, amending R100's "canonicalised" wording):**
+/// this check is lexical, not filesystem-canonicalised, and that is
+/// intentional — a canonicalising guard needs its target to exist, which a
+/// create path's target does not yet, and would either be skipped exactly
+/// where a new file is written or need a fragile parent-walk. This means
+/// `safe_join` does **not** defend against a symlink or junction already
+/// present *inside* `data_root` that itself points outside it: a segment
+/// that lexically stays under `data_root` can still resolve, at the
+/// filesystem level, to a target elsewhere. That threat requires an
+/// attacker who can already create a link inside the user's data
+/// directory — at which point they have local write access and this sync
+/// server is not the weak point. The case is *detected*, not defended
+/// against: `verify_data_dir` (C4 §7) gains a finding for a symlink or
+/// junction found inside the data directory (an L8-class follow-on, not
+/// this lane's work).
 pub fn safe_join(data_root: &Path, segments: &[&str]) -> Option<PathBuf> {
     let mut joined = data_root.to_path_buf();
     for segment in segments {

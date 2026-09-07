@@ -272,12 +272,22 @@ fn install_session_json(data_root: &Path, item: &SyncItem, bytes: &[u8], ctx: &I
     let merged = merge_session_json(&local_doc, &peer_doc, local_updated_at_ms, peer_updated_at_ms);
     let merged_bytes = serde_json::to_vec_pretty(&merged).map_err(|e| malformed(format!("session.json: serialize merged result: {e}")))?;
 
+    // `outcome` starts `Installed` (the common, no-conflict case) and is
+    // only ever revised to `KeptLocal` by `rederive_session_json_write`'s
+    // own parse-failure fallback below — mirrors `install_workbook`'s
+    // identical `Cell` pattern (this module, workbook branch) rather than
+    // this call site's own previous shortcut of always reporting
+    // `Installed` regardless of what the retry loop actually did (L11 Task
+    // 6 fix re-review Minor, folded into Task 12's sweep).
+    let outcome = std::cell::Cell::new(InstallOutcome::Installed);
     #[cfg(test)]
     fire_sync_race_hook();
     write_atomic_with_retry(data_root, &target, &merged_bytes, based_on_hash.as_deref(), |current| {
-        rederive_session_json_write(&peer_doc, peer_updated_at_ms, current)
+        let (next_bytes, next_outcome) = rederive_session_json_write(&peer_doc, peer_updated_at_ms, current);
+        outcome.set(next_outcome);
+        next_bytes
     })?;
-    Ok(InstallOutcome::Installed)
+    Ok(outcome.into_inner())
 }
 
 /// Re-runs [`merge_session_json`] against `current` — the freshly re-read
@@ -288,15 +298,18 @@ fn install_session_json(data_root: &Path, item: &SyncItem, bytes: &[u8], ctx: &I
 /// this treats the moment of the retry as "now" for the tiebreak — the same
 /// approximation `install`'s own `_now_ms` parameter exists for. Malformed
 /// `current` bytes (should not happen for a file this module itself last
-/// wrote) fall back to leaving `current` untouched rather than losing data.
-fn rederive_session_json_write(peer_doc: &SessionJson, peer_updated_at_ms: i64, current: &[u8]) -> Vec<u8> {
+/// wrote) fall back to leaving `current` untouched, reporting `KeptLocal`
+/// rather than the caller's default `Installed` (L11 Task 6 fix re-review
+/// Minor) — nothing was actually written for this retry attempt.
+fn rederive_session_json_write(peer_doc: &SessionJson, peer_updated_at_ms: i64, current: &[u8]) -> (Vec<u8>, InstallOutcome) {
     #[cfg(test)]
     fire_sync_race_hook();
-    let Ok(current_doc) = parse_session_json(current) else { return current.to_vec() };
+    let Ok(current_doc) = parse_session_json(current) else { return (current.to_vec(), InstallOutcome::KeptLocal) };
     let current_updated_at_ms =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
     let remerged = merge_session_json(&current_doc, peer_doc, current_updated_at_ms, peer_updated_at_ms);
-    serde_json::to_vec_pretty(&remerged).unwrap_or_else(|_| current.to_vec())
+    let bytes = serde_json::to_vec_pretty(&remerged).unwrap_or_else(|_| current.to_vec());
+    (bytes, InstallOutcome::Installed)
 }
 
 /// Last-modified time of `meta`, milliseconds since the Unix epoch — same
@@ -836,6 +849,48 @@ mod tests {
         assert_eq!(merged.rider, "Isaac");
         assert_eq!(merged.venue_name, "Whistler");
         assert_eq!(merged.bike, "Trek");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_session_json_a_concurrent_write_corrupts_the_file_the_race_window_keptlocal_not_installed() {
+        // Arrange — L11 Task 6 fix re-review Minor: the rederive fallback
+        // for malformed `current` bytes must report `KeptLocal` (nothing
+        // was actually written this retry attempt), not the previous
+        // hardcoded `Installed`.
+        let root = temp_root();
+        let initial_local = empty_session_json("0123456789abcdef");
+        crate::store::session_json::write_session_json(&root, "0123456789abcdef", &initial_local, None).unwrap();
+        let target = root.join("sessions").join("0123456789abcdef").join("session.json");
+
+        let mut peer = empty_session_json("0123456789abcdef");
+        peer.rider = "Isaac".to_string();
+        let peer_bytes = serde_json::to_vec(&peer).unwrap();
+
+        // A concurrent write lands between the initial read and the write,
+        // and leaves behind bytes that do not parse as `session.json` —
+        // the retry's re-read sees this corrupt content.
+        let fired = std::cell::Cell::new(false);
+        let hook_target = target.clone();
+        set_race_hook(move || {
+            if !fired.get() {
+                fired.set(true);
+                std::fs::write(&hook_target, b"not valid session.json").unwrap();
+            }
+        });
+
+        let item = SyncItem { class: SyncClass::SessionJson, key: "0123456789abcdef".to_string(), session_id: Some("0123456789abcdef".to_string()), size_bytes: peer_bytes.len() as u64 };
+        let ctx = InstallContext { peer_session_json_updated_at_ms: Some(1000), ..Default::default() };
+
+        // Act
+        let outcome = install(&root, &item, &peer_bytes, "peer-laptop", 1000, &ctx);
+        clear_race_hook();
+
+        // Assert — the corrupt bytes are left untouched, and the outcome
+        // says so rather than claiming a write that never happened.
+        assert_eq!(outcome.unwrap(), InstallOutcome::KeptLocal);
+        assert_eq!(std::fs::read(&target).unwrap(), b"not valid session.json");
 
         let _ = std::fs::remove_dir_all(&root);
     }

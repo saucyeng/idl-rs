@@ -12,7 +12,7 @@ pub mod range;
 pub mod server;
 pub mod wire;
 
-pub use client::{sync_with_peer, SyncProgress, SyncRunResult};
+pub use client::{pair_with_peer, sync_with_peer, SyncProgress, SyncRunResult};
 pub use discovery::{advertise, browse, build_txt, parse_txt, Advertisement, DiscoveredPeer, SERVICE_TYPE};
 pub use pairing::{check_protocol_version, load_peers, save_peers, PairingState, MAX_ATTEMPTS, PAIRING_TTL_MS};
 pub use range::{parse_range, RangeError, RangeErrorKind};
