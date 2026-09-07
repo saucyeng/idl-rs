@@ -5,6 +5,8 @@
 
 pub mod client;
 pub mod discovery;
+#[cfg(test)]
+mod loopback_tests;
 pub mod pairing;
 pub mod range;
 pub mod server;
