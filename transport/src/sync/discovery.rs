@@ -8,9 +8,9 @@
 //! doc comment) — `browse`'s channel is fed by a task spawned onto whichever
 //! runtime is already driving the call.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV6};
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::sync::mpsc;
 
 use super::wire::PROTOCOL_VERSION;
@@ -69,6 +69,25 @@ fn sync_error(message: impl Into<String>) -> TransportError {
     TransportError::new(TransportErrorKind::Sync, message.into())
 }
 
+/// Converts a `mdns-sd` [`ScopedIp`] into a [`SocketAddr`], preserving the
+/// IPv6 zone/scope id (review-task9 Minor). `ScopedIp::to_ip_addr` drops it,
+/// which makes a link-local IPv6 peer (`fe80::1`) ambiguous on a
+/// multi-interface host — a subsequent connect can pick the wrong NIC or
+/// fail outright. IPv4 addresses have no scope concept and pass through
+/// unchanged.
+fn scoped_addr_to_socket_addr(addr: &ScopedIp, port: u16) -> SocketAddr {
+    match addr {
+        ScopedIp::V4(v4) => SocketAddr::new(std::net::IpAddr::V4(*v4.addr()), port),
+        ScopedIp::V6(v6) => {
+            let scope_id = v6.scope_id().index;
+            SocketAddr::V6(SocketAddrV6::new(*v6.addr(), port, 0, scope_id))
+        }
+        // `ScopedIp` is `#[non_exhaustive]` (future mdns-sd variants); fall
+        // back to the scope-losing conversion rather than fail to compile.
+        other => SocketAddr::new(other.to_ip_addr(), port),
+    }
+}
+
 /// Handle to this instance's mDNS advertisement. The service is withdrawn
 /// when this value is dropped (best-effort — `mdns-sd` unregisters
 /// asynchronously and drop cannot wait on it).
@@ -121,6 +140,18 @@ pub fn advertise(peer_id: &str, name: &str, port: u16) -> Result<Advertisement, 
 /// network, a firewall, or another local failure to start the daemon or
 /// begin the browse — never a panic.
 pub fn browse() -> Result<mpsc::Receiver<DiscoveredPeer>, TransportError> {
+    let (rx, _handle) = browse_with_handle()?;
+    Ok(rx)
+}
+
+/// Same as [`browse`], but also returns the spawned task's
+/// [`tokio::task::JoinHandle`] so a test can await its completion. Not part
+/// of the public API surface a caller needs — `browse` is — kept
+/// `pub(crate)` purely so `mod tests` below can prove the task exits
+/// promptly once the receiver is dropped (review-task9 Important), which
+/// isn't observable from `browse`'s signature alone.
+pub(crate) fn browse_with_handle()
+-> Result<(mpsc::Receiver<DiscoveredPeer>, tokio::task::JoinHandle<()>), TransportError> {
     let daemon =
         ServiceDaemon::new().map_err(|e| sync_error(format!("starting mDNS daemon: {e}")))?;
     let events = daemon
@@ -128,28 +159,48 @@ pub fn browse() -> Result<mpsc::Receiver<DiscoveredPeer>, TransportError> {
         .map_err(|e| sync_error(format!("browsing for {SERVICE_TYPE}: {e}")))?;
 
     let (tx, rx) = mpsc::channel(32);
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         // `daemon` is moved into this task so it (and the underlying
         // browse) stays alive for as long as anyone holds the receiver;
-        // dropping the last sender clone below ends the loop and lets it
-        // drop, tearing the daemon down.
+        // `drain_events` returning (either the channel closing or the
+        // receiver dropping) ends this task and lets `_daemon` drop,
+        // tearing the mDNS daemon down.
         let _daemon = daemon;
-        while let Ok(event) = events.recv_async().await {
-            let ServiceEvent::ServiceResolved(info) = event else { continue };
-            let Some(addr) = info.get_addresses().iter().next() else { continue };
-            let socket_addr = SocketAddr::new(addr.to_ip_addr(), info.get_port());
-            let txt: Vec<(String, String)> = info
-                .get_properties()
-                .iter()
-                .map(|p| (p.key().to_string(), p.val_str().to_string()))
-                .collect();
-            let Some(peer) = parse_txt(&txt, socket_addr) else { continue };
-            if tx.send(peer).await.is_err() {
-                break;
+        drain_events(events, tx).await;
+    });
+    Ok((rx, handle))
+}
+
+/// Turns raw `mdns-sd` events into [`DiscoveredPeer`]s on `tx` until either
+/// side closes: `events` closing (the daemon shut down), or `tx` closing
+/// (the caller dropped its receiver). `tokio::select!`'s `biased` ordering
+/// checks `tx.closed()` first each iteration, so a dropped receiver ends
+/// this loop on its own without waiting on the next mDNS event — the fix
+/// for review-task9's Important finding, where the old single-armed
+/// `while let Ok(event) = events.recv_async().await` only noticed a
+/// dropped receiver from inside a successful `tx.send`, never on its own.
+async fn drain_events(events: mdns_sd::Receiver<ServiceEvent>, tx: mpsc::Sender<DiscoveredPeer>) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = tx.closed() => break,
+            event = events.recv_async() => {
+                let Ok(event) = event else { break };
+                let ServiceEvent::ServiceResolved(info) = event else { continue };
+                let Some(addr) = info.get_addresses().iter().next() else { continue };
+                let socket_addr = scoped_addr_to_socket_addr(addr, info.get_port());
+                let txt: Vec<(String, String)> = info
+                    .get_properties()
+                    .iter()
+                    .map(|p| (p.key().to_string(), p.val_str().to_string()))
+                    .collect();
+                let Some(peer) = parse_txt(&txt, socket_addr) else { continue };
+                if tx.send(peer).await.is_err() {
+                    break;
+                }
             }
         }
-    });
-    Ok(rx)
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +296,28 @@ mod tests {
 
         // Assert
         assert_eq!(keys, vec!["pid", "name", "v"]);
+    }
+
+    /// review-task9 fix: proves `drain_events` ends promptly when the
+    /// caller drops the `DiscoveredPeer` receiver, even though no mDNS
+    /// event ever arrives on the (synthetic, no-daemon) event channel — the
+    /// exact "quiet LAN" scenario the Important finding described. Uses a
+    /// bare `flume` channel rather than a real `ServiceDaemon` so it needs
+    /// no multicast and runs in the gate.
+    #[tokio::test]
+    async fn drain_events_receiver_dropped_no_event_arrives_task_ends() {
+        // Arrange
+        let (_events_tx, events_rx) = flume::unbounded::<ServiceEvent>();
+        let (tx, rx) = mpsc::channel::<DiscoveredPeer>(1);
+        let handle = tokio::spawn(drain_events(events_rx, tx));
+
+        // Act
+        drop(rx);
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+
+        // Assert
+        result.expect("drain_events ends without waiting on an event").expect("task did not panic");
     }
 
     /// Manual-only: advertises and browses on the real loopback interface.

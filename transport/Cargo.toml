@@ -61,6 +61,13 @@ mdns-sd = "0.21.1"
 
 [dev-dependencies]
 serde_json = "1"
+# review-task9 fix: `mdns_sd::Receiver<T>` is `flume::Receiver<T>` (mdns-sd
+# re-exports the type but not a constructor). Already resolved in
+# Cargo.lock as mdns-sd's own dependency — this just names it directly so
+# `sync::discovery`'s tests can build a synthetic event channel and prove
+# `drain_events` exits on receiver-drop without starting a real
+# `ServiceDaemon` (PLAN §7: "no test needs multicast").
+flume = "0.12.0"
 # Task 7: the mock HTTP device server (wifi_transport.rs integration tests)
 # hand-rolls HTTP/1.1 over a raw `tokio::net::TcpListener` rather than adding
 # a server framework — "net" is dev-only (test builds), so it never reaches
