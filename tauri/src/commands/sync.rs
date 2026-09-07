@@ -1,6 +1,7 @@
-//! LAN sync commands (C3 §3.9, L11 Task 12): `sync_status`, `sync_now`,
-//! `pair_peer`, `start_pairing`, `unpair_peer`, plus the `peer_appeared`
-//! event and the pure auto-trigger decision. Thin over `idl-transport`'s
+//! LAN sync commands (C3 §3.9, L11 Tasks 12–13): `sync_status`, `sync_now`,
+//! `pair_peer`, `start_pairing`, `unpair_peer`, `set_sync_device_name`,
+//! plus the `peer_appeared` event and the pure auto-trigger decision. Thin
+//! over `idl-transport`'s
 //! `sync` module — merging, diffing and installing stay in `idl-rs`; the
 //! wire itself stays in `idl-transport` (CLAUDE.md §2, this task's brief).
 //! No HTTP client of any kind lives in this crate — `idl_transport::sync::
@@ -158,6 +159,47 @@ pub async fn unpair_peer(peer_id: String, state: tauri::State<'_, SyncState>) ->
     unpair_peer_via(&state.peers_path, &state.peers, &peer_id)
 }
 
+/// Transport-agnostic core of `set_sync_device_name`: rejects a
+/// blank/whitespace-only name — unlike the hostname-seeded default
+/// (`identity::load_or_create`, applied only on first launch), there is no
+/// sensible fallback to apply silently once the user has explicitly chosen
+/// to rename — then persists the renamed identity to `identity_path` via
+/// `identity::set_name`, keeping `peer_id` unchanged, and updates the live
+/// `name` lock so the rest of the process sees the new name immediately.
+fn set_sync_device_name_via(
+    identity_path: &std::path::Path,
+    peer_id: &str,
+    name_lock: &std::sync::Mutex<String>,
+    name: String,
+) -> Result<String, IpcError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(IpcError::new(IpcErrorKind::InvalidArgument, "device name must not be blank"));
+    }
+
+    let current = idl_transport::sync::Identity {
+        peer_id: peer_id.to_string(),
+        name: name_lock.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+    };
+    let updated = idl_transport::sync::identity::set_name(identity_path, &current, trimmed.to_string()).map_err(IpcError::from)?;
+
+    *name_lock.lock().unwrap_or_else(|e| e.into_inner()) = updated.name.clone();
+    Ok(updated.name)
+}
+
+/// C3 §3.9 `set_sync_device_name(name)` — added post-sign (2026-09-07, lead
+/// ruling R105, L11 Task 13). Renames this device: persists to
+/// `identity.json` and updates the live `SyncState` so `pair_peer`'s
+/// outgoing `PairRequest.name` reflects it for the rest of the process's
+/// life. Does not retroactively change what an already-paired peer
+/// displays for us — that name was copied into their own peer file at
+/// pairing time, and re-sending it would need a wire message this contract
+/// does not define.
+#[tauri::command]
+pub async fn set_sync_device_name(name: String, state: tauri::State<'_, SyncState>) -> Result<String, IpcError> {
+    set_sync_device_name_via(&state.identity_path, &state.peer_id, &state.name, name)
+}
+
 /// `true` if `code` is exactly six ASCII digits (design §7, C3 §3.9). Kept
 /// separate from `pair_peer`'s body so a malformed code fails before any
 /// state is touched and before any request is sent (this task's brief's
@@ -197,7 +239,12 @@ pub async fn pair_peer(peer_id: String, code: String, state: tauri::State<'_, Sy
         resolve_discovered_addr(&discovered, &peer_id)?
     };
 
-    let request = PairRequest { code, peer_id: state.peer_id.clone(), name: state.name.clone(), protocol_version: idl_transport::sync::PROTOCOL_VERSION };
+    let request = PairRequest {
+        code,
+        peer_id: state.peer_id.clone(),
+        name: state.name.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        protocol_version: idl_transport::sync::PROTOCOL_VERSION,
+    };
     let response = idl_transport::sync::pair_with_peer(addr, &request).await.map_err(IpcError::from)?;
 
     let peer = Peer {
@@ -436,6 +483,42 @@ mod tests {
         let persisted = idl_transport::sync::load_peers(&peers_path).unwrap();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].peer_id, "peer-2");
+    }
+
+    // -- set_sync_device_name ---------------------------------------------
+
+    #[test]
+    fn set_sync_device_name_blank_is_invalid_argument_nothing_written() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.json");
+        let name_lock = std::sync::Mutex::new("idl1".to_string());
+
+        // Act
+        let result = set_sync_device_name_via(&identity_path, "peer-1", &name_lock, "   ".to_string());
+
+        // Assert
+        assert_eq!(result.unwrap_err().kind, IpcErrorKind::InvalidArgument);
+        assert!(!identity_path.exists());
+        assert_eq!(*name_lock.lock().unwrap(), "idl1");
+    }
+
+    #[test]
+    fn set_sync_device_name_persists_the_trimmed_name_and_updates_the_live_lock() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.json");
+        let name_lock = std::sync::Mutex::new("idl1".to_string());
+
+        // Act
+        let result = set_sync_device_name_via(&identity_path, "peer-1", &name_lock, "  Pit Wall Laptop  ".to_string());
+
+        // Assert
+        assert_eq!(result.unwrap(), "Pit Wall Laptop");
+        assert_eq!(*name_lock.lock().unwrap(), "Pit Wall Laptop");
+        let persisted = idl_transport::sync::identity::load_or_create(&identity_path, None).unwrap();
+        assert_eq!(persisted.peer_id, "peer-1");
+        assert_eq!(persisted.name, "Pit Wall Laptop");
     }
 
     // -- pair_peer --------------------------------------------------------

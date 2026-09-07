@@ -147,40 +147,48 @@ pub fn load_peers(peers_path: &Path) -> Result<Vec<Peer>, TransportError> {
     })
 }
 
-/// Writes `peers` to `peers_path` atomically: a `tmp` sibling is written and
-/// fsynced, then renamed into place. `peers_path` is passed in by the
-/// caller (never resolved from a Tauri app handle here) and lives outside
-/// `<data>` so its contents never sync (PLAN §8 Q7).
+/// Writes `peers` to `peers_path` atomically (PLAN §8 Q7). `peers_path` is
+/// passed in by the caller (never resolved from a Tauri app handle here)
+/// and lives outside `<data>` so its contents never sync. Thin wrapper over
+/// [`write_json_atomic`], the primitive `sync::identity::save`/`set_name`
+/// reuse for `identity.json` (ruling R105: "the same helper the peer file
+/// uses").
 pub fn save_peers(peers_path: &Path, peers: &[Peer]) -> Result<(), TransportError> {
-    let bytes = serde_json::to_vec_pretty(peers)
-        .map_err(|e| TransportError::new(TransportErrorKind::Sync, format!("encoding peer file: {e}")))?;
+    write_json_atomic(peers_path, &peers)
+}
 
-    let parent = peers_path.parent().ok_or_else(|| {
-        TransportError::new(
-            TransportErrorKind::Sync,
-            format!("peer file path has no parent directory: {}", peers_path.display()),
-        )
+/// Atomically writes `value` as pretty JSON to `path`: a `tmp` sibling is
+/// written and fsynced, then renamed into place, and the parent directory
+/// is created first if missing. Shared by every small local JSON file this
+/// crate persists outside `<data>` (PLAN §8 Q7) — currently `peers.json`
+/// ([`save_peers`]) and `identity.json` (`sync::identity`, ruling R105).
+pub(crate) fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), TransportError> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|e| TransportError::new(TransportErrorKind::Sync, format!("encoding {}: {e}", path.display())))?;
+
+    let parent = path.parent().ok_or_else(|| {
+        TransportError::new(TransportErrorKind::Sync, format!("{} has no parent directory", path.display()))
     })?;
     std::fs::create_dir_all(parent)
         .map_err(|e| TransportError::new(TransportErrorKind::Sync, format!("creating {}: {e}", parent.display())))?;
 
-    let tmp_name = match peers_path.file_name() {
+    let tmp_name = match path.file_name() {
         Some(name) => format!("{}.tmp-{}", name.to_string_lossy(), Uuid::new_v4()),
-        None => format!("peers.tmp-{}", Uuid::new_v4()),
+        None => format!("tmp-{}", Uuid::new_v4()),
     };
     let tmp_path = parent.join(tmp_name);
 
     write_and_fsync(&tmp_path, &bytes)?;
 
-    if let Err(e) = std::fs::rename(&tmp_path, peers_path) {
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(TransportError::new(
             TransportErrorKind::Sync,
-            format!("renaming {} -> {}: {e}", tmp_path.display(), peers_path.display()),
+            format!("renaming {} -> {}: {e}", tmp_path.display(), path.display()),
         ));
     }
 
-    fsync_parent_dir(peers_path);
+    fsync_parent_dir(path);
     Ok(())
 }
 

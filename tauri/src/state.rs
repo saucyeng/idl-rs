@@ -44,11 +44,19 @@ pub struct Connections(
 /// stops serving and browsing.
 pub struct SyncState {
     /// This instance's own stable id — advertised over mDNS and sent to a
-    /// peer on `POST /pair`.
+    /// peer on `POST /pair`. Minted once into `identity.json` and never
+    /// regenerated (ruling R105).
     pub peer_id: String,
     /// Display name advertised over mDNS and shown by a peer that pairs
-    /// with us.
-    pub name: String,
+    /// with us. Behind a `Mutex` (unlike `peer_id`, fixed for the process
+    /// lifetime) because `set_sync_device_name` (C3 §3.9) changes it while
+    /// the app runs.
+    pub name: Mutex<String>,
+    /// Where this device's own sync identity persists:
+    /// `app_config_dir()/identity.json` (ruling R105) — never under
+    /// `<data>`, so it never syncs. Read once at startup by
+    /// [`Self::start`]; written again only by `set_sync_device_name`.
+    pub identity_path: PathBuf,
     /// Where the paired-peer list persists: `app_config_dir()/peers.json`
     /// (PLAN §8 Q7) — never under `<data>`, so a peer's bearer token never
     /// syncs.
@@ -95,14 +103,26 @@ impl SyncState {
     /// through `sync_status`... never a startup crash") — `browse_task` is
     /// simply `None` and every peer shows offline until the next launch on
     /// a working network.
+    ///
+    /// This device's own identity (`peer_id`/`name`) is read from
+    /// `identity_path` here — minted and persisted on first launch, never
+    /// re-minted after (ruling R105, L11 Task 13) — rather than passed in
+    /// by the caller, so a corrupt `identity.json` fails `.setup()` the
+    /// same explicit way a corrupt `settings.json` cannot (that file
+    /// degrades to defaults by design; this one must not, or a fresh id
+    /// would silently orphan every existing pairing).
     pub async fn start<R: tauri::Runtime>(
         app: tauri::AppHandle<R>,
         data_root: PathBuf,
         peers_path: PathBuf,
-        peer_id: String,
-        name: String,
+        identity_path: PathBuf,
     ) -> Result<Self, crate::error::IpcError> {
         use crate::error::IpcError;
+
+        let identity = idl_transport::sync::identity::load_or_create(&identity_path, os_hostname().as_deref())
+            .map_err(IpcError::from)?;
+        let peer_id = identity.peer_id;
+        let name = identity.name;
 
         let loaded_peers = idl_transport::sync::load_peers(&peers_path).map_err(IpcError::from)?;
         let peers = Arc::new(Mutex::new(loaded_peers));
@@ -134,8 +154,44 @@ impl SyncState {
             Err(_) => None,
         };
 
-        Ok(Self { peer_id, name, peers_path, server, pairing, peers, discovered, last_sync, running, browse_task })
+        Ok(Self {
+            peer_id,
+            name: Mutex::new(name),
+            identity_path,
+            peers_path,
+            server,
+            pairing,
+            peers,
+            discovered,
+            last_sync,
+            running,
+            browse_task,
+        })
     }
+}
+
+/// Best-effort OS hostname, used only to seed `identity.json`'s default
+/// `name` on first launch (ruling R105) — never a hard requirement, since
+/// [`idl_transport::sync::identity::load_or_create`] already falls back to
+/// [`idl_transport::sync::DEFAULT_NAME`] on `None`. `std` only: Windows
+/// always sets `COMPUTERNAME`; Unix has no equivalent environment
+/// convention, so this shells out to the `hostname` command a terminal user
+/// would run themselves, rather than adding a dependency for one lookup
+/// (CLAUDE.md §1 judgment call — see this task's report).
+fn os_hostname() -> Option<String> {
+    if let Ok(name) = std::env::var("COMPUTERNAME") {
+        let name = name.trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// The background browse-consuming loop (PLAN §2's "the browse task's
