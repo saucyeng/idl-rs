@@ -193,6 +193,39 @@ pub fn resolve_lap_window(data_root: &Path, session_id: &str, lap: u32) -> Resul
     )
 }
 
+/// Builds a [`MathLapContext`] scoped to a single resolved [`WindowDto`]
+/// (C1 §6.x, R115) — the per-window replacement for [`load_lap_context`]'s
+/// per-session lap selection, used by `eval_workbook_v2` and its siblings
+/// (Task 4 onward).
+///
+/// `main_lap_bounds` is always a one-entry vec — [`resolve_window`]'s
+/// bounds for `window` — and `main_lap_number` is always `Some(1)`,
+/// regardless of `window.span`'s kind: a window is not "the Nth lap of the
+/// session", it is *the* selected span, so lap number must never again be
+/// read as a position in `main_lap_bounds` (the fix to `core`'s private
+/// `main_lap_window`, this same commit, closes the indexing bug this
+/// coupling caused). `main_sectors`/`overlay`/`baseline_row` are empty —
+/// a window carries no overlay of its own; `handle` is accepted for
+/// signature symmetry with [`load_lap_context`] and is not read here.
+///
+/// Errors are [`resolve_window`]'s: `not_found` for a missing session on
+/// the `Session`/`Range` kinds, `invalid_argument` (`detail: { "lap": n }`)
+/// for an unknown lap number on the `Lap` kind.
+pub fn load_window_context(
+    data_dir: &Path,
+    window: &WindowDto,
+    _handle: &SessionHandle,
+) -> Result<MathLapContext, IpcError> {
+    let bounds = resolve_window(data_dir, window)?;
+    Ok(MathLapContext {
+        main_lap_bounds: vec![bounds],
+        main_sectors: Vec::new(),
+        main_lap_number: Some(1),
+        overlay: Vec::new(),
+        baseline_row: None,
+    })
+}
+
 /// Builds a [`MathLapContext`] from `session_id`'s `session.json` `laps[]`,
 /// optionally validated and overridden by a caller-supplied `selection`
 /// (C3 §3.4 `lap_context`, ruling R52 Q5; same-session `overlay_laps` per
@@ -772,6 +805,67 @@ mod tests {
 
         // Assert
         assert_eq!(span, (0.0, 0.0));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_window_context_lap_span_one_entry_bounds_main_lap_number_always_one() {
+        // Arrange — lap 3 of a 4-lap session; the resolved lap number (3)
+        // must never leak into `main_lap_number`, which stays `Some(1)`
+        // regardless of which lap or span kind was selected.
+        let root = temp_root();
+        seed_session(&root, "s1");
+        write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
+        let handle = load_session_handle(&root, "s1").unwrap();
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 3 }, colour: String::new() };
+
+        // Act
+        let ctx = load_window_context(&root, &window, &handle).unwrap();
+
+        // Assert
+        assert_eq!(ctx.main_lap_bounds, vec![(2.0, 3.0)]);
+        assert_eq!(ctx.main_lap_number, Some(1));
+        assert!(ctx.main_sectors.is_empty());
+        assert!(ctx.overlay.is_empty());
+        assert_eq!(ctx.baseline_row, None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_window_context_session_span_bounds_the_whole_recorded_span() {
+        // Arrange — `seed_session`'s "Speed" channel spans 0..500_000 µs.
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let handle = load_session_handle(&root, "s1").unwrap();
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Session, colour: String::new() };
+
+        // Act
+        let ctx = load_window_context(&root, &window, &handle).unwrap();
+
+        // Assert
+        assert_eq!(ctx.main_lap_bounds, vec![(0.0, 0.5)]);
+        assert_eq!(ctx.main_lap_number, Some(1));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_window_context_unknown_lap_number_invalid_argument_with_detail() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root, "s1");
+        write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
+        let handle = load_session_handle(&root, "s1").unwrap();
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 99 }, colour: String::new() };
+
+        // Act
+        let err = load_window_context(&root, &window, &handle).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(err.detail, Some(serde_json::json!({ "lap": 99 })));
 
         let _ = std::fs::remove_dir_all(&root);
     }

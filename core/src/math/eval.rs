@@ -658,12 +658,25 @@ fn require_ref_channel(v: &Value, ctx: &str) -> Result<(Arc<[f64]>, f64, Arc<[i6
 // The designated main lap's `(start_sec, end_sec)` from the already-uniform
 // `main_lap_bounds`, or the `(0.0, 0.0)` gating-off sentinel. Mirrors the
 // uniform-time `_mainLapWindow`.
+//
+// `main_lap_bounds` has two possible shapes, and they read differently: the
+// whole-session `load_lap_context(selection = None)` path fills it with
+// every lap in `session.json`'s order, so `main_lap_number` (1-based) is a
+// genuine index into it (`get(n - 1)`). A single *window* — one resolved
+// lap/session/range span (S1, R117, `load_window_context`) — is always a
+// one-entry vec, and `main_lap_number` there is a fixed `Some(1)` marker
+// ("a main lap is designated"), not a position; treating a 1-entry vec as
+// number-indexed silently fell back to the `(0.0, 0.0)` sentinel for any
+// lap number other than 1 and switched gating off entirely (`variance_time`/
+// `variance_dist`'s gate is `start < end`, and `0.0 < 0.0` is false) — the
+// live defect this function now closes. A one-entry vec is therefore always
+// read directly, regardless of what `main_lap_number` says; only a longer
+// vec is still indexed by lap number.
 fn main_lap_window(lap_ctx: &MathLapContext) -> (f64, f64) {
-    match lap_ctx.main_lap_number {
-        Some(n) => {
-            lap_ctx.main_lap_bounds.get((n as usize).saturating_sub(1)).copied().unwrap_or((0.0, 0.0))
-        }
-        None => (0.0, 0.0),
+    match (lap_ctx.main_lap_number, lap_ctx.main_lap_bounds.as_slice()) {
+        (Some(_), [only]) => *only,
+        (Some(n), bounds) => bounds.get((n as usize).saturating_sub(1)).copied().unwrap_or((0.0, 0.0)),
+        (None, _) => (0.0, 0.0),
     }
 }
 
@@ -2335,6 +2348,69 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, MathEvalErrorKind::NoLapContext);
+    }
+
+    #[test]
+    fn variance_time_main_lap_number_other_than_one_over_single_entry_bounds_still_gates() {
+        // Arrange — a window-scoped `MathLapContext` (S1, R117): exactly one
+        // entry in `main_lap_bounds` (0..5 s) but `main_lap_number = Some(3)`,
+        // since a window's lap number is no longer an index into that vec.
+        // Before the fix, `main_lap_window` read `main_lap_bounds.get(3 - 1)`
+        // on a 1-element vec, missed, and fell back to the `(0.0, 0.0)`
+        // sentinel. `variance_time`'s gate is `start < end` (`variance.rs`'s
+        // `variance_time`), so `(0.0, 0.0)` does not merely gate everything
+        // out — `0.0 < 0.0` is false, so it silently disables gating
+        // entirely and every sample (including t = 9 s, well outside the
+        // real 0..5 s window) passes through ungated. The regression this
+        // guards is samples at/after t = 5 s must be `NaN`.
+        let lon: Vec<f64> = (0..10).map(|i| i as f64 * 0.001).collect();
+        let lat = vec![0.0; 10];
+        let epoch: Vec<f64> = (0..10).map(|i| (i * 1000) as f64).collect();
+        let chan: Vec<f64> = (0..10).map(|i| i as f64).collect();
+
+        let main = lookup(&[
+            ("GPS_Latitude", lat.clone(), 1.0),
+            ("GPS_Longitude", lon.clone(), 1.0),
+            ("GPS_EpochMs", epoch.clone(), 1.0),
+            ("LapTime", chan.clone(), 1.0),
+        ]);
+        let overlay = lookup(&[
+            ("GPS_Latitude", lat, 1.0),
+            ("GPS_Longitude", lon, 1.0),
+            ("GPS_EpochMs", epoch, 1.0),
+            ("LapTime", chan, 1.0),
+        ]);
+        let ctx = MathLapContext {
+            main_lap_bounds: vec![(0.0, 5.0)],
+            main_sectors: Vec::new(),
+            main_lap_number: Some(3),
+            overlay: vec![MathOverlay {
+                lookup: std::sync::Arc::new(overlay),
+                lap_start_ms: 0.0,
+                lap_end_ms: 9000.0,
+                lap_start_uniform_sec: 0.0,
+            }],
+            baseline_row: None,
+        };
+
+        // Act
+        let v = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &main, &ctx)
+            .unwrap();
+
+        // Assert — the single bounds entry gates the window regardless of
+        // `main_lap_number`'s value: t = 6 s (index 6, outside 0..5 s) must
+        // be `NaN`. (Index 9 is excluded from this check — it is the last
+        // sample, where the finite-difference heading fallback points
+        // backward and fails the projector's own heading match regardless
+        // of gating, an unrelated quirk this test does not exercise.)
+        match v {
+            Value::Channel(c) => {
+                assert!(c.samples[6].is_nan(), "expected t=6s outside 0..5s window to be NaN, got {}", c.samples[6]);
+                let inside: Vec<f64> = c.samples[0..5].iter().copied().filter(|x| !x.is_nan()).collect();
+                assert!(!inside.is_empty(), "expected some in-window (t<5s) samples, got all-NaN");
+            }
+            _ => panic!(),
+        }
     }
 
     // ---- Vector & rotation primitives (parser-level integration) ----
