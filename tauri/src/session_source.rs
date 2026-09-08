@@ -102,8 +102,9 @@ pub enum SpanDto {
     /// An explicit span. **Not** epoch time — session-relative.
     Range {
         /// Start, microseconds since `session_id`'s first sample (the same
-        /// axis as `Channel.t_us`). `t0_us < t1_us` is the producer's
-        /// invariant, not checked here.
+        /// axis as `Channel.t_us`). C1 §6.1 states `t0_us < t1_us` as part
+        /// of the type, not an unchecked producer invariant — a value
+        /// violating it is rejected by [`resolve_window`] (ruling R120).
         t0_us: i64,
         /// End, microseconds since `session_id`'s first sample.
         t1_us: i64,
@@ -167,6 +168,30 @@ fn no_overlap(session_id: &str, t0_us: i64, t1_us: i64, session_span_us: (i64, i
     )
 }
 
+/// Builds an [`IpcErrorKind::InvalidArgument`] for a `Range` span whose
+/// `t0_us >= t1_us` (ruling R120, amending R119). C1 §6.1 states
+/// `t0_us < t1_us` as part of the `Range` type, so a value violating it is
+/// invalid input, not a degenerate-but-legal single-sample window — slicing
+/// is inclusive at `t1`, so an in-span `(T, T)` would otherwise select
+/// exactly one sample rather than the empty selection the user actually
+/// asked for (e.g. dragging both boundary cursors together, decision 52).
+/// `detail` shares [`no_overlap`]'s shape:
+/// `{ session_id, t0_us, t1_us, session_span_us }`.
+fn invalid_range_order(session_id: &str, t0_us: i64, t1_us: i64, session_span_us: (i64, i64)) -> IpcError {
+    IpcError::with_detail(
+        IpcErrorKind::InvalidArgument,
+        format!(
+            "range [{t0_us}, {t1_us}] µs is not ordered (t0_us must be < t1_us) for session '{session_id}'"
+        ),
+        serde_json::json!({
+            "session_id": session_id,
+            "t0_us": t0_us,
+            "t1_us": t1_us,
+            "session_span_us": [session_span_us.0, session_span_us.1],
+        }),
+    )
+}
+
 /// Resolves a [`WindowDto`]'s span to its recording-time bounds, seconds,
 /// against `data_root`'s session store (C1 §6.1, R115; generalises the
 /// lap-only [`resolve_lap_window`], which now forwards here).
@@ -192,11 +217,13 @@ fn no_overlap(session_id: &str, t0_us: i64, t1_us: i64, session_span_us: (i64, i
 ///   ([`idl_rs::session::handle::time_window_index_range`]) is inclusive at
 ///   `t1`, and the clamp target is always a real recorded sample's `t_us`,
 ///   so `(T, T)` would select exactly one sample rather than none — ruling
-///   R119, C1 §6.1. A degenerate `t0_us == t1_us` that falls *inside* the
-///   span is not rejected here: §6.1's type states `t0_us < t1_us` as the
-///   producer's invariant, not a check this function makes, and a
-///   fully-in-bounds instant is a legitimate (if single-sample) overlap —
-///   only "no overlap at all" is this function's error.
+///   R119, C1 §6.1. `t0_us >= t1_us` is rejected the same way, via
+///   [`invalid_range_order`], even when both endpoints fall inside the
+///   session's span — C1 §6.1 states `t0_us < t1_us` as part of the
+///   `Range` type, not an unchecked producer invariant, and an in-span
+///   `(T, T)` is the same defect one step inward: inclusive-at-`t1`
+///   slicing would still select exactly one sample rather than the empty
+///   selection the caller asked for (ruling R120, amending R119).
 ///
 /// `Session` and `Range` load the session's `data.parquet` (via
 /// [`load_session`]) to know its span, so a missing session is
@@ -218,6 +245,9 @@ pub fn resolve_window(data_root: &Path, window: &WindowDto) -> Result<(f64, f64)
         }
         SpanDto::Range { t0_us, t1_us } => {
             let session_span_us = full_session_span_us(data_root, &window.session_id)?;
+            if *t0_us >= *t1_us {
+                return Err(invalid_range_order(&window.session_id, *t0_us, *t1_us, session_span_us));
+            }
             let (session_start_us, session_end_us) = session_span_us;
             if *t1_us < session_start_us || *t0_us > session_end_us {
                 return Err(no_overlap(&window.session_id, *t0_us, *t1_us, session_span_us));
@@ -915,6 +945,68 @@ mod tests {
                 "session_id": "s1",
                 "t0_us": -500_000,
                 "t1_us": -100_000,
+                "session_span_us": [0, 500_000],
+            }))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_window_range_span_equal_endpoints_inside_session_invalid_argument_with_detail() {
+        // Arrange — t0_us == t1_us falls inside the session's recorded span
+        // (0..500_000 µs), but slicing is inclusive at t1, so this would
+        // otherwise select exactly one sample — rejected as an ordering
+        // violation, not resolved as a legitimate single-sample overlap
+        // (ruling R120, amending R119).
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: SpanDto::Range { t0_us: 200_000, t1_us: 200_000 },
+            colour: String::new(),
+        };
+
+        // Act
+        let err = resolve_window(&root, &window).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(
+            err.detail,
+            Some(serde_json::json!({
+                "session_id": "s1",
+                "t0_us": 200_000,
+                "t1_us": 200_000,
+                "session_span_us": [0, 500_000],
+            }))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_window_range_span_t0_after_t1_invalid_argument_with_detail() {
+        // Arrange — t0_us > t1_us, the general case R120 closes.
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: SpanDto::Range { t0_us: 300_000, t1_us: 100_000 },
+            colour: String::new(),
+        };
+
+        // Act
+        let err = resolve_window(&root, &window).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(
+            err.detail,
+            Some(serde_json::json!({
+                "session_id": "s1",
+                "t0_us": 300_000,
+                "t1_us": 100_000,
                 "session_span_us": [0, 500_000],
             }))
         );
