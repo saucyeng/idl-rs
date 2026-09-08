@@ -2399,10 +2399,9 @@ mod tests {
 
         // Assert — the single bounds entry gates the window regardless of
         // `main_lap_number`'s value: t = 6 s (index 6, outside 0..5 s) must
-        // be `NaN`. (Index 9 is excluded from this check — it is the last
-        // sample, where the finite-difference heading fallback points
-        // backward and fails the projector's own heading match regardless
-        // of gating, an unrelated quirk this test does not exercise.)
+        // be `NaN`. (Index 9 is excluded from this check — it falls outside
+        // the same 0..5 s window gate as index 6, so asserting it separately
+        // would exercise the identical gate path and add no new coverage.)
         match v {
             Value::Channel(c) => {
                 assert!(c.samples[6].is_nan(), "expected t=6s outside 0..5s window to be NaN, got {}", c.samples[6]);
