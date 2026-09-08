@@ -268,7 +268,16 @@ pub fn resolve_window(data_root: &Path, window: &WindowDto) -> Result<(f64, f64)
                 return Err(invalid_range_order(&window.session_id, *t0_us, *t1_us, session_span_us));
             }
             let (session_start_us, session_end_us) = session_span_us;
-            if *t1_us < session_start_us || *t0_us > session_end_us {
+            // Half-open overlap test (ruling R128, amending R126/R119):
+            // `session_span_us` is now `[session_start_us, session_end_us)`
+            // (R126), so the closed-bound `<`/`>` this used before R126
+            // under-rejects at the boundary — a range starting exactly at
+            // `session_end_us` has no sample it could possibly cover (no
+            // recorded sample falls at or after `session_end_us`) and must
+            // be `no_overlap`, not a zero-width clamp that `window_index_
+            // range`'s `(0.0, 0.0)`-only sentinel then silently reads back
+            // as "no window", i.e. the whole channel.
+            if *t1_us <= session_start_us || *t0_us >= session_end_us {
                 return Err(no_overlap(&window.session_id, *t0_us, *t1_us, session_span_us));
             }
             let session_start_s = session_start_us as f64 / 1e6;
@@ -939,6 +948,42 @@ mod tests {
                 "session_id": "s1",
                 "t0_us": 600_000,
                 "t1_us": 700_000,
+                "session_span_us": [0, 500_001],
+            }))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_window_range_span_starting_exactly_at_the_half_open_session_end_no_overlap() {
+        // Arrange — R128 (amending R126): `session_span_us`'s end is
+        // half-open (`last_us + 1` = 500_001 µs here), so a range starting
+        // there covers no sample the session actually has — it must be
+        // rejected as `no_overlap`, never accepted as an in-bounds range
+        // that clamps to a zero-width `(X, X)` window (which
+        // `window_index_range`'s sentinel would then silently read back as
+        // the whole channel).
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: SpanDto::Range { t0_us: 500_001, t1_us: 600_000 },
+            colour: String::new(),
+        };
+
+        // Act
+        let err = resolve_window(&root, &window).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert!(err.message.contains("does not overlap"), "message: {}", err.message);
+        assert_eq!(
+            err.detail,
+            Some(serde_json::json!({
+                "session_id": "s1",
+                "t0_us": 500_001,
+                "t1_us": 600_000,
                 "session_span_us": [0, 500_001],
             }))
         );

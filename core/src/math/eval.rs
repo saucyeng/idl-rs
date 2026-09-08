@@ -720,16 +720,27 @@ fn main_lap_window(lap_ctx: &MathLapContext) -> (f64, f64) {
 // excluded boundary.
 //
 // Whole range (no narrowing) when: the gate is off (`main_lap_window`'s
-// `(0.0, 0.0)` sentinel, `start < end` false), or `sample_rate_hz <= 0.0` — a
-// `{col[]}` whole-column table reference has no time axis and is never
-// windowed (R124.3).
+// exact `(0.0, 0.0)` sentinel — "no window selected", not any other
+// `start >= end`), or `sample_rate_hz <= 0.0` — a `{col[]}` whole-column
+// table reference has no time axis and is never windowed (R124.3). Any
+// *other* non-narrowing bound (`start_sec >= end_sec` but not the sentinel)
+// is an empty, resolved window and yields `(0, 0)`, never `(0, len)`
+// (ruling R128, amending R126): conflating "no window" with "an empty
+// window" here is what let a Range clamped past the session's end silently
+// read back as the whole channel instead of nothing selected.
 fn window_index_range(lap_ctx: &MathLapContext, sample_rate_hz: f64, len: usize) -> (usize, usize) {
     if sample_rate_hz <= 0.0 {
         return (0, len);
     }
     let (start_sec, end_sec) = main_lap_window(lap_ctx);
     if !(start_sec < end_sec) {
-        return (0, len);
+        // R128 (amending R126): only `main_lap_window`'s exact `(0.0, 0.0)`
+        // sentinel means "no window selected, gate off" — the whole
+        // channel. Any *other* `start_sec >= end_sec` (e.g. a Range window
+        // that clamped to a degenerate `(X, X)` past the session's end) is
+        // an empty, resolved window, not an absent one, and must read back
+        // as nothing selected, never silently as everything.
+        return if start_sec == 0.0 && end_sec == 0.0 { (0, len) } else { (0, 0) };
     }
     let start = (start_sec * sample_rate_hz).ceil().max(0.0) as usize;
     let end = (end_sec * sample_rate_hz).ceil().max(0.0) as usize;
@@ -2001,6 +2012,36 @@ mod tests {
                 other => panic!("{expr}: expected two scalars, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn window_index_range_no_lap_context_sentinel_is_the_whole_channel() {
+        // Arrange — `no_laps()` has no bounds at all, so `main_lap_window`
+        // returns its `(0.0, 0.0)` "no window selected" sentinel — the one
+        // and only shape that means "gate off" (ruling R128).
+
+        // Act
+        let (start, end) = window_index_range(&no_laps(), 10.0, 7);
+
+        // Assert
+        assert_eq!((start, end), (0, 7));
+    }
+
+    #[test]
+    fn window_index_range_degenerate_non_sentinel_bound_is_empty_not_the_whole_channel() {
+        // Arrange — a *resolved* window whose bounds happen to collapse to
+        // equal (e.g. a Range clamped past the session's end, R128) is not
+        // the same value as "no window selected": only the exact
+        // `(0.0, 0.0)` sentinel means that. `(0.5, 0.5)` is degenerate for
+        // an entirely different reason and must read back as nothing
+        // selected, never silently as everything.
+        let degenerate = window_ctx(0.5, 0.5);
+
+        // Act
+        let (start, end) = window_index_range(&degenerate, 10.0, 7);
+
+        // Assert — empty, not the whole 7-sample channel.
+        assert_eq!((start, end), (0, 0));
     }
 
     #[test]
