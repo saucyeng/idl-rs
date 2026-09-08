@@ -18,7 +18,7 @@ use idl_rs::raster::{
 use idl_rs::session::{Channel, Session};
 
 use crate::error::{IpcError, IpcErrorKind};
-use crate::session_source::{load_session, load_session_handle, resolve_lap_window};
+use crate::session_source::{load_session, load_session_handle, resolve_lap_window, resolve_window, WindowDto};
 use crate::state::DataDir;
 
 /// `SpectrogramParams.window` (C3 §3.6) — `idl_rs::fft::FftWindow`'s three
@@ -536,6 +536,74 @@ pub fn fetch_fft(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// Transport-agnostic core of `fetch_fft_v2` (C3 §3.6, R117.3, R117.7,
+/// R123). Same shape as [`fetch_fft_via`], but resolves its span through
+/// [`resolve_window`] instead of `lap: Option<u32>` — [`WindowDto`]'s three
+/// span kinds (`session`, `lap`, `range`) replace the old command's
+/// whole-channel/lap-only split, so there is no `None` arm: `SpanDto::
+/// Session` already names "the whole recording". Ruling R123: a
+/// single-spectrum FFT consumes the time axis, so it is an *aggregation*
+/// over the window — the window is correctly this function's slicing
+/// domain, unlike a `[t]`-series definition (which stays session-wide,
+/// core's own concern, untouched here).
+///
+/// R85's slice-then-guard order is preserved exactly: [`resolve_window`]
+/// resolves the span first (surfacing R119/R120's `no_overlap`/
+/// `invalid_range_order` for a degenerate `range`, or [`unknown_lap`] for a
+/// `lap` — `unknown_lap`'s check predates R119/R120 and needs no bounds),
+/// then `handle.slice_by_time`/[`slice_t_us_by_time`] slice the channel and
+/// its `t_us` to that window, then `check_none_averaging_segments` and
+/// `effective_rate_hz_from_t_us` run against the *sliced* window, never the
+/// whole channel — the same ordering [`fetch_fft_via`]'s doc comment
+/// explains. A `lap` span's own degenerate-window cases (a one-sample or
+/// duplicate-timestamp lap boundary) are unaffected by R119/R120: those
+/// rulings only added checks to the `range` arm, so a bad `lap` window
+/// still reaches this slice-then-guard path exactly as before, and still
+/// fails there rather than at `resolve_window`.
+///
+/// `not_found`: unknown `session_id` (via [`load_session_handle`], `session`
+/// and `range` spans) or `channel`. `invalid_argument`: an unknown `lap`
+/// number, a `range` failing R119/R120, `params` that fail
+/// [`resolve_spectrogram_params`]'s validation, `averaging: none` with more
+/// than one segment, or a window with too few samples/duplicate timestamps
+/// to derive a sample rate.
+pub fn fetch_fft_v2_via(
+    data_dir: &Path,
+    window: &WindowDto,
+    channel: &str,
+    params: &SpectrogramParams,
+    averaging: Averaging,
+) -> Result<Vec<u8>, IpcError> {
+    let handle = load_session_handle(data_dir, &window.session_id)?;
+    let ch = find_channel_in(handle.channel_data(), channel)?;
+    let (fft_window, detrend, scaling, window_size, noverlap) = resolve_spectrogram_params(params)?;
+    let (t0_secs, t1_secs) = resolve_window(data_dir, window)?;
+    let samples = handle.slice_by_time(channel, t0_secs, t1_secs);
+    let window_t_us = slice_t_us_by_time(&ch.t_us, t0_secs, t1_secs);
+    idl_rs::fft::check_none_averaging_segments(&averaging, window_size, noverlap, samples.len())
+        .map_err(map_fft_error)?;
+    let sample_rate_hz = idl_rs::fft::effective_rate_hz_from_t_us(&window_t_us).map_err(map_fft_error)?;
+    let result = idl_rs::fft::welch(samples, sample_rate_hz, fft_window, window_size, noverlap, detrend, averaging, scaling);
+    Ok(idl_rs::fft_wire::encode_fft_idlf(&result.values, sample_rate_hz))
+}
+
+/// Fetches one channel's FFT spectrum as `IDLF` v1 bytes, resolving its span
+/// through a [`WindowDto`] rather than `lap: Option<u32>` (C3 §3.6, R117.3,
+/// R117.7). The `_v1` `fetch_fft` stays registered, deprecated for one
+/// revision (R117.3); see [`fetch_fft_v2_via`] for resolution and error
+/// mapping.
+#[tauri::command]
+pub fn fetch_fft_v2(
+    window: WindowDto,
+    channel: String,
+    params: SpectrogramParams,
+    averaging: AveragingToken,
+    data_dir: tauri::State<'_, DataDir>,
+) -> Result<tauri::ipc::Response, IpcError> {
+    let bytes = fetch_fft_v2_via(&data_dir.0, &window, &channel, &params, averaging.into())?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +612,8 @@ mod tests {
     use idl_rs::store::parquet::write_session_parquet;
     use idl_rs::store::session_json::{empty_session_json, write_session_json, LapJson};
     use uuid::Uuid;
+
+    use crate::session_source::SpanDto;
 
     fn temp_root() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("idl-rs-tauri-rasters-test-{}", Uuid::new_v4()));
@@ -1209,6 +1279,85 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_v2_via_range_window_and_lap_window_over_the_same_span_produce_identical_bytes() {
+        // Arrange — lap 2 of `seed_laps_for_s1` is `start_time_secs: 1.0`,
+        // `end_time_secs: 1.140625` (indices 64..=73 at 64 Hz, dt = 1/64 is
+        // exact in binary, so the round-trip through microseconds loses no
+        // precision). A `range` window naming the identical span in µs must
+        // resolve to the same seconds bounds and so slice to the same
+        // samples — the two span kinds are two ways of naming one interval
+        // (R117.6) and must not diverge.
+        let root = temp_root();
+        seed_session(&root);
+        seed_laps_for_s1(&root);
+        let lap_window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 2 }, colour: "--chart-1".to_string() };
+        let range_window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Range { t0_us: 1_000_000, t1_us: 1_140_625 }, colour: "--chart-1".to_string() };
+
+        // Act
+        let lap_bytes = fetch_fft_v2_via(&root, &lap_window, "Speed", &fft_params(), Averaging::Mean).unwrap();
+        let range_bytes = fetch_fft_v2_via(&root, &range_window, "Speed", &fft_params(), Averaging::Mean).unwrap();
+
+        // Assert
+        assert_eq!(lap_bytes, range_bytes);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_v2_via_session_span_matches_v1_lap_none_whole_channel() {
+        // Arrange — `SpanDto::Session` is `_v2`'s replacement for `_v1`'s
+        // `lap: None`; both must select the whole channel and derive the
+        // same rate, so their bytes must agree.
+        let root = temp_root();
+        seed_session(&root);
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Session, colour: "--chart-1".to_string() };
+
+        // Act
+        let v1_bytes = fetch_fft_via(&root, "s1", "Speed", None, &fft_params(), Averaging::Mean).unwrap();
+        let v2_bytes = fetch_fft_v2_via(&root, &window, "Speed", &fft_params(), Averaging::Mean).unwrap();
+
+        // Assert
+        assert_eq!(v1_bytes, v2_bytes);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_v2_via_range_wholly_outside_session_invalid_argument() {
+        // Arrange — R119: a non-overlapping range is a typed error, never a
+        // spectrum computed from one edge sample.
+        let root = temp_root();
+        seed_session(&root);
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Range { t0_us: 10_000_000, t1_us: 11_000_000 }, colour: "--chart-1".to_string() };
+
+        // Act
+        let err = fetch_fft_v2_via(&root, &window, "Speed", &fft_params(), Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_fft_v2_via_unknown_lap_invalid_argument_with_detail_lap() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root);
+        seed_laps_for_s1(&root);
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 99 }, colour: "--chart-1".to_string() };
+
+        // Act
+        let err = fetch_fft_v2_via(&root, &window, "Speed", &fft_params(), Averaging::Mean).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(err.detail, Some(serde_json::json!({ "lap": 99 })));
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -22,7 +22,7 @@ use idl_rs::workbook::v3::front_matter::{parse_front_matter, render_front_matter
 use idl_rs::workbook::v3::{parse_workbook, render_prose_html, CellDoc, CellError, CellKindToken, WorkbookError};
 
 use crate::error::{IpcError, IpcErrorKind};
-use crate::session_source::{load_lap_context, load_session_handle};
+use crate::session_source::{load_lap_context, load_session_handle, load_window_context, WindowDto};
 use crate::state::{DataDir, Hashes, Watchers};
 use crate::watcher::{ExpectedHashSet, WorkbookWatcher};
 
@@ -123,6 +123,25 @@ pub struct CellOutput {
     /// `prose_after_html`, in document order (`prose_before` first, then
     /// `prose_after`) — added post-sign (2026-09-05, ledger R70).
     pub prose_spans: Vec<ProseSpan>,
+}
+
+/// One `windows[i]` entry of `eval_workbook_v2`'s return (C3 §3.4, ruling
+/// R121): that window's own outputs, or that window's own error — never
+/// both, and never a shape that can only report one call-wide outcome.
+/// `#[serde(untagged)]` so the two variants serialise exactly as C3 §3.4
+/// writes them, `{ "ok": [...] }` or `{ "error": {...} }`, with no added
+/// discriminant field for a TypeScript reader to ignore.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub enum WindowEval {
+    /// This window resolved; `ok` is this window's [`CellOutput`] vec, same
+    /// as a single-window `eval_workbook` result.
+    Ok { ok: Vec<CellOutput> },
+    /// This window failed to resolve (R121: unresolvable `session_id`,
+    /// unknown lap number, or either R119/R120 range failure) — siblings
+    /// are unaffected and still evaluate. `error.detail` carries `"window":
+    /// i` via [`with_window_index`].
+    Error { error: IpcError },
 }
 
 /// C3 §3.4 `LapContext` (ruling R52 Q5, added post-sign 2026-09-05, ruling
@@ -352,6 +371,22 @@ fn eval_workbook_via(
         None => (empty_session_handle(), MathLapContext::empty()),
     };
 
+    Ok(build_cell_outputs(&doc, &structural, &handle, &lap_ctx, session_id.is_some()))
+}
+
+/// Evaluates `doc`/`structural` against `handle`/`lap_ctx` and builds this
+/// module's `CellOutput` wire shape — the cell-output half of
+/// [`eval_workbook_via`], factored out so [`eval_workbook_v2_via`] can share
+/// it across its per-window loop without re-deriving it. `session_bound` is
+/// [`table_cell_value`]'s "was a session actually bound" flag, since `handle`
+/// alone cannot distinguish a real session from [`empty_session_handle`].
+fn build_cell_outputs(
+    doc: &idl_rs::workbook::v3::WorkbookDoc,
+    structural: &[WorkbookError],
+    handle: &SessionHandle,
+    lap_ctx: &MathLapContext,
+    session_bound: bool,
+) -> Vec<CellOutput> {
     // `eval_cells` used to panic here whenever a definition name repeated
     // anywhere in the document (`resolve_workbook_defs`'s output was keyed
     // by bare name, so a duplicate collapsed to one entry and the second
@@ -359,9 +394,9 @@ fn eval_workbook_via(
     // the root, ledger R47: `resolve_workbook_defs`/`math_cell_defs` now key
     // by `(cell_id, name)`, so every cell — including the offending one —
     // always gets its own result back; no defensive net needed here.
-    let cell_results = idl_rs::workbook::v3::eval_cells(&doc, &structural, &handle, &lap_ctx);
+    let cell_results = idl_rs::workbook::v3::eval_cells(doc, structural, handle, lap_ctx);
 
-    let out = cell_results
+    cell_results
         .iter()
         .zip(doc.cells.iter())
         .map(|(cell_eval, cell_doc)| {
@@ -385,7 +420,7 @@ fn eval_workbook_via(
                 })
                 .collect();
 
-            let value = table_cell_value(cell_eval.kind, cell_doc, session_id.is_some(), &handle);
+            let value = table_cell_value(cell_eval.kind, cell_doc, session_bound, handle);
 
             let before = cell_doc
                 .prose_before
@@ -415,9 +450,81 @@ fn eval_workbook_via(
                 prose_spans,
             }
         })
-        .collect();
+        .collect()
+}
 
-    Ok(out)
+/// Annotates `err`'s `detail` with `"window": i` (C3 §3.4 `eval_workbook_v2`:
+/// "naming the offending window's index in `detail: { \"window\": i }`") —
+/// merged into whatever `detail` the underlying error already carries (e.g.
+/// [`crate::session_source::unknown_lap`]'s `{ "lap": n }`) rather than
+/// replacing it, so the caller keeps both the original failure's own detail
+/// and which window produced it.
+fn with_window_index(mut err: IpcError, i: usize) -> IpcError {
+    let mut detail = err.detail.take().unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = detail.as_object_mut() {
+        obj.insert("window".to_string(), serde_json::json!(i));
+    }
+    err.detail = Some(detail);
+    err
+}
+
+/// Transport-agnostic core of `eval_workbook_v2` (C3 §3.4, R117.3/.4,
+/// R121). Evaluates workbook `id` once per entry of `windows`, in order,
+/// returning one [`WindowEval`] per window — per-window evaluation
+/// (R117.4): a single evaluation sees exactly one window, so multi-window
+/// *maths* (a ghost-delta chart reading two windows at once) is out of
+/// scope here, per that ruling.
+///
+/// `windows: []` evaluates once against no session — [`empty_session_handle`]
+/// and [`MathLapContext::empty`] (ledger R41) — and returns a one-element
+/// outer `Vec` so a caller always has a result array to render; its single
+/// entry's `ok` is byte-identical to [`eval_workbook_via`]`(id, None, None)`.
+///
+/// A repeated `session_id` across `windows` is legal and never deduplicated
+/// (R117.2 — two windows over one session with different laps is the common
+/// case, lap-to-lap comparison); each window resolves its own
+/// [`SessionHandle`]/[`MathLapContext`] independently via
+/// [`load_session_handle`]/[`load_window_context`].
+///
+/// # Errors
+/// Split by attribution (C3 §3.4, ruling R121). **Per-window** — an
+/// unresolvable `session_id` ([`IpcErrorKind::NotFound`]), an unknown lap
+/// number, or either R119/R120 range failure (all
+/// [`IpcErrorKind::InvalidArgument`]) — fails only that entry (the
+/// `WindowEval::Error` variant, `detail` annotated with the window's index
+/// via [`with_window_index`], `{ …, "window": i }`); every other window
+/// still evaluates and returns its own outputs. **Call-level** — an unknown
+/// or unparseable workbook `id` — rejects the whole call (`Err`), since no
+/// window has a meaningful answer without a document to evaluate. Per-cell
+/// evaluation errors keep their existing home in `CellOutput.errors`,
+/// unaffected by either path.
+fn eval_workbook_v2_via(data_dir: &Path, id: &str, windows: &[WindowDto]) -> Result<Vec<WindowEval>, IpcError> {
+    let path = resolve_workbook_path(data_dir, id)?;
+    let markdown = std::fs::read_to_string(&path)
+        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
+    let (doc, structural) = parse_workbook(&markdown).map_err(fatal_parse_error)?;
+
+    if windows.is_empty() {
+        let handle = empty_session_handle();
+        let lap_ctx = MathLapContext::empty();
+        return Ok(vec![WindowEval::Ok { ok: build_cell_outputs(&doc, &structural, &handle, &lap_ctx, false) }]);
+    }
+
+    Ok(windows
+        .iter()
+        .enumerate()
+        .map(|(i, window)| {
+            let handle = match load_session_handle(data_dir, &window.session_id) {
+                Ok(h) => h,
+                Err(e) => return WindowEval::Error { error: with_window_index(e, i) },
+            };
+            let lap_ctx = match load_window_context(data_dir, window, &handle) {
+                Ok(c) => c,
+                Err(e) => return WindowEval::Error { error: with_window_index(e, i) },
+            };
+            WindowEval::Ok { ok: build_cell_outputs(&doc, &structural, &handle, &lap_ctx, true) }
+        })
+        .collect())
 }
 
 /// Transport-agnostic core of `fetch_host_channel` (C3 §3.4). Validates
@@ -470,6 +577,77 @@ fn fetch_host_channel_via(
         Some(sid) => {
             let handle = load_session_handle(data_dir, sid)?;
             let lap_ctx = load_lap_context(data_dir, sid, &handle, None)?;
+            (handle, lap_ctx)
+        }
+        None => (empty_session_handle(), MathLapContext::empty()),
+    };
+
+    let cell_results = idl_rs::workbook::v3::eval_cells(&doc, &structural, &handle, &lap_ctx);
+
+    let def = cell_results.iter().flat_map(|c| c.defs.iter()).find(|d| d.name == def_name).ok_or_else(|| {
+        IpcError::new(IpcErrorKind::NotFound, format!("no definition named '{def_name}' in workbook '{id}'"))
+    })?;
+
+    if let Some(err) = &def.error {
+        return Err(IpcError::from(err.clone()));
+    }
+
+    let hc = def.value.as_ref().ok_or_else(|| {
+        IpcError::new(IpcErrorKind::Internal, format!("definition '{def_name}' has neither a value nor an error"))
+    })?;
+
+    Ok(idl_rs::workbook::v3::encode_host_channel_idlh(hc, budget))
+}
+
+/// Transport-agnostic core of `fetch_host_channel_v2` (C3 §3.4, R117.7).
+/// Replaces [`fetch_host_channel_via`]'s `session_id: Option<&str>` with a
+/// single `window: Option<&WindowDto>`, resolved via [`load_session_handle`]/
+/// [`load_window_context`] — the same per-window path
+/// [`eval_workbook_v2_via`] uses — instead of [`load_lap_context`]'s
+/// session-wide `laps[]`/`main_lap_number`. This is the fix for the gap
+/// `fetch_host_channel_via` leaves open (R117 item 7): that function ignores
+/// whatever lap the caller selected and always evaluates the whole session,
+/// so it disagrees with `eval_workbook_v2` whenever a lap window is in
+/// effect. A single window, not a list (unlike `eval_workbook_v2`'s
+/// `windows`) — per-window evaluation (R117.4) means a host-channel fetch is
+/// always for one window; `window: None` reproduces `fetch_host_channel`'s
+/// own `session_id: None` behaviour ([`empty_session_handle`] /
+/// [`MathLapContext::empty`]).
+///
+/// Otherwise identical to [`fetch_host_channel_via`]: same `budget`
+/// validation-before-bytes rule, same whole-document [`idl_rs::workbook::v3::
+/// eval_cells`] evaluation with `def_name` picked out of the results, same
+/// reject-on-the-named-definition's-own-failure behaviour, same `IDLH` v1
+/// encoding via [`idl_rs::workbook::v3::encode_host_channel_idlh`].
+/// [`fetch_host_channel_via`] itself is untouched — deprecated for one
+/// revision (R117.3), not rewritten in terms of this function.
+///
+/// # Errors
+/// Same set as [`fetch_host_channel_via`] plus [`load_window_context`]'s own
+/// (`not_found` for an unresolvable `window.session_id`, `invalid_argument`
+/// with `detail: { "lap": n }` for an unknown lap number on a `Lap` window,
+/// or `invalid_argument` with `detail: { session_id, t0_us, t1_us,
+/// session_span_us }` for a non-overlapping or misordered `Range` window).
+fn fetch_host_channel_v2_via(
+    data_dir: &Path,
+    id: &str,
+    window: Option<&crate::session_source::WindowDto>,
+    def_name: &str,
+    budget: u32,
+) -> Result<Vec<u8>, IpcError> {
+    if !(1..=65536).contains(&budget) {
+        return Err(IpcError::new(IpcErrorKind::InvalidArgument, format!("budget {budget} outside 1..=65536")));
+    }
+
+    let path = resolve_workbook_path(data_dir, id)?;
+    let markdown = std::fs::read_to_string(&path)
+        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
+    let (doc, structural) = parse_workbook(&markdown).map_err(fatal_parse_error)?;
+
+    let (handle, lap_ctx) = match window {
+        Some(w) => {
+            let handle = load_session_handle(data_dir, &w.session_id)?;
+            let lap_ctx = load_window_context(data_dir, w, &handle)?;
             (handle, lap_ctx)
         }
         None => (empty_session_handle(), MathLapContext::empty()),
@@ -766,6 +944,21 @@ pub fn eval_workbook(
     eval_workbook_via(&data_dir.0, &id, session_id.as_deref(), lap_context.as_ref())
 }
 
+/// C3 §3.4 `eval_workbook_v2(id, windows)` (R117.3/.4, R121). Replaces
+/// `eval_workbook`'s `session_id`/`lap_context` pair with an ordered list of
+/// [`WindowDto`]s; `eval_workbook` stays registered, deprecated for one
+/// revision (R117.3). Returns one [`WindowEval`] per window — a window that
+/// fails to resolve fails only its own entry (R121); see
+/// [`eval_workbook_v2_via`] for the full resolution.
+#[tauri::command]
+pub fn eval_workbook_v2(
+    id: String,
+    windows: Vec<WindowDto>,
+    data_dir: tauri::State<'_, DataDir>,
+) -> Result<Vec<WindowEval>, IpcError> {
+    eval_workbook_v2_via(&data_dir.0, &id, &windows)
+}
+
 /// C3 §3.4 `fetch_host_channel(workbook_id, session_id, def_name, budget)` —
 /// evaluates the named `math` definition and returns its sample data as
 /// `IDLH` v1 raw bytes (see [`idl_rs::workbook::v3::encode_host_channel_idlh`]),
@@ -781,6 +974,25 @@ pub fn fetch_host_channel(
     budget: u32,
 ) -> Result<tauri::ipc::Response, IpcError> {
     let bytes = fetch_host_channel_via(&data_dir.0, &workbook_id, session_id.as_deref(), &def_name, budget)?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// C3 §3.4 `fetch_host_channel_v2(workbook_id, window, def_name, budget)`
+/// (R117.7). Replaces `fetch_host_channel`'s `session_id` with a single
+/// `Window | null`, resolved the same lap-aware way `eval_workbook_v2` is —
+/// closing the gap where a host channel disagreed with the evaluated cell
+/// whenever a lap was selected (R117 item 7). `fetch_host_channel` stays
+/// registered, deprecated for one revision (R117.3). See
+/// [`fetch_host_channel_v2_via`] for the full resolution and error mapping.
+#[tauri::command]
+pub fn fetch_host_channel_v2(
+    data_dir: tauri::State<'_, DataDir>,
+    workbook_id: String,
+    window: Option<WindowDto>,
+    def_name: String,
+    budget: u32,
+) -> Result<tauri::ipc::Response, IpcError> {
+    let bytes = fetch_host_channel_v2_via(&data_dir.0, &workbook_id, window.as_ref(), &def_name, budget)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -865,8 +1077,29 @@ mod tests {
 
     use idl_rs::session::{Channel, RawColumn, Session, SourceFormat};
     use idl_rs::store::parquet::write_session_parquet;
-    use idl_rs::store::session_json::{empty_session_json, write_session_json};
+    use idl_rs::store::session_json::{empty_session_json, write_session_json, LapJson, SessionJson};
     use uuid::Uuid;
+
+    /// A 4-lap `session.json`, laps 1..=4 each 1 s long — mirrors
+    /// `session_source.rs`'s own private `four_lap_doc` (not `pub`, so
+    /// duplicated here rather than reached across the module boundary).
+    fn four_lap_doc(session_id: &str) -> SessionJson {
+        let mut doc = empty_session_json(session_id);
+        doc.laps = (1..=4u32)
+            .map(|n| LapJson {
+                lap_number: n,
+                start_timestamp_ms: (n as i64 - 1) * 1_000,
+                end_timestamp_ms: n as i64 * 1_000,
+                raw_elapsed_ms: 1_000,
+                lap_time_ms: 1_000,
+                start_time_secs: (n - 1) as f64,
+                end_time_secs: n as f64,
+                sectors: Vec::new(),
+                neutral_zone_visits: Vec::new(),
+            })
+            .collect();
+        doc
+    }
 
     fn temp_root() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("idl-rs-tauri-workbook-test-{}", Uuid::new_v4()));
@@ -1427,6 +1660,154 @@ mod tests {
     }
 
     #[test]
+    fn eval_workbook_v2_via_empty_windows_byte_identical_to_eval_workbook_via_no_session() {
+        // Arrange — same fixture as the `eval_workbook` "no session bound"
+        // test, `windows: []`. C3 §3.4: the one entry's `ok` must be
+        // byte-identical to `eval_workbook_via(id, None, None)`, wrapped in
+        // a one-element outer `Vec` so a caller always has a result array to
+        // render.
+        let root = temp_root();
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [ChanA]\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+
+        // Act
+        let via = eval_workbook_via(&root, WB_ID, None, None).unwrap();
+        let v2 = eval_workbook_v2_via(&root, WB_ID, &[]).unwrap();
+
+        // Assert — byte-identical via JSON, `CellOutput` has no `PartialEq`.
+        assert_eq!(
+            serde_json::to_string(&v2).unwrap(),
+            serde_json::to_string(&vec![WindowEval::Ok { ok: via }]).unwrap()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eval_workbook_v2_via_two_windows_one_session_different_laps_each_window_sees_its_own_lap() {
+        // Arrange — a 4-lap session (R117.2: a repeated session_id across
+        // windows is legal and must never be deduped, and comparing two laps
+        // of the same session is the common case). `lap_start_time(1)` reads
+        // `main_lap_bounds[0].0` (`load_window_context`'s `main_lap_number`
+        // is always `Some(1)`), so it differs per window only if each
+        // window's own lap window was actually used.
+        //
+        // R121/S1-review: the wire `CellOutput.defs[i].value` is a
+        // `HostChannelRef { length, has_t }` with no scalar, so both windows
+        // report `length: 1` either way — comparing that alone cannot tell
+        // a correct per-window loop from one that always evaluates
+        // `windows[0]`. This test reaches `eval_cells` directly, alongside
+        // `eval_workbook_v2_via`, to inspect the actual resolved
+        // `HostChannel.v[0]` scalar, which *can* disagree.
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = lap_start_time(1)\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let windows = vec![
+            WindowDto {
+                session_id: "s1".to_string(),
+                span: crate::session_source::SpanDto::Lap { lap_number: 2 },
+                colour: "--chart-1".to_string(),
+            },
+            WindowDto {
+                session_id: "s1".to_string(),
+                span: crate::session_source::SpanDto::Lap { lap_number: 3 },
+                colour: "--chart-2".to_string(),
+            },
+        ];
+
+        // Act — the wire path, asserted for shape (both windows resolve,
+        // `out[1]` inspected, not skipped).
+        let out = eval_workbook_v2_via(&root, WB_ID, &windows).unwrap();
+
+        // Act — the same resolution `eval_workbook_v2_via` uses internally,
+        // called directly per window so the actual scalar is visible.
+        let markdown_text = std::fs::read_to_string(root.join("workbooks").join("test.idl1wb")).unwrap();
+        let (doc, structural) = parse_workbook(&markdown_text).unwrap();
+        let scalar_for = |w: &WindowDto| -> f64 {
+            let handle = load_session_handle(&root, &w.session_id).unwrap();
+            let lap_ctx = load_window_context(&root, w, &handle).unwrap();
+            let cells = idl_rs::workbook::v3::eval_cells(&doc, &structural, &handle, &lap_ctx);
+            cells[0].defs[0].value.as_ref().unwrap().v[0]
+        };
+
+        // Assert — lap 2 starts at 1.0 s, lap 3 starts at 2.0 s
+        // (`four_lap_doc`); each window's evaluation sees only its own.
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], WindowEval::Ok { .. }));
+        let WindowEval::Ok { ok: out1 } = &out[1] else {
+            panic!("expected window 1 to resolve, got {:?}", out[1]);
+        };
+        assert_eq!(out1[0].defs[0].value.as_ref().unwrap().length, 1);
+        assert_eq!(scalar_for(&windows[0]), 1.0);
+        assert_eq!(scalar_for(&windows[1]), 2.0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eval_workbook_v2_via_three_windows_middle_one_degenerate_first_and_third_still_return_their_outputs() {
+        // Arrange — ruling R121: today's bug piped every per-window error
+        // through `?` inside `.collect::<Result<_, _>>()`, so a single
+        // dragged-together range (R120's `invalid_range_order`) blanked all
+        // three windows. This is the test R121 requires: three windows, the
+        // middle one degenerate, the first and third must still return
+        // their own outputs.
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [ChanA]\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let windows = vec![
+            WindowDto {
+                session_id: "s1".to_string(),
+                span: crate::session_source::SpanDto::Session,
+                colour: "--chart-1".to_string(),
+            },
+            WindowDto {
+                session_id: "s1".to_string(),
+                // t0_us == t1_us, in-span — R120's degenerate range.
+                span: crate::session_source::SpanDto::Range { t0_us: 0, t1_us: 0 },
+                colour: "--chart-2".to_string(),
+            },
+            WindowDto {
+                session_id: "s1".to_string(),
+                span: crate::session_source::SpanDto::Session,
+                colour: "--chart-3".to_string(),
+            },
+        ];
+
+        // Act
+        let out = eval_workbook_v2_via(&root, WB_ID, &windows).unwrap();
+
+        // Assert
+        assert_eq!(out.len(), 3);
+        match &out[0] {
+            WindowEval::Ok { ok } => assert_eq!(ok[0].defs[0].value.as_ref().unwrap().length, 1),
+            WindowEval::Error { error } => panic!("window 0 unexpectedly failed: {error:?}"),
+        }
+        match &out[1] {
+            WindowEval::Error { error } => {
+                assert_eq!(error.kind, IpcErrorKind::InvalidArgument);
+                assert_eq!(error.detail.as_ref().unwrap()["window"], serde_json::json!(1));
+            }
+            WindowEval::Ok { .. } => panic!("window 1 unexpectedly succeeded"),
+        }
+        match &out[2] {
+            WindowEval::Ok { ok } => assert_eq!(ok[0].defs[0].value.as_ref().unwrap().length, 1),
+            WindowEval::Error { error } => panic!("window 2 unexpectedly failed: {error:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn eval_workbook_a_math_cell_referencing_an_unknown_channel_command_succeeds_that_def_carries_math_unknown_channel(
     ) {
         // Arrange
@@ -1843,6 +2224,110 @@ mod tests {
 
         let v0 = f64::from_le_bytes(bytes[48..56].try_into().unwrap());
         assert_eq!(v0, 1.0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- Step 5: fetch_host_channel_v2 ----
+
+    #[test]
+    fn fetch_host_channel_v2_via_a_lap_window_agrees_with_eval_workbook_v2_via_on_the_same_window() {
+        // Arrange — a 4-lap session (`four_lap_doc`: lap 3 = [2.0, 3.0) s).
+        // `lap_start_time(1)` reads `main_lap_bounds[0].0`
+        // (`load_window_context`'s `main_lap_number` is always `Some(1)`),
+        // so its value differs from the session-wide answer (0.0) only if
+        // the lap window was actually threaded through — the R117 item 7 gap
+        // this task closes.
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = lap_start_time(1)\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: crate::session_source::SpanDto::Lap { lap_number: 3 },
+            colour: "--chart-1".to_string(),
+        };
+
+        // Act
+        let v2 = eval_workbook_v2_via(&root, WB_ID, std::slice::from_ref(&window)).unwrap();
+        let bytes = fetch_host_channel_v2_via(&root, WB_ID, Some(&window), "x", 65536).unwrap();
+
+        // Assert — same window, same definition, same value: `eval_workbook_v2`'s
+        // marker (length/has_t) matches the decoded `IDLH` bytes, and both
+        // reflect lap 3's start (2.0 s), not the session-wide answer (0.0).
+        let WindowEval::Ok { ok: v2_out } = &v2[0] else {
+            panic!("expected window to resolve, got {:?}", v2[0]);
+        };
+        let marker = v2_out[0].defs[0].value.as_ref().unwrap();
+        let length = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let t_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        assert_eq!(marker.length, length);
+        assert_eq!(marker.has_t, t_length > 0);
+        assert_eq!(t_length, 0, "lap_start_time is a scalar, no recorded time axis");
+        let v0 = f64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        assert_eq!(v0, 2.0, "lap 3 starts at 2.0s per four_lap_doc");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_host_channel_v2_via_window_none_reproduces_fetch_host_channel_via_session_none() {
+        // Arrange — same fixture as `fetch_host_channel_via`'s own no-session
+        // test: `window: None` must reproduce `session_id: None`'s bytes
+        // exactly, byte for byte.
+        let root = temp_root();
+        let markdown =
+            format!("---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = 1 + 1\n```\n");
+        write_workbook(&root, "test.idl1wb", &markdown);
+
+        // Act
+        let via = fetch_host_channel_via(&root, WB_ID, None, "x", 100).unwrap();
+        let v2 = fetch_host_channel_v2_via(&root, WB_ID, None, "x", 100).unwrap();
+
+        // Assert
+        assert_eq!(via, v2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_host_channel_v2_via_budget_zero_invalid_argument() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let err = fetch_host_channel_v2_via(&root, WB_ID, None, "x", 0).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_host_channel_v2_via_unresolvable_lap_number_is_invalid_argument_with_lap_detail() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
+        let markdown =
+            format!("---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [ChanA]\n```\n");
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: crate::session_source::SpanDto::Lap { lap_number: 99 },
+            colour: "--chart-1".to_string(),
+        };
+
+        // Act
+        let err = fetch_host_channel_v2_via(&root, WB_ID, Some(&window), "x", 100).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(err.detail.unwrap()["lap"], 99);
 
         let _ = std::fs::remove_dir_all(&root);
     }

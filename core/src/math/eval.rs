@@ -593,6 +593,29 @@ fn one_channel(args: &[Value], name: &str) -> Result<Arc<[f64]>, MathEvalError> 
     Ok(require_channel(&args[0], name)?.samples)
 }
 
+/// Like [`one_channel`], but for the scalar-aggregate family (R123/R124):
+/// returns the full samples plus the `[start, end)` index range the reducer
+/// should fold over — the selected window, or the whole series when the
+/// argument has no time axis (`{col[]}`) or no window is gating. A subslice
+/// (`&samples[start..end]`), not a copy: `aggregate::*`'s existing `finite()`
+/// skip keeps meaning "missing sample", not "outside the window" — those stay
+/// distinguishable (R124.2).
+fn one_channel_windowed(
+    args: &[Value],
+    name: &str,
+    lap_ctx: &MathLapContext,
+) -> Result<(Arc<[f64]>, usize, usize), MathEvalError> {
+    if args.len() != 1 {
+        return Err(err(
+            MathEvalErrorKind::ArgCount,
+            format!("{name}() takes one channel argument"),
+        ));
+    }
+    let ch = require_channel(&args[0], name)?;
+    let (start, end) = window_index_range(lap_ctx, ch.sample_rate_hz, ch.samples.len());
+    Ok((ch.samples, start, end))
+}
+
 fn require_string<'a>(v: &'a Value, ctx: &str) -> Result<&'a str, MathEvalError> {
     match v {
         Value::Str(s) => Ok(s),
@@ -658,13 +681,71 @@ fn require_ref_channel(v: &Value, ctx: &str) -> Result<(Arc<[f64]>, f64, Arc<[i6
 // The designated main lap's `(start_sec, end_sec)` from the already-uniform
 // `main_lap_bounds`, or the `(0.0, 0.0)` gating-off sentinel. Mirrors the
 // uniform-time `_mainLapWindow`.
+//
+// `main_lap_bounds` has two possible shapes, and they read differently: the
+// whole-session `load_lap_context(selection = None)` path fills it with
+// every lap in `session.json`'s order, so `main_lap_number` (1-based) is a
+// genuine index into it (`get(n - 1)`). A single *window* — one resolved
+// lap/session/range span (S1, R117, `load_window_context`) — is always a
+// one-entry vec, and `main_lap_number` there is a fixed `Some(1)` marker
+// ("a main lap is designated"), not a position; treating a 1-entry vec as
+// number-indexed silently fell back to the `(0.0, 0.0)` sentinel for any
+// lap number other than 1 and switched gating off entirely (`variance_time`/
+// `variance_dist`'s gate is `start < end`, and `0.0 < 0.0` is false) — the
+// live defect this function now closes. A one-entry vec is therefore always
+// read directly, regardless of what `main_lap_number` says; only a longer
+// vec is still indexed by lap number.
 fn main_lap_window(lap_ctx: &MathLapContext) -> (f64, f64) {
-    match lap_ctx.main_lap_number {
-        Some(n) => {
-            lap_ctx.main_lap_bounds.get((n as usize).saturating_sub(1)).copied().unwrap_or((0.0, 0.0))
-        }
-        None => (0.0, 0.0),
+    match (lap_ctx.main_lap_number, lap_ctx.main_lap_bounds.as_slice()) {
+        (Some(_), [only]) => *only,
+        (Some(n), bounds) => bounds.get((n as usize).saturating_sub(1)).copied().unwrap_or((0.0, 0.0)),
+        (None, _) => (0.0, 0.0),
     }
+}
+
+// The scalar-aggregate index range for the selected window (R123/R124: the
+// aggregation domain is the window, computation stays session-wide — this
+// narrows only where a reduction reads, never what a channel holds). A
+// resolved window is **half-open `[start_sec, end_sec)`** (ruling R126, C1
+// §6.1) and this function returns that same half-open `[start, end)` as
+// sample indices into a `len`-sample, `sample_rate_hz`-rate series, matching
+// `variance_time`'s own per-sample gate (`t = i / rate`, `start <= t < end`)
+// exactly so the two stay consistent; `idx = ceil(bound * rate)` is the same
+// formula for both ends because "smallest i with i/rate >= start_sec" and
+// "smallest i with i/rate >= end_sec" (the first *excluded* index) are the
+// same ceiling computation. Callers resolving a whole session (`SpanDto::
+// Session`) must supply `end_sec` one microsecond past the last sample
+// (`idl-rs-tauri`'s `full_session_span_us`, R126) — the last sample's own
+// timestamp as `end_sec` silently drops it, since it lands exactly on the
+// excluded boundary.
+//
+// Whole range (no narrowing) when: the gate is off (`main_lap_window`'s
+// exact `(0.0, 0.0)` sentinel — "no window selected", not any other
+// `start >= end`), or `sample_rate_hz <= 0.0` — a `{col[]}` whole-column
+// table reference has no time axis and is never windowed (R124.3). Any
+// *other* non-narrowing bound (`start_sec >= end_sec` but not the sentinel)
+// is an empty, resolved window and yields `(0, 0)`, never `(0, len)`
+// (ruling R128, amending R126): conflating "no window" with "an empty
+// window" here is what let a Range clamped past the session's end silently
+// read back as the whole channel instead of nothing selected.
+fn window_index_range(lap_ctx: &MathLapContext, sample_rate_hz: f64, len: usize) -> (usize, usize) {
+    if sample_rate_hz <= 0.0 {
+        return (0, len);
+    }
+    let (start_sec, end_sec) = main_lap_window(lap_ctx);
+    if !(start_sec < end_sec) {
+        // R128 (amending R126): only `main_lap_window`'s exact `(0.0, 0.0)`
+        // sentinel means "no window selected, gate off" — the whole
+        // channel. Any *other* `start_sec >= end_sec` (e.g. a Range window
+        // that clamped to a degenerate `(X, X)` past the session's end) is
+        // an empty, resolved window, not an absent one, and must read back
+        // as nothing selected, never silently as everything.
+        return if start_sec == 0.0 && end_sec == 0.0 { (0, len) } else { (0, 0) };
+    }
+    let start = (start_sec * sample_rate_hz).ceil().max(0.0) as usize;
+    let end = (end_sec * sample_rate_hz).ceil().max(0.0) as usize;
+    let start = start.min(len);
+    (start, end.clamp(start, len))
 }
 
 /// Folds one delta series per overlay lap into a single series: the
@@ -849,10 +930,14 @@ fn call_function(
                     ))
                 }
             };
+            // Single-spectrum fft is a reduction (R123/R124): the selected
+            // window's samples only, so a lap's spectrum is the lap's
+            // spectrum, not the session's.
+            let (start, end) = window_index_range(lap_ctx, ch.sample_rate_hz, ch.samples.len());
             // Output is n/2+1 bins; preserve the original rate so the caller can
             // compute freq[k] = k * sample_rate_hz / n. Bins are not per-sample
             // time — no t_us axis applies (empty, not ch's, per L3-R12).
-            Ok(channel(crate::fft::fft(&ch.samples, window), ch.sample_rate_hz, Arc::from(&[] as &[i64])))
+            Ok(channel(crate::fft::fft(&ch.samples[start..end], window), ch.sample_rate_hz, Arc::from(&[] as &[i64])))
         }
         "declip" => {
             require_arg_count(name, &args, 1)?;
@@ -907,9 +992,12 @@ fn call_function(
             Ok(channel(crate::statistics::detrend(&ch.samples, mode), ch.sample_rate_hz, ch.t_us))
         }
         "rms" => {
-            // 1-arg → scalar aggregate; 2-arg → rolling RMS over a window.
+            // 1-arg → scalar aggregate (windowed, R123/R124); 2-arg → rolling
+            // RMS over a sample-count window (unaffected — a different
+            // "window").
             if args.len() == 1 {
-                Ok(Value::Scalar(crate::math::aggregate::rms(&one_channel(&args, "rms")?)))
+                let (samples, s, e) = one_channel_windowed(&args, "rms", lap_ctx)?;
+                Ok(Value::Scalar(crate::math::aggregate::rms(&samples[s..e])))
             } else {
                 require_arg_count(name, &args, 2)?;
                 let ch = require_channel(&args[0], name)?;
@@ -918,9 +1006,11 @@ fn call_function(
             }
         }
         "mean" => {
-            // 1-arg → scalar aggregate; 2-arg → rolling mean over a window.
+            // 1-arg → scalar aggregate (windowed, R123/R124); 2-arg → rolling
+            // mean over a sample-count window (unaffected).
             if args.len() == 1 {
-                Ok(Value::Scalar(crate::math::aggregate::mean(&one_channel(&args, "mean")?)))
+                let (samples, s, e) = one_channel_windowed(&args, "mean", lap_ctx)?;
+                Ok(Value::Scalar(crate::math::aggregate::mean(&samples[s..e])))
             } else {
                 require_arg_count(name, &args, 2)?;
                 let ch = require_channel(&args[0], name)?;
@@ -929,9 +1019,11 @@ fn call_function(
             }
         }
         "std" => {
-            // 1-arg → scalar aggregate (population σ); 2-arg → rolling std.
+            // 1-arg → scalar aggregate (population σ, windowed, R123/R124);
+            // 2-arg → rolling std over a sample-count window (unaffected).
             if args.len() == 1 {
-                Ok(Value::Scalar(crate::math::aggregate::std_pop(&one_channel(&args, "std")?)))
+                let (samples, s, e) = one_channel_windowed(&args, "std", lap_ctx)?;
+                Ok(Value::Scalar(crate::math::aggregate::std_pop(&samples[s..e])))
             } else {
                 require_arg_count(name, &args, 2)?;
                 let ch = require_channel(&args[0], name)?;
@@ -970,10 +1062,11 @@ fn call_function(
             elemwise(it.next().unwrap(), it.next().unwrap(), "pow", |a, b| Ok(a.powf(b)))
         }
         "min" => {
-            // 1-arg → scalar aggregate (column/series minimum); 2-arg →
-            // elementwise minimum of two operands.
+            // 1-arg → scalar aggregate (column/series minimum, windowed,
+            // R123/R124); 2-arg → elementwise minimum of two operands.
             if args.len() == 1 {
-                Ok(Value::Scalar(crate::math::aggregate::min(&one_channel(&args, "min")?)))
+                let (samples, s, e) = one_channel_windowed(&args, "min", lap_ctx)?;
+                Ok(Value::Scalar(crate::math::aggregate::min(&samples[s..e])))
             } else {
                 require_arg_count(name, &args, 2)?;
                 let mut it = args.into_iter();
@@ -981,10 +1074,11 @@ fn call_function(
             }
         }
         "max" => {
-            // 1-arg → scalar aggregate (column/series maximum); 2-arg →
-            // elementwise maximum of two operands.
+            // 1-arg → scalar aggregate (column/series maximum, windowed,
+            // R123/R124); 2-arg → elementwise maximum of two operands.
             if args.len() == 1 {
-                Ok(Value::Scalar(crate::math::aggregate::max(&one_channel(&args, "max")?)))
+                let (samples, s, e) = one_channel_windowed(&args, "max", lap_ctx)?;
+                Ok(Value::Scalar(crate::math::aggregate::max(&samples[s..e])))
             } else {
                 require_arg_count(name, &args, 2)?;
                 let mut it = args.into_iter();
@@ -1003,30 +1097,46 @@ fn call_function(
             Ok(Value::Scalar(v))
         }
 
-        // ---- Scalar aggregates (channel/column → scalar). The colliding names
-        // (mean/std/rms/min/max/median) are arity-dispatched in their arms
-        // above; these have no windowed/elementwise counterpart. ----
-        "sum" => Ok(Value::Scalar(crate::math::aggregate::sum(&one_channel(&args, "sum")?))),
-        "count" => Ok(Value::Scalar(crate::math::aggregate::count(&one_channel(&args, "count")?))),
-        "first" => Ok(Value::Scalar(crate::math::aggregate::first(&one_channel(&args, "first")?))),
-        "last" => Ok(Value::Scalar(crate::math::aggregate::last(&one_channel(&args, "last")?))),
+        // ---- Scalar aggregates (channel/column → scalar, windowed per
+        // R123/R124). The colliding names (mean/std/rms/min/max/median) are
+        // arity-dispatched in their arms above; these have no
+        // windowed/elementwise counterpart. ----
+        "sum" => {
+            let (samples, s, e) = one_channel_windowed(&args, "sum", lap_ctx)?;
+            Ok(Value::Scalar(crate::math::aggregate::sum(&samples[s..e])))
+        }
+        "count" => {
+            let (samples, s, e) = one_channel_windowed(&args, "count", lap_ctx)?;
+            Ok(Value::Scalar(crate::math::aggregate::count(&samples[s..e])))
+        }
+        "first" => {
+            let (samples, s, e) = one_channel_windowed(&args, "first", lap_ctx)?;
+            Ok(Value::Scalar(crate::math::aggregate::first(&samples[s..e])))
+        }
+        "last" => {
+            let (samples, s, e) = one_channel_windowed(&args, "last", lap_ctx)?;
+            Ok(Value::Scalar(crate::math::aggregate::last(&samples[s..e])))
+        }
         "median" => {
             // 1-arg → scalar aggregate. A 2-arg rolling median remains deferred
             // (preserve the exact deferred-stub message for parity).
             if args.len() == 1 {
-                Ok(Value::Scalar(crate::math::aggregate::median(&one_channel(&args, "median")?)))
+                let (samples, s, e) = one_channel_windowed(&args, "median", lap_ctx)?;
+                Ok(Value::Scalar(crate::math::aggregate::median(&samples[s..e])))
             } else {
                 Err(err(MathEvalErrorKind::NotImplemented, "not yet implemented: median".to_string()))
             }
         }
         "p" => {
-            // p(channel, quantile) → linear-interpolated percentile (quantile in 0..=100).
+            // p(channel, quantile) → linear-interpolated percentile (quantile
+            // in 0..=100), windowed per R123/R124.
             if args.len() != 2 {
                 return Err(err(MathEvalErrorKind::ArgCount, "p(channel, quantile) takes 2 args"));
             }
             let ch = require_channel(&args[0], "p")?;
             let q = require_scalar(&args[1], "p quantile")?;
-            Ok(Value::Scalar(crate::math::aggregate::percentile(&ch.samples, q)))
+            let (start, end) = window_index_range(lap_ctx, ch.sample_rate_hz, ch.samples.len());
+            Ok(Value::Scalar(crate::math::aggregate::percentile(&ch.samples[start..end], q)))
         }
         "atan2" => {
             require_arg_count(name, &args, 2)?;
@@ -1824,6 +1934,186 @@ mod tests {
         assert_eq!(out, 2.0);
     }
 
+    // ---- R123/R124: scalar aggregates are windowed (aggregation domain =
+    // the selected window), while the input channel stays session-length. ----
+
+    // A single-window `MathLapContext`, mirroring `load_window_context`'s
+    // real shape (S1, R117): one bounds entry, `main_lap_number = Some(1)`
+    // ("a main lap is designated" marker, not a position).
+    fn window_ctx(start_s: f64, end_s: f64) -> MathLapContext {
+        MathLapContext {
+            main_lap_bounds: vec![(start_s, end_s)],
+            main_lap_number: Some(1),
+            ..MathLapContext::empty()
+        }
+    }
+
+    #[test]
+    fn max_scalar_aggregate_reduces_over_the_lap_window_not_the_session() {
+        // Arrange — 1 Hz, 10 s: session max is 10.0 at t=3s, outside the
+        // selected [5, 9) window, where the max is 9.0 (t=8s).
+        let lk = lookup(&[("a", vec![1.0, 2.0, 3.0, 10.0, 5.0, 6.0, 7.0, 8.0, 9.0, 0.0], 1.0)]);
+        let lap = window_ctx(5.0, 9.0);
+
+        // Act
+        let windowed = eval_with_laps("max([a])", &lk, &lap);
+        let session = eval_expr("max([a])", &lk).unwrap();
+
+        // Assert
+        assert!(matches!(windowed, Value::Scalar(x) if x == 9.0));
+        assert!(matches!(session, Value::Scalar(x) if x == 10.0));
+    }
+
+    #[test]
+    fn mean_scalar_aggregate_reduces_over_the_lap_window_not_the_session() {
+        // Arrange — same series; window [5, 9) is samples [6,7,8,9], mean 7.5.
+        let lk = lookup(&[("a", vec![1.0, 2.0, 3.0, 10.0, 5.0, 6.0, 7.0, 8.0, 9.0, 0.0], 1.0)]);
+        let lap = window_ctx(5.0, 9.0);
+
+        // Act
+        let windowed = eval_with_laps("mean([a])", &lk, &lap);
+        let session = eval_expr("mean([a])", &lk).unwrap();
+
+        // Assert
+        assert!(matches!(windowed, Value::Scalar(x) if (x - 7.5).abs() < 1e-12));
+        assert!(matches!(session, Value::Scalar(x) if (x - 5.1).abs() < 1e-12));
+    }
+
+    #[test]
+    fn scalar_aggregates_over_a_session_span_window_match_the_unwindowed_result() {
+        // Arrange — a window whose bounds are the whole recorded span
+        // (`SpanDto::Session`'s shape) must change nothing: the regression
+        // that proves scope changed, not arithmetic. The bound is built the
+        // way `idl-rs-tauri`'s `full_session_span_us`/`resolve_window`
+        // actually produce it for `SpanDto::Session` (ruling R126), not a
+        // fabricated duration-shaped `(0.0, 1.0)`: 10 samples at 10 Hz have
+        // `t_us` 0, 100_000, …, 900_000, so `end_sec` is one microsecond
+        // past the *last* sample's own timestamp, `(900_000 + 1) / 1e6`.
+        // The old fabricated `(0.0, 1.0)` bound happened to equal this by
+        // coincidence (10 samples / 10 Hz = 1.0 s exactly) and so never
+        // caught the drop; the old *buggy* production bound was
+        // `(0.0, 0.9)` — the last sample's own timestamp, excluded by
+        // `window_index_range`'s half-open `[start, end)`. Confirmed by
+        // hand: swapping `end_s` below back to `0.9` fails every one of
+        // these aggregates against the pre-fix code. The last sample is
+        // `4.5`, not `0.0` — a zero last sample makes `sum` numerically
+        // identical whether it is included or not, so it alone would not
+        // catch the drop (R130 review note); every other value here is
+        // already distinct and nonzero.
+        let samples = vec![1.0, 2.0, 3.0, 10.0, 5.0, 6.0, 7.0, 8.0, 9.0, 4.5];
+        let lk = lookup(&[("a", samples, 10.0)]);
+        let last_us: i64 = 900_000;
+        let end_s = (last_us + 1) as f64 / 1e6;
+        let whole_session = window_ctx(0.0, end_s);
+
+        for expr in ["max([a])", "min([a])", "mean([a])", "rms([a])", "std([a])", "sum([a])", "median([a])"] {
+            let windowed = eval_with_laps(expr, &lk, &whole_session);
+            let session = eval_expr(expr, &lk).unwrap();
+            match (windowed, session) {
+                (Value::Scalar(w), Value::Scalar(s)) => {
+                    assert!((w - s).abs() < 1e-12 || (w.is_nan() && s.is_nan()), "{expr}: {w} != {s}")
+                }
+                other => panic!("{expr}: expected two scalars, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn window_index_range_no_lap_context_sentinel_is_the_whole_channel() {
+        // Arrange — `no_laps()` has no bounds at all, so `main_lap_window`
+        // returns its `(0.0, 0.0)` "no window selected" sentinel — the one
+        // and only shape that means "gate off" (ruling R128).
+
+        // Act
+        let (start, end) = window_index_range(&no_laps(), 10.0, 7);
+
+        // Assert
+        assert_eq!((start, end), (0, 7));
+    }
+
+    #[test]
+    fn window_index_range_degenerate_non_sentinel_bound_is_empty_not_the_whole_channel() {
+        // Arrange — a *resolved* window whose bounds happen to collapse to
+        // equal (e.g. a Range clamped past the session's end, R128) is not
+        // the same value as "no window selected": only the exact
+        // `(0.0, 0.0)` sentinel means that. `(0.5, 0.5)` is degenerate for
+        // an entirely different reason and must read back as nothing
+        // selected, never silently as everything.
+        let degenerate = window_ctx(0.5, 0.5);
+
+        // Act
+        let (start, end) = window_index_range(&degenerate, 10.0, 7);
+
+        // Assert — empty, not the whole 7-sample channel.
+        assert_eq!((start, end), (0, 0));
+    }
+
+    #[test]
+    fn window_index_range_ceil_and_per_sample_gate_agree_at_thirty_minutes_1khz() {
+        // Arrange — a realistic extreme: ~30 minutes at 1 kHz (1,800,000
+        // samples). `window_index_range`'s `ceil(bound_sec * rate)` and
+        // `variance_time`'s per-sample gate `i as f64 / rate < end_sec` are
+        // algebraically equal, not bit-identical (R126's accepted Minor) —
+        // this documents that they still agree at this scale rather than
+        // pretending the float limitation away.
+        let rate_hz = 1000.0;
+        let len: usize = 30 * 60 * 1000; // 1,800,000 samples
+        let last_us = (len as i64 - 1) * 1000; // 1 ms per sample at 1 kHz
+        let end_sec = (last_us + 1) as f64 / 1e6; // R126: session end is half-open
+        let lap_ctx = window_ctx(0.0, end_sec);
+
+        // Act
+        let (start, end) = window_index_range(&lap_ctx, rate_hz, len);
+
+        // Assert — the ceil-based index range covers every sample the
+        // per-sample gate would also admit, and vice versa.
+        assert_eq!((start, end), (0, len));
+        for i in [0usize, 1, len / 2, len - 2, len - 1] {
+            let t = i as f64 / rate_hz;
+            let gate_admits = start as f64 / rate_hz <= t && t < end_sec;
+            let range_admits = i >= start && i < end;
+            assert_eq!(gate_admits, range_admits, "sample {i}: gate={gate_admits} range={range_admits}");
+        }
+    }
+
+    #[test]
+    fn first_and_last_return_the_windows_own_endpoints_not_the_sessions() {
+        // Arrange — session first/last are 1.0/0.0; the [5, 9) window's
+        // first/last are 6.0/9.0.
+        let lk = lookup(&[("a", vec![1.0, 2.0, 3.0, 10.0, 5.0, 6.0, 7.0, 8.0, 9.0, 0.0], 1.0)]);
+        let lap = window_ctx(5.0, 9.0);
+
+        // Act
+        let first = eval_with_laps("first([a])", &lk, &lap);
+        let last = eval_with_laps("last([a])", &lk, &lap);
+
+        // Assert
+        assert!(matches!(first, Value::Scalar(x) if x == 6.0));
+        assert!(matches!(last, Value::Scalar(x) if x == 9.0));
+    }
+
+    #[test]
+    fn table_column_reference_is_never_windowed() {
+        // Arrange — {a[]} is a rate-0 table column (R124.3): a window has no
+        // meaning on it, so a lap window must not truncate it.
+        struct ColLookup;
+        impl ChannelLookup for ColLookup {
+            fn lookup(&self, _: &str) -> Option<LookupChannel> {
+                None
+            }
+            fn lookup_cell_column(&self, name: &str) -> Option<Vec<f64>> {
+                (name == "a").then(|| vec![10.0, 20.0, 30.0])
+            }
+        }
+        let lap = window_ctx(0.0, 0.001); // would truncate to nothing if applied
+
+        // Act
+        let v = eval_with_laps("sum({a[]})", &ColLookup, &lap);
+
+        // Assert
+        assert!(matches!(v, Value::Scalar(x) if x == 60.0));
+    }
+
     #[test]
     fn detrend_default_mode_is_linear_and_preserves_rate_and_length() {
         // Arrange — a pure ramp at 50 Hz; default (no mode arg) is linear.
@@ -2335,6 +2625,68 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, MathEvalErrorKind::NoLapContext);
+    }
+
+    #[test]
+    fn variance_time_main_lap_number_other_than_one_over_single_entry_bounds_still_gates() {
+        // Arrange — a window-scoped `MathLapContext` (S1, R117): exactly one
+        // entry in `main_lap_bounds` (0..5 s) but `main_lap_number = Some(3)`,
+        // since a window's lap number is no longer an index into that vec.
+        // Before the fix, `main_lap_window` read `main_lap_bounds.get(3 - 1)`
+        // on a 1-element vec, missed, and fell back to the `(0.0, 0.0)`
+        // sentinel. `variance_time`'s gate is `start < end` (`variance.rs`'s
+        // `variance_time`), so `(0.0, 0.0)` does not merely gate everything
+        // out — `0.0 < 0.0` is false, so it silently disables gating
+        // entirely and every sample (including t = 9 s, well outside the
+        // real 0..5 s window) passes through ungated. The regression this
+        // guards is samples at/after t = 5 s must be `NaN`.
+        let lon: Vec<f64> = (0..10).map(|i| i as f64 * 0.001).collect();
+        let lat = vec![0.0; 10];
+        let epoch: Vec<f64> = (0..10).map(|i| (i * 1000) as f64).collect();
+        let chan: Vec<f64> = (0..10).map(|i| i as f64).collect();
+
+        let main = lookup(&[
+            ("GPS_Latitude", lat.clone(), 1.0),
+            ("GPS_Longitude", lon.clone(), 1.0),
+            ("GPS_EpochMs", epoch.clone(), 1.0),
+            ("LapTime", chan.clone(), 1.0),
+        ]);
+        let overlay = lookup(&[
+            ("GPS_Latitude", lat, 1.0),
+            ("GPS_Longitude", lon, 1.0),
+            ("GPS_EpochMs", epoch, 1.0),
+            ("LapTime", chan, 1.0),
+        ]);
+        let ctx = MathLapContext {
+            main_lap_bounds: vec![(0.0, 5.0)],
+            main_sectors: Vec::new(),
+            main_lap_number: Some(3),
+            overlay: vec![MathOverlay {
+                lookup: std::sync::Arc::new(overlay),
+                lap_start_ms: 0.0,
+                lap_end_ms: 9000.0,
+                lap_start_uniform_sec: 0.0,
+            }],
+            baseline_row: None,
+        };
+
+        // Act
+        let v = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &main, &ctx)
+            .unwrap();
+
+        // Assert — the single bounds entry gates the window regardless of
+        // `main_lap_number`'s value: t = 6 s (index 6, outside 0..5 s) must
+        // be `NaN`. (Index 9 is excluded from this check — it falls outside
+        // the same 0..5 s window gate as index 6, so asserting it separately
+        // would exercise the identical gate path and add no new coverage.)
+        match v {
+            Value::Channel(c) => {
+                assert!(c.samples[6].is_nan(), "expected t=6s outside 0..5s window to be NaN, got {}", c.samples[6]);
+                let inside: Vec<f64> = c.samples[0..5].iter().copied().filter(|x| !x.is_nan()).collect();
+                assert!(!inside.is_empty(), "expected some in-window (t<5s) samples, got all-NaN");
+            }
+            _ => panic!(),
+        }
     }
 
     // ---- Vector & rotation primitives (parser-level integration) ----
