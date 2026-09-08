@@ -59,6 +59,24 @@ fn unknown_lap(lap: u32) -> IpcError {
     )
 }
 
+/// Builds an [`IpcErrorKind::InvalidArgument`] for a `laps[]` entry whose
+/// `start_time_secs >= end_time_secs` (ruling R130). `LapJson` deserialises
+/// plain `f64`s with no ordering check, and `start_time_secs ==
+/// end_time_secs == 0.0` is indistinguishable downstream from
+/// `window_index_range`'s "no window selected" sentinel — it would
+/// silently resolve to the whole channel rather than the invalid lap it
+/// is. C1 treats `session.json` as data to validate, not trust: a
+/// corrupted or hand-edited file (or one from an older engine) can produce
+/// this even though the shipped lap detectors cannot. `detail: { "lap": n
+/// }`, matching [`unknown_lap`]'s shape for the same `Lap` span kind.
+fn invalid_lap_bounds(lap: u32) -> IpcError {
+    IpcError::with_detail(
+        IpcErrorKind::InvalidArgument,
+        format!("lap {lap}'s bounds in session.json are not ordered (start_time_secs must be < end_time_secs)"),
+        serde_json::json!({ "lap": lap }),
+    )
+}
+
 /// Reads `session_id`'s `session.json`, `Err(())` if it is absent or fails
 /// to parse. The one place [`load_lap_context`] and [`resolve_lap_window`]
 /// both call to reach the file, so a path change or a parse-library swap
@@ -256,11 +274,22 @@ pub fn resolve_window(data_root: &Path, window: &WindowDto) -> Result<(f64, f64)
         SpanDto::Lap { lap_number } => {
             let doc = try_read_session_json(data_root, &window.session_id)
                 .unwrap_or_else(|_| empty_session_json(&window.session_id));
-            doc.laps
+            let (start, end) = doc
+                .laps
                 .iter()
                 .find(|l| l.lap_number == *lap_number)
                 .map(|l| (l.start_time_secs, l.end_time_secs))
-                .ok_or_else(|| unknown_lap(*lap_number))
+                .ok_or_else(|| unknown_lap(*lap_number))?;
+            // R130: `session.json` is validated, not trusted — an unordered
+            // (or degenerate) pair is rejected here rather than reaching
+            // `window_index_range`, where `(0.0, 0.0)` is indistinguishable
+            // from "no window selected" and would silently return the
+            // whole channel.
+            if start < end {
+                Ok((start, end))
+            } else {
+                Err(invalid_lap_bounds(*lap_number))
+            }
         }
         SpanDto::Range { t0_us, t1_us } => {
             let session_span_us = full_session_span_us(data_root, &window.session_id)?;
@@ -855,6 +884,41 @@ mod tests {
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
         assert_eq!(err.detail, Some(serde_json::json!({ "lap": 99 })));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_window_lap_span_degenerate_zero_zero_bounds_invalid_argument_with_detail() {
+        // Arrange — a `laps[]` entry with `start_time_secs == end_time_secs
+        // == 0.0` (a corrupted or hand-edited `session.json`; the shipped
+        // detectors cannot produce this). Unvalidated, `(0.0, 0.0)` is
+        // exactly `main_lap_window`'s "no window selected" sentinel and
+        // would silently resolve to the whole channel (ruling R130).
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let mut doc = empty_session_json("s1");
+        doc.laps = vec![LapJson {
+            lap_number: 1,
+            start_timestamp_ms: 0,
+            end_timestamp_ms: 0,
+            raw_elapsed_ms: 0,
+            lap_time_ms: 0,
+            start_time_secs: 0.0,
+            end_time_secs: 0.0,
+            sectors: Vec::new(),
+            neutral_zone_visits: Vec::new(),
+        }];
+        write_session_json(&root, "s1", &doc, None).unwrap();
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 1 }, colour: String::new() };
+
+        // Act
+        let err = resolve_window(&root, &window).unwrap_err();
+
+        // Assert — a typed error, not a `(0.0, 0.0)` window read back as
+        // the whole channel.
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(err.detail, Some(serde_json::json!({ "lap": 1 })));
 
         let _ = std::fs::remove_dir_all(&root);
     }

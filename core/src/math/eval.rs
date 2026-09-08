@@ -1995,8 +1995,12 @@ mod tests {
         // `(0.0, 0.9)` — the last sample's own timestamp, excluded by
         // `window_index_range`'s half-open `[start, end)`. Confirmed by
         // hand: swapping `end_s` below back to `0.9` fails every one of
-        // these aggregates against the pre-fix code.
-        let samples = vec![1.0, 2.0, 3.0, 10.0, 5.0, 6.0, 7.0, 8.0, 9.0, 0.0];
+        // these aggregates against the pre-fix code. The last sample is
+        // `4.5`, not `0.0` — a zero last sample makes `sum` numerically
+        // identical whether it is included or not, so it alone would not
+        // catch the drop (R130 review note); every other value here is
+        // already distinct and nonzero.
+        let samples = vec![1.0, 2.0, 3.0, 10.0, 5.0, 6.0, 7.0, 8.0, 9.0, 4.5];
         let lk = lookup(&[("a", samples, 10.0)]);
         let last_us: i64 = 900_000;
         let end_s = (last_us + 1) as f64 / 1e6;
