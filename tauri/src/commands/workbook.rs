@@ -63,6 +63,13 @@ pub struct CellDefResult {
     pub name: String,
     pub label: Option<String>,
     pub value: Option<HostChannelRef>,
+    /// This definition's sample rate, Hz, on success — ruling R144
+    /// (`runs/2026-09-03/decisions.md`), verbatim from
+    /// [`idl_rs::workbook::v3::CellDefResult::sample_rate_hz`]. `null` means
+    /// genuinely not applicable (a scalar reduction has no rate), never
+    /// "unknown"; also `null` on failure. R144's `unit` half is deferred
+    /// (ruling R152) — no unit exists on the engine's value type today.
+    pub sample_rate_hz: Option<f64>,
     /// `math_*` kind only — a structural problem on this definition keeps it
     /// out of `defs` entirely (routed to the cell's own `errors` instead).
     pub error: Option<IpcError>,
@@ -407,6 +414,7 @@ fn build_cell_outputs(
                     name: d.name.clone(),
                     label: d.label.clone(),
                     value: d.value.as_ref().map(HostChannelRef::from),
+                    sample_rate_hz: d.sample_rate_hz,
                     error: d.error.clone().map(IpcError::from),
                 })
                 .collect();
