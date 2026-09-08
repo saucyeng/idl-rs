@@ -69,23 +69,128 @@ fn try_read_session_json(data_dir: &Path, session_id: &str) -> Result<SessionJso
     read_session_json(&path).map_err(|_| ())
 }
 
+/// One session's id plus the tagged-union span the UI picked (C1 §6.x, R115)
+/// — the wire shape of a time window, `snake_case`, deserialised straight
+/// from JS's `Window`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WindowDto {
+    /// The session `span` is resolved against. A window is meaningless
+    /// without it (C1 §6.x).
+    pub session_id: String,
+    /// Which portion of `session_id`'s recording this window names.
+    pub span: SpanDto,
+    /// A chart-token name (`--chart-1` … `--chart-8`), never a hex literal
+    /// (C1 §6.x, R117.6). Not validated at this layer — see
+    /// [`resolve_window`]'s doc comment for why.
+    pub colour: String,
+}
+
+/// The tagged union naming which portion of a session's recording a
+/// [`WindowDto`] resolves to (C1 §6.x). `kind` tags the wire JSON;
+/// `snake_case` on both the tag and `lap_number`/`t0_us`/`t1_us`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SpanDto {
+    /// The whole session, start to end of its recorded samples.
+    Session,
+    /// One lap by its 1-based `lap_number`, matching `LapSummary.lap_number`
+    /// / `session.json`'s `laps[]`.
+    Lap {
+        /// 1-based, as stored in `session.json`'s `laps[]`.
+        lap_number: u32,
+    },
+    /// An explicit span. **Not** epoch time — session-relative.
+    Range {
+        /// Start, microseconds since `session_id`'s first sample (the same
+        /// axis as `Channel.t_us`). `t0_us < t1_us` is the producer's
+        /// invariant, not checked here.
+        t0_us: i64,
+        /// End, microseconds since `session_id`'s first sample.
+        t1_us: i64,
+    },
+}
+
+/// The session's full recorded span, seconds: the earliest and latest
+/// `t_us` across every channel of `session_id`'s `data.parquet`.
+/// `Channel.t_us` is µs since the session's first sample, but not every
+/// channel starts (or ends) at the same sample — e.g. an event-driven
+/// channel's first `t_us` can be well after `0` — so the session's own
+/// start/end is the min/max across all of them, not any one channel's own
+/// span (contrast [`idl_rs::session::handle::SessionMeta::duration_ms`],
+/// which is the *longest single channel's* span and does not track the
+/// start offset at all). `(0.0, 0.0)` for a session with no channels or
+/// only empty channels.
+fn full_session_span_secs(data_dir: &Path, session_id: &str) -> Result<(f64, f64), IpcError> {
+    let session = load_session(data_dir, session_id)?;
+    let mut start_us: Option<i64> = None;
+    let mut end_us: Option<i64> = None;
+    for c in &session.channels {
+        if let (Some(&first), Some(&last)) = (c.t_us.first(), c.t_us.last()) {
+            start_us = Some(start_us.map_or(first, |s| s.min(first)));
+            end_us = Some(end_us.map_or(last, |e| e.max(last)));
+        }
+    }
+    let (start_us, end_us) = (start_us.unwrap_or(0), end_us.unwrap_or(0));
+    Ok((start_us as f64 / 1e6, end_us as f64 / 1e6))
+}
+
+/// Resolves a [`WindowDto`]'s span to its recording-time bounds, seconds,
+/// against `data_root`'s session store (C1 §6.x, R115; generalises the
+/// lap-only [`resolve_lap_window`], which now forwards here).
+///
+/// - `Session` resolves to [`full_session_span_secs`] — the full recorded
+///   span.
+/// - `Lap` resolves one lap number from `session_id`'s `session.json`
+///   `laps[]`; a missing or unparsable `session.json` has no `laps[]` to
+///   resolve against — treated as zero known laps, so every `lap_number` is
+///   [`unknown_lap`] (`invalid_argument`, `detail: { "lap": n }`), shared
+///   with [`load_lap_context`] so a bad lap number reports identically
+///   wherever it is named.
+/// - `Range` converts `t0_us`/`t1_us` to seconds and clamps each endpoint
+///   independently to [`full_session_span_secs`]'s bounds (C1 §6.x: "a range
+///   wholly outside it resolves to the empty window"). A range wholly before
+///   or wholly after the session clamps both endpoints to the same edge,
+///   returning a zero-width `(t, t)` window — that is the empty window, not
+///   an error; a partially-overlapping range keeps its in-bounds edge and
+///   clamps only the other.
+///
+/// `Session` and `Range` load the session's `data.parquet` (via
+/// [`load_session`]) to know its span, so a missing session is
+/// [`IpcErrorKind::NotFound`] for those two kinds. `Lap` never loads the
+/// parquet — matching [`resolve_lap_window`]'s original behaviour of not
+/// caring whether the session itself exists, only whether the lap number
+/// resolves.
+pub fn resolve_window(data_root: &Path, window: &WindowDto) -> Result<(f64, f64), IpcError> {
+    match &window.span {
+        SpanDto::Session => full_session_span_secs(data_root, &window.session_id),
+        SpanDto::Lap { lap_number } => {
+            let doc = try_read_session_json(data_root, &window.session_id)
+                .unwrap_or_else(|_| empty_session_json(&window.session_id));
+            doc.laps
+                .iter()
+                .find(|l| l.lap_number == *lap_number)
+                .map(|l| (l.start_time_secs, l.end_time_secs))
+                .ok_or_else(|| unknown_lap(*lap_number))
+        }
+        SpanDto::Range { t0_us, t1_us } => {
+            let (session_start_s, session_end_s) = full_session_span_secs(data_root, &window.session_id)?;
+            let t0_s = (*t0_us as f64 / 1e6).clamp(session_start_s, session_end_s);
+            let t1_s = (*t1_us as f64 / 1e6).clamp(session_start_s, session_end_s);
+            Ok((t0_s, t1_s))
+        }
+    }
+}
+
 /// Resolves one lap number to its recording-time window, seconds, from
-/// `session_id`'s `session.json` `laps[]` (C3 §3.6 `fetch_fft`). Shares
-/// [`unknown_lap`]'s error shape with [`load_lap_context`] so a bad lap
-/// number reports identically wherever it is named (C3 §3.4's
-/// `invalid_argument` + `detail: { "lap": n }`). A missing or unparsable
-/// `session.json` has no `laps[]` to resolve against — treated as zero
-/// known laps, so every `lap` number is [`unknown_lap`], not a distinct
-/// error (this function has no "no lap context" answer to give back, unlike
-/// [`load_lap_context`]'s `Ok(MathLapContext::empty())`: a window is either
-/// resolved or it is an error).
+/// `session_id`'s `session.json` `laps[]` (C3 §3.6 `fetch_fft`). A thin
+/// wrapper over [`resolve_window`]'s `Lap` arm — kept as its own function
+/// until Task 6 retires its last caller; `colour` is irrelevant to
+/// resolution so an empty placeholder is passed through.
 pub fn resolve_lap_window(data_root: &Path, session_id: &str, lap: u32) -> Result<(f64, f64), IpcError> {
-    let doc = try_read_session_json(data_root, session_id).unwrap_or_else(|_| empty_session_json(session_id));
-    doc.laps
-        .iter()
-        .find(|l| l.lap_number == lap)
-        .map(|l| (l.start_time_secs, l.end_time_secs))
-        .ok_or_else(|| unknown_lap(lap))
+    resolve_window(
+        data_root,
+        &WindowDto { session_id: session_id.to_string(), span: SpanDto::Lap { lap_number: lap }, colour: String::new() },
+    )
 }
 
 /// Builds a [`MathLapContext`] from `session_id`'s `session.json` `laps[]`,
@@ -555,6 +660,118 @@ mod tests {
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
         assert_eq!(err.detail, Some(serde_json::json!({ "lap": 1 })));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_window_session_span_full_recorded_span_from_t_us() {
+        // Arrange — `seed_session`'s "Speed" channel spans 0..500_000 µs.
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Session, colour: String::new() };
+
+        // Act
+        let span = resolve_window(&root, &window).unwrap();
+
+        // Assert
+        assert_eq!(span, (0.0, 0.5));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_window_lap_span_matches_session_json_laps() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root, "s1");
+        write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 3 }, colour: String::new() };
+
+        // Act
+        let span = resolve_window(&root, &window).unwrap();
+
+        // Assert
+        assert_eq!(span, (2.0, 3.0));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_window_lap_span_unknown_lap_number_invalid_argument_with_detail() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root, "s1");
+        write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 99 }, colour: String::new() };
+
+        // Act
+        let err = resolve_window(&root, &window).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(err.detail, Some(serde_json::json!({ "lap": 99 })));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_window_range_span_inside_session_converts_us_to_seconds() {
+        // Arrange — within the 0..500_000 µs session span.
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: SpanDto::Range { t0_us: 100_000, t1_us: 400_000 },
+            colour: String::new(),
+        };
+
+        // Act
+        let span = resolve_window(&root, &window).unwrap();
+
+        // Assert
+        assert_eq!(span, (0.1, 0.4));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_window_range_span_wholly_after_session_clamps_to_empty_window_at_the_end() {
+        // Arrange — session ends at 500_000 µs; this range starts after it.
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: SpanDto::Range { t0_us: 600_000, t1_us: 700_000 },
+            colour: String::new(),
+        };
+
+        // Act
+        let span = resolve_window(&root, &window).unwrap();
+
+        // Assert — both endpoints clamp to the session's own end: a
+        // zero-width window, not an error (C1 §6.x's "empty window").
+        assert_eq!(span, (0.5, 0.5));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_window_range_span_wholly_before_session_clamps_to_empty_window_at_the_start() {
+        // Arrange — session starts at 0 µs; this range ends before it.
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: SpanDto::Range { t0_us: -500_000, t1_us: -100_000 },
+            colour: String::new(),
+        };
+
+        // Act
+        let span = resolve_window(&root, &window).unwrap();
+
+        // Assert
+        assert_eq!(span, (0.0, 0.0));
 
         let _ = std::fs::remove_dir_all(&root);
     }
