@@ -22,7 +22,7 @@ use idl_rs::workbook::v3::front_matter::{parse_front_matter, render_front_matter
 use idl_rs::workbook::v3::{parse_workbook, render_prose_html, CellDoc, CellError, CellKindToken, WorkbookError};
 
 use crate::error::{IpcError, IpcErrorKind};
-use crate::session_source::{load_lap_context, load_session_handle};
+use crate::session_source::{load_lap_context, load_session_handle, load_window_context, WindowDto};
 use crate::state::{DataDir, Hashes, Watchers};
 use crate::watcher::{ExpectedHashSet, WorkbookWatcher};
 
@@ -352,6 +352,22 @@ fn eval_workbook_via(
         None => (empty_session_handle(), MathLapContext::empty()),
     };
 
+    Ok(build_cell_outputs(&doc, &structural, &handle, &lap_ctx, session_id.is_some()))
+}
+
+/// Evaluates `doc`/`structural` against `handle`/`lap_ctx` and builds this
+/// module's `CellOutput` wire shape — the cell-output half of
+/// [`eval_workbook_via`], factored out so [`eval_workbook_v2_via`] can share
+/// it across its per-window loop without re-deriving it. `session_bound` is
+/// [`table_cell_value`]'s "was a session actually bound" flag, since `handle`
+/// alone cannot distinguish a real session from [`empty_session_handle`].
+fn build_cell_outputs(
+    doc: &idl_rs::workbook::v3::WorkbookDoc,
+    structural: &[WorkbookError],
+    handle: &SessionHandle,
+    lap_ctx: &MathLapContext,
+    session_bound: bool,
+) -> Vec<CellOutput> {
     // `eval_cells` used to panic here whenever a definition name repeated
     // anywhere in the document (`resolve_workbook_defs`'s output was keyed
     // by bare name, so a duplicate collapsed to one entry and the second
@@ -359,9 +375,9 @@ fn eval_workbook_via(
     // the root, ledger R47: `resolve_workbook_defs`/`math_cell_defs` now key
     // by `(cell_id, name)`, so every cell — including the offending one —
     // always gets its own result back; no defensive net needed here.
-    let cell_results = idl_rs::workbook::v3::eval_cells(&doc, &structural, &handle, &lap_ctx);
+    let cell_results = idl_rs::workbook::v3::eval_cells(doc, structural, handle, lap_ctx);
 
-    let out = cell_results
+    cell_results
         .iter()
         .zip(doc.cells.iter())
         .map(|(cell_eval, cell_doc)| {
@@ -385,7 +401,7 @@ fn eval_workbook_via(
                 })
                 .collect();
 
-            let value = table_cell_value(cell_eval.kind, cell_doc, session_id.is_some(), &handle);
+            let value = table_cell_value(cell_eval.kind, cell_doc, session_bound, handle);
 
             let before = cell_doc
                 .prose_before
@@ -415,9 +431,72 @@ fn eval_workbook_via(
                 prose_spans,
             }
         })
-        .collect();
+        .collect()
+}
 
-    Ok(out)
+/// Annotates `err`'s `detail` with `"window": i` (C3 §3.4 `eval_workbook_v2`:
+/// "naming the offending window's index in `detail: { \"window\": i }`") —
+/// merged into whatever `detail` the underlying error already carries (e.g.
+/// [`crate::session_source::unknown_lap`]'s `{ "lap": n }`) rather than
+/// replacing it, so the caller keeps both the original failure's own detail
+/// and which window produced it.
+fn with_window_index(mut err: IpcError, i: usize) -> IpcError {
+    let mut detail = err.detail.take().unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = detail.as_object_mut() {
+        obj.insert("window".to_string(), serde_json::json!(i));
+    }
+    err.detail = Some(detail);
+    err
+}
+
+/// Transport-agnostic core of `eval_workbook_v2` (C3 §3.4, R117.3/.4).
+/// Evaluates workbook `id` once per entry of `windows`, in order, returning
+/// one `CellOutput` vec per window — per-window evaluation (R117.4): a
+/// single evaluation sees exactly one window, so multi-window *maths* (a
+/// ghost-delta chart reading two windows at once) is out of scope here, per
+/// that ruling.
+///
+/// `windows: []` evaluates once against no session — [`empty_session_handle`]
+/// and [`MathLapContext::empty`] (ledger R41) — and returns a one-element
+/// outer `Vec` so a caller always has a result array to render; this is
+/// byte-identical to [`eval_workbook_via`]`(id, None, None)`.
+///
+/// A repeated `session_id` across `windows` is legal and never deduplicated
+/// (R117.2 — two windows over one session with different laps is the common
+/// case, lap-to-lap comparison); each window resolves its own
+/// [`SessionHandle`]/[`MathLapContext`] independently via
+/// [`load_session_handle`]/[`load_window_context`].
+///
+/// # Errors
+/// Per call, not per window (C3 §3.4): an unresolvable `session_id`
+/// ([`IpcErrorKind::NotFound`]) or an unknown lap number
+/// ([`IpcErrorKind::InvalidArgument`], `detail: { "lap": n }`) fails the
+/// whole call, both annotated with the offending window's index via
+/// [`with_window_index`] (`detail: { …, "window": i }`). Per-cell evaluation
+/// errors keep their existing home in `CellOutput.errors`, unaffected by this
+/// annotation.
+fn eval_workbook_v2_via(data_dir: &Path, id: &str, windows: &[WindowDto]) -> Result<Vec<Vec<CellOutput>>, IpcError> {
+    let path = resolve_workbook_path(data_dir, id)?;
+    let markdown = std::fs::read_to_string(&path)
+        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
+    let (doc, structural) = parse_workbook(&markdown).map_err(fatal_parse_error)?;
+
+    if windows.is_empty() {
+        let handle = empty_session_handle();
+        let lap_ctx = MathLapContext::empty();
+        return Ok(vec![build_cell_outputs(&doc, &structural, &handle, &lap_ctx, false)]);
+    }
+
+    windows
+        .iter()
+        .enumerate()
+        .map(|(i, window)| {
+            let handle = load_session_handle(data_dir, &window.session_id).map_err(|e| with_window_index(e, i))?;
+            let lap_ctx =
+                load_window_context(data_dir, window, &handle).map_err(|e| with_window_index(e, i))?;
+            Ok(build_cell_outputs(&doc, &structural, &handle, &lap_ctx, true))
+        })
+        .collect()
 }
 
 /// Transport-agnostic core of `fetch_host_channel` (C3 §3.4). Validates
@@ -766,6 +845,19 @@ pub fn eval_workbook(
     eval_workbook_via(&data_dir.0, &id, session_id.as_deref(), lap_context.as_ref())
 }
 
+/// C3 §3.4 `eval_workbook_v2(id, windows)` (R117.3/.4). Replaces
+/// `eval_workbook`'s `session_id`/`lap_context` pair with an ordered list of
+/// [`WindowDto`]s; `eval_workbook` stays registered, deprecated for one
+/// revision (R117.3). See [`eval_workbook_v2_via`] for the full resolution.
+#[tauri::command]
+pub fn eval_workbook_v2(
+    id: String,
+    windows: Vec<WindowDto>,
+    data_dir: tauri::State<'_, DataDir>,
+) -> Result<Vec<Vec<CellOutput>>, IpcError> {
+    eval_workbook_v2_via(&data_dir.0, &id, &windows)
+}
+
 /// C3 §3.4 `fetch_host_channel(workbook_id, session_id, def_name, budget)` —
 /// evaluates the named `math` definition and returns its sample data as
 /// `IDLH` v1 raw bytes (see [`idl_rs::workbook::v3::encode_host_channel_idlh`]),
@@ -865,8 +957,29 @@ mod tests {
 
     use idl_rs::session::{Channel, RawColumn, Session, SourceFormat};
     use idl_rs::store::parquet::write_session_parquet;
-    use idl_rs::store::session_json::{empty_session_json, write_session_json};
+    use idl_rs::store::session_json::{empty_session_json, write_session_json, LapJson, SessionJson};
     use uuid::Uuid;
+
+    /// A 4-lap `session.json`, laps 1..=4 each 1 s long — mirrors
+    /// `session_source.rs`'s own private `four_lap_doc` (not `pub`, so
+    /// duplicated here rather than reached across the module boundary).
+    fn four_lap_doc(session_id: &str) -> SessionJson {
+        let mut doc = empty_session_json(session_id);
+        doc.laps = (1..=4u32)
+            .map(|n| LapJson {
+                lap_number: n,
+                start_timestamp_ms: (n as i64 - 1) * 1_000,
+                end_timestamp_ms: n as i64 * 1_000,
+                raw_elapsed_ms: 1_000,
+                lap_time_ms: 1_000,
+                start_time_secs: (n - 1) as f64,
+                end_time_secs: n as f64,
+                sectors: Vec::new(),
+                neutral_zone_visits: Vec::new(),
+            })
+            .collect();
+        doc
+    }
 
     fn temp_root() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("idl-rs-tauri-workbook-test-{}", Uuid::new_v4()));
@@ -1422,6 +1535,69 @@ mod tests {
             json,
             r#"[{"cell_id":"aaaaaaaa","kind":"math","value":null,"defs":[{"name":"x","label":null,"value":{"length":3,"has_t":true},"error":null}],"errors":[],"prose_before_html":"","prose_after_html":"","prose_spans":[]}]"#
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eval_workbook_v2_via_empty_windows_byte_identical_to_eval_workbook_via_no_session() {
+        // Arrange — same fixture as the `eval_workbook` "no session bound"
+        // test, `windows: []`. C3 §3.4: this must be byte-identical to
+        // `eval_workbook_via(id, None, None)`, wrapped in a one-element outer
+        // `Vec` so a caller always has a result array to render.
+        let root = temp_root();
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [ChanA]\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+
+        // Act
+        let via = eval_workbook_via(&root, WB_ID, None, None).unwrap();
+        let v2 = eval_workbook_v2_via(&root, WB_ID, &[]).unwrap();
+
+        // Assert — byte-identical via JSON, `CellOutput` has no `PartialEq`.
+        assert_eq!(serde_json::to_string(&v2).unwrap(), serde_json::to_string(&vec![via]).unwrap());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eval_workbook_v2_via_two_windows_one_session_different_laps_each_window_sees_its_own_lap() {
+        // Arrange — a 4-lap session (R117.2: a repeated session_id across
+        // windows is legal and must never be deduped, and comparing two laps
+        // of the same session is the common case). `lap_start_time(1)` reads
+        // `main_lap_bounds[0].0` (`load_window_context`'s `main_lap_number`
+        // is always `Some(1)`), so it differs per window only if each
+        // window's own lap window was actually used.
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = lap_start_time(1)\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let windows = vec![
+            WindowDto {
+                session_id: "s1".to_string(),
+                span: crate::session_source::SpanDto::Lap { lap_number: 2 },
+                colour: "--chart-1".to_string(),
+            },
+            WindowDto {
+                session_id: "s1".to_string(),
+                span: crate::session_source::SpanDto::Lap { lap_number: 3 },
+                colour: "--chart-2".to_string(),
+            },
+        ];
+
+        // Act
+        let out = eval_workbook_v2_via(&root, WB_ID, &windows).unwrap();
+
+        // Assert — lap 2 starts at 1.0 s, lap 3 starts at 2.0 s
+        // (`four_lap_doc`); each window's evaluation must see only its own.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0][0].defs[0].value.as_ref().unwrap().length, 1);
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains(r#""x""#));
 
         let _ = std::fs::remove_dir_all(&root);
     }
