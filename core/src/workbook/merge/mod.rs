@@ -153,6 +153,7 @@ fn to_front_matter(doc: &WorkbookDoc) -> FrontMatter {
         constants: doc.constants_raw.clone(),
         units: doc.units_pref,
         version: doc.version,
+        unknown: doc.front_matter_unknown.clone(),
     }
 }
 
@@ -271,6 +272,7 @@ pub fn merge(local: &WorkbookDoc, peer: &WorkbookDoc, base: &WorkbookDoc, peer_n
         const_lines,
         defs,
         constants,
+        front_matter_unknown: merged_fm.unknown,
     };
 
     Ok(MergedDoc { doc, conflicts, warnings })

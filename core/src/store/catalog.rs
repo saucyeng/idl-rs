@@ -1093,6 +1093,7 @@ mod tests {
             constants: Default::default(),
             units: Default::default(),
             version: 3,
+            unknown: Default::default(),
         };
         let fm_b = FrontMatter {
             id: "1a2b3c4d-4b6a-4f1c-9c3d-2a7e8f9b0c1d".to_string(),
@@ -1100,6 +1101,7 @@ mod tests {
             constants: Default::default(),
             units: Default::default(),
             version: 3,
+            unknown: Default::default(),
         };
         std::fs::write(workbooks_dir.join("Fork tuning.idl1wb"), render_front_matter(&fm_a)).unwrap();
         std::fs::write(workbooks_dir.join("Session review.idl1wb"), render_front_matter(&fm_b)).unwrap();

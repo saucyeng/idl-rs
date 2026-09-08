@@ -1,7 +1,7 @@
 //! Front-matter parsing for workbook v3 (C2 §1): the YAML block bounded by
 //! `---` lines at the top of a `.idl1wb` document.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -175,6 +175,28 @@ pub struct FrontMatter {
     /// Schema version; defaults to `3` only when the key is absent.
     #[serde(default = "default_version")]
     pub version: u32,
+    /// Every top-level front-matter key this contract does not itself
+    /// define, preserved verbatim across parse → render (C2 §1, ruling
+    /// R135, 2026-09-08). Before this field existed, [`render_front_matter`]
+    /// emitted only the five typed fields above and silently deleted
+    /// everything else on save — a workbook written by a newer build, or
+    /// synced from a peer's newer engine, lost data the moment an older
+    /// build opened and re-saved it, which already broke this section's own
+    /// requirement that `_migrate_charts`/`_migrate_math` (C2 §6) and, once
+    /// added, `graph` (C2 §3.7) round-trip unmodified through a build that
+    /// doesn't recognise them.
+    ///
+    /// `#[serde(flatten)]` merges these keys as YAML siblings of the typed
+    /// fields on both sides: parsing collects whatever the five fields above
+    /// don't claim; rendering re-emits them alongside those fields.
+    /// `BTreeMap` (not `HashMap`) so a fixed, deterministic — alphabetical —
+    /// key order comes for free, independent of the source YAML's own key
+    /// order or of hash iteration order, which would otherwise make
+    /// [`render_front_matter`]'s output vary run to run for the same input.
+    /// Values are opaque `serde_yaml_ng::Value`: this type has no opinion on
+    /// what an unrecognised key means, only that it must survive.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_yaml_ng::Value>,
 }
 
 /// Splits `markdown` into its front-matter YAML and the remaining document
@@ -220,7 +242,9 @@ pub fn parse_front_matter(markdown: &str) -> Result<(FrontMatter, &str), Workboo
 /// round-trips through [`parse_front_matter`] back to the same `FrontMatter`
 /// — that round-trip, not the exact bytes emitted, is this function's
 /// contract; `serde_yaml_ng` is free to choose block, quoted, or literal
-/// scalar style for any given string.
+/// scalar style for any given string. This now includes [`FrontMatter::unknown`]:
+/// every top-level key this contract doesn't itself define is re-emitted,
+/// not dropped (ruling R135).
 pub fn render_front_matter(fm: &FrontMatter) -> String {
     let yaml_block = serde_yaml_ng::to_string(fm).expect("FrontMatter has no non-serialisable field");
     format!("---\n{yaml_block}---\n")
@@ -323,6 +347,7 @@ mod tests {
             constants: HashMap::new(),
             units: UnitsPref::Si,
             version: 3,
+            unknown: BTreeMap::new(),
         }
     }
 
@@ -417,5 +442,52 @@ mod tests {
         // Assert
         assert_eq!(round_tripped.version, 3);
         assert_eq!(round_tripped.id, VALID_ID);
+    }
+
+    #[test]
+    fn parse_front_matter_preserves_an_unrecognised_top_level_key() {
+        // Arrange
+        let text = doc(&format!("id: {VALID_ID}\nname: Fork tuning\n_migrate_charts: true"));
+
+        // Act
+        let (fm, _body) = parse_front_matter(&text).unwrap();
+
+        // Assert
+        assert_eq!(fm.unknown.get("_migrate_charts"), Some(&serde_yaml_ng::Value::Bool(true)));
+    }
+
+    #[test]
+    fn render_front_matter_round_trips_an_unrecognised_top_level_key() {
+        // Arrange
+        let mut fm = fresh("Fork tuning");
+        fm.unknown.insert("_migrate_charts".to_string(), serde_yaml_ng::to_value(true).unwrap());
+        fm.unknown.insert(
+            "_migrate_math".to_string(),
+            serde_yaml_ng::to_value(vec!["roll_deg", "pitch_deg"]).unwrap(),
+        );
+
+        // Act
+        let round_tripped = round_trip(&fm);
+
+        // Assert
+        assert_eq!(round_tripped.unknown, fm.unknown);
+    }
+
+    #[test]
+    fn render_front_matter_an_unrecognised_key_never_shadows_a_typed_field() {
+        // Arrange — a hand-edited file that (wrongly) repeats `name` inside
+        // an unrelated unknown block cannot happen (YAML forbids duplicate
+        // top-level keys), so this instead checks that `unknown` never
+        // contains any of the five typed keys after a normal parse.
+        let text = doc(&format!(
+            "id: {VALID_ID}\nname: Fork tuning\nversion: 3\nunits: si\nconstants: {{}}\n_migrate_charts: true"
+        ));
+
+        // Act
+        let (fm, _body) = parse_front_matter(&text).unwrap();
+
+        // Assert
+        assert_eq!(fm.unknown.len(), 1);
+        assert!(fm.unknown.contains_key("_migrate_charts"));
     }
 }

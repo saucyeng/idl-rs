@@ -665,7 +665,14 @@ mod tests {
     }
 
     fn workbook_front_matter(id: &str, name: &str) -> FrontMatter {
-        FrontMatter { id: id.to_string(), name: name.to_string(), constants: HashMap::new(), units: Default::default(), version: 3 }
+        FrontMatter {
+            id: id.to_string(),
+            name: name.to_string(),
+            constants: HashMap::new(),
+            units: Default::default(),
+            version: 3,
+            unknown: Default::default(),
+        }
     }
 
     #[test]

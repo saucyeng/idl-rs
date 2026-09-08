@@ -1,7 +1,7 @@
 //! Front-matter merge (C2 §7.1): each top-level key merged independently of
 //! the cell table, three-way against `base`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::workbook::v3::front_matter::{ConstantRaw, FrontMatter, UnitsPref};
 
@@ -107,7 +107,50 @@ pub fn merge_front_matter(
         }
     }
 
-    Ok((FrontMatter { id: local.id.clone(), name, constants, units, version: local.version }, warnings))
+    let unknown = merge_unknown(&local.unknown, &peer.unknown, &base.unknown, &mut warnings);
+
+    Ok((FrontMatter { id: local.id.clone(), name, constants, units, version: local.version, unknown }, warnings))
+}
+
+/// Merges every front-matter key this contract does not itself define (C2
+/// §1's `unknown` catch-all), one entry at a time, on the same
+/// unchanged-on-one-side/changed-on-both-keeps-local rule as `constants`
+/// above — a coarse, whole-value merge per key rather than a per-key rule
+/// tailored to what that key means, since this function has no way to know.
+/// A key with its own merge rule (C2 §3.7.2's `graph`, merged per *entry
+/// within* `nodes`/`cells` and never a conflict) gets that finer rule from
+/// its own future task; this is the generic fallback that guarantees no
+/// unrecognised key is ever silently dropped by a sync merge — the same
+/// durability guarantee ruling R135 requires of parse/render, extended here
+/// to the merge step those bytes also pass through.
+fn merge_unknown(
+    local: &BTreeMap<String, serde_yaml_ng::Value>,
+    peer: &BTreeMap<String, serde_yaml_ng::Value>,
+    base: &BTreeMap<String, serde_yaml_ng::Value>,
+    warnings: &mut Vec<MergeWarning>,
+) -> BTreeMap<String, serde_yaml_ng::Value> {
+    let mut keys: BTreeSet<&String> = BTreeSet::new();
+    keys.extend(local.keys());
+    keys.extend(peer.keys());
+
+    let mut merged = BTreeMap::new();
+    for key in keys {
+        let base_value = base.get(key).cloned();
+        let local_value = local.get(key).cloned();
+        let peer_value = peer.get(key).cloned();
+
+        let (merged_value, discarded) = merge_scalar(&local_value, &peer_value, &base_value);
+        if let Some(value) = merged_value {
+            merged.insert(key.clone(), value);
+        }
+        if let Some(discarded_value) = discarded {
+            let peer_display = discarded_value
+                .map(|v| serde_yaml_ng::to_string(&v).unwrap_or_default().trim().to_string())
+                .unwrap_or_else(|| "<deleted>".to_string());
+            warnings.push(MergeWarning::FrontMatterConflict { key: key.clone(), peer_value: peer_display });
+        }
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -117,7 +160,14 @@ mod tests {
     const ID: &str = "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d";
 
     fn fm(name: &str, constants: HashMap<String, ConstantRaw>) -> FrontMatter {
-        FrontMatter { id: ID.to_string(), name: name.to_string(), constants, units: UnitsPref::Si, version: 3 }
+        FrontMatter {
+            id: ID.to_string(),
+            name: name.to_string(),
+            constants,
+            units: UnitsPref::Si,
+            version: 3,
+            unknown: BTreeMap::new(),
+        }
     }
 
     #[test]
@@ -238,6 +288,42 @@ mod tests {
         assert_eq!(
             warnings,
             vec![MergeWarning::ConstantConflict { name: "rider_mass_kg".to_string(), peer_value: "84".to_string() }]
+        );
+    }
+
+    #[test]
+    fn merge_front_matter_an_unknown_key_added_on_the_peer_only_survives_merged() {
+        // Arrange
+        let base = fm("Fork tuning", HashMap::new());
+        let local = fm("Fork tuning", HashMap::new());
+        let mut peer = fm("Fork tuning", HashMap::new());
+        peer.unknown.insert("_migrate_charts".to_string(), serde_yaml_ng::to_value(true).unwrap());
+
+        // Act
+        let (merged, warnings) = merge_front_matter(&local, &peer, &base, "peer-laptop").unwrap();
+
+        // Assert
+        assert_eq!(merged.unknown.get("_migrate_charts"), Some(&serde_yaml_ng::to_value(true).unwrap()));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn merge_front_matter_an_unknown_key_changed_on_both_sides_local_wins_one_warning() {
+        // Arrange
+        let base = fm("Fork tuning", HashMap::new());
+        let mut local = fm("Fork tuning", HashMap::new());
+        local.unknown.insert("_migrate_charts".to_string(), serde_yaml_ng::to_value("local").unwrap());
+        let mut peer = fm("Fork tuning", HashMap::new());
+        peer.unknown.insert("_migrate_charts".to_string(), serde_yaml_ng::to_value("peer").unwrap());
+
+        // Act
+        let (merged, warnings) = merge_front_matter(&local, &peer, &base, "peer-laptop").unwrap();
+
+        // Assert
+        assert_eq!(merged.unknown.get("_migrate_charts"), Some(&serde_yaml_ng::to_value("local").unwrap()));
+        assert_eq!(
+            warnings,
+            vec![MergeWarning::FrontMatterConflict { key: "_migrate_charts".to_string(), peer_value: "peer".to_string() }]
         );
     }
 }

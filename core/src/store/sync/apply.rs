@@ -359,6 +359,7 @@ fn empty_workbook_doc(workbook_id: &str) -> WorkbookDoc {
         const_lines: Vec::new(),
         defs: Vec::new(),
         constants: std::collections::HashMap::new(),
+        front_matter_unknown: std::collections::BTreeMap::new(),
     }
 }
 
