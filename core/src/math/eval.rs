@@ -893,16 +893,16 @@ fn call_function(
             let ch = require_channel(&args[3], name)?;
             let order = order.round() as usize;
             match ftype {
-                "high" | "highpass" => Ok(channel(
-                    crate::filters::highpass(&ch.samples, order, cutoff, ch.sample_rate_hz),
-                    ch.sample_rate_hz,
-                    ch.t_us,
-                )),
-                "low" | "lowpass" => Ok(channel(
-                    crate::filters::lowpass(&ch.samples, order, cutoff, ch.sample_rate_hz),
-                    ch.sample_rate_hz,
-                    ch.t_us,
-                )),
+                "high" | "highpass" => {
+                    let out = crate::filters::highpass(&ch.samples, order, cutoff, ch.sample_rate_hz)
+                        .map_err(|e| err(MathEvalErrorKind::Runtime, e.to_string()))?;
+                    Ok(channel(out, ch.sample_rate_hz, ch.t_us))
+                }
+                "low" | "lowpass" => {
+                    let out = crate::filters::lowpass(&ch.samples, order, cutoff, ch.sample_rate_hz)
+                        .map_err(|e| err(MathEvalErrorKind::Runtime, e.to_string()))?;
+                    Ok(channel(out, ch.sample_rate_hz, ch.t_us))
+                }
                 "band" => Err(err(
                     MathEvalErrorKind::Runtime,
                     "butter: band-pass filter not yet implemented",
@@ -1150,6 +1150,18 @@ fn call_function(
             let ch = require_channel(&args[0], name)?;
             let lo = require_scalar(&args[1], name)?;
             let hi = require_scalar(&args[2], name)?;
+            // std's f64::clamp panics if lo/hi is NaN or lo > hi — both
+            // reachable from a user-typed scalar (an infinite lo or hi is a
+            // legitimate one-sided clamp and stays allowed). Written as
+            // `lo <= hi` (not `!(lo > hi)`) so a NaN lo/hi, which makes every
+            // comparison false, is caught by this same check rather than
+            // slipping through to the panic.
+            if !(lo <= hi) {
+                return Err(err(
+                    MathEvalErrorKind::Runtime,
+                    format!("clamp: lo ({lo}) and hi ({hi}) must not be NaN, and lo must be <= hi"),
+                ));
+            }
             let out = ch.samples.iter().map(|&x| x.clamp(lo, hi)).collect();
             Ok(channel(out, ch.sample_rate_hz, ch.t_us))
         }
@@ -1846,6 +1858,32 @@ mod tests {
     }
 
     #[test]
+    fn butter_cutoff_at_nyquist_errors_instead_of_panicking() {
+        // Arrange — 100 Hz sample rate, Nyquist = 50 Hz; sci-rs requires
+        // 0 < cutoff < Nyquist strictly.
+        let lk = lookup(&[("a", vec![0.0; 8], 100.0)]);
+
+        // Act
+        let err = eval_expr("butter(2, 50, \"low\", [a])", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("Nyquist"));
+    }
+
+    #[test]
+    fn butter_nan_cutoff_errors_instead_of_panicking() {
+        // Arrange
+        let lk = lookup(&[("a", vec![0.0; 8], 100.0)]);
+
+        // Act
+        let err = eval_expr("butter(2, sqrt(-1), \"low\", [a])", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
+    }
+
+    #[test]
     fn fft_unknown_window_errors() {
         // Arrange
         let lk = lookup(&[("a", vec![0.0; 8], 100.0)]);
@@ -2284,6 +2322,32 @@ mod tests {
 
         // Assert
         assert!(matches!(v, Value::Channel(c) if c.samples == vec![0.0, 0.5, 1.0].into()));
+    }
+
+    #[test]
+    fn clamp_lo_greater_than_hi_errors_instead_of_panicking() {
+        // Arrange — std's f64::clamp asserts lo <= hi and panics otherwise.
+        let lk = lookup(&[("a", vec![1.0, 2.0], 1.0)]);
+
+        // Act
+        let err = eval_expr("clamp([a], 5, 1)", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("lo"));
+    }
+
+    #[test]
+    fn clamp_nan_bound_errors_instead_of_panicking() {
+        // Arrange — a NaN lo/hi makes every direct comparison false, which
+        // is exactly the case a naive `lo > hi` guard misses.
+        let lk = lookup(&[("a", vec![1.0, 2.0], 1.0)]);
+
+        // Act
+        let err = eval_expr("clamp([a], sqrt(-1), 1)", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
     }
 
     #[test]

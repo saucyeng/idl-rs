@@ -35,6 +35,17 @@ pub struct CellDefResult {
     pub label: Option<String>,
     /// The resolved channel, host-variable shape (C2 §5.1), on success.
     pub value: Option<crate::workbook::v3::HostChannel>,
+    /// This definition's sample rate, Hz, on success (ruling R144,
+    /// `runs/2026-09-03/decisions.md`) — [`crate::math::eval::EvalOutput::sample_rate_hz`]
+    /// verbatim, except `0.0` (that field's "scalar-as-channel" / no-rate
+    /// marker) is normalized to `None` here: `None` means genuinely not
+    /// applicable (a scalar reduction has no rate), never "unknown", and is
+    /// also `None` on failure. **Not** a unit field — R144's unit half is
+    /// deferred (ruling R152): no `unit` exists on [`crate::math::value::ChannelValue`]
+    /// today, and C2 §3.3 has no stated rule for a binary operator between
+    /// two differently-unitted channels, so shipping unit here would be a
+    /// guess CLAUDE.md §1 forbids.
+    pub sample_rate_hz: Option<f64>,
     /// The evaluation failure, on failure — reuses [`MathEvalError`]
     /// verbatim (C2 §3.5.B) so C3's `math_*` IPC kind prefixes need no
     /// translation layer.
@@ -156,11 +167,19 @@ fn math_cell_defs(
                     name: def.name.clone(),
                     label: def.label.clone(),
                     value: Some(to_host_channel(&out.t_us, &out.samples)),
+                    // 0.0 is EvalOutput::sample_rate_hz's own "scalar-as-channel /
+                    // no rate" marker — normalize it to None so this field means
+                    // "not applicable" the same way for a scalar as for a failure.
+                    sample_rate_hz: if out.sample_rate_hz == 0.0 { None } else { Some(out.sample_rate_hz) },
                     error: None,
                 },
-                Err(err) => {
-                    CellDefResult { name: def.name.clone(), label: def.label.clone(), value: None, error: Some(err) }
-                }
+                Err(err) => CellDefResult {
+                    name: def.name.clone(),
+                    label: def.label.clone(),
+                    value: None,
+                    sample_rate_hz: None,
+                    error: Some(err),
+                },
             }
         })
         .collect()
@@ -295,6 +314,41 @@ mod tests {
         assert_eq!(ok.name, "ok");
         assert_eq!(ok.value.as_ref().unwrap().v, vec![5.0]);
         assert!(ok.error.is_none());
+
+        // A scalar-literal definition has no rate — genuinely not
+        // applicable, R144's "never unknown" rule.
+        assert_eq!(ok.sample_rate_hz, None);
+        // A failed definition also carries no rate.
+        assert_eq!(bad.sample_rate_hz, None);
+    }
+
+    struct OneChannelLookup;
+    impl ChannelLookup for OneChannelLookup {
+        fn lookup(&self, name: &str) -> Option<crate::math::eval::LookupChannel> {
+            if name == "Speed" {
+                Some(crate::math::eval::LookupChannel {
+                    samples: vec![1.0, 2.0, 3.0].into(),
+                    sample_rate_hz: 10.0,
+                    t_us: std::sync::Arc::from(&[] as &[i64]),
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn a_channel_backed_definition_carries_its_sample_rate() {
+        // Arrange
+        let cells = vec![math_cell("aaaaaaaa")];
+        let defs = vec![def("aaaaaaaa", "doubled", "[Speed] * 2", 0)];
+        let d = doc(cells, defs);
+
+        // Act
+        let got = eval_cells(&d, &[], &OneChannelLookup, &no_laps());
+
+        // Assert
+        assert_eq!(got[0].defs[0].sample_rate_hz, Some(10.0));
     }
 
     // ---- Step 2: structural error routing by cell_id (L3-R2) ----
