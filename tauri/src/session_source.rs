@@ -69,24 +69,24 @@ fn try_read_session_json(data_dir: &Path, session_id: &str) -> Result<SessionJso
     read_session_json(&path).map_err(|_| ())
 }
 
-/// One session's id plus the tagged-union span the UI picked (C1 §6.x, R115)
+/// One session's id plus the tagged-union span the UI picked (C1 §6.1, R115)
 /// — the wire shape of a time window, `snake_case`, deserialised straight
 /// from JS's `Window`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WindowDto {
     /// The session `span` is resolved against. A window is meaningless
-    /// without it (C1 §6.x).
+    /// without it (C1 §6.1).
     pub session_id: String,
     /// Which portion of `session_id`'s recording this window names.
     pub span: SpanDto,
     /// A chart-token name (`--chart-1` … `--chart-8`), never a hex literal
-    /// (C1 §6.x, R117.6). Not validated at this layer — see
+    /// (C1 §6.1, R117.6). Not validated at this layer — see
     /// [`resolve_window`]'s doc comment for why.
     pub colour: String,
 }
 
 /// The tagged union naming which portion of a session's recording a
-/// [`WindowDto`] resolves to (C1 §6.x). `kind` tags the wire JSON;
+/// [`WindowDto`] resolves to (C1 §6.1). `kind` tags the wire JSON;
 /// `snake_case` on both the tag and `lap_number`/`t0_us`/`t1_us`.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -110,7 +110,7 @@ pub enum SpanDto {
     },
 }
 
-/// The session's full recorded span, seconds: the earliest and latest
+/// The session's full recorded span, microseconds: the earliest and latest
 /// `t_us` across every channel of `session_id`'s `data.parquet`.
 /// `Channel.t_us` is µs since the session's first sample, but not every
 /// channel starts (or ends) at the same sample — e.g. an event-driven
@@ -118,9 +118,13 @@ pub enum SpanDto {
 /// start/end is the min/max across all of them, not any one channel's own
 /// span (contrast [`idl_rs::session::handle::SessionMeta::duration_ms`],
 /// which is the *longest single channel's* span and does not track the
-/// start offset at all). `(0.0, 0.0)` for a session with no channels or
-/// only empty channels.
-fn full_session_span_secs(data_dir: &Path, session_id: &str) -> Result<(f64, f64), IpcError> {
+/// start offset at all). `(0, 0)` for a session with no channels or only
+/// empty channels. [`full_session_span_secs`] is this in seconds, the unit
+/// [`resolve_window`] returns; this µs form exists for
+/// [`no_overlap`]'s `session_span_us` detail, which must name the same
+/// integer axis as the caller's `t0_us`/`t1_us` rather than a lossy
+/// seconds round-trip.
+fn full_session_span_us(data_dir: &Path, session_id: &str) -> Result<(i64, i64), IpcError> {
     let session = load_session(data_dir, session_id)?;
     let mut start_us: Option<i64> = None;
     let mut end_us: Option<i64> = None;
@@ -130,12 +134,41 @@ fn full_session_span_secs(data_dir: &Path, session_id: &str) -> Result<(f64, f64
             end_us = Some(end_us.map_or(last, |e| e.max(last)));
         }
     }
-    let (start_us, end_us) = (start_us.unwrap_or(0), end_us.unwrap_or(0));
+    Ok((start_us.unwrap_or(0), end_us.unwrap_or(0)))
+}
+
+/// [`full_session_span_us`] converted to seconds — the unit every
+/// [`resolve_window`] bound is expressed in.
+fn full_session_span_secs(data_dir: &Path, session_id: &str) -> Result<(f64, f64), IpcError> {
+    let (start_us, end_us) = full_session_span_us(data_dir, session_id)?;
     Ok((start_us as f64 / 1e6, end_us as f64 / 1e6))
 }
 
+/// Builds an [`IpcErrorKind::InvalidArgument`] for a `Range` span that does
+/// not overlap `session_id`'s recorded span at all (C1 §6.1, ruling R119).
+/// `detail: { session_id, t0_us, t1_us, session_span_us }` names every value
+/// the caller needs to explain the failure without re-deriving it —
+/// `session_span_us` is `[start_us, end_us]`, the same integer axis as the
+/// caller's own `t0_us`/`t1_us` (not a seconds round-trip, which would lose
+/// precision `full_session_span_secs` already discards).
+fn no_overlap(session_id: &str, t0_us: i64, t1_us: i64, session_span_us: (i64, i64)) -> IpcError {
+    IpcError::with_detail(
+        IpcErrorKind::InvalidArgument,
+        format!(
+            "range [{t0_us}, {t1_us}] µs does not overlap session '{session_id}''s recorded span [{}, {}] µs",
+            session_span_us.0, session_span_us.1
+        ),
+        serde_json::json!({
+            "session_id": session_id,
+            "t0_us": t0_us,
+            "t1_us": t1_us,
+            "session_span_us": [session_span_us.0, session_span_us.1],
+        }),
+    )
+}
+
 /// Resolves a [`WindowDto`]'s span to its recording-time bounds, seconds,
-/// against `data_root`'s session store (C1 §6.x, R115; generalises the
+/// against `data_root`'s session store (C1 §6.1, R115; generalises the
 /// lap-only [`resolve_lap_window`], which now forwards here).
 ///
 /// - `Session` resolves to [`full_session_span_secs`] — the full recorded
@@ -146,13 +179,24 @@ fn full_session_span_secs(data_dir: &Path, session_id: &str) -> Result<(f64, f64
 ///   [`unknown_lap`] (`invalid_argument`, `detail: { "lap": n }`), shared
 ///   with [`load_lap_context`] so a bad lap number reports identically
 ///   wherever it is named.
-/// - `Range` converts `t0_us`/`t1_us` to seconds and clamps each endpoint
-///   independently to [`full_session_span_secs`]'s bounds (C1 §6.x: "a range
-///   wholly outside it resolves to the empty window"). A range wholly before
-///   or wholly after the session clamps both endpoints to the same edge,
-///   returning a zero-width `(t, t)` window — that is the empty window, not
-///   an error; a partially-overlapping range keeps its in-bounds edge and
-///   clamps only the other.
+/// - `Range` converts `t0_us`/`t1_us` to seconds against
+///   [`full_session_span_secs`]'s bounds. A range that **overlaps** the
+///   session's recorded span (including only partially) clamps each
+///   endpoint independently to that span — a boundary cursor dragged past
+///   the edge (decision 52), which is legitimate; the in-bounds edge of a
+///   partial overlap is kept exactly, only the out-of-bounds edge moves. A
+///   range that does **not overlap at all** is
+///   [`no_overlap`] (`invalid_argument`, `detail: { session_id, t0_us,
+///   t1_us, session_span_us }`), **not** a zero-width `(t, t)` window: this
+///   crate's own slicing primitive
+///   ([`idl_rs::session::handle::time_window_index_range`]) is inclusive at
+///   `t1`, and the clamp target is always a real recorded sample's `t_us`,
+///   so `(T, T)` would select exactly one sample rather than none — ruling
+///   R119, C1 §6.1. A degenerate `t0_us == t1_us` that falls *inside* the
+///   span is not rejected here: §6.1's type states `t0_us < t1_us` as the
+///   producer's invariant, not a check this function makes, and a
+///   fully-in-bounds instant is a legitimate (if single-sample) overlap —
+///   only "no overlap at all" is this function's error.
 ///
 /// `Session` and `Range` load the session's `data.parquet` (via
 /// [`load_session`]) to know its span, so a missing session is
@@ -173,7 +217,13 @@ pub fn resolve_window(data_root: &Path, window: &WindowDto) -> Result<(f64, f64)
                 .ok_or_else(|| unknown_lap(*lap_number))
         }
         SpanDto::Range { t0_us, t1_us } => {
-            let (session_start_s, session_end_s) = full_session_span_secs(data_root, &window.session_id)?;
+            let session_span_us = full_session_span_us(data_root, &window.session_id)?;
+            let (session_start_us, session_end_us) = session_span_us;
+            if *t1_us < session_start_us || *t0_us > session_end_us {
+                return Err(no_overlap(&window.session_id, *t0_us, *t1_us, session_span_us));
+            }
+            let session_start_s = session_start_us as f64 / 1e6;
+            let session_end_s = session_end_us as f64 / 1e6;
             let t0_s = (*t0_us as f64 / 1e6).clamp(session_start_s, session_end_s);
             let t1_s = (*t1_us as f64 / 1e6).clamp(session_start_s, session_end_s);
             Ok((t0_s, t1_s))
@@ -194,7 +244,7 @@ pub fn resolve_lap_window(data_root: &Path, session_id: &str, lap: u32) -> Resul
 }
 
 /// Builds a [`MathLapContext`] scoped to a single resolved [`WindowDto`]
-/// (C1 §6.x, R115) — the per-window replacement for [`load_lap_context`]'s
+/// (C1 §6.1, R115) — the per-window replacement for [`load_lap_context`]'s
 /// per-session lap selection, used by `eval_workbook_v2` and its siblings
 /// (Task 4 onward).
 ///
@@ -769,8 +819,53 @@ mod tests {
     }
 
     #[test]
-    fn resolve_window_range_span_wholly_after_session_clamps_to_empty_window_at_the_end() {
-        // Arrange — session ends at 500_000 µs; this range starts after it.
+    fn resolve_window_range_span_partially_overlapping_before_clamps_only_the_out_of_bounds_edge() {
+        // Arrange — session spans 0..500_000 µs; this range starts before
+        // it and ends inside it, so only `t0_us` is out of bounds.
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: SpanDto::Range { t0_us: -100_000, t1_us: 200_000 },
+            colour: String::new(),
+        };
+
+        // Act
+        let span = resolve_window(&root, &window).unwrap();
+
+        // Assert — the in-bounds edge (t1_us = 200_000 µs = 0.2 s) is kept
+        // exactly; only the out-of-bounds start clamps to the session start.
+        assert_eq!(span, (0.0, 0.2));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_window_range_span_partially_overlapping_after_clamps_only_the_out_of_bounds_edge() {
+        // Arrange — mirror of the "before" case: starts inside the session,
+        // ends after it.
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: SpanDto::Range { t0_us: 300_000, t1_us: 900_000 },
+            colour: String::new(),
+        };
+
+        // Act
+        let span = resolve_window(&root, &window).unwrap();
+
+        // Assert — the in-bounds edge (t0_us = 300_000 µs = 0.3 s) is kept
+        // exactly; only the out-of-bounds end clamps to the session end.
+        assert_eq!(span, (0.3, 0.5));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_window_range_span_wholly_after_session_invalid_argument_with_detail() {
+        // Arrange — session ends at 500_000 µs; this range starts after it,
+        // so there is no overlap at all (ruling R119).
         let root = temp_root();
         seed_session(&root, "s1");
         let window = WindowDto {
@@ -780,18 +875,27 @@ mod tests {
         };
 
         // Act
-        let span = resolve_window(&root, &window).unwrap();
+        let err = resolve_window(&root, &window).unwrap_err();
 
-        // Assert — both endpoints clamp to the session's own end: a
-        // zero-width window, not an error (C1 §6.x's "empty window").
-        assert_eq!(span, (0.5, 0.5));
+        // Assert — a typed error, not a zero-width `(0.5, 0.5)` window.
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(
+            err.detail,
+            Some(serde_json::json!({
+                "session_id": "s1",
+                "t0_us": 600_000,
+                "t1_us": 700_000,
+                "session_span_us": [0, 500_000],
+            }))
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn resolve_window_range_span_wholly_before_session_clamps_to_empty_window_at_the_start() {
-        // Arrange — session starts at 0 µs; this range ends before it.
+    fn resolve_window_range_span_wholly_before_session_invalid_argument_with_detail() {
+        // Arrange — session starts at 0 µs; this range ends before it, so
+        // there is no overlap at all (ruling R119).
         let root = temp_root();
         seed_session(&root, "s1");
         let window = WindowDto {
@@ -801,10 +905,19 @@ mod tests {
         };
 
         // Act
-        let span = resolve_window(&root, &window).unwrap();
+        let err = resolve_window(&root, &window).unwrap_err();
 
         // Assert
-        assert_eq!(span, (0.0, 0.0));
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(
+            err.detail,
+            Some(serde_json::json!({
+                "session_id": "s1",
+                "t0_us": -500_000,
+                "t1_us": -100_000,
+                "session_span_us": [0, 500_000],
+            }))
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
