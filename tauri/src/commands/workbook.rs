@@ -838,6 +838,7 @@ fn create_workbook_via(data_dir: &Path, name: &str) -> Result<WorkbookHandle, Ip
         constants: HashMap::new(),
         units: Default::default(),
         version: 3,
+        unknown: Default::default(),
     };
     let markdown = render_front_matter(&front_matter);
 

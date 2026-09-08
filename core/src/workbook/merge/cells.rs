@@ -233,6 +233,7 @@ mod tests {
             const_lines: Vec::new(),
             defs: Vec::new(),
             constants: HashMap::new(),
+            front_matter_unknown: std::collections::BTreeMap::new(),
         }
     }
 

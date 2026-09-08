@@ -219,6 +219,7 @@ mod tests {
             const_lines: Vec::<ConstLine>::new(),
             defs,
             constants: HashMap::new(),
+            front_matter_unknown: std::collections::BTreeMap::new(),
         }
     }
 

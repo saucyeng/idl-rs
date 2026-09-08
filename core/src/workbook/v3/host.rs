@@ -437,6 +437,7 @@ mod tests {
             const_lines: Vec::new(),
             defs: Vec::new(),
             constants: HashMap::from([("g".to_string(), 9.80665), ("rider_mass_kg".to_string(), 82.0)]),
+            front_matter_unknown: std::collections::BTreeMap::new(),
         };
 
         // Act

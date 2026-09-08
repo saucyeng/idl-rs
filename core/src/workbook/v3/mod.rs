@@ -113,6 +113,12 @@ pub struct WorkbookDoc {
     /// `name → f64` output over `constants_raw` and `const_lines`, run once
     /// inside [`parse_workbook`] (L3-R16/17).
     pub constants: HashMap<String, f64>,
+    /// Every top-level front-matter key this contract does not itself
+    /// define, carried verbatim from [`FrontMatter::unknown`] (C2 §1) so
+    /// [`render_workbook`] can re-emit it instead of dropping it — the fix
+    /// for ruling R135's round-trip defect at the whole-document level, not
+    /// just the front-matter-struct level.
+    pub front_matter_unknown: std::collections::BTreeMap<String, serde_yaml_ng::Value>,
 }
 
 /// Parses a `.idl1wb` document's front matter, cell fences and prose spans
@@ -203,6 +209,7 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
         const_lines,
         defs,
         constants,
+        front_matter_unknown: front_matter.unknown,
     };
 
     Ok((doc, errors))
@@ -261,6 +268,11 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
 /// `body` alone (everything after the front matter's closing `---`) in
 /// every case — see the `tests` module's `render_workbook_is_a_fixed_point_*`
 /// suite.
+///
+/// `doc.front_matter_unknown` (ruling R135) is threaded into the rendered
+/// `FrontMatter` here, not dropped — this is the whole-document half of the
+/// fix; [`front_matter::render_front_matter`] alone only fixes the
+/// `FrontMatter`-struct half.
 pub fn render_workbook(doc: &WorkbookDoc) -> String {
     let fm = FrontMatter {
         id: doc.id.clone(),
@@ -268,6 +280,7 @@ pub fn render_workbook(doc: &WorkbookDoc) -> String {
         constants: doc.constants_raw.clone(),
         units: doc.units_pref,
         version: doc.version,
+        unknown: doc.front_matter_unknown.clone(),
     };
     let mut out = front_matter::render_front_matter(&fm);
 
@@ -435,6 +448,7 @@ mod tests {
             constants: HashMap::new(),
             units: UnitsPref::Si,
             version: 3,
+            unknown: std::collections::BTreeMap::new(),
         };
         format!("{}{}", front_matter::render_front_matter(&fm), body)
     }
@@ -459,6 +473,7 @@ mod tests {
             constants: doc.constants_raw.clone(),
             units: doc.units_pref,
             version: doc.version,
+            unknown: doc.front_matter_unknown.clone(),
         });
         if markdown.starts_with(&canonical_front_matter) {
             assert_eq!(rendered, markdown, "whole document diverged for already-canonical front matter {markdown:?}");
@@ -510,8 +525,36 @@ mod tests {
             ]),
             units: UnitsPref::Imperial,
             version: 3,
+            unknown: std::collections::BTreeMap::new(),
         };
         let markdown = format!("{}```math id=aaaaaaaa\nx = 1\n```\n", front_matter::render_front_matter(&fm));
+        assert_fixed_point(&markdown);
+    }
+
+    #[test]
+    fn render_workbook_is_a_fixed_point_front_matter_with_migrate_charts_and_migrate_math_keys() {
+        // Arrange — a workbook whose front matter carries C2 §6's two
+        // transient migration-only keys, unrecognised by this contract.
+        let mut unknown = std::collections::BTreeMap::new();
+        unknown.insert("_migrate_charts".to_string(), serde_yaml_ng::to_value(true).unwrap());
+        unknown.insert("_migrate_math".to_string(), serde_yaml_ng::to_value(true).unwrap());
+        let fm = FrontMatter {
+            id: "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d".to_string(),
+            name: "Fork tuning".to_string(),
+            constants: HashMap::new(),
+            units: UnitsPref::Si,
+            version: 3,
+            unknown,
+        };
+        let markdown = format!("{}```math id=aaaaaaaa\nx = 1\n```\n", front_matter::render_front_matter(&fm));
+
+        // Act
+        let (doc, errors) = parse_workbook(&markdown).unwrap();
+        assert!(errors.is_empty(), "fixture must parse cleanly: {errors:?}");
+
+        // Assert — both migration keys survived parse, and the whole
+        // document round-trips byte-for-byte (R135's fix).
+        assert_eq!(doc.front_matter_unknown.len(), 2);
         assert_fixed_point(&markdown);
     }
 }
