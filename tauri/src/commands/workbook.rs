@@ -1662,7 +1662,7 @@ mod tests {
         let json = serde_json::to_string(&out).unwrap();
         assert_eq!(
             json,
-            r#"[{"cell_id":"aaaaaaaa","kind":"math","value":null,"defs":[{"name":"x","label":null,"value":{"length":3,"has_t":true},"error":null}],"errors":[],"prose_before_html":"","prose_after_html":"","prose_spans":[]}]"#
+            r#"[{"cell_id":"aaaaaaaa","kind":"math","value":null,"defs":[{"name":"x","label":null,"value":{"length":3,"has_t":true},"sample_rate_hz":10.0,"error":null}],"errors":[],"prose_before_html":"","prose_after_html":"","prose_spans":[]}]"#
         );
 
         let _ = std::fs::remove_dir_all(&root);
