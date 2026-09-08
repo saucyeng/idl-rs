@@ -111,16 +111,24 @@ pub enum SpanDto {
     },
 }
 
-/// The session's full recorded span, microseconds: the earliest and latest
-/// `t_us` across every channel of `session_id`'s `data.parquet`.
+/// The session's full recorded span, microseconds, **half-open**: the
+/// earliest `t_us` across every channel of `session_id`'s `data.parquet`,
+/// and one microsecond past the latest (ruling R126). Every resolved
+/// window is half-open `[t0, t1)` (C1 §6.1), and `t_us` is integer
+/// microseconds, so `last_us + 1` is the exact, minimal half-open bound
+/// containing the sample at `last_us` — no recorded sample can fall in
+/// `(last_us, last_us + 1)`. Using the last sample's own `t_us` as the end
+/// (the pre-R126 behaviour) silently dropped that final sample from every
+/// windowed reduction over a whole-session window.
 /// `Channel.t_us` is µs since the session's first sample, but not every
 /// channel starts (or ends) at the same sample — e.g. an event-driven
 /// channel's first `t_us` can be well after `0` — so the session's own
-/// start/end is the min/max across all of them, not any one channel's own
-/// span (contrast [`idl_rs::session::handle::SessionMeta::duration_ms`],
-/// which is the *longest single channel's* span and does not track the
-/// start offset at all). `(0, 0)` for a session with no channels or only
-/// empty channels. [`full_session_span_secs`] is this in seconds, the unit
+/// start is the min across all of them and the end is one past the max,
+/// not any one channel's own span (contrast [`idl_rs::session::handle::
+/// SessionMeta::duration_ms`], which is the *longest single channel's*
+/// span and does not track the start offset at all). `(0, 0)` for a
+/// session with no channels or only empty channels. [`full_session_span_secs`]
+/// is this in seconds, the unit
 /// [`resolve_window`] returns; this µs form exists for
 /// [`no_overlap`]'s `session_span_us` detail, which must name the same
 /// integer axis as the caller's `t0_us`/`t1_us` rather than a lossy
@@ -128,14 +136,17 @@ pub enum SpanDto {
 fn full_session_span_us(data_dir: &Path, session_id: &str) -> Result<(i64, i64), IpcError> {
     let session = load_session(data_dir, session_id)?;
     let mut start_us: Option<i64> = None;
-    let mut end_us: Option<i64> = None;
+    let mut last_us: Option<i64> = None;
     for c in &session.channels {
         if let (Some(&first), Some(&last)) = (c.t_us.first(), c.t_us.last()) {
             start_us = Some(start_us.map_or(first, |s| s.min(first)));
-            end_us = Some(end_us.map_or(last, |e| e.max(last)));
+            last_us = Some(last_us.map_or(last, |e| e.max(last)));
         }
     }
-    Ok((start_us.unwrap_or(0), end_us.unwrap_or(0)))
+    match (start_us, last_us) {
+        (Some(start), Some(last)) => Ok((start, last + 1)),
+        _ => Ok((0, 0)),
+    }
 }
 
 /// [`full_session_span_us`] converted to seconds — the unit every
@@ -149,7 +160,9 @@ fn full_session_span_secs(data_dir: &Path, session_id: &str) -> Result<(f64, f64
 /// not overlap `session_id`'s recorded span at all (C1 §6.1, ruling R119).
 /// `detail: { session_id, t0_us, t1_us, session_span_us }` names every value
 /// the caller needs to explain the failure without re-deriving it —
-/// `session_span_us` is `[start_us, end_us]`, the same integer axis as the
+/// `session_span_us` is [`full_session_span_us`]'s half-open `[start_us,
+/// end_us)` (R126; `end_us` is one microsecond past the last recorded
+/// sample, not that sample's own timestamp), the same integer axis as the
 /// caller's own `t0_us`/`t1_us` (not a seconds round-trip, which would lose
 /// precision `full_session_span_secs` already discards).
 fn no_overlap(session_id: &str, t0_us: i64, t1_us: i64, session_span_us: (i64, i64)) -> IpcError {
@@ -196,8 +209,14 @@ fn invalid_range_order(session_id: &str, t0_us: i64, t1_us: i64, session_span_us
 /// against `data_root`'s session store (C1 §6.1, R115; generalises the
 /// lap-only [`resolve_lap_window`], which now forwards here).
 ///
+/// **A resolved window is half-open `[t0, t1)`** (ruling R126, C1 §6.1):
+/// `t1` is one microsecond past the window's last sample, never that
+/// sample's own timestamp. `idl-rs`'s `window_index_range` (`core/src/math/
+/// eval.rs`) relies on this to reduce over every sample in the window, and
+/// `full_session_span_us`'s `last_us + 1` is what makes `Session` honour it.
+///
 /// - `Session` resolves to [`full_session_span_secs`] — the full recorded
-///   span.
+///   span, `[first_us, last_us + 1)`.
 /// - `Lap` resolves one lap number from `session_id`'s `session.json`
 ///   `laps[]`; a missing or unparsable `session.json` has no `laps[]` to
 ///   resolve against — treated as zero known laps, so every `lap_number` is
@@ -779,7 +798,10 @@ mod tests {
 
     #[test]
     fn resolve_window_session_span_full_recorded_span_from_t_us() {
-        // Arrange — `seed_session`'s "Speed" channel spans 0..500_000 µs.
+        // Arrange — `seed_session`'s "Speed" channel's last sample is at
+        // 500_000 µs; the resolved span is half-open, one microsecond past
+        // it (ruling R126), so the last sample is not silently dropped by a
+        // downstream half-open reduction.
         let root = temp_root();
         seed_session(&root, "s1");
         let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Session, colour: String::new() };
@@ -788,7 +810,7 @@ mod tests {
         let span = resolve_window(&root, &window).unwrap();
 
         // Assert
-        assert_eq!(span, (0.0, 0.5));
+        assert_eq!(span, (0.0, 0.500_001));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -886,16 +908,18 @@ mod tests {
         let span = resolve_window(&root, &window).unwrap();
 
         // Assert — the in-bounds edge (t0_us = 300_000 µs = 0.3 s) is kept
-        // exactly; only the out-of-bounds end clamps to the session end.
-        assert_eq!(span, (0.3, 0.5));
+        // exactly; only the out-of-bounds end clamps to the session's
+        // half-open end, one microsecond past its last sample (R126).
+        assert_eq!(span, (0.3, 0.500_001));
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn resolve_window_range_span_wholly_after_session_invalid_argument_with_detail() {
-        // Arrange — session ends at 500_000 µs; this range starts after it,
-        // so there is no overlap at all (ruling R119).
+        // Arrange — session's half-open end is 500_001 µs (one past its
+        // last sample, R126); this range starts after it, so there is no
+        // overlap at all (ruling R119).
         let root = temp_root();
         seed_session(&root, "s1");
         let window = WindowDto {
@@ -915,7 +939,7 @@ mod tests {
                 "session_id": "s1",
                 "t0_us": 600_000,
                 "t1_us": 700_000,
-                "session_span_us": [0, 500_000],
+                "session_span_us": [0, 500_001],
             }))
         );
 
@@ -945,7 +969,7 @@ mod tests {
                 "session_id": "s1",
                 "t0_us": -500_000,
                 "t1_us": -100_000,
-                "session_span_us": [0, 500_000],
+                "session_span_us": [0, 500_001],
             }))
         );
 
@@ -978,7 +1002,7 @@ mod tests {
                 "session_id": "s1",
                 "t0_us": 200_000,
                 "t1_us": 200_000,
-                "session_span_us": [0, 500_000],
+                "session_span_us": [0, 500_001],
             }))
         );
 
@@ -1017,7 +1041,7 @@ mod tests {
                 "session_id": "s1",
                 "t0_us": 600_000,
                 "t1_us": 100_000,
-                "session_span_us": [0, 500_000],
+                "session_span_us": [0, 500_001],
             }))
         );
 
@@ -1046,7 +1070,7 @@ mod tests {
                 "session_id": "s1",
                 "t0_us": 300_000,
                 "t1_us": 100_000,
-                "session_span_us": [0, 500_000],
+                "session_span_us": [0, 500_001],
             }))
         );
 
@@ -1079,7 +1103,9 @@ mod tests {
 
     #[test]
     fn load_window_context_session_span_bounds_the_whole_recorded_span() {
-        // Arrange — `seed_session`'s "Speed" channel spans 0..500_000 µs.
+        // Arrange — `seed_session`'s "Speed" channel's last sample is at
+        // 500_000 µs; the resolved bound is half-open, one microsecond past
+        // it (ruling R126).
         let root = temp_root();
         seed_session(&root, "s1");
         let handle = load_session_handle(&root, "s1").unwrap();
@@ -1089,7 +1115,7 @@ mod tests {
         let ctx = load_window_context(&root, &window, &handle).unwrap();
 
         // Assert
-        assert_eq!(ctx.main_lap_bounds, vec![(0.0, 0.5)]);
+        assert_eq!(ctx.main_lap_bounds, vec![(0.0, 0.500_001)]);
         assert_eq!(ctx.main_lap_number, Some(1));
 
         let _ = std::fs::remove_dir_all(&root);

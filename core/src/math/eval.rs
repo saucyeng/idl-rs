@@ -705,13 +705,19 @@ fn main_lap_window(lap_ctx: &MathLapContext) -> (f64, f64) {
 
 // The scalar-aggregate index range for the selected window (R123/R124: the
 // aggregation domain is the window, computation stays session-wide — this
-// narrows only where a reduction reads, never what a channel holds). `[start,
-// end)` into a `len`-sample, `sample_rate_hz`-rate series, matching
+// narrows only where a reduction reads, never what a channel holds). A
+// resolved window is **half-open `[start_sec, end_sec)`** (ruling R126, C1
+// §6.1) and this function returns that same half-open `[start, end)` as
+// sample indices into a `len`-sample, `sample_rate_hz`-rate series, matching
 // `variance_time`'s own per-sample gate (`t = i / rate`, `start <= t < end`)
 // exactly so the two stay consistent; `idx = ceil(bound * rate)` is the same
 // formula for both ends because "smallest i with i/rate >= start_sec" and
 // "smallest i with i/rate >= end_sec" (the first *excluded* index) are the
-// same ceiling computation.
+// same ceiling computation. Callers resolving a whole session (`SpanDto::
+// Session`) must supply `end_sec` one microsecond past the last sample
+// (`idl-rs-tauri`'s `full_session_span_us`, R126) — the last sample's own
+// timestamp as `end_sec` silently drops it, since it lands exactly on the
+// excluded boundary.
 //
 // Whole range (no narrowing) when: the gate is off (`main_lap_window`'s
 // `(0.0, 0.0)` sentinel, `start < end` false), or `sample_rate_hz <= 0.0` — a
@@ -1966,10 +1972,24 @@ mod tests {
     fn scalar_aggregates_over_a_session_span_window_match_the_unwindowed_result() {
         // Arrange — a window whose bounds are the whole recorded span
         // (`SpanDto::Session`'s shape) must change nothing: the regression
-        // that proves scope changed, not arithmetic.
+        // that proves scope changed, not arithmetic. The bound is built the
+        // way `idl-rs-tauri`'s `full_session_span_us`/`resolve_window`
+        // actually produce it for `SpanDto::Session` (ruling R126), not a
+        // fabricated duration-shaped `(0.0, 1.0)`: 10 samples at 10 Hz have
+        // `t_us` 0, 100_000, …, 900_000, so `end_sec` is one microsecond
+        // past the *last* sample's own timestamp, `(900_000 + 1) / 1e6`.
+        // The old fabricated `(0.0, 1.0)` bound happened to equal this by
+        // coincidence (10 samples / 10 Hz = 1.0 s exactly) and so never
+        // caught the drop; the old *buggy* production bound was
+        // `(0.0, 0.9)` — the last sample's own timestamp, excluded by
+        // `window_index_range`'s half-open `[start, end)`. Confirmed by
+        // hand: swapping `end_s` below back to `0.9` fails every one of
+        // these aggregates against the pre-fix code.
         let samples = vec![1.0, 2.0, 3.0, 10.0, 5.0, 6.0, 7.0, 8.0, 9.0, 0.0];
         let lk = lookup(&[("a", samples, 10.0)]);
-        let whole_session = window_ctx(0.0, 1.0); // 10 samples @ 10 Hz = 1.0 s
+        let last_us: i64 = 900_000;
+        let end_s = (last_us + 1) as f64 / 1e6;
+        let whole_session = window_ctx(0.0, end_s);
 
         for expr in ["max([a])", "min([a])", "mean([a])", "rms([a])", "std([a])", "sum([a])", "median([a])"] {
             let windowed = eval_with_laps(expr, &lk, &whole_session);
@@ -1980,6 +2000,34 @@ mod tests {
                 }
                 other => panic!("{expr}: expected two scalars, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn window_index_range_ceil_and_per_sample_gate_agree_at_thirty_minutes_1khz() {
+        // Arrange — a realistic extreme: ~30 minutes at 1 kHz (1,800,000
+        // samples). `window_index_range`'s `ceil(bound_sec * rate)` and
+        // `variance_time`'s per-sample gate `i as f64 / rate < end_sec` are
+        // algebraically equal, not bit-identical (R126's accepted Minor) —
+        // this documents that they still agree at this scale rather than
+        // pretending the float limitation away.
+        let rate_hz = 1000.0;
+        let len: usize = 30 * 60 * 1000; // 1,800,000 samples
+        let last_us = (len as i64 - 1) * 1000; // 1 ms per sample at 1 kHz
+        let end_sec = (last_us + 1) as f64 / 1e6; // R126: session end is half-open
+        let lap_ctx = window_ctx(0.0, end_sec);
+
+        // Act
+        let (start, end) = window_index_range(&lap_ctx, rate_hz, len);
+
+        // Assert — the ceil-based index range covers every sample the
+        // per-sample gate would also admit, and vice versa.
+        assert_eq!((start, end), (0, len));
+        for i in [0usize, 1, len / 2, len - 2, len - 1] {
+            let t = i as f64 / rate_hz;
+            let gate_admits = start as f64 / rate_hz <= t && t < end_sec;
+            let range_admits = i >= start && i < end;
+            assert_eq!(gate_admits, range_admits, "sample {i}: gate={gate_admits} range={range_admits}");
         }
     }
 
