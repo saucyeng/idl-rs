@@ -199,7 +199,7 @@ fn parity_butter_high_delegates_to_highpass() {
     let samples = sine(64, 400.0, 10.0);
     let c = ctx(&[("Accel", samples.clone(), 400.0)]);
     let (got, rate) = eval_samples("butter(2, 0.3, \"high\", [Accel])", &c);
-    let expected = crate::filters::highpass(&samples, 2, 0.3, 400.0);
+    let expected = crate::filters::highpass(&samples, 2, 0.3, 400.0).expect("valid cutoff");
     assert_eq!(rate, 400.0);
     assert_close("butter high", &got, &expected);
 }
@@ -210,7 +210,7 @@ fn parity_butter_low_delegates_to_lowpass() {
     let samples = sine(64, 400.0, 10.0);
     let c = ctx(&[("Accel", samples.clone(), 400.0)]);
     let (got, _rate) = eval_samples("butter(4, 10.0, \"low\", [Accel])", &c);
-    let expected = crate::filters::lowpass(&samples, 4, 10.0, 400.0);
+    let expected = crate::filters::lowpass(&samples, 4, 10.0, 400.0).expect("valid cutoff");
     assert_close("butter low", &got, &expected);
 }
 
@@ -244,7 +244,7 @@ fn parity_nested_integrate_of_highpass_applies_inner_first() {
     let samples = sine(64, 200.0, 10.0);
     let c = ctx(&[("Accel", samples.clone(), 200.0)]);
     let (got, _rate) = eval_samples("integrate(butter(2, 0.2, \"high\", [Accel]))", &c);
-    let hp = crate::filters::highpass(&samples, 2, 0.2, 200.0);
+    let hp = crate::filters::highpass(&samples, 2, 0.2, 200.0).expect("valid cutoff");
     let expected = crate::integration::integrate(&hp, 200.0);
     assert_close("integrate(highpass)", &got, &expected);
 }
