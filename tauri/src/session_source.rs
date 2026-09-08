@@ -986,6 +986,45 @@ mod tests {
     }
 
     #[test]
+    fn resolve_window_range_span_mis_ordered_and_wholly_outside_session_invalid_range_order_not_no_overlap() {
+        // Arrange — both defects at once: `t0_us > t1_us` (R120) *and* the
+        // range falls entirely outside the session's recorded span
+        // (0..500_000 µs) as R119's `no_overlap` alone would also reject.
+        // The two R120 tests above both use in-span endpoints, so they only
+        // pin ordering precedence for an in-span pair — this pins that the
+        // ordering check fires first regardless, per `resolve_window`'s own
+        // check order.
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: SpanDto::Range { t0_us: 600_000, t1_us: 100_000 },
+            colour: String::new(),
+        };
+
+        // Act
+        let err = resolve_window(&root, &window).unwrap_err();
+
+        // Assert — `invalid_range_order` fired, not `no_overlap`: same
+        // `detail` shape either way, so the distinguishing evidence is
+        // `message` (`no_overlap`'s reads "does not overlap"; this must not).
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert!(err.message.contains("not ordered"), "message: {}", err.message);
+        assert!(!err.message.contains("does not overlap"), "message: {}", err.message);
+        assert_eq!(
+            err.detail,
+            Some(serde_json::json!({
+                "session_id": "s1",
+                "t0_us": 600_000,
+                "t1_us": 100_000,
+                "session_span_us": [0, 500_000],
+            }))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn resolve_window_range_span_t0_after_t1_invalid_argument_with_detail() {
         // Arrange — t0_us > t1_us, the general case R120 closes.
         let root = temp_root();

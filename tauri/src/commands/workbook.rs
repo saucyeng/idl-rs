@@ -125,6 +125,25 @@ pub struct CellOutput {
     pub prose_spans: Vec<ProseSpan>,
 }
 
+/// One `windows[i]` entry of `eval_workbook_v2`'s return (C3 §3.4, ruling
+/// R121): that window's own outputs, or that window's own error — never
+/// both, and never a shape that can only report one call-wide outcome.
+/// `#[serde(untagged)]` so the two variants serialise exactly as C3 §3.4
+/// writes them, `{ "ok": [...] }` or `{ "error": {...} }`, with no added
+/// discriminant field for a TypeScript reader to ignore.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub enum WindowEval {
+    /// This window resolved; `ok` is this window's [`CellOutput`] vec, same
+    /// as a single-window `eval_workbook` result.
+    Ok { ok: Vec<CellOutput> },
+    /// This window failed to resolve (R121: unresolvable `session_id`,
+    /// unknown lap number, or either R119/R120 range failure) — siblings
+    /// are unaffected and still evaluate. `error.detail` carries `"window":
+    /// i` via [`with_window_index`].
+    Error { error: IpcError },
+}
+
 /// C3 §3.4 `LapContext` (ruling R52 Q5, added post-sign 2026-09-05, ruling
 /// R59; same-session-only `overlay_laps` per lead ruling R64.1) — a per-call
 /// UI selection (ledger R41: not a property of the file), passed unchanged
@@ -449,17 +468,17 @@ fn with_window_index(mut err: IpcError, i: usize) -> IpcError {
     err
 }
 
-/// Transport-agnostic core of `eval_workbook_v2` (C3 §3.4, R117.3/.4).
-/// Evaluates workbook `id` once per entry of `windows`, in order, returning
-/// one `CellOutput` vec per window — per-window evaluation (R117.4): a
-/// single evaluation sees exactly one window, so multi-window *maths* (a
-/// ghost-delta chart reading two windows at once) is out of scope here, per
-/// that ruling.
+/// Transport-agnostic core of `eval_workbook_v2` (C3 §3.4, R117.3/.4,
+/// R121). Evaluates workbook `id` once per entry of `windows`, in order,
+/// returning one [`WindowEval`] per window — per-window evaluation
+/// (R117.4): a single evaluation sees exactly one window, so multi-window
+/// *maths* (a ghost-delta chart reading two windows at once) is out of
+/// scope here, per that ruling.
 ///
 /// `windows: []` evaluates once against no session — [`empty_session_handle`]
 /// and [`MathLapContext::empty`] (ledger R41) — and returns a one-element
-/// outer `Vec` so a caller always has a result array to render; this is
-/// byte-identical to [`eval_workbook_via`]`(id, None, None)`.
+/// outer `Vec` so a caller always has a result array to render; its single
+/// entry's `ok` is byte-identical to [`eval_workbook_via`]`(id, None, None)`.
 ///
 /// A repeated `session_id` across `windows` is legal and never deduplicated
 /// (R117.2 — two windows over one session with different laps is the common
@@ -468,14 +487,18 @@ fn with_window_index(mut err: IpcError, i: usize) -> IpcError {
 /// [`load_session_handle`]/[`load_window_context`].
 ///
 /// # Errors
-/// Per call, not per window (C3 §3.4): an unresolvable `session_id`
-/// ([`IpcErrorKind::NotFound`]) or an unknown lap number
-/// ([`IpcErrorKind::InvalidArgument`], `detail: { "lap": n }`) fails the
-/// whole call, both annotated with the offending window's index via
-/// [`with_window_index`] (`detail: { …, "window": i }`). Per-cell evaluation
-/// errors keep their existing home in `CellOutput.errors`, unaffected by this
-/// annotation.
-fn eval_workbook_v2_via(data_dir: &Path, id: &str, windows: &[WindowDto]) -> Result<Vec<Vec<CellOutput>>, IpcError> {
+/// Split by attribution (C3 §3.4, ruling R121). **Per-window** — an
+/// unresolvable `session_id` ([`IpcErrorKind::NotFound`]), an unknown lap
+/// number, or either R119/R120 range failure (all
+/// [`IpcErrorKind::InvalidArgument`]) — fails only that entry (the
+/// `WindowEval::Error` variant, `detail` annotated with the window's index
+/// via [`with_window_index`], `{ …, "window": i }`); every other window
+/// still evaluates and returns its own outputs. **Call-level** — an unknown
+/// or unparseable workbook `id` — rejects the whole call (`Err`), since no
+/// window has a meaningful answer without a document to evaluate. Per-cell
+/// evaluation errors keep their existing home in `CellOutput.errors`,
+/// unaffected by either path.
+fn eval_workbook_v2_via(data_dir: &Path, id: &str, windows: &[WindowDto]) -> Result<Vec<WindowEval>, IpcError> {
     let path = resolve_workbook_path(data_dir, id)?;
     let markdown = std::fs::read_to_string(&path)
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
@@ -484,19 +507,24 @@ fn eval_workbook_v2_via(data_dir: &Path, id: &str, windows: &[WindowDto]) -> Res
     if windows.is_empty() {
         let handle = empty_session_handle();
         let lap_ctx = MathLapContext::empty();
-        return Ok(vec![build_cell_outputs(&doc, &structural, &handle, &lap_ctx, false)]);
+        return Ok(vec![WindowEval::Ok { ok: build_cell_outputs(&doc, &structural, &handle, &lap_ctx, false) }]);
     }
 
-    windows
+    Ok(windows
         .iter()
         .enumerate()
         .map(|(i, window)| {
-            let handle = load_session_handle(data_dir, &window.session_id).map_err(|e| with_window_index(e, i))?;
-            let lap_ctx =
-                load_window_context(data_dir, window, &handle).map_err(|e| with_window_index(e, i))?;
-            Ok(build_cell_outputs(&doc, &structural, &handle, &lap_ctx, true))
+            let handle = match load_session_handle(data_dir, &window.session_id) {
+                Ok(h) => h,
+                Err(e) => return WindowEval::Error { error: with_window_index(e, i) },
+            };
+            let lap_ctx = match load_window_context(data_dir, window, &handle) {
+                Ok(c) => c,
+                Err(e) => return WindowEval::Error { error: with_window_index(e, i) },
+            };
+            WindowEval::Ok { ok: build_cell_outputs(&doc, &structural, &handle, &lap_ctx, true) }
         })
-        .collect()
+        .collect())
 }
 
 /// Transport-agnostic core of `fetch_host_channel` (C3 §3.4). Validates
@@ -916,16 +944,18 @@ pub fn eval_workbook(
     eval_workbook_via(&data_dir.0, &id, session_id.as_deref(), lap_context.as_ref())
 }
 
-/// C3 §3.4 `eval_workbook_v2(id, windows)` (R117.3/.4). Replaces
+/// C3 §3.4 `eval_workbook_v2(id, windows)` (R117.3/.4, R121). Replaces
 /// `eval_workbook`'s `session_id`/`lap_context` pair with an ordered list of
 /// [`WindowDto`]s; `eval_workbook` stays registered, deprecated for one
-/// revision (R117.3). See [`eval_workbook_v2_via`] for the full resolution.
+/// revision (R117.3). Returns one [`WindowEval`] per window — a window that
+/// fails to resolve fails only its own entry (R121); see
+/// [`eval_workbook_v2_via`] for the full resolution.
 #[tauri::command]
 pub fn eval_workbook_v2(
     id: String,
     windows: Vec<WindowDto>,
     data_dir: tauri::State<'_, DataDir>,
-) -> Result<Vec<Vec<CellOutput>>, IpcError> {
+) -> Result<Vec<WindowEval>, IpcError> {
     eval_workbook_v2_via(&data_dir.0, &id, &windows)
 }
 
@@ -1632,9 +1662,10 @@ mod tests {
     #[test]
     fn eval_workbook_v2_via_empty_windows_byte_identical_to_eval_workbook_via_no_session() {
         // Arrange — same fixture as the `eval_workbook` "no session bound"
-        // test, `windows: []`. C3 §3.4: this must be byte-identical to
-        // `eval_workbook_via(id, None, None)`, wrapped in a one-element outer
-        // `Vec` so a caller always has a result array to render.
+        // test, `windows: []`. C3 §3.4: the one entry's `ok` must be
+        // byte-identical to `eval_workbook_via(id, None, None)`, wrapped in
+        // a one-element outer `Vec` so a caller always has a result array to
+        // render.
         let root = temp_root();
         let markdown = format!(
             "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [ChanA]\n```\n"
@@ -1646,7 +1677,10 @@ mod tests {
         let v2 = eval_workbook_v2_via(&root, WB_ID, &[]).unwrap();
 
         // Assert — byte-identical via JSON, `CellOutput` has no `PartialEq`.
-        assert_eq!(serde_json::to_string(&v2).unwrap(), serde_json::to_string(&vec![via]).unwrap());
+        assert_eq!(
+            serde_json::to_string(&v2).unwrap(),
+            serde_json::to_string(&vec![WindowEval::Ok { ok: via }]).unwrap()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1659,6 +1693,14 @@ mod tests {
         // `main_lap_bounds[0].0` (`load_window_context`'s `main_lap_number`
         // is always `Some(1)`), so it differs per window only if each
         // window's own lap window was actually used.
+        //
+        // R121/S1-review: the wire `CellOutput.defs[i].value` is a
+        // `HostChannelRef { length, has_t }` with no scalar, so both windows
+        // report `length: 1` either way — comparing that alone cannot tell
+        // a correct per-window loop from one that always evaluates
+        // `windows[0]`. This test reaches `eval_cells` directly, alongside
+        // `eval_workbook_v2_via`, to inspect the actual resolved
+        // `HostChannel.v[0]` scalar, which *can* disagree.
         let root = temp_root();
         seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
         write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
@@ -1679,15 +1721,88 @@ mod tests {
             },
         ];
 
+        // Act — the wire path, asserted for shape (both windows resolve,
+        // `out[1]` inspected, not skipped).
+        let out = eval_workbook_v2_via(&root, WB_ID, &windows).unwrap();
+
+        // Act — the same resolution `eval_workbook_v2_via` uses internally,
+        // called directly per window so the actual scalar is visible.
+        let markdown_text = std::fs::read_to_string(root.join("workbooks").join("test.idl1wb")).unwrap();
+        let (doc, structural) = parse_workbook(&markdown_text).unwrap();
+        let scalar_for = |w: &WindowDto| -> f64 {
+            let handle = load_session_handle(&root, &w.session_id).unwrap();
+            let lap_ctx = load_window_context(&root, w, &handle).unwrap();
+            let cells = idl_rs::workbook::v3::eval_cells(&doc, &structural, &handle, &lap_ctx);
+            cells[0].defs[0].value.as_ref().unwrap().v[0]
+        };
+
+        // Assert — lap 2 starts at 1.0 s, lap 3 starts at 2.0 s
+        // (`four_lap_doc`); each window's evaluation sees only its own.
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], WindowEval::Ok { .. }));
+        let WindowEval::Ok { ok: out1 } = &out[1] else {
+            panic!("expected window 1 to resolve, got {:?}", out[1]);
+        };
+        assert_eq!(out1[0].defs[0].value.as_ref().unwrap().length, 1);
+        assert_eq!(scalar_for(&windows[0]), 1.0);
+        assert_eq!(scalar_for(&windows[1]), 2.0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eval_workbook_v2_via_three_windows_middle_one_degenerate_first_and_third_still_return_their_outputs() {
+        // Arrange — ruling R121: today's bug piped every per-window error
+        // through `?` inside `.collect::<Result<_, _>>()`, so a single
+        // dragged-together range (R120's `invalid_range_order`) blanked all
+        // three windows. This is the test R121 requires: three windows, the
+        // middle one degenerate, the first and third must still return
+        // their own outputs.
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [ChanA]\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let windows = vec![
+            WindowDto {
+                session_id: "s1".to_string(),
+                span: crate::session_source::SpanDto::Session,
+                colour: "--chart-1".to_string(),
+            },
+            WindowDto {
+                session_id: "s1".to_string(),
+                // t0_us == t1_us, in-span — R120's degenerate range.
+                span: crate::session_source::SpanDto::Range { t0_us: 0, t1_us: 0 },
+                colour: "--chart-2".to_string(),
+            },
+            WindowDto {
+                session_id: "s1".to_string(),
+                span: crate::session_source::SpanDto::Session,
+                colour: "--chart-3".to_string(),
+            },
+        ];
+
         // Act
         let out = eval_workbook_v2_via(&root, WB_ID, &windows).unwrap();
 
-        // Assert — lap 2 starts at 1.0 s, lap 3 starts at 2.0 s
-        // (`four_lap_doc`); each window's evaluation must see only its own.
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0][0].defs[0].value.as_ref().unwrap().length, 1);
-        let json = serde_json::to_string(&out).unwrap();
-        assert!(json.contains(r#""x""#));
+        // Assert
+        assert_eq!(out.len(), 3);
+        match &out[0] {
+            WindowEval::Ok { ok } => assert_eq!(ok[0].defs[0].value.as_ref().unwrap().length, 1),
+            WindowEval::Error { error } => panic!("window 0 unexpectedly failed: {error:?}"),
+        }
+        match &out[1] {
+            WindowEval::Error { error } => {
+                assert_eq!(error.kind, IpcErrorKind::InvalidArgument);
+                assert_eq!(error.detail.as_ref().unwrap()["window"], serde_json::json!(1));
+            }
+            WindowEval::Ok { .. } => panic!("window 1 unexpectedly succeeded"),
+        }
+        match &out[2] {
+            WindowEval::Ok { ok } => assert_eq!(ok[0].defs[0].value.as_ref().unwrap().length, 1),
+            WindowEval::Error { error } => panic!("window 2 unexpectedly failed: {error:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2143,7 +2258,10 @@ mod tests {
         // Assert — same window, same definition, same value: `eval_workbook_v2`'s
         // marker (length/has_t) matches the decoded `IDLH` bytes, and both
         // reflect lap 3's start (2.0 s), not the session-wide answer (0.0).
-        let marker = v2[0][0].defs[0].value.as_ref().unwrap();
+        let WindowEval::Ok { ok: v2_out } = &v2[0] else {
+            panic!("expected window to resolve, got {:?}", v2[0]);
+        };
+        let marker = v2_out[0].defs[0].value.as_ref().unwrap();
         let length = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         let t_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
         assert_eq!(marker.length, length);
