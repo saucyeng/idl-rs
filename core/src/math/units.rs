@@ -745,8 +745,18 @@ fn function_unit_rule(name: &str, arg_count: usize) -> (FnUnitRule, Vec<FnUnitCh
         "deg2rad" => (Fixed("rad"), vec![FnUnitCheck::Expect(0, "deg")]),
         "rad2deg" => (Fixed("deg"), vec![FnUnitCheck::Expect(0, "rad")]),
         "periodogram" | "welch" | "spectrogram" => (spectral_rule(), no_checks),
-        "hilbert" => (SameAsArg(0), no_checks),
+        // Retired from `hilbert` (R151 item 8, C2 3.8): with no complex type
+        // in the language, this was always going to return an envelope, not
+        // scipy's analytic signal — the scipy name was a false friend before
+        // a single line of it existed (R146). `NotImplemented`, so the
+        // rename cost zero migration.
+        "envelope" => (SameAsArg(0), no_checks),
         "correlate" | "convolve" => (Product(same(0), same(1)), no_checks),
+        // `resample(ch, n)` — `n` is a target sample count (scipy's own
+        // parameterisation), not a rate (R146/R151 item 8): a count is
+        // `Dimensionless` and carries no unit check of its own, so this rule
+        // is unaffected by the rename — only the C2 §3.3 signature/prose
+        // changed, not the argument this rule reads.
         "resample" => (SameAsArg(0), no_checks),
         "where" => (AllMatch(vec![1, 2]), no_checks),
         "current_lap" => (Dimensionless, no_checks),
