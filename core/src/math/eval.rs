@@ -1312,17 +1312,17 @@ fn call_function(
         // elementwise mean across all N (mean_across_overlays, R73) — a rider
         // comparing against several ghosts sees the average deviation, not
         // just the first ghost's.
-        "variance_time" => {
+        "lap_delta_time" => {
             require_arg_count(name, &args, 1)?;
             if lap_ctx.overlay.is_empty() || lap_ctx.main_lap_number.is_none() {
                 return Err(err(
                     MathEvalErrorKind::NoLapContext,
-                    "variance_time(): requires a main lap AND at least one overlay lap to be \
+                    "lap_delta_time(): requires a main lap AND at least one overlay lap to be \
                      designated. Pick both in the Analyze lap table.",
                 ));
             }
             let (main_samples, main_rate, main_t_us, channel_id) =
-                require_ref_channel(&args[0], "variance_time")?;
+                require_ref_channel(&args[0], "lap_delta_time")?;
             let window = main_lap_window(lap_ctx);
             let mut series = Vec::with_capacity(lap_ctx.overlay.len());
             for overlay in &lap_ctx.overlay {
@@ -1347,17 +1347,17 @@ fn call_function(
                 t_us: main_t_us,
             }))
         }
-        "variance_dist" => {
+        "lap_delta_dist" => {
             require_arg_count(name, &args, 1)?;
             if lap_ctx.overlay.is_empty() || lap_ctx.main_lap_number.is_none() {
                 return Err(err(
                     MathEvalErrorKind::NoLapContext,
-                    "variance_dist(): requires a main lap AND at least one overlay lap to be \
+                    "lap_delta_dist(): requires a main lap AND at least one overlay lap to be \
                      designated. Pick both in the Analyze lap table.",
                 ));
             }
             let (main_samples, main_rate, main_t_us, channel_id) =
-                require_ref_channel(&args[0], "variance_dist")?;
+                require_ref_channel(&args[0], "lap_delta_dist")?;
             let window = main_lap_window(lap_ctx);
             let mut series = Vec::with_capacity(lap_ctx.overlay.len());
             for overlay in &lap_ctx.overlay {
@@ -2534,7 +2534,7 @@ mod tests {
         };
 
         // Act
-        let v = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &main, &ctx)
+        let v = eval(&crate::math::parse::parse("lap_delta_time([LapTime])").unwrap(), &main, &ctx)
             .unwrap();
 
         // Assert — identity main==overlay, single-entry overlay_laps: diff ≈ 0
@@ -2597,7 +2597,7 @@ mod tests {
         };
 
         // Act
-        let v = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &main, &ctx)
+        let v = eval(&crate::math::parse::parse("lap_delta_time([LapTime])").unwrap(), &main, &ctx)
             .unwrap();
 
         // Assert — mean of (+i, -i) is ~0 in-window, not the first entry's `i`.
@@ -2655,7 +2655,7 @@ mod tests {
         };
 
         // Act
-        let v = eval(&crate::math::parse::parse("variance_dist([LapTime])").unwrap(), &main, &ctx)
+        let v = eval(&crate::math::parse::parse("lap_delta_dist([LapTime])").unwrap(), &main, &ctx)
             .unwrap();
 
         // Assert — mean of (+i, -i) is ~0 in-window, not the first entry's `i`.
@@ -2684,7 +2684,7 @@ mod tests {
         };
 
         // Act
-        let err = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &lk, &ctx)
+        let err = eval(&crate::math::parse::parse("lap_delta_time([LapTime])").unwrap(), &lk, &ctx)
             .unwrap_err();
 
         // Assert
@@ -2735,7 +2735,7 @@ mod tests {
         };
 
         // Act
-        let v = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &main, &ctx)
+        let v = eval(&crate::math::parse::parse("lap_delta_time([LapTime])").unwrap(), &main, &ctx)
             .unwrap();
 
         // Assert — the single bounds entry gates the window regardless of
@@ -2891,7 +2891,7 @@ mod tests {
         let ctx = laps_ctx(vec![(0.0, 2.0)]);
 
         // Act
-        let err = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &lk, &ctx)
+        let err = eval(&crate::math::parse::parse("lap_delta_time([LapTime])").unwrap(), &lk, &ctx)
             .unwrap_err();
 
         // Assert

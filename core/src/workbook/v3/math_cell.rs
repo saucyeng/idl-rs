@@ -240,6 +240,65 @@ fn parse_bare_number(s: &str) -> Option<f64> {
     }
 }
 
+/// Rewrites every `def_line`'s right-hand side in a `math` cell's raw fence
+/// `body`, byte-splicing `rewrite`'s output in place of the isolated
+/// expression text — name, `=`, surrounding whitespace, and any trailing `#
+/// label:`/`#`-comment are copied through untouched (C2 §3.1). `rewrite` is
+/// called with the line's 1-based position in `body` (matching
+/// `body.split('\n')` order) and the trimmed expression text; its return
+/// value replaces that text exactly. A `const_line`'s right-hand side is
+/// always a bare `number` (never a call site) and is never passed to
+/// `rewrite`. A blank line, comment line, or line that fails to classify is
+/// copied through unchanged. Used by
+/// [`crate::math::alias::migrate_document`] (R151 item 9) so a renamed
+/// builtin can be spliced into a workbook without reflowing anything else
+/// in the cell.
+pub fn rewrite_math_cell_body(body: &str, mut rewrite: impl FnMut(usize, &str) -> String) -> String {
+    let mut out_lines: Vec<String> = Vec::new();
+    for (idx, raw_line) in body.split('\n').enumerate() {
+        out_lines.push(rewrite_def_line_rhs(raw_line, idx + 1, &mut rewrite));
+    }
+    out_lines.join("\n")
+}
+
+/// One `body.split('\n')` line's worth of [`rewrite_math_cell_body`],
+/// mirroring [`classify_line`]'s own splitting exactly (comment-stripping,
+/// `const`-prefix check, first-`=` split) so the two never disagree about
+/// where a line's expression text starts and ends.
+fn rewrite_def_line_rhs(raw_line: &str, line_no: usize, rewrite: &mut impl FnMut(usize, &str) -> String) -> String {
+    let leading_len = raw_line.len() - raw_line.trim_start().len();
+    let content = &raw_line[leading_len..];
+    let trimmed = content.trim_end();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return raw_line.to_string();
+    }
+    let (before_hash, _comment) = split_trailing_comment(trimmed);
+    let main = before_hash.trim_end();
+
+    if let Some(rest) = main.strip_prefix("const") {
+        if rest.starts_with(' ') || rest.starts_with('\t') {
+            // const_line's RHS is always a bare number — nothing to rewrite.
+            return raw_line.to_string();
+        }
+    }
+
+    let Some(eq_idx) = main.find('=') else {
+        return raw_line.to_string();
+    };
+
+    // `main` starts at byte offset `leading_len` in `raw_line` (it is built
+    // from `content`, which starts there, by trimming only from the end).
+    let expr_region = &main[eq_idx + 1..];
+    let expr_leading = expr_region.len() - expr_region.trim_start().len();
+    let expr_core = expr_region.trim();
+
+    let expr_start = leading_len + eq_idx + 1 + expr_leading;
+    let expr_end = expr_start + expr_core.len();
+
+    let new_expr = rewrite(line_no, expr_core);
+    format!("{}{}{}", &raw_line[..expr_start], new_expr, &raw_line[expr_end..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +543,56 @@ mod tests {
         // Assert
         assert!(errors.is_empty());
         assert_eq!(lines, vec![MathCellLine::Comment]);
+    }
+
+    #[test]
+    fn rewrite_math_cell_body_replaces_only_the_expr_text_leaving_name_eq_and_comment_untouched() {
+        // Arrange — a def_line with a `# label:` comment and irregular
+        // spacing around `=`, plus a blank line and a comment line that
+        // must pass through unchanged.
+        let body = "x  =   old_call([A])   # label: X\n\n# a comment\nconst k = 2";
+
+        // Act
+        let out = rewrite_math_cell_body(body, |_line_no, expr| {
+            assert_eq!(expr, "old_call([A])");
+            "new_call([A])".to_string()
+        });
+
+        // Assert — only the expression text changed; everything else,
+        // including the odd spacing and the label comment, is byte-identical.
+        assert_eq!(out, "x  =   new_call([A])   # label: X\n\n# a comment\nconst k = 2");
+    }
+
+    #[test]
+    fn rewrite_math_cell_body_never_calls_rewrite_for_a_const_lines_bare_number_rhs() {
+        // Arrange
+        let body = "const k = 2\ny = old_call([A])";
+        let mut calls = 0;
+
+        // Act
+        let out = rewrite_math_cell_body(body, |_line_no, expr| {
+            calls += 1;
+            expr.replace("old_call", "new_call")
+        });
+
+        // Assert — the const line is untouched; only the def_line's RHS is rewritten.
+        assert_eq!(calls, 1);
+        assert_eq!(out, "const k = 2\ny = new_call([A])");
+    }
+
+    #[test]
+    fn rewrite_math_cell_body_reports_1_based_line_numbers_matching_split_order() {
+        // Arrange
+        let body = "\na = old_call([A])\nb = old_call([B])";
+        let mut seen = Vec::new();
+
+        // Act
+        let _ = rewrite_math_cell_body(body, |line_no, expr| {
+            seen.push(line_no);
+            expr.to_string()
+        });
+
+        // Assert
+        assert_eq!(seen, vec![2, 3]);
     }
 }

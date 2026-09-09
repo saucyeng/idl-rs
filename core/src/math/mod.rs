@@ -3,6 +3,7 @@
 //! (`app/lib/data/math_channel_evaluator.dart`). Pure: data in, data out.
 
 pub mod aggregate;
+pub mod alias;
 pub mod catalog;
 pub mod channel_def;
 pub mod error;
@@ -14,6 +15,10 @@ pub mod value;
 pub mod variance_geom;
 pub mod vector;
 
+pub use alias::{
+    math_name_migrations, migrate_body, migrate_document, migrate_expression, AppliedRename,
+    DocumentRename, MigrationKind, NameMigration,
+};
 pub use catalog::{math_builtin_catalog, MathBuiltin, MathBuiltinStatus};
 pub use channel_def::MathChannelDef;
 pub use error::{MathEvalError, MathEvalErrorKind};

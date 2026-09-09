@@ -168,10 +168,10 @@ mod tests {
 
     #[test]
     fn lap_aware_channel_reports_no_lap_context_under_empty_ctx() {
-        // Arrange — variance_time needs a main + overlay lap; an empty context
+        // Arrange — lap_delta_time needs a main + overlay lap; an empty context
         // has neither, so it fails with NoLapContext (it takes one channel ref).
         let h = handle_with(vec![base("X", vec![1.0, 2.0])]);
-        let wb = workbook_with(&[("Plain", "[X] + 1"), ("V", "variance_time([X])")]);
+        let wb = workbook_with(&[("Plain", "[X] + 1"), ("V", "lap_delta_time([X])")]);
 
         // Act
         let report = apply_workbook(&h, &wb, &MathLapContext::empty());

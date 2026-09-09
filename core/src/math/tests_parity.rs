@@ -285,7 +285,7 @@ fn parity_variance_time_identity_is_zero_in_window() {
     let ctx = identity_overlay_ctx(Some(1), (0.0, 9.0));
 
     // Act
-    let out = evaluate("variance_time([LapTime])", &main, &ctx).unwrap();
+    let out = evaluate("lap_delta_time([LapTime])", &main, &ctx).unwrap();
 
     // Assert — diff ≈ 0 on the in-window (non-NaN) samples.
     let inside: Vec<f64> = out.samples.iter().copied().filter(|x| !x.is_nan()).collect();
@@ -302,7 +302,7 @@ fn parity_variance_time_nan_outside_main_lap_window() {
     let ctx = identity_overlay_ctx(Some(1), (3.0, 7.0));
 
     // Act
-    let out = evaluate("variance_time([LapTime])", &main, &ctx).unwrap();
+    let out = evaluate("lap_delta_time([LapTime])", &main, &ctx).unwrap();
 
     // Assert — indices 0..2 and 7..9 are NaN (end exclusive).
     for (i, v) in out.samples.iter().enumerate() {
@@ -321,7 +321,7 @@ fn parity_variance_dist_identity_is_zero_in_window() {
     let ctx = identity_overlay_ctx(Some(1), (0.0, 9.0));
 
     // Act
-    let out = evaluate("variance_dist([LapTime])", &main, &ctx).unwrap();
+    let out = evaluate("lap_delta_dist([LapTime])", &main, &ctx).unwrap();
 
     // Assert — identical arc-length polylines → diff ≈ 0 in-window.
     let inside: Vec<f64> = out.samples.iter().copied().filter(|x| !x.is_nan()).collect();
