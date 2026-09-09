@@ -91,7 +91,21 @@ impl WorkbookWatcher {
                 let Ok(bytes) = std::fs::read(&path) else { continue }; // gone again before we read it
                 let hash = sha256_hex(&bytes);
                 if hashes.check_and_consume(&path, &hash) {
-                    continue; // our own write — matches a live expected hash, do not re-parse (C4 §4)
+                    // Our own write — matches a live expected hash, do not
+                    // re-parse (C4 §4). Also cancel any debounce already
+                    // pending for this path: a single logical write can
+                    // surface as more than one filesystem event (module
+                    // doc), and under scheduling contention an *earlier*
+                    // event for this same write can be read before the
+                    // bytes are fully flushed, hashing to a mismatch and
+                    // scheduling a callback before a *later* event for the
+                    // same write reads the complete, matching content. Left
+                    // uncancelled, that stale pending entry still fires
+                    // DEBOUNCE later even though this write was our own —
+                    // the flaky false-positive callback this closure must
+                    // never produce.
+                    pending.lock().unwrap().remove(&path);
+                    continue;
                 }
                 pending.lock().unwrap().insert(path.clone(), Instant::now());
                 let pending = Arc::clone(&pending);
