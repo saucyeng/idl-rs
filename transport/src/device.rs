@@ -11,6 +11,13 @@ pub struct DiscoveredDevice {
     pub name: String,
     /// Received signal strength, dBm. Negative; closer to 0 is stronger.
     pub rssi_dbm: i32,
+    /// Service UUIDs from the device's advertisement, lowercase hyphenated
+    /// form (e.g. `"000000ff-0000-1000-8000-00805f9b34fb"`). Lets a caller
+    /// filter discovered devices by service client-side (e.g. an HRM search
+    /// filtering to the standard heart-rate service by default) without a
+    /// second round of GATT discovery. Empty if the platform's advertisement
+    /// report carried none.
+    pub service_uuids: Vec<String>,
 }
 
 /// Result of a successful BLE connect + GATT setup (SPEC §7.4 steps 2–4).
