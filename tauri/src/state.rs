@@ -16,11 +16,11 @@ pub struct DataDir(pub PathBuf);
 pub struct Hashes(pub Arc<crate::watcher::ExpectedHashSet>);
 
 /// Live `watch_workbook` subscriptions, keyed by workbook id. Dropping the
-/// entry stops the watcher (`WorkbookWatcher`'s `Drop` tears down its
-/// `notify` handle). Re-subscribing to the same id replaces the previous
-/// entry, so a frontend remount cannot leak watchers — Tauri v2 gives no
-/// channel-close signal this task can observe, so there is no unsubscribe
-/// command in wave 1 (see the CHANGELOG entry).
+/// entry stops the watcher (`WorkbookWatcher`'s `notify` field tears down
+/// its handle on drop). `unwatch_workbook` removes an entry by id;
+/// re-subscribing to the same id also replaces — and so stops — the
+/// previous one, which stays the backstop for a frontend that never calls
+/// unwatch (Tauri v2 gives no channel-close signal this task can observe).
 pub struct Watchers(pub Mutex<HashMap<String, crate::watcher::WorkbookWatcher>>);
 
 /// Live managed BLE connections, keyed by `device_id` (C3 §3.8's
