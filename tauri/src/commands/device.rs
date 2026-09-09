@@ -118,7 +118,9 @@ impl From<idl_transport::ble_status::GpsState> for GpsState {
 }
 
 /// IMU health state (C3 §3.8's `device_status`), mirroring
-/// `idl_transport::ble_status::ImuState` variant for variant.
+/// `idl_transport::ble_status::ImuState` variant for variant. `Off` only
+/// appears on the per-sensor `imu0`/`imu1`/`imu2` fields (disabled in the
+/// loaded config), never on the aggregate `imu` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImuState {
@@ -130,6 +132,8 @@ pub enum ImuState {
     Error,
     /// No IMU detected.
     Absent,
+    /// Per-sensor only: disabled in the loaded config.
+    Off,
 }
 
 impl From<idl_transport::ble_status::ImuState> for ImuState {
@@ -139,6 +143,7 @@ impl From<idl_transport::ble_status::ImuState> for ImuState {
             idl_transport::ble_status::ImuState::Partial => Self::Partial,
             idl_transport::ble_status::ImuState::Error => Self::Error,
             idl_transport::ble_status::ImuState::Absent => Self::Absent,
+            idl_transport::ble_status::ImuState::Off => Self::Off,
         }
     }
 }
@@ -170,6 +175,32 @@ pub struct DeviceStatus {
     pub hr: Option<String>,
     /// Heart-rate strap battery, percent. `None` if unreported.
     pub hr_battery_pct: Option<u8>,
+    /// Seconds elapsed since the current logging session started, present
+    /// only while `logging` is `Some(true)`; `None` otherwise, including
+    /// while logging (older firmware, or the value simply not yet reported).
+    pub logging_elapsed_s: Option<u32>,
+    /// Unscaled main battery ADC count. `Battery: NN%` (`battery_pct`) is
+    /// deprecated on the wire; the app scales this raw count itself and
+    /// prefers it whenever both are present.
+    pub battery_raw: Option<u32>,
+    /// Free space on the mounted SD card, MiB. Present when `sd` is `Ok` or
+    /// `Full`; `None` for `Error`/`Absent` or when unreported.
+    pub sd_free_mib: Option<u32>,
+    /// Raw NMEA GGA fix-quality field: 0 none, 1 GPS, 2 DGPS, 3 PPS or
+    /// better. Present whenever `gps` is not `Absent`; `None` if unreported.
+    pub gps_fix_quality: Option<u8>,
+    /// Satellites used in the GPS solution. `0` is a valid reported value
+    /// ("searching"), distinct from `None` ("unknown" — line absent).
+    pub gps_sats: Option<u32>,
+    /// HDOP × 100 (e.g. 0.9 → 90). Optional even when a fix is present — the
+    /// GPS driver may not expose it cheaply — so `None` is always "unknown".
+    pub gps_hdop_x100: Option<u32>,
+    /// Per-IMU state for IMU index 0. `None` if unreported.
+    pub imu0: Option<ImuState>,
+    /// Per-IMU state for IMU index 1. `None` if unreported.
+    pub imu1: Option<ImuState>,
+    /// Per-IMU state for IMU index 2. `None` if unreported.
+    pub imu2: Option<ImuState>,
 }
 
 impl From<idl_transport::ble_status::DeviceStatus> for DeviceStatus {
@@ -185,6 +216,15 @@ impl From<idl_transport::ble_status::DeviceStatus> for DeviceStatus {
             ota_pending_verify: s.ota_pending_verify,
             hr: s.hr,
             hr_battery_pct: s.hr_battery_pct,
+            logging_elapsed_s: s.logging_elapsed_s,
+            battery_raw: s.battery_raw,
+            sd_free_mib: s.sd_free_mib,
+            gps_fix_quality: s.gps_fix_quality,
+            gps_sats: s.gps_sats,
+            gps_hdop_x100: s.gps_hdop_x100,
+            imu0: s.imu0.map(ImuState::from),
+            imu1: s.imu1.map(ImuState::from),
+            imu2: s.imu2.map(ImuState::from),
         }
     }
 }
@@ -1253,6 +1293,15 @@ mod tests {
             ota_pending_verify: true,
             hr: Some("CONNECTED 140".to_string()),
             hr_battery_pct: Some(88),
+            logging_elapsed_s: Some(305),
+            battery_raw: Some(2731),
+            sd_free_mib: Some(14208),
+            gps_fix_quality: Some(1),
+            gps_sats: Some(7),
+            gps_hdop_x100: Some(90),
+            imu0: Some(idl_transport::ble_status::ImuState::Ok),
+            imu1: Some(idl_transport::ble_status::ImuState::Error),
+            imu2: Some(idl_transport::ble_status::ImuState::Off),
         };
 
         // Act
@@ -1269,6 +1318,15 @@ mod tests {
         assert!(dto.ota_pending_verify);
         assert_eq!(dto.hr.as_deref(), Some("CONNECTED 140"));
         assert_eq!(dto.hr_battery_pct, Some(88));
+        assert_eq!(dto.logging_elapsed_s, Some(305));
+        assert_eq!(dto.battery_raw, Some(2731));
+        assert_eq!(dto.sd_free_mib, Some(14208));
+        assert_eq!(dto.gps_fix_quality, Some(1));
+        assert_eq!(dto.gps_sats, Some(7));
+        assert_eq!(dto.gps_hdop_x100, Some(90));
+        assert_eq!(dto.imu0, Some(super::ImuState::Ok));
+        assert_eq!(dto.imu1, Some(super::ImuState::Error));
+        assert_eq!(dto.imu2, Some(super::ImuState::Off));
     }
 
     #[test]
@@ -1291,6 +1349,15 @@ mod tests {
         assert!(!dto.ota_pending_verify);
         assert_eq!(dto.hr, None);
         assert_eq!(dto.hr_battery_pct, None);
+        assert_eq!(dto.logging_elapsed_s, None);
+        assert_eq!(dto.battery_raw, None);
+        assert_eq!(dto.sd_free_mib, None);
+        assert_eq!(dto.gps_fix_quality, None);
+        assert_eq!(dto.gps_sats, None);
+        assert_eq!(dto.gps_hdop_x100, None);
+        assert_eq!(dto.imu0, None);
+        assert_eq!(dto.imu1, None);
+        assert_eq!(dto.imu2, None);
     }
 
     #[tokio::test(start_paused = true)]
