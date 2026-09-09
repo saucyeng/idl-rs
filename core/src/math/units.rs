@@ -431,11 +431,23 @@ impl UnknownReason {
 /// far as any consumer is concerned). `unit: string | null` must not ship in
 /// its place (R154) — `None` cannot mean both "not applicable" and "we
 /// could not work it out".
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `serde::Serialize` here (unusually, for a `core` type — see CLAUDE.md
+// §2) mirrors `HostChannel`'s own already-established exception
+// (`core/src/workbook/v3/host.rs`): a host-variable value crosses to the
+// JS sandbox as JSON via `postMessage`, never through Tauri IPC, so there
+// is no `idl-rs-tauri` layer between this type and its wire form the way
+// `CellDefResult`'s own `UnitLabel` mirror (`tauri/src/commands/workbook.rs`)
+// has. Same shape as that mirror (`tag = "state"`) so the two paths render
+// identically JS-side.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum UnitLabel {
     /// A determined, non-empty unit, rendered from [`UnitExpr`] — `"mm"`,
-    /// `"km/h"`.
-    Known(String),
+    /// `"km/h"`. A struct variant (not a newtype) because
+    /// `#[serde(tag = "state")]` (internal tagging, for a clean
+    /// discriminated union on the JS side) requires one — a tuple variant
+    /// cannot be internally tagged.
+    Known { text: String },
     /// Genuinely no unit: a ratio, a count, a comparison result, or a
     /// top-level [`Unit::Scalar`].
     Dimensionless,
@@ -448,7 +460,7 @@ impl From<&Unit> for UnitLabel {
         match unit {
             Unit::Scalar => UnitLabel::Dimensionless,
             Unit::Known(u) if u.is_dimensionless() => UnitLabel::Dimensionless,
-            Unit::Known(u) => UnitLabel::Known(u.to_string()),
+            Unit::Known(u) => UnitLabel::Known { text: u.to_string() },
             Unit::Unknown(reason) => UnitLabel::Unknown { reason: reason.describe() },
         }
     }
@@ -1128,7 +1140,7 @@ mod tests {
         let label = UnitLabel::from(&unit);
 
         // Assert
-        assert_eq!(label, UnitLabel::Known("mm".to_string()));
+        assert_eq!(label, UnitLabel::Known { text: "mm".to_string() });
     }
 
     #[test]

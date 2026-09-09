@@ -215,8 +215,15 @@ fn recompute_derived_fields(
         let mut order = 0usize;
         for line in lines {
             match line {
-                MathCellLine::Def { name, expr_text, label } => {
-                    defs.push(MathCellDef { cell_id: cell.id.clone(), name, expr_text, label, order });
+                MathCellLine::Def { name, expr_text, label, unit_annotation } => {
+                    defs.push(MathCellDef {
+                        cell_id: cell.id.clone(),
+                        name,
+                        expr_text,
+                        label,
+                        unit_annotation,
+                        order,
+                    });
                     order += 1;
                 }
                 MathCellLine::Const { name, value, unit_display } => {

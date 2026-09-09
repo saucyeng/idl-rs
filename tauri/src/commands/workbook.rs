@@ -76,7 +76,7 @@ pub enum UnitLabel {
 impl From<&idl_rs::math::units::UnitLabel> for UnitLabel {
     fn from(u: &idl_rs::math::units::UnitLabel) -> Self {
         match u {
-            idl_rs::math::units::UnitLabel::Known(text) => UnitLabel::Known { text: text.clone() },
+            idl_rs::math::units::UnitLabel::Known { text } => UnitLabel::Known { text: text.clone() },
             idl_rs::math::units::UnitLabel::Dimensionless => UnitLabel::Dimensionless,
             idl_rs::math::units::UnitLabel::Unknown { reason } => {
                 UnitLabel::Unknown { reason: reason.clone() }

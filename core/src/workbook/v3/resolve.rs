@@ -279,6 +279,46 @@ impl ChannelLookup for UnitOverlayLookup<'_> {
     }
 }
 
+/// Applies a `# unit:` annotation (R164) over an already-inferred `unit`.
+/// **Authoritative, not a fallback**: a declared unit always wins when it
+/// parses, even overriding a confidently `Known` inference — the author
+/// knows what their CSV column holds and the engine cannot. A disagreement
+/// with a `Known` inference is a diagnostic (the same non-fatal treatment
+/// as a mismatched `+`, R154 §2.1), never a silent override refusal. An
+/// annotation that fails to parse as a unit is *itself* a diagnostic and
+/// changes nothing — the inferred unit stands.
+fn apply_unit_annotation(
+    annotation: Option<&str>,
+    unit: crate::math::units::Unit,
+    mut notes: Vec<crate::math::units::UnitNote>,
+) -> (crate::math::units::Unit, Vec<crate::math::units::UnitNote>) {
+    use crate::math::units::{Unit, UnitExpr, UnitNote};
+
+    let Some(text) = annotation else {
+        return (unit, notes);
+    };
+    match UnitExpr::parse(text) {
+        Ok(declared) => {
+            if let Unit::Known(inferred) = &unit {
+                if inferred != &declared {
+                    notes.push(UnitNote {
+                        message: format!(
+                            "declared unit `{declared}` (`# unit:`) differs from the inferred unit `{inferred}`"
+                        ),
+                    });
+                }
+            }
+            (Unit::Known(declared), notes)
+        }
+        Err(_) => {
+            notes.push(UnitNote {
+                message: format!("`# unit: {text}` is not a valid unit — using the inferred unit"),
+            });
+            (unit, notes)
+        }
+    }
+}
+
 /// Resolves every `def_line`'s inferred unit (R154 §3's "math definition"
 /// row: `[Name]` resolving to another definition takes that definition's
 /// own inferred unit), in the same dependency order as
@@ -351,6 +391,7 @@ pub fn resolve_workbook_units(
                     (Unit::Unknown(UnknownReason::Propagated { of: "a definition with a parse error".to_string() }), Vec::new())
                 }
             };
+            let (unit, notes) = apply_unit_annotation(def.unit_annotation.as_deref(), unit, notes);
 
             if std::ptr::eq(primary_for_name[def.name.as_str()], def) {
                 if let Unit::Known(u) = &unit {
@@ -400,8 +441,14 @@ mod tests {
             name: name.to_string(),
             expr_text: expr_text.to_string(),
             label: None,
+            unit_annotation: None,
             order,
         }
+    }
+
+    /// Like [`def`], with an author-declared `# unit:` annotation (R164).
+    fn def_with_unit(cell_id: &str, name: &str, expr_text: &str, unit: &str, order: usize) -> MathCellDef {
+        MathCellDef { unit_annotation: Some(unit.to_string()), ..def(cell_id, name, expr_text, order) }
     }
 
     fn no_laps() -> MathLapContext {
@@ -517,6 +564,89 @@ mod tests {
         assert_eq!(
             get_unit(&out, "c1", "B").0,
             crate::math::units::Unit::Unknown(crate::math::units::UnknownReason::Cycle)
+        );
+    }
+
+    #[test]
+    fn resolve_units_unit_annotation_turns_unknown_into_known() {
+        // Arrange — R164 item 2: the escape hatch for CSV-sourced maths
+        let defs = vec![def_with_unit("c1", "SpringRate", "[Force] / [Travel]", "N/mm", 0)];
+        let lk = EmptyLookup; // no C1 unit for Force or Travel: inference alone is Unknown
+
+        // Act
+        let out = resolve_workbook_units(&defs, &HashMap::new(), &lk);
+
+        // Assert
+        let (unit, notes) = get_unit(&out, "c1", "SpringRate");
+        assert_eq!(*unit, crate::math::units::Unit::Known(crate::math::units::UnitExpr::parse("N/mm").unwrap()));
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn resolve_units_unit_annotation_wins_over_a_disagreeing_inference_but_leaves_a_diagnostic() {
+        // Arrange — declared wins (authoritative), but the disagreement is visible
+        let defs = vec![def_with_unit("c1", "TravelIn", "[Travel]", "in", 0)];
+        let lk = UnitChannel { name: "Travel", unit: "mm" };
+
+        // Act
+        let out = resolve_workbook_units(&defs, &HashMap::new(), &lk);
+
+        // Assert
+        let (unit, notes) = get_unit(&out, "c1", "TravelIn");
+        assert_eq!(*unit, crate::math::units::Unit::Known(crate::math::units::UnitExpr::atom("in")));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].message.contains("in"));
+        assert!(notes[0].message.contains("mm"));
+    }
+
+    #[test]
+    fn resolve_units_unit_annotation_agreeing_with_inference_no_diagnostic() {
+        // Arrange
+        let defs = vec![def_with_unit("c1", "TravelMm", "[Travel]", "mm", 0)];
+        let lk = UnitChannel { name: "Travel", unit: "mm" };
+
+        // Act
+        let out = resolve_workbook_units(&defs, &HashMap::new(), &lk);
+
+        // Assert
+        let (unit, notes) = get_unit(&out, "c1", "TravelMm");
+        assert_eq!(*unit, crate::math::units::Unit::Known(crate::math::units::UnitExpr::atom("mm")));
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn resolve_units_malformed_unit_annotation_is_a_diagnostic_and_inference_stands() {
+        // Arrange — a malformed annotation never silently wins
+        let defs = vec![def_with_unit("c1", "TravelMm", "[Travel]", "/bad", 0)];
+        let lk = UnitChannel { name: "Travel", unit: "mm" };
+
+        // Act
+        let out = resolve_workbook_units(&defs, &HashMap::new(), &lk);
+
+        // Assert — the inferred unit (mm) stands, with a note explaining why
+        let (unit, notes) = get_unit(&out, "c1", "TravelMm");
+        assert_eq!(*unit, crate::math::units::Unit::Known(crate::math::units::UnitExpr::atom("mm")));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].message.contains("not a valid unit"));
+    }
+
+    #[test]
+    fn resolve_units_annotated_sibling_propagates_its_declared_unit() {
+        // Arrange — R154 §3's cascade, fed by a declaration rather than a
+        // recorded C1 unit
+        let defs = vec![
+            def("c1", "A", "[B] * 2", 0),
+            def_with_unit("c1", "B", "[Force] / [Travel]", "N/mm", 1),
+        ];
+        let lk = EmptyLookup;
+
+        // Act
+        let out = resolve_workbook_units(&defs, &HashMap::new(), &lk);
+
+        // Assert
+        assert_eq!(
+            get_unit(&out, "c1", "A").0,
+            crate::math::units::Unit::Known(crate::math::units::UnitExpr::parse("N/mm").unwrap())
         );
     }
 

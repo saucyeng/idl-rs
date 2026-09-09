@@ -39,6 +39,13 @@ pub struct HostChannel {
     pub t: Vec<f64>,
     /// The channel's values, verbatim.
     pub v: Vec<f64>,
+    /// This channel's unit (R164) — a `math`-cell definition's own
+    /// [`crate::math::units::infer`]red unit, or (for [`channel`]'s direct
+    /// name lookup) the C1 §4.1 unit recorded on the base/session channel.
+    /// Always present as one of the three states (R154) — never a bare
+    /// `Option<String>`, which would recreate the ambiguity this model
+    /// exists to remove.
+    pub unit: crate::math::units::UnitLabel,
 }
 
 /// Converts a resolved channel's `(t_us, v)` pair into the [`HostChannel`]
@@ -49,11 +56,15 @@ pub struct HostChannel {
 /// zero out every rate-0/scalar/table-sourced definition, G8.1). `t` is
 /// `t_us[i] as f64 / 1e6` (**µs → seconds**) over `min(t_us.len(),
 /// v.len())` entries, so `t` is empty whenever `t_us` is empty (no
-/// recorded axis) — never a synthesized ramp.
-pub fn to_host_channel(t_us: &[i64], v: &[f64]) -> HostChannel {
+/// recorded axis) — never a synthesized ramp. `unit` (R164) is threaded
+/// through verbatim, never computed here — this function has no `Ast` and
+/// no `ChannelLookup`, so it cannot infer one; each caller supplies its own
+/// (a `math`-cell definition's already-inferred [`crate::math::units::UnitLabel`],
+/// or [`channel`]'s direct base-channel lookup).
+pub fn to_host_channel(t_us: &[i64], v: &[f64], unit: crate::math::units::UnitLabel) -> HostChannel {
     let n = t_us.len().min(v.len());
     let t = t_us[..n].iter().map(|&us| us as f64 / 1e6).collect();
-    HostChannel { length: v.len(), t, v: v.to_vec() }
+    HostChannel { length: v.len(), t, v: v.to_vec(), unit }
 }
 
 /// General host-variable channel lookup (C2 §5.1's `channel(name, {lap,
@@ -105,6 +116,10 @@ pub fn channel(
     lap_ctx: &MathLapContext,
     other_session: Option<(&str, &dyn ChannelLookup)>,
 ) -> Result<HostChannel, MathEvalError> {
+    let unit_lookup: &dyn ChannelLookup = match other_session {
+        Some((_, other_lookup)) => other_lookup,
+        None => lookup,
+    };
     let resolved = match other_session {
         Some((_, other_lookup)) => other_lookup.lookup(name),
         None => lookup.lookup(name),
@@ -112,9 +127,17 @@ pub fn channel(
     let LookupChannel { samples, t_us, .. } = resolved.ok_or_else(|| {
         MathEvalError::new(MathEvalErrorKind::UnknownChannel, format!("Channel '[{name}]' not in this session"))
     })?;
+    // A direct `[Name]` lookup, not an expression — reuse `infer`'s own
+    // ChannelRef rule (parse/None handling included) rather than
+    // duplicating it here.
+    let unit = {
+        let ast = crate::math::parse::Ast::ChannelRef(name.to_string());
+        let (unit, _) = crate::math::units::infer(&ast, unit_lookup);
+        crate::math::units::UnitLabel::from(&unit)
+    };
 
     let Some(lap_number) = lap else {
-        return Ok(to_host_channel(&t_us, &samples));
+        return Ok(to_host_channel(&t_us, &samples, unit));
     };
 
     let window = (lap_number as usize).checked_sub(1).and_then(|i| lap_ctx.main_lap_bounds.get(i));
@@ -142,7 +165,7 @@ pub fn channel(
         .filter(|(&t, _)| t >= start_us && t <= end_us)
         .map(|(&t, &v)| (t, v))
         .unzip();
-    Ok(to_host_channel(&win_t_us, &win_v))
+    Ok(to_host_channel(&win_t_us, &win_v, unit))
 }
 
 /// One lap of the active session's lap table, as exposed to JS host code
@@ -233,7 +256,7 @@ mod tests {
         let v = [10.0, 20.0, 30.0];
 
         // Act
-        let got = to_host_channel(&t_us, &v);
+        let got = to_host_channel(&t_us, &v, crate::math::units::UnitLabel::Dimensionless);
 
         // Assert
         assert_eq!(got.t, vec![0.0, 1.0, 2.5]);
@@ -248,7 +271,7 @@ mod tests {
         let v = [1.0, 2.0, 3.0];
 
         // Act
-        let got = to_host_channel(&t_us, &v);
+        let got = to_host_channel(&t_us, &v, crate::math::units::UnitLabel::Dimensionless);
 
         // Assert
         assert_eq!(got.length, 3);
@@ -263,7 +286,7 @@ mod tests {
         let v: [f64; 0] = [];
 
         // Act
-        let got = to_host_channel(&t_us, &v);
+        let got = to_host_channel(&t_us, &v, crate::math::units::UnitLabel::Dimensionless);
 
         // Assert
         assert_eq!(got.length, 0);
@@ -282,7 +305,14 @@ mod tests {
         let got = channel(&lookup, "X", None, &no_laps(), None).unwrap();
 
         // Assert
-        assert_eq!(got, to_host_channel(&[0, 100_000], &[1.0, 2.0]));
+        assert_eq!(
+            got,
+            to_host_channel(
+                &[0, 100_000],
+                &[1.0, 2.0],
+                crate::math::units::UnitLabel::Unknown { reason: "no unit recorded for this channel".to_string() }
+            )
+        );
     }
 
     #[test]

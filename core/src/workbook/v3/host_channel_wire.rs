@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn encode_host_channel_idlh_a_channel_with_a_recorded_axis_round_trips_every_value_and_flag() {
         // Arrange
-        let hc = HostChannel { length: 3, t: vec![0.0, 0.1, 0.2], v: vec![1.0, 2.0, 3.0] };
+        let hc = HostChannel { length: 3, t: vec![0.0, 0.1, 0.2], v: vec![1.0, 2.0, 3.0], unit: crate::math::units::UnitLabel::Dimensionless };
 
         // Act
         let bytes = encode_host_channel_idlh(&hc, 65536);
@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn encode_host_channel_idlh_an_empty_t_channel_encodes_t_length_zero_flag_clear_and_v_starts_at_24() {
         // Arrange — a scalar/table-column result: no recorded axis.
-        let hc = HostChannel { length: 1, t: Vec::new(), v: vec![5.0] };
+        let hc = HostChannel { length: 1, t: Vec::new(), v: vec![5.0], unit: crate::math::units::UnitLabel::Dimensionless };
 
         // Act
         let bytes = encode_host_channel_idlh(&hc, 65536);
@@ -138,7 +138,7 @@ mod tests {
         // Arrange — 10 samples, budget 3: step = ceil(10/3) = 4, indices 0,4,8 -> 3 points.
         let v: Vec<f64> = (0..10).map(|i| i as f64).collect();
         let t: Vec<f64> = (0..10).map(|i| i as f64 * 0.1).collect();
-        let hc = HostChannel { length: 10, t, v };
+        let hc = HostChannel { length: 10, t, v, unit: crate::math::units::UnitLabel::Dimensionless };
 
         // Act
         let bytes = encode_host_channel_idlh(&hc, 3);
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn encode_host_channel_idlh_source_at_or_under_budget_is_a_no_op() {
         // Arrange
-        let hc = HostChannel { length: 3, t: vec![0.0, 0.1, 0.2], v: vec![1.0, 2.0, 3.0] };
+        let hc = HostChannel { length: 3, t: vec![0.0, 0.1, 0.2], v: vec![1.0, 2.0, 3.0], unit: crate::math::units::UnitLabel::Dimensionless };
 
         // Act
         let bytes = encode_host_channel_idlh(&hc, 100);
@@ -173,8 +173,8 @@ mod tests {
     #[test]
     fn encode_host_channel_idlh_header_is_exactly_24_bytes_in_every_case() {
         // Arrange
-        let with_t = HostChannel { length: 2, t: vec![0.0, 1.0], v: vec![1.0, 2.0] };
-        let without_t = HostChannel { length: 2, t: Vec::new(), v: vec![1.0, 2.0] };
+        let with_t = HostChannel { length: 2, t: vec![0.0, 1.0], v: vec![1.0, 2.0], unit: crate::math::units::UnitLabel::Dimensionless };
+        let without_t = HostChannel { length: 2, t: Vec::new(), v: vec![1.0, 2.0], unit: crate::math::units::UnitLabel::Dimensionless };
 
         // Act
         let a = encode_host_channel_idlh(&with_t, 65536);

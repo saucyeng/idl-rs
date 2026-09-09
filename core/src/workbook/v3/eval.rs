@@ -181,7 +181,7 @@ fn math_cell_defs(
                 Ok(out) => CellDefResult {
                     name: def.name.clone(),
                     label: def.label.clone(),
-                    value: Some(to_host_channel(&out.t_us, &out.samples)),
+                    value: Some(to_host_channel(&out.t_us, &out.samples, unit.clone())),
                     // 0.0 is EvalOutput::sample_rate_hz's own "scalar-as-channel /
                     // no rate" marker — normalize it to None so this field means
                     // "not applicable" the same way for a scalar as for a failure.
@@ -242,7 +242,14 @@ mod tests {
     }
 
     fn def(cell_id: &str, name: &str, expr_text: &str, order: usize) -> MathCellDef {
-        MathCellDef { cell_id: cell_id.to_string(), name: name.to_string(), expr_text: expr_text.to_string(), label: None, order }
+        MathCellDef {
+            cell_id: cell_id.to_string(),
+            name: name.to_string(),
+            expr_text: expr_text.to_string(),
+            label: None,
+            unit_annotation: None,
+            order,
+        }
     }
 
     fn doc(cells: Vec<CellDoc>, defs: Vec<MathCellDef>) -> WorkbookDoc {

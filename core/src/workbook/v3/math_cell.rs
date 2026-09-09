@@ -43,6 +43,13 @@ pub enum MathCellLine {
         /// The definition's display name, from a `# label: <text>` trailing
         /// comment (C2 §3.1). `None` when the line has no such comment.
         label: Option<String>,
+        /// An author-declared unit, from a `# unit: <text>` trailing
+        /// comment (R164) — unparsed (`UnitExpr::parse` happens at unit
+        /// inference, not here, matching `expr_text`). `None` when the line
+        /// has no such comment. Authoritative over inference (R164 item 1):
+        /// a declared unit wins, and a disagreement with a `Known` inferred
+        /// unit is a diagnostic, never a silent override refusal.
+        unit_annotation: Option<String>,
     },
 }
 
@@ -177,8 +184,15 @@ fn classify_def_line(
         return (None, Some(err));
     }
 
-    let label = comment.and_then(extract_label);
-    (Some(MathCellLine::Def { name: name.to_string(), expr_text, label }), None)
+    // R164: `unit:` joins the ordered annotation scan ahead of `label:` —
+    // consumed first (if present), and whatever it leaves behind is handed
+    // to `extract_label` exactly as an ordinary comment would be.
+    let (unit_annotation, remaining) = match comment {
+        Some(c) => extract_unit_annotation(c),
+        None => (None, ""),
+    };
+    let label = if unit_annotation.is_some() { extract_label(remaining) } else { comment.and_then(extract_label) };
+    (Some(MathCellLine::Def { name: name.to_string(), expr_text, label, unit_annotation }), None)
 }
 
 /// C2 §3.1's display-name annotation: a trailing comment (already stripped
@@ -190,6 +204,53 @@ fn extract_label(comment: &str) -> Option<String> {
     let rest = comment.trim_start().strip_prefix("label")?;
     let rest = rest.trim_start().strip_prefix(':')?;
     Some(rest.trim().to_string())
+}
+
+/// R164's `unit:` annotation: a trailing comment (already stripped of its
+/// leading `#`) declares this definition's unit only when it matches
+/// `[ \t]* "unit" [ \t]* ":" .*` at its very start — same shape as
+/// `label:`. Unlike `label:` (which always runs to end of line, since
+/// nothing recognised follows it) the unit's *value* has no closing
+/// delimiter of its own (no bracket, the way §3.6.4's `shape:` has `]`), so
+/// its terminator is the next recognised annotation keyword — today, only
+/// `label:` — or end of line (R164: "same terminator rule as its
+/// siblings"). Returns `(declared_unit_text, remaining_comment)`; when no
+/// `unit:` prefix is present, `remaining_comment` is `comment` unchanged so
+/// the ordinary `label:` scan sees exactly what it always has.
+fn extract_unit_annotation(comment: &str) -> (Option<String>, &str) {
+    let trimmed = comment.trim_start();
+    let Some(rest) = trimmed.strip_prefix("unit") else {
+        return (None, comment);
+    };
+    let Some(rest) = rest.trim_start().strip_prefix(':') else {
+        return (None, comment);
+    };
+    let rest = rest.trim_start();
+    match find_label_keyword(rest) {
+        Some(idx) => (Some(rest[..idx].trim().to_string()), &rest[idx..]),
+        None => (Some(rest.trim().to_string()), ""),
+    }
+}
+
+/// Finds the byte offset of a `label:` keyword occurrence in `s`, at a word
+/// boundary (preceded by whitespace, or at the start of `s`) — so a unit
+/// token that merely contains the letters "label" (unlikely, but not
+/// grammar-forbidden) is never mistaken for the next annotation.
+fn find_label_keyword(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = s[search_from..].find("label") {
+        let start = search_from + rel;
+        let at_boundary = start == 0 || bytes[start - 1].is_ascii_whitespace();
+        if at_boundary && s[start + "label".len()..].trim_start().starts_with(':') {
+            return Some(start);
+        }
+        search_from = start + "label".len();
+        if search_from >= s.len() {
+            break;
+        }
+    }
+    None
 }
 
 /// Validates `name` against C2 §3.1's `identifier` grammar and
@@ -313,7 +374,7 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(
             lines,
-            vec![MathCellLine::Def { name: "roll_deg".to_string(), expr_text: "[Roll]".to_string(), label: None }]
+            vec![MathCellLine::Def { name: "roll_deg".to_string(), expr_text: "[Roll]".to_string(), label: None, unit_annotation: None }]
         );
     }
 
@@ -329,7 +390,45 @@ mod tests {
             vec![MathCellLine::Def {
                 name: "x".to_string(),
                 expr_text: "1".to_string(),
-                label: Some("My Label".to_string())
+                label: Some("My Label".to_string()),
+                unit_annotation: None
+            }]
+        );
+    }
+
+    #[test]
+    fn def_line_with_hash_unit_comment_unit_annotation_captured() {
+        // Act — R164
+        let (lines, errors) = parse_math_cell_body("aaaaaaaa", "spring_rate = [force] / [travel] # unit: N/mm");
+
+        // Assert
+        assert!(errors.is_empty());
+        assert_eq!(
+            lines,
+            vec![MathCellLine::Def {
+                name: "spring_rate".to_string(),
+                expr_text: "[force] / [travel]".to_string(),
+                label: None,
+                unit_annotation: Some("N/mm".to_string())
+            }]
+        );
+    }
+
+    #[test]
+    fn def_line_with_hash_unit_and_label_both_captured_in_order() {
+        // Act — R164's own worked example: unit: leads, label: follows
+        let (lines, errors) =
+            parse_math_cell_body("aaaaaaaa", "spring_rate = [force] / [travel]   # unit: N/mm label: Spring rate");
+
+        // Assert
+        assert!(errors.is_empty());
+        assert_eq!(
+            lines,
+            vec![MathCellLine::Def {
+                name: "spring_rate".to_string(),
+                expr_text: "[force] / [travel]".to_string(),
+                label: Some("Spring rate".to_string()),
+                unit_annotation: Some("N/mm".to_string())
             }]
         );
     }
@@ -343,7 +442,20 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(
             lines,
-            vec![MathCellLine::Def { name: "x".to_string(), expr_text: "1".to_string(), label: None }]
+            vec![MathCellLine::Def { name: "x".to_string(), expr_text: "1".to_string(), label: None, unit_annotation: None }]
+        );
+    }
+
+    #[test]
+    fn def_line_a_word_starting_with_unit_but_not_the_keyword_is_not_mistaken_for_the_annotation() {
+        // Arrange/Act — "unitless" is not "unit" + ":", so no annotation
+        let (lines, errors) = parse_math_cell_body("aaaaaaaa", "x = 1 # unitless value");
+
+        // Assert
+        assert!(errors.is_empty());
+        assert_eq!(
+            lines,
+            vec![MathCellLine::Def { name: "x".to_string(), expr_text: "1".to_string(), label: None, unit_annotation: None }]
         );
     }
 
@@ -366,7 +478,8 @@ mod tests {
             vec![MathCellLine::Def {
                 name: "x".to_string(),
                 expr_text: "where([a] > 0, mean([b], dim=\"t\"), 0)".to_string(),
-                label: None
+                label: None,
+                unit_annotation: None
             }]
         );
     }
@@ -467,7 +580,7 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(
             lines,
-            vec![MathCellLine::Def { name: "constant".to_string(), expr_text: "[X]".to_string(), label: None }]
+            vec![MathCellLine::Def { name: "constant".to_string(), expr_text: "[X]".to_string(), label: None, unit_annotation: None }]
         );
     }
 
@@ -486,7 +599,8 @@ mod tests {
             vec![MathCellLine::Def {
                 name: "x".to_string(),
                 expr_text: "detrend([X], \"no#ne\")".to_string(),
-                label: None
+                label: None,
+                unit_annotation: None
             }]
         );
     }
