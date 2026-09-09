@@ -224,6 +224,7 @@ impl BleTransport for BtleplugBle {
                     // doesn't define a sentinel because DiscoveredDevice's
                     // rssi_dbm has no Option wrapper to express "unknown").
                     rssi_dbm: props.rssi.map(i32::from).unwrap_or(-127),
+                    service_uuids: props.services.iter().map(Uuid::to_string).collect(),
                 };
                 if tx.send(device).await.is_err() {
                     break;

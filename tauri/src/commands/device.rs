@@ -46,11 +46,18 @@ pub struct DeviceDiscovered {
     pub name: String,
     /// Received signal strength, dBm.
     pub rssi_dbm: i32,
+    /// Service UUIDs from the device's advertisement (lowercase hyphenated
+    /// form), e.g. `["000000ff-0000-1000-8000-00805f9b34fb"]`. Lets the UI
+    /// filter a scan to a specific service (e.g. an HRM search filtering to
+    /// the standard heart-rate service by default, with a show-all toggle)
+    /// without a second GATT round trip. Empty if the advertisement carried
+    /// none.
+    pub service_uuids: Vec<String>,
 }
 
 impl From<idl_transport::DiscoveredDevice> for DeviceDiscovered {
     fn from(d: idl_transport::DiscoveredDevice) -> Self {
-        Self { device_id: d.device_id, name: d.name, rssi_dbm: d.rssi_dbm }
+        Self { device_id: d.device_id, name: d.name, rssi_dbm: d.rssi_dbm, service_uuids: d.service_uuids }
     }
 }
 
@@ -1050,7 +1057,12 @@ mod tests {
     }
 
     fn discovered(device_id: &str, name: &str, rssi_dbm: i32) -> idl_transport::DiscoveredDevice {
-        idl_transport::DiscoveredDevice { device_id: device_id.to_string(), name: name.to_string(), rssi_dbm }
+        idl_transport::DiscoveredDevice {
+            device_id: device_id.to_string(),
+            name: name.to_string(),
+            rssi_dbm,
+            service_uuids: Vec::new(),
+        }
     }
 
     #[tokio::test]
@@ -1067,6 +1079,25 @@ mod tests {
         assert_eq!(seen[0].device_id, "AA:BB");
         assert_eq!(seen[0].rssi_dbm, -40);
         assert_eq!(seen[1].name, "IDL0-9911");
+    }
+
+    #[tokio::test]
+    async fn scan_via_advertised_service_uuids_carried_through_to_device_discovered() {
+        // Arrange
+        let with_service = idl_transport::DiscoveredDevice {
+            device_id: "AA:BB".to_string(),
+            name: "IDL0-A3F2".to_string(),
+            rssi_dbm: -40,
+            service_uuids: vec!["0000180d-0000-1000-8000-00805f9b34fb".to_string()],
+        };
+        let ble = StubBle { scan_devices: vec![with_service], ..Default::default() };
+        let mut seen = Vec::new();
+
+        // Act
+        scan_via(&ble, Duration::from_millis(10), |d| seen.push(d)).await.unwrap();
+
+        // Assert
+        assert_eq!(seen[0].service_uuids, vec!["0000180d-0000-1000-8000-00805f9b34fb".to_string()]);
     }
 
     #[tokio::test]
