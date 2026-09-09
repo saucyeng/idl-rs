@@ -1631,7 +1631,11 @@ fn call_function(
             require_arg_count(name, &args, 1)?;
             crate::math::vector::normalize(&args[0], name)
         }
-        "angle" => {
+        // Retired as `angle` (R143/R151 item 4): `numpy.angle` is complex
+        // phase, not the angle between two vectors — a false friend.
+        // `vector::angle`'s own Rust fn name is unchanged (internal, R151's
+        // "internal fn names may stay" precedent from `variance_geom.rs`).
+        "angle_between" => {
             require_arg_count(name, &args, 2)?;
             crate::math::vector::angle(&args[0], &args[1], name)
         }
@@ -3366,6 +3370,35 @@ mod tests {
 
         // Assert
         assert!(e.message.contains("IMU0"), "{}", e.message);
+    }
+
+    #[test]
+    fn angle_between_orthogonal_channels_is_half_pi() {
+        // Arrange — R143/R151 item 4: `numpy.angle` is complex phase, so
+        // the language's own angle-between-vectors function takes a
+        // deliberately different name.
+        let lk = lookup(&[("dummy", vec![0.0], 1.0)]);
+        let ast = crate::math::parse::parse(
+            "angle_between(vec(1, 0, 0), vec(0, 1, 0))",
+        )
+        .unwrap();
+
+        // Act
+        let result = eval(&ast, &lk, &no_laps()).unwrap();
+
+        // Assert
+        assert!(matches!(result, Value::Scalar(x) if (x - std::f64::consts::FRAC_PI_2).abs() < 1e-9));
+    }
+
+    #[test]
+    fn angle_is_retired_and_names_its_replacement() {
+        // Arrange / Act
+        let lk = lookup(&[("Ax", vec![1.0], 1.0)]);
+        let err = eval_expr("angle([Ax], [Ax])", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::UnknownFunction);
+        assert!(err.message.contains("angle_between"), "{}", err.message);
     }
 
     #[test]

@@ -73,6 +73,9 @@ pub fn math_name_migrations() -> &'static [NameMigration] {
         // target, not the only function `fft` retired in favour of;
         // `unknown_function_error`'s message additionally names `welch`.
         NameMigration { old: "fft", new: "periodogram", kind: Rewrite },
+        // `numpy.angle` is complex phase, not the angle between two vectors
+        // — a false friend (R143/R151 item 4).
+        NameMigration { old: "angle", new: "angle_between", kind: Rename },
     ]
 }
 
@@ -635,6 +638,19 @@ mod tests {
 
         // Assert
         assert_eq!(olds.len(), before);
+    }
+
+    #[test]
+    fn migrate_expression_rewrites_angle_to_angle_between() {
+        // Act
+        let (out, applied) = migrate_expression("angle([A], [B])");
+
+        // Assert
+        assert_eq!(out, "angle_between([A], [B])");
+        assert_eq!(
+            applied,
+            vec![AppliedRename { old: "angle".to_string(), new: "angle_between".to_string(), position: 0 }]
+        );
     }
 
     #[test]

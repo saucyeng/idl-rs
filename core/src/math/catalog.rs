@@ -138,7 +138,7 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
         MathBuiltin { name: "dot", arity: &[2], status: I },
         MathBuiltin { name: "norm", arity: &[1], status: I },
         MathBuiltin { name: "normalize", arity: &[1], status: I },
-        MathBuiltin { name: "angle", arity: &[2], status: I },
+        MathBuiltin { name: "angle_between", arity: &[2], status: I },
         MathBuiltin { name: "rotate_mat", arity: &[10], status: I },
         MathBuiltin { name: "rotate_axis", arity: &[5], status: I },
         MathBuiltin { name: "rotate_euler", arity: &[4], status: I },
