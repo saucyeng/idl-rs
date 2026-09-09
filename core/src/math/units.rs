@@ -404,6 +404,56 @@ pub struct UnitNote {
     pub message: String,
 }
 
+impl UnknownReason {
+    /// Display-ready English for this reason — what `UnitLabel::Unknown`'s
+    /// `reason` (and, later, a UI tooltip) shows. Never references internal
+    /// type names; a rider or mechanic reads this, not a developer.
+    pub fn describe(&self) -> String {
+        match self {
+            UnknownReason::NoSourceUnit => "no unit recorded for this channel".to_string(),
+            UnknownReason::Mismatch { left, right, op } => {
+                format!("`{op}`: units differ (`{left}` and `{right}`)")
+            }
+            UnknownReason::NonLiteralExponent => {
+                "exponent is not a literal number".to_string()
+            }
+            UnknownReason::Propagated { of } => format!("unit of {of} could not be determined"),
+            UnknownReason::Cycle => "definition cycle".to_string(),
+            UnknownReason::NotNumeric => "not a numeric value".to_string(),
+        }
+    }
+}
+
+/// The unit as it crosses to the outer layers (R154 §5) — a three-state
+/// rendering of [`Unit`] with `Scalar` folded into `Dimensionless`, since
+/// `Scalar` is inference-internal only (it never crosses the wire; a
+/// top-level `Scalar` result, e.g. `count(x)`, is genuinely dimensionless as
+/// far as any consumer is concerned). `unit: string | null` must not ship in
+/// its place (R154) — `None` cannot mean both "not applicable" and "we
+/// could not work it out".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitLabel {
+    /// A determined, non-empty unit, rendered from [`UnitExpr`] — `"mm"`,
+    /// `"km/h"`.
+    Known(String),
+    /// Genuinely no unit: a ratio, a count, a comparison result, or a
+    /// top-level [`Unit::Scalar`].
+    Dimensionless,
+    /// Not determinable. `reason` is [`UnknownReason::describe`]'s text.
+    Unknown { reason: String },
+}
+
+impl From<&Unit> for UnitLabel {
+    fn from(unit: &Unit) -> UnitLabel {
+        match unit {
+            Unit::Scalar => UnitLabel::Dimensionless,
+            Unit::Known(u) if u.is_dimensionless() => UnitLabel::Dimensionless,
+            Unit::Known(u) => UnitLabel::Known(u.to_string()),
+            Unit::Unknown(reason) => UnitLabel::Unknown { reason: reason.describe() },
+        }
+    }
+}
+
 /// `a op b`'s unit under `+`/`-` (R154 §2's table row for `a + b`, `a - b`):
 /// `Scalar` on either side adopts the other's unit; two different `Known`s
 /// mismatch; anything touching `Unknown` propagates. Shared by both `Add`
@@ -1065,5 +1115,58 @@ mod tests {
 
         // Assert
         assert_eq!(unit, Unit::Unknown(UnknownReason::NotNumeric));
+    }
+
+    // --- UnitLabel (task 4's wire shape) ---
+
+    #[test]
+    fn unit_label_known_renders_the_unit_string() {
+        // Arrange
+        let unit = Unit::Known(UnitExpr::atom("mm"));
+
+        // Act
+        let label = UnitLabel::from(&unit);
+
+        // Assert
+        assert_eq!(label, UnitLabel::Known("mm".to_string()));
+    }
+
+    #[test]
+    fn unit_label_scalar_folds_to_dimensionless() {
+        // Arrange — Scalar never crosses the wire (R154 §5)
+        let unit = Unit::Scalar;
+
+        // Act
+        let label = UnitLabel::from(&unit);
+
+        // Assert
+        assert_eq!(label, UnitLabel::Dimensionless);
+    }
+
+    #[test]
+    fn unit_label_known_dimensionless_folds_to_dimensionless() {
+        // Arrange
+        let unit = Unit::Known(UnitExpr::dimensionless());
+
+        // Act
+        let label = UnitLabel::from(&unit);
+
+        // Assert
+        assert_eq!(label, UnitLabel::Dimensionless);
+    }
+
+    #[test]
+    fn unit_label_unknown_carries_a_display_ready_reason() {
+        // Arrange
+        let unit = Unit::Unknown(UnknownReason::NoSourceUnit);
+
+        // Act
+        let label = UnitLabel::from(&unit);
+
+        // Assert
+        assert_eq!(
+            label,
+            UnitLabel::Unknown { reason: "no unit recorded for this channel".to_string() }
+        );
     }
 }

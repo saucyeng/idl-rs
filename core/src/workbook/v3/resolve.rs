@@ -248,6 +248,141 @@ pub fn resolve_workbook_defs(
     results
 }
 
+/// A [`ChannelLookup`] layering already-inferred sibling-definition units
+/// *over* `base`, for [`resolve_workbook_units`]'s fixed-point pass — the
+/// unit-inference analogue of [`OverlayLookup`] above. Only carries
+/// [`Unit::Known`], non-dimensionless entries (rendered back to a C1-style
+/// string, the only shape [`ChannelLookup::unit_of`] can carry): a sibling
+/// definition whose own inferred unit is `Scalar`, dimensionless, or
+/// `Unknown` has no string to hand back, so a reference to it here falls
+/// through to `base` and reports [`UnknownReason::NoSourceUnit`] rather than
+/// the more specific state it actually has. This is a conservative
+/// approximation, not a wrong one (R152: no unit is never a lie) — a
+/// dimensionless or `Scalar` sibling definition should ideally propagate
+/// its own state through a `[Name]` reference too, but doing that exactly
+/// needs `infer` to accept something richer than `ChannelLookup`'s
+/// `Option<String>`, which is future work, not guessed here.
+struct UnitOverlayLookup<'a> {
+    base: &'a dyn ChannelLookup,
+    /// name → rendered unit string, only for `Known` non-dimensionless
+    /// sibling definitions already resolved this pass.
+    units: &'a HashMap<String, String>,
+}
+
+impl ChannelLookup for UnitOverlayLookup<'_> {
+    fn lookup(&self, name: &str) -> Option<LookupChannel> {
+        self.base.lookup(name)
+    }
+
+    fn unit_of(&self, name: &str) -> Option<String> {
+        self.units.get(name).cloned().or_else(|| self.base.unit_of(name))
+    }
+}
+
+/// Resolves every `def_line`'s inferred unit (R154 §3's "math definition"
+/// row: `[Name]` resolving to another definition takes that definition's
+/// own inferred unit), in the same dependency order as
+/// [`resolve_workbook_defs`] — a definition referenced by two others infers
+/// its unit once. Deliberately **independent of value evaluation**: a
+/// definition's unit is inferred from its `Ast` alone (R154's "inference is
+/// a separate pass"), never from `resolve_workbook_defs`'s `results`, so a
+/// definition can report a determined unit even when its own evaluation
+/// fails (a mismatched-rate error, say), and vice versa.
+///
+/// Cross-referencing is by bare name, first-declaration-wins, mirroring
+/// [`resolve_workbook_defs`]'s `primary_for_name` rule (R47/R49) — the same
+/// document should not resolve a same-name collision two different ways for
+/// its value and its unit.
+///
+/// A dependency cycle among defs (the fixed point makes no further
+/// progress) yields [`UnknownReason::Cycle`] for every member — unlike
+/// [`resolve_workbook_defs`]'s leftover sweep, which names the one blocking
+/// dependency, a cycle has no single blocker to name for a unit.
+pub fn resolve_workbook_units(
+    defs: &[MathCellDef],
+    constants: &HashMap<String, f64>,
+    lookup: &dyn ChannelLookup,
+) -> HashMap<DefKey, (crate::math::units::Unit, Vec<crate::math::units::UnitNote>)> {
+    use crate::math::units::{infer, Unit, UnknownReason};
+
+    let def_names: std::collections::HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+
+    let deps: HashMap<DefKey, Vec<String>> = defs
+        .iter()
+        .map(|d| {
+            let names = channel_refs(&d.expr_text)
+                .into_iter()
+                .filter(|n| def_names.contains(n.as_str()))
+                .collect();
+            ((d.cell_id.clone(), d.name.clone()), names)
+        })
+        .collect();
+
+    let primary_for_name: HashMap<&str, &MathCellDef> =
+        defs.iter().fold(HashMap::new(), |mut m, d| {
+            m.entry(d.name.as_str()).or_insert(d);
+            m
+        });
+
+    let mut resolved_units: HashMap<String, String> = HashMap::new();
+    let mut settled_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut results: HashMap<DefKey, (Unit, Vec<crate::math::units::UnitNote>)> = HashMap::new();
+    let mut remaining: Vec<&MathCellDef> = defs.iter().collect();
+
+    loop {
+        let mut made_progress = false;
+        let mut still_remaining = Vec::new();
+
+        for def in remaining {
+            let key = (def.cell_id.clone(), def.name.clone());
+            let ready = deps[&key].iter().all(|dep| settled_names.contains(dep));
+            if !ready {
+                still_remaining.push(def);
+                continue;
+            }
+
+            let overlay = UnitOverlayLookup { base: lookup, units: &resolved_units };
+            let (unit, notes) = match crate::math::parse::parse_with_constants(&def.expr_text, constants) {
+                Ok(ast) => infer(&ast, &overlay),
+                // The definition does not even parse — `resolve_workbook_defs`
+                // already surfaces the real MathEvalError on `CellDefResult::error`;
+                // this pass only needs a unit state to publish alongside it.
+                Err(_) => {
+                    (Unit::Unknown(UnknownReason::Propagated { of: "a definition with a parse error".to_string() }), Vec::new())
+                }
+            };
+
+            if std::ptr::eq(primary_for_name[def.name.as_str()], def) {
+                if let Unit::Known(u) = &unit {
+                    if !u.is_dimensionless() {
+                        resolved_units.insert(def.name.clone(), u.to_string());
+                    }
+                }
+                settled_names.insert(def.name.clone());
+            }
+            results.insert(key, (unit, notes));
+            made_progress = true;
+        }
+
+        remaining = still_remaining;
+        if !made_progress || remaining.is_empty() {
+            break;
+        }
+    }
+
+    // Leftovers are cycle members — every one of them gets Unknown(Cycle),
+    // no single blocking dependency to name (unlike resolve_workbook_defs's
+    // leftover sweep, which reports one).
+    for def in remaining {
+        results.insert(
+            (def.cell_id.clone(), def.name.clone()),
+            (Unit::Unknown(UnknownReason::Cycle), Vec::new()),
+        );
+    }
+
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +437,87 @@ mod tests {
                 None
             }
         }
+    }
+
+    // A lookup double with one named base channel carrying a C1 unit
+    // (`unit_of`), for `resolve_workbook_units`'s tests below.
+    struct UnitChannel {
+        name: &'static str,
+        unit: &'static str,
+    }
+    impl ChannelLookup for UnitChannel {
+        fn lookup(&self, _name: &str) -> Option<LookupChannel> {
+            None
+        }
+        fn unit_of(&self, name: &str) -> Option<String> {
+            if name == self.name {
+                Some(self.unit.to_string())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Looks up a [`resolve_workbook_units`] result by `(cell_id, name)`.
+    fn get_unit<'a>(
+        out: &'a HashMap<DefKey, (crate::math::units::Unit, Vec<crate::math::units::UnitNote>)>,
+        cell_id: &str,
+        name: &str,
+    ) -> &'a (crate::math::units::Unit, Vec<crate::math::units::UnitNote>) {
+        &out[&(cell_id.to_string(), name.to_string())]
+    }
+
+    #[test]
+    fn resolve_units_channel_ref_takes_the_base_channel_unit() {
+        // Arrange
+        let defs = vec![def("c1", "TravelMm", "[Travel]", 0)];
+        let lk = UnitChannel { name: "Travel", unit: "mm" };
+
+        // Act
+        let out = resolve_workbook_units(&defs, &HashMap::new(), &lk);
+
+        // Assert
+        assert_eq!(
+            get_unit(&out, "c1", "TravelMm").0,
+            crate::math::units::Unit::Known(crate::math::units::UnitExpr::atom("mm"))
+        );
+    }
+
+    #[test]
+    fn resolve_units_a_references_b_takes_bs_own_inferred_unit() {
+        // Arrange — R154 §3: a math-definition [Name] reference takes that
+        // definition's own inferred unit, in dependency order.
+        let defs = vec![def("c1", "A", "[B] * 2", 0), def("c1", "B", "[Travel]", 1)];
+        let lk = UnitChannel { name: "Travel", unit: "mm" };
+
+        // Act
+        let out = resolve_workbook_units(&defs, &HashMap::new(), &lk);
+
+        // Assert
+        assert_eq!(
+            get_unit(&out, "c1", "A").0,
+            crate::math::units::Unit::Known(crate::math::units::UnitExpr::atom("mm"))
+        );
+    }
+
+    #[test]
+    fn resolve_units_cycle_reports_unknown_cycle_for_every_member_no_infinite_loop() {
+        // Arrange
+        let defs = vec![def("c1", "A", "[B] + 1", 0), def("c1", "B", "[A] + 1", 1)];
+        let lk = UnitChannel { name: "nothing", unit: "mm" };
+
+        // Act — must terminate.
+        let out = resolve_workbook_units(&defs, &HashMap::new(), &lk);
+
+        // Assert
+        assert_eq!(
+            get_unit(&out, "c1", "A").0,
+            crate::math::units::Unit::Unknown(crate::math::units::UnknownReason::Cycle)
+        );
+        assert_eq!(
+            get_unit(&out, "c1", "B").0,
+            crate::math::units::Unit::Unknown(crate::math::units::UnknownReason::Cycle)
+        );
     }
 
     #[test]

@@ -57,6 +57,49 @@ impl From<&idl_rs::workbook::v3::HostChannel> for HostChannelRef {
     }
 }
 
+/// The unit as it crosses IPC (C2 §3.3's unit model, rulings R154/R162),
+/// mirroring [`idl_rs::math::units::UnitLabel`]. `#[serde(tag = "state", …)]`
+/// so the TypeScript side is a discriminated union — `unit: string | null`
+/// must never ship in its place (R154: `None` cannot mean both "not
+/// applicable" and "we could not work it out").
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum UnitLabel {
+    /// A determined, non-empty unit — `"mm"`, `"km/h"`.
+    Known { text: String },
+    /// Genuinely no unit: a ratio, a count, a comparison result.
+    Dimensionless,
+    /// Not determinable. `reason` is display-ready English.
+    Unknown { reason: String },
+}
+
+impl From<&idl_rs::math::units::UnitLabel> for UnitLabel {
+    fn from(u: &idl_rs::math::units::UnitLabel) -> Self {
+        match u {
+            idl_rs::math::units::UnitLabel::Known(text) => UnitLabel::Known { text: text.clone() },
+            idl_rs::math::units::UnitLabel::Dimensionless => UnitLabel::Dimensionless,
+            idl_rs::math::units::UnitLabel::Unknown { reason } => {
+                UnitLabel::Unknown { reason: reason.clone() }
+            }
+        }
+    }
+}
+
+/// One non-fatal unit diagnostic (R154 §2.1) — most often a `+`/`-`
+/// mismatch. Never an evaluation failure; mirrors
+/// [`idl_rs::math::units::UnitNote`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnitNote {
+    /// Display-ready English, e.g. "`+`: units differ (`bpm` and `km/h`)".
+    pub message: String,
+}
+
+impl From<&idl_rs::math::units::UnitNote> for UnitNote {
+    fn from(n: &idl_rs::math::units::UnitNote) -> Self {
+        UnitNote { message: n.message.clone() }
+    }
+}
+
 /// One `math`-cell definition's evaluated result (C3 §3.4).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CellDefResult {
@@ -67,9 +110,15 @@ pub struct CellDefResult {
     /// (`runs/2026-09-03/decisions.md`), verbatim from
     /// [`idl_rs::workbook::v3::CellDefResult::sample_rate_hz`]. `null` means
     /// genuinely not applicable (a scalar reduction has no rate), never
-    /// "unknown"; also `null` on failure. R144's `unit` half is deferred
-    /// (ruling R152) — no unit exists on the engine's value type today.
+    /// "unknown"; also `null` on failure.
     pub sample_rate_hz: Option<f64>,
+    /// This definition's inferred unit (R144/R152/R154, ruling R162) —
+    /// independent of `value`/`error`: a definition can carry a determined
+    /// unit even when its own evaluation failed.
+    pub unit: UnitLabel,
+    /// Non-fatal unit diagnostics for this definition (R154 §2.1). `[]` in
+    /// the overwhelming majority of cases.
+    pub unit_notes: Vec<UnitNote>,
     /// `math_*` kind only — a structural problem on this definition keeps it
     /// out of `defs` entirely (routed to the cell's own `errors` instead).
     pub error: Option<IpcError>,
@@ -455,6 +504,8 @@ fn build_cell_outputs(
                     label: d.label.clone(),
                     value: d.value.as_ref().map(HostChannelRef::from),
                     sample_rate_hz: d.sample_rate_hz,
+                    unit: UnitLabel::from(&d.unit),
+                    unit_notes: d.unit_notes.iter().map(UnitNote::from).collect(),
                     error: d.error.clone().map(IpcError::from),
                 })
                 .collect();
@@ -1799,7 +1850,10 @@ mod tests {
         // session+workbook by running this test's body against the
         // pre-Task-9 `eval_workbook_via(&root, WB_ID, Some("s1"))` (two
         // trailing args, no `lap_context`), before the `lap_context`
-        // parameter was added. `None` here must reproduce it exactly.
+        // parameter was added. `None` here must reproduce it exactly,
+        // updated for `unit`/`unit_notes` (ruling R154/R162): `ChanA` has
+        // no C1 unit recorded (seed_session's `unit: String::new()`), so
+        // `x`'s inferred unit is `unknown`.
         let root = temp_root();
         seed_session(&root, "s1", "ChanA", vec![1.0, 2.0, 3.0], vec![0, 100_000, 200_000]);
         let markdown = format!(
@@ -1814,7 +1868,7 @@ mod tests {
         let json = serde_json::to_string(&out).unwrap();
         assert_eq!(
             json,
-            r#"[{"cell_id":"aaaaaaaa","kind":"math","value":null,"defs":[{"name":"x","label":null,"value":{"length":3,"has_t":true},"sample_rate_hz":10.0,"error":null}],"errors":[],"prose_before_html":"","prose_after_html":"","prose_spans":[]}]"#
+            r#"[{"cell_id":"aaaaaaaa","kind":"math","value":null,"defs":[{"name":"x","label":null,"value":{"length":3,"has_t":true},"sample_rate_hz":10.0,"unit":{"state":"unknown","reason":"no unit recorded for this channel"},"unit_notes":[],"error":null}],"errors":[],"prose_before_html":"","prose_after_html":"","prose_spans":[]}]"#
         );
 
         let _ = std::fs::remove_dir_all(&root);
