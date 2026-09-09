@@ -2360,6 +2360,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn unwatch_workbook_via_a_watched_workbook_the_entry_is_gone_from_the_registry() {
+        // Arrange
+        let root = temp_root();
+        let markdown = two_cell_markdown();
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let hashes = Arc::new(ExpectedHashSet::new());
+        let watcher = watch_workbook_via(&root, hashes, WB_ID, |_| {}).unwrap();
+        let watchers = std::sync::Mutex::new(HashMap::new());
+        watchers.lock().unwrap().insert(WB_ID.to_string(), watcher);
+
+        // Act
+        unwatch_workbook_via(&watchers, WB_ID);
+
+        // Assert
+        assert!(!watchers.lock().unwrap().contains_key(WB_ID));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unwatch_workbook_via_an_id_that_was_never_watched_registry_unchanged() {
+        // Arrange
+        let watchers: std::sync::Mutex<HashMap<String, WorkbookWatcher>> = std::sync::Mutex::new(HashMap::new());
+
+        // Act — no entry for this id existed before or after.
+        unwatch_workbook_via(&watchers, "nope");
+
+        // Assert
+        assert!(watchers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unwatch_workbook_via_called_twice_the_second_call_is_a_no_op() {
+        // Arrange
+        let root = temp_root();
+        let markdown = two_cell_markdown();
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let hashes = Arc::new(ExpectedHashSet::new());
+        let watcher = watch_workbook_via(&root, hashes, WB_ID, |_| {}).unwrap();
+        let watchers = std::sync::Mutex::new(HashMap::new());
+        watchers.lock().unwrap().insert(WB_ID.to_string(), watcher);
+
+        // Act — the first call removes it, the second finds nothing.
+        unwatch_workbook_via(&watchers, WB_ID);
+        unwatch_workbook_via(&watchers, WB_ID);
+
+        // Assert
+        assert!(!watchers.lock().unwrap().contains_key(WB_ID));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unwatch_workbook_via_after_unwatch_an_external_edit_delivers_no_event() {
+        // Arrange — mirrors watch_workbook_external_edit_...'s pattern for
+        // driving a real file edit and waiting past the ~100 ms debounce.
+        let root = temp_root();
+        let markdown = two_cell_markdown();
+        let path = write_workbook(&root, "test.idl1wb", &markdown);
+        let hashes = Arc::new(ExpectedHashSet::new());
+        let (tx, rx) = std::sync::mpsc::channel::<WorkbookEvent>();
+        let watcher = watch_workbook_via(&root, hashes, WB_ID, move |e| {
+            let _ = tx.send(e);
+        })
+        .unwrap();
+        let watchers = std::sync::Mutex::new(HashMap::new());
+        watchers.lock().unwrap().insert(WB_ID.to_string(), watcher);
+
+        // Act — unwatch (drops the WorkbookWatcher, tearing down the
+        // `notify` handle), then edit the file exactly as the still-live
+        // watcher test does.
+        unwatch_workbook_via(&watchers, WB_ID);
+        let edited = markdown.replace("x = 1", "x = 2");
+        std::fs::write(&path, &edited).unwrap();
+
+        // Assert — no event, because the watch itself stopped, not merely
+        // because the registry forgot it.
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(1000)).is_err(),
+            "no event after unwatch"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ---- Step 4: fetch_host_channel ----
 
     #[test]
