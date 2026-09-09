@@ -457,6 +457,61 @@ mod tests {
         assert_eq!(status.last_sync_utc_ms, Some(2_000));
     }
 
+    #[test]
+    fn sync_status_a_freshly_minted_identity_this_device_carries_its_peer_id_and_name() {
+        // Arrange
+        let peers: Vec<Peer> = Vec::new();
+        let discovered = HashMap::new();
+        let last_sync = HashMap::new();
+
+        // Act
+        let status = sync_status_via(&peers, &discovered, &last_sync, "peer-self", "idl1");
+
+        // Assert
+        assert_eq!(status.this_device.peer_id, "peer-self");
+        assert_eq!(status.this_device.name, "idl1");
+    }
+
+    #[test]
+    fn sync_status_after_set_sync_device_name_reports_the_new_name() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.json");
+        let name_lock = std::sync::Mutex::new("idl1".to_string());
+        let peers: Vec<Peer> = Vec::new();
+        let discovered = HashMap::new();
+        let last_sync = HashMap::new();
+
+        // Act
+        set_sync_device_name_via(&identity_path, "peer-self", &name_lock, "Pit Wall Laptop".to_string()).unwrap();
+        let name = name_lock.lock().unwrap().clone();
+        let status = sync_status_via(&peers, &discovered, &last_sync, "peer-self", &name);
+
+        // Assert
+        assert_eq!(status.this_device.peer_id, "peer-self");
+        assert_eq!(status.this_device.name, "Pit Wall Laptop");
+    }
+
+    #[test]
+    fn sync_status_a_rejected_blank_rename_still_reports_the_old_name() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.json");
+        let name_lock = std::sync::Mutex::new("idl1".to_string());
+        let peers: Vec<Peer> = Vec::new();
+        let discovered = HashMap::new();
+        let last_sync = HashMap::new();
+
+        // Act
+        let rename = set_sync_device_name_via(&identity_path, "peer-self", &name_lock, "   ".to_string());
+        let name = name_lock.lock().unwrap().clone();
+        let status = sync_status_via(&peers, &discovered, &last_sync, "peer-self", &name);
+
+        // Assert
+        assert_eq!(rename.unwrap_err().kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(status.this_device.name, "idl1");
+    }
+
     // -- start_pairing --------------------------------------------------
 
     #[test]
