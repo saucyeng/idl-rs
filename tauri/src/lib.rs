@@ -55,6 +55,7 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::workbook::fetch_host_channel_v2,
         commands::workbook::list_math_builtins,
         commands::workbook::watch_workbook,
+        commands::workbook::unwatch_workbook,
         commands::cursor::cursor_readout,
         commands::rasters::fetch_raster,
         commands::rasters::fetch_raster_meta,
