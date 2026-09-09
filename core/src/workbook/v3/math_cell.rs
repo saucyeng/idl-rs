@@ -206,17 +206,15 @@ fn extract_label(comment: &str) -> Option<String> {
     Some(rest.trim().to_string())
 }
 
-/// R164's `unit:` annotation: a trailing comment (already stripped of its
-/// leading `#`) declares this definition's unit only when it matches
-/// `[ \t]* "unit" [ \t]* ":" .*` at its very start — same shape as
-/// `label:`. Unlike `label:` (which always runs to end of line, since
-/// nothing recognised follows it) the unit's *value* has no closing
-/// delimiter of its own (no bracket, the way §3.6.4's `shape:` has `]`), so
-/// its terminator is the next recognised annotation keyword — today, only
-/// `label:` — or end of line (R164: "same terminator rule as its
-/// siblings"). Returns `(declared_unit_text, remaining_comment)`; when no
-/// `unit:` prefix is present, `remaining_comment` is `comment` unchanged so
-/// the ordinary `label:` scan sees exactly what it always has.
+/// C2 §3.2's `unit_annotation` (ruling R164, spec commit `3a9e0ab`): a
+/// trailing comment (already stripped of its leading `#`) declares this
+/// definition's unit when it matches `"unit:" /[ \t]*/ unit_expr` at its
+/// very start — `unit_expr ::= /[^ \t\n]+/`, one whitespace-delimited
+/// token (§3.3.1's rendered unit never contains a space). Ordered ahead of
+/// `label:` in the comment scan (`shape:` → `unit:` → `label:`). Returns
+/// `(declared_unit_text, remaining_comment)`; when no `unit:` prefix is
+/// present, `remaining_comment` is `comment` unchanged so the ordinary
+/// `label:` scan sees exactly what it always has.
 fn extract_unit_annotation(comment: &str) -> (Option<String>, &str) {
     let trimmed = comment.trim_start();
     let Some(rest) = trimmed.strip_prefix("unit") else {
@@ -226,31 +224,13 @@ fn extract_unit_annotation(comment: &str) -> (Option<String>, &str) {
         return (None, comment);
     };
     let rest = rest.trim_start();
-    match find_label_keyword(rest) {
-        Some(idx) => (Some(rest[..idx].trim().to_string()), &rest[idx..]),
-        None => (Some(rest.trim().to_string()), ""),
-    }
-}
-
-/// Finds the byte offset of a `label:` keyword occurrence in `s`, at a word
-/// boundary (preceded by whitespace, or at the start of `s`) — so a unit
-/// token that merely contains the letters "label" (unlikely, but not
-/// grammar-forbidden) is never mistaken for the next annotation.
-fn find_label_keyword(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut search_from = 0;
-    while let Some(rel) = s[search_from..].find("label") {
-        let start = search_from + rel;
-        let at_boundary = start == 0 || bytes[start - 1].is_ascii_whitespace();
-        if at_boundary && s[start + "label".len()..].trim_start().starts_with(':') {
-            return Some(start);
-        }
-        search_from = start + "label".len();
-        if search_from >= s.len() {
-            break;
-        }
-    }
-    None
+    // C2 §3.2's unit_expr ::= /[^ \t\n]+/ — one whitespace-delimited
+    // token, the same shape §3.3.1's UnitExpr renders (its atoms are
+    // joined by `·`/`*` with no internal space), so stopping at the first
+    // space or tab is exact, not an approximation of "until the next
+    // recognised key".
+    let end = rest.find([' ', '\t']).unwrap_or(rest.len());
+    (Some(rest[..end].to_string()), rest[end..].trim_start())
 }
 
 /// Validates `name` against C2 §3.1's `identifier` grammar and
