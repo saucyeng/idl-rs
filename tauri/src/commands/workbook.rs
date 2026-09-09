@@ -62,7 +62,7 @@ impl From<&idl_rs::workbook::v3::HostChannel> for HostChannelRef {
 /// so the TypeScript side is a discriminated union — `unit: string | null`
 /// must never ship in its place (R154: `None` cannot mean both "not
 /// applicable" and "we could not work it out").
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum UnitLabel {
     /// A determined, non-empty unit — `"mm"`, `"km/h"`.
