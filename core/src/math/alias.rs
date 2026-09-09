@@ -88,6 +88,13 @@ pub fn math_name_migrations() -> &'static [NameMigration] {
         // already spelling it `cumtrapz` would need no migration in the
         // first place, since that name didn't exist before this lane.
         NameMigration { old: "integrate", new: "cumulative_trapezoid", kind: Rename },
+        // With no complex type in the language, `hilbert` was never going
+        // to return scipy's analytic signal — it returns an envelope, so
+        // the scipy name was a false friend before a single line of it
+        // existed (R146). Both names are `NotImplemented`, so this rename
+        // costs zero migration (R151 item 8): rename what has no users
+        // before it has users.
+        NameMigration { old: "hilbert", new: "envelope", kind: Rename },
     ]
 }
 
@@ -667,6 +674,16 @@ mod tests {
             applied,
             vec![AppliedRename { old: "angle".to_string(), new: "angle_between".to_string(), position: 0 }]
         );
+    }
+
+    #[test]
+    fn migrate_expression_rewrites_hilbert_to_envelope() {
+        // Act
+        let (out, applied) = migrate_expression("hilbert([A])");
+
+        // Assert
+        assert_eq!(out, "envelope([A])");
+        assert_eq!(applied, vec![AppliedRename { old: "hilbert".to_string(), new: "envelope".to_string(), position: 0 }]);
     }
 
     #[test]

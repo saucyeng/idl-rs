@@ -53,7 +53,7 @@ pub enum MathBuiltinStatus {
     Implemented,
     /// The function parses and validates but its match arm returns
     /// `MathEvalErrorKind::NotImplemented` (C2 §3.3's committed-but-deferred
-    /// surface, e.g. `spectrogram`, `hilbert`).
+    /// surface, e.g. `spectrogram`, `envelope`).
     NotImplemented,
 }
 
@@ -120,7 +120,9 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
         MathBuiltin { name: "periodogram", arity: &[1], status: I },
         MathBuiltin { name: "welch", arity: &[1], status: I },
         MathBuiltin { name: "spectrogram", arity: &[1], status: N },
-        MathBuiltin { name: "hilbert", arity: &[1], status: N },
+        // Retired from `hilbert` (R151 item 8, C2 3.8) — zero migration cost,
+        // NotImplemented.
+        MathBuiltin { name: "envelope", arity: &[1], status: N },
         MathBuiltin { name: "correlate", arity: &[2], status: N },
         MathBuiltin { name: "convolve", arity: &[2], status: N },
         MathBuiltin { name: "resample", arity: &[2], status: N },

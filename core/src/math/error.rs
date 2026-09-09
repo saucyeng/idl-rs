@@ -22,7 +22,7 @@ pub enum MathEvalErrorKind {
     DivisionByZero,
     /// Lap-aware function called with no lap context available.
     NoLapContext,
-    /// A deferred function stub (`spectrogram`, `hilbert`, …).
+    /// A deferred function stub (`spectrogram`, `envelope`, …).
     NotImplemented,
     /// Any other runtime failure (mismatched rates/lengths, bad window, …).
     Runtime,

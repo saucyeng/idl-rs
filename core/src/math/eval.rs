@@ -1441,7 +1441,7 @@ fn call_function(
             }
             Ok(channel(out, cond.sample_rate_hz, t_us))
         }
-        "spectrogram" | "hilbert" | "correlate" | "convolve" | "resample" | "sosfilt" => {
+        "spectrogram" | "envelope" | "correlate" | "convolve" | "resample" | "sosfilt" => {
             Err(err(MathEvalErrorKind::NotImplemented, format!("not yet implemented: {name}")))
         }
 

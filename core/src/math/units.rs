@@ -745,8 +745,18 @@ fn function_unit_rule(name: &str, arg_count: usize) -> (FnUnitRule, Vec<FnUnitCh
         "deg2rad" => (Fixed("rad"), vec![FnUnitCheck::Expect(0, "deg")]),
         "rad2deg" => (Fixed("deg"), vec![FnUnitCheck::Expect(0, "rad")]),
         "periodogram" | "welch" | "spectrogram" => (spectral_rule(), no_checks),
-        "hilbert" => (SameAsArg(0), no_checks),
+        // Retired from `hilbert` (R151 item 8, C2 3.8): with no complex type
+        // in the language, this was always going to return an envelope, not
+        // scipy's analytic signal — the scipy name was a false friend before
+        // a single line of it existed (R146). `NotImplemented`, so the
+        // rename cost zero migration.
+        "envelope" => (SameAsArg(0), no_checks),
         "correlate" | "convolve" => (Product(same(0), same(1)), no_checks),
+        // `resample(ch, n)` — `n` is a target sample count (scipy's own
+        // parameterisation), not a rate (R146/R151 item 8): a count is
+        // `Dimensionless` and carries no unit check of its own, so this rule
+        // is unaffected by the rename — only the C2 §3.3 signature/prose
+        // changed, not the argument this rule reads.
         "resample" => (SameAsArg(0), no_checks),
         "where" => (AllMatch(vec![1, 2]), no_checks),
         "current_lap" => (Dimensionless, no_checks),
@@ -860,6 +870,38 @@ fn spectral_rule() -> FnUnitRule {
         ],
         default: "density",
     }
+}
+
+/// `periodogram`/`welch`/`spectrogram`'s output unit (§3.3.1), for a caller
+/// that reaches a spectrum without walking an `Ast` — the raster/`fetch_fft`
+/// path (`idl_rs::fft::welch`/`spectrogram`, called directly on a channel's
+/// materialized samples) has no math-cell call site for [`infer`] to visit,
+/// so it cannot see [`function_unit_rule`] (a private, `Ast`-shaped table).
+/// This reuses [`spectral_rule`] itself — never a second hard-coded copy of
+/// §3.3.1's table (R163) — over a synthesized single-argument unit and a
+/// synthesized `scaling` keyword, so the two paths can never drift apart.
+///
+/// `source_unit` is the source channel's raw C1 §4.1 unit string (`""` means
+/// no unit recorded, the same `NoSourceUnit` reason a `[Name]` reference with
+/// no unit gets); `scaling` is one of §3.3.1's three literals (`"density"`,
+/// `"spectrum"`, `"raw_magnitude"`) — an absent selection is the caller's own
+/// choice to omit, expressed the same way `infer` sees an omitted keyword
+/// argument: pass `"density"`, the rule's own default, explicitly.
+pub fn spectral_output_unit(source_unit: &str, scaling: &str) -> UnitLabel {
+    let source = if source_unit.is_empty() {
+        Unit::Unknown(UnknownReason::NoSourceUnit)
+    } else {
+        match UnitExpr::parse(source_unit) {
+            Ok(expr) => Unit::Known(expr),
+            // A malformed C1 unit string is treated the same as no unit at
+            // all — the same fallback `infer`'s own `Ast::ChannelRef` arm
+            // takes, never a panic or a guess at what the author meant.
+            Err(_) => Unit::Unknown(UnknownReason::NoSourceUnit),
+        }
+    };
+    let kwargs = vec![("scaling".to_string(), Ast::Str(scaling.to_string()))];
+    let (unit, _notes) = eval_fn_rule(&spectral_rule(), &[source], &kwargs);
+    UnitLabel::from(&unit)
 }
 
 /// Reads a keyword argument's value as a string literal, if `kwargs`
@@ -1797,6 +1839,57 @@ mod tests {
 
         // Assert
         assert_eq!(unit, Unit::Known(UnitExpr::parse("g^2/Hz").unwrap()));
+    }
+
+    #[test]
+    fn spectral_output_unit_density_scaling_is_ch_squared_per_hz() {
+        // Arrange / Act
+        let label = spectral_output_unit("g", "density");
+
+        // Assert
+        assert_eq!(label, UnitLabel::Known { text: "g^2/Hz".to_string() });
+    }
+
+    #[test]
+    fn spectral_output_unit_spectrum_scaling_is_ch_squared() {
+        // Arrange / Act
+        let label = spectral_output_unit("g", "spectrum");
+
+        // Assert
+        assert_eq!(label, UnitLabel::Known { text: "g^2".to_string() });
+    }
+
+    #[test]
+    fn spectral_output_unit_raw_magnitude_scaling_is_same_as_source() {
+        // Arrange / Act
+        let label = spectral_output_unit("g", "raw_magnitude");
+
+        // Assert
+        assert_eq!(label, UnitLabel::Known { text: "g".to_string() });
+    }
+
+    #[test]
+    fn spectral_output_unit_matches_infers_periodogram_call_for_every_scaling() {
+        // Arrange
+        let lk = units(&[("AccelG", "g")]);
+
+        // Act / Assert — the direct helper and infer()'s Ast::Call path must
+        // never disagree, since both read spectral_rule().
+        for scaling in ["density", "spectrum", "raw_magnitude"] {
+            let ast = parse(&format!("periodogram([AccelG], scaling=\"{scaling}\")"));
+            let (via_infer, _) = infer(&ast, &lk);
+            let via_helper = spectral_output_unit("g", scaling);
+            assert_eq!(UnitLabel::from(&via_infer), via_helper);
+        }
+    }
+
+    #[test]
+    fn spectral_output_unit_empty_source_unit_is_unknown_no_source_unit() {
+        // Arrange / Act
+        let label = spectral_output_unit("", "raw_magnitude");
+
+        // Assert
+        assert_eq!(label, UnitLabel::Unknown { reason: UnknownReason::NoSourceUnit.describe() });
     }
 
     #[test]
