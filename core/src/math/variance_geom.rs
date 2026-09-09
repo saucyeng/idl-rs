@@ -180,7 +180,7 @@ pub fn eval_variance_time(
 ) -> Result<Value, MathEvalError> {
     let overlay_ch = overlay.lookup.lookup(channel_id).ok_or_else(|| {
         runtime_err(format!(
-            "variance_time(): channel \"{channel_id}\" not present in overlay session."
+            "lap_delta_time(): channel \"{channel_id}\" not present in overlay session."
         ))
     })?;
     let r = build_overlay_reference(
@@ -191,12 +191,12 @@ pub fn eval_variance_time(
     )
     .ok_or_else(|| {
         runtime_err(
-            "variance_time(): overlay session lap could not be resolved (missing GPS or empty lap window).",
+            "lap_delta_time(): overlay session lap could not be resolved (missing GPS or empty lap window).",
         )
     })?;
     let main_pos = build_main_positions(main, r.lat0, r.lon0, r.lat_scale, r.lon_scale)
         .ok_or_else(|| {
-            runtime_err("variance_time(): main session is missing GPS_Latitude / GPS_Longitude.")
+            runtime_err("lap_delta_time(): main session is missing GPS_Latitude / GPS_Longitude.")
         })?;
 
     let result = variance_time_against(&r, &overlay_ch, &main_pos, main_samples, main_rate, main_window);
@@ -256,7 +256,7 @@ pub fn eval_variance_dist(
 ) -> Result<Value, MathEvalError> {
     let overlay_ch = overlay.lookup.lookup(channel_id).ok_or_else(|| {
         runtime_err(format!(
-            "variance_dist(): channel \"{channel_id}\" not present in overlay session."
+            "lap_delta_dist(): channel \"{channel_id}\" not present in overlay session."
         ))
     })?;
     let r = build_overlay_reference(
@@ -265,10 +265,10 @@ pub fn eval_variance_dist(
         overlay.lap_end_ms,
         overlay.lap_start_uniform_sec,
     )
-    .ok_or_else(|| runtime_err("variance_dist(): overlay session lap could not be resolved."))?;
+    .ok_or_else(|| runtime_err("lap_delta_dist(): overlay session lap could not be resolved."))?;
     let main_pos = build_main_positions(main, r.lat0, r.lon0, r.lat_scale, r.lon_scale)
         .ok_or_else(|| {
-            runtime_err("variance_dist(): main session is missing GPS_Latitude / GPS_Longitude.")
+            runtime_err("lap_delta_dist(): main session is missing GPS_Latitude / GPS_Longitude.")
         })?;
 
     let overlay_arc = cumulative_arc(&r.e, &r.n);
