@@ -83,6 +83,19 @@ pub trait ChannelLookup {
     fn sample_times(&self, _name: &str) -> Option<Vec<f64>> {
         None
     }
+
+    /// This channel's recorded display unit (C1 §4.1), e.g. `"mm"`,
+    /// `"km/h"`. Used by the separate unit-inference pass
+    /// ([`crate::math::units::infer`], ruling R154) to resolve `[Name]`
+    /// references — never consulted by `evaluate`/`eval` themselves, which
+    /// stay unit-agnostic. `None` when the lookup has no unit for it — a
+    /// test double, a math-store channel with no unit recorded yet, or a
+    /// source that recorded none. Never `Some("")`: an empty C1 unit string
+    /// means "no unit recorded" and is reported the same way as `None`, not
+    /// as a distinct case. Default `None`; `SessionHandle` overrides it.
+    fn unit_of(&self, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Per-evaluation-pass memoizer over a [`ChannelLookup`]. Caches each `lookup`
@@ -309,6 +322,9 @@ pub fn eval(
 ) -> Result<Value, MathEvalError> {
     match ast {
         Ast::Number(v) => Ok(Value::Scalar(*v)),
+        // A named constant (pi/tau/e/g, R162) evaluates identically to a
+        // plain literal — only the unit-inference pass reads `name`.
+        Ast::Constant { value, .. } => Ok(Value::Scalar(*value)),
         Ast::Str(s) => Ok(Value::Str(s.clone())),
         Ast::ChannelRef(name) => {
             let ch = lookup.lookup(name).ok_or_else(|| {

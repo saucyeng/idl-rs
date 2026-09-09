@@ -74,6 +74,12 @@ pub struct MathCellDef {
     /// The definition's display name, from a `# label: <text>` trailing
     /// comment (C2 §3.1). `None` when the line has no such comment.
     pub label: Option<String>,
+    /// An author-declared unit, from a `# unit: <text>` trailing comment
+    /// (R164) — unparsed. `None` when the line has no such comment.
+    /// Authoritative over inference: [`super::resolve::resolve_workbook_units`]
+    /// uses this in place of the inferred unit when present, and raises a
+    /// diagnostic (not a refusal) when the two disagree.
+    pub unit_annotation: Option<String>,
     /// Index within this definition's own cell's `Def` lines (source order).
     pub order: usize,
 }
@@ -182,11 +188,18 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
                 let mut order = 0;
                 for line in lines {
                     match line {
-                        MathCellLine::Def { name, expr_text, label } => {
+                        MathCellLine::Def { name, expr_text, label, unit_annotation } => {
                             if !def_names.insert(name.clone()) {
                                 errors.push(error::duplicate_definition(&cell.id, &name));
                             }
-                            defs.push(MathCellDef { cell_id: cell.id.clone(), name, expr_text, label, order });
+                            defs.push(MathCellDef {
+                                cell_id: cell.id.clone(),
+                                name,
+                                expr_text,
+                                label,
+                                unit_annotation,
+                                order,
+                            });
                             order += 1;
                         }
                         MathCellLine::Const { name, value, unit_display } => {

@@ -39,6 +39,15 @@ pub enum UnOp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ast {
     Number(f64),
+    /// One of the four universal named constants (`pi`, `tau`, `e`, `g`,
+    /// [`constant_value`]) — resolved to its numeric `value` at parse time,
+    /// same as a workbook constant, but keeping `name` so a later pass can
+    /// tell it apart from an arbitrary literal. `eval` treats this exactly
+    /// like `Number(value)`; the unit-inference pass (R154/R162) is the
+    /// only reader of `name` — `pi`/`tau`/`e` are dimensionless, `g`
+    /// carries `m/s²` (C2 §3.2). Declared workbook constants (C2 §3.1)
+    /// stay plain `Number`s (R154 open question 4: no unit this revision).
+    Constant { name: &'static str, value: f64 },
     Str(String),
     ChannelRef(String),
     /// `{ … }` cell reference — resolved against the table's cell namespace.
@@ -71,13 +80,15 @@ fn parse_err(msg: impl Into<String>) -> MathEvalError {
 /// travel with a portable `.idl0wb`. Channel references are always bracketed
 /// (`[g]`), so a bare `g` is unambiguously the constant.
 ///
-/// `g` is standard gravity in m/s²; `pi` / `tau` / `e` are the math constants.
-fn constant_value(name: &str) -> Option<f64> {
+/// `g` is standard gravity in m/s²; `pi` / `tau` / `e` are the math
+/// constants. Returns the canonical `&'static str` name alongside the value
+/// so a caller can build an [`Ast::Constant`] without re-matching (R162).
+fn constant_value(name: &str) -> Option<(&'static str, f64)> {
     match name {
-        "pi" => Some(std::f64::consts::PI),
-        "tau" => Some(std::f64::consts::TAU),
-        "e" => Some(std::f64::consts::E),
-        "g" => Some(9.806_65),
+        "pi" => Some(("pi", std::f64::consts::PI)),
+        "tau" => Some(("tau", std::f64::consts::TAU)),
+        "e" => Some(("e", std::f64::consts::E)),
+        "g" => Some(("g", 9.806_65)),
         _ => None,
     }
 }
@@ -287,8 +298,8 @@ impl<'a> Parser<'a> {
             // resolves to a literal; failing that, a threaded workbook
             // constants-table lookup (C2 §3.1); anything else is a
             // missing-bracket error.
-            if let Some(value) = constant_value(&name) {
-                return Ok(Ast::Number(value));
+            if let Some((canonical_name, value)) = constant_value(&name) {
+                return Ok(Ast::Constant { name: canonical_name, value });
             }
             if let Some(value) = self.constants.get(&name) {
                 return Ok(Ast::Number(*value));
@@ -565,12 +576,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_universal_constants_resolve_to_numbers() {
-        // Arrange / Act / Assert — bare pi / tau / e / g are literal constants.
-        assert!(matches!(ast("pi"), Ast::Number(n) if (n - std::f64::consts::PI).abs() < 1e-12));
-        assert!(matches!(ast("tau"), Ast::Number(n) if (n - std::f64::consts::TAU).abs() < 1e-12));
-        assert!(matches!(ast("e"), Ast::Number(n) if (n - std::f64::consts::E).abs() < 1e-12));
-        assert!(matches!(ast("g"), Ast::Number(n) if (n - 9.806_65).abs() < 1e-12));
+    fn parse_universal_constants_resolve_to_named_constants() {
+        // Arrange / Act / Assert — bare pi / tau / e / g are literal
+        // constants, but keep their name (R162) so the unit-inference pass
+        // can tell `g` apart from an arbitrary literal.
+        assert!(matches!(ast("pi"), Ast::Constant { name: "pi", value } if (value - std::f64::consts::PI).abs() < 1e-12));
+        assert!(matches!(ast("tau"), Ast::Constant { name: "tau", value } if (value - std::f64::consts::TAU).abs() < 1e-12));
+        assert!(matches!(ast("e"), Ast::Constant { name: "e", value } if (value - std::f64::consts::E).abs() < 1e-12));
+        assert!(matches!(ast("g"), Ast::Constant { name: "g", value } if (value - 9.806_65).abs() < 1e-12));
     }
 
     #[test]
@@ -578,11 +591,11 @@ mod tests {
         // Arrange / Act — `[X] * g` multiplies the channel by gravity.
         let a = ast("[IMU1_AccelZ] * g");
 
-        // Assert — Binary(Mul, ChannelRef, Number(9.80665)).
+        // Assert — Binary(Mul, ChannelRef, Constant("g", 9.80665)).
         match a {
             Ast::Binary { op: BinOp::Mul, left, right } => {
                 assert!(matches!(*left, Ast::ChannelRef(ref n) if n == "IMU1_AccelZ"));
-                assert!(matches!(*right, Ast::Number(n) if (n - 9.806_65).abs() < 1e-12));
+                assert!(matches!(*right, Ast::Constant { name: "g", value } if (value - 9.806_65).abs() < 1e-12));
             }
             other => panic!("unexpected root: {other:?}"),
         }
@@ -620,7 +633,7 @@ mod tests {
         // Assert
         match a {
             Ast::Binary { op: BinOp::Mul, left, right } => {
-                assert!(matches!(*left, Ast::Number(n) if (n - std::f64::consts::PI).abs() < 1e-12));
+                assert!(matches!(*left, Ast::Constant { name: "pi", value } if (value - std::f64::consts::PI).abs() < 1e-12));
                 assert!(matches!(*right, Ast::Number(n) if n == 2.0));
             }
             other => panic!("unexpected root: {other:?}"),

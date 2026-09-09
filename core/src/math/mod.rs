@@ -11,6 +11,7 @@ pub mod eval;
 pub mod parse;
 pub mod resolve;
 pub mod token;
+pub mod units;
 pub mod value;
 pub mod variance_geom;
 pub mod vector;

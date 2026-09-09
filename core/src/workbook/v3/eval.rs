@@ -40,12 +40,17 @@ pub struct CellDefResult {
     /// verbatim, except `0.0` (that field's "scalar-as-channel" / no-rate
     /// marker) is normalized to `None` here: `None` means genuinely not
     /// applicable (a scalar reduction has no rate), never "unknown", and is
-    /// also `None` on failure. **Not** a unit field — R144's unit half is
-    /// deferred (ruling R152): no `unit` exists on [`crate::math::value::ChannelValue`]
-    /// today, and C2 §3.3 has no stated rule for a binary operator between
-    /// two differently-unitted channels, so shipping unit here would be a
-    /// guess CLAUDE.md §1 forbids.
+    /// also `None` on failure.
     pub sample_rate_hz: Option<f64>,
+    /// This definition's inferred unit (R144/R152/R154's unit model,
+    /// ruling R162) — from [`super::resolve::resolve_workbook_units`],
+    /// independent of `value`/`error`: a definition can carry a determined
+    /// unit even when its own evaluation failed, and vice versa.
+    pub unit: crate::math::units::UnitLabel,
+    /// Non-fatal unit diagnostics for this definition (R154 §2.1) — most
+    /// often a `+`/`-` mismatch. Never an evaluation failure; `[]` in the
+    /// overwhelming majority of cases.
+    pub unit_notes: Vec<crate::math::units::UnitNote>,
     /// The evaluation failure, on failure — reuses [`MathEvalError`]
     /// verbatim (C2 §3.5.B) so C3's `math_*` IPC kind prefixes need no
     /// translation layer.
@@ -110,6 +115,7 @@ pub fn eval_cells(
     lap_ctx: &MathLapContext,
 ) -> Vec<CellEvalResult> {
     let mut resolved = resolve_workbook_defs(&doc.defs, &doc.constants, lookup, lap_ctx);
+    let mut resolved_units = super::resolve::resolve_workbook_units(&doc.defs, &doc.constants, lookup);
 
     // Step 2: group structural errors by owning cell_id up front, dropping
     // the front-matter-scoped ones (G9.1) — a single pass over `structural`
@@ -126,7 +132,7 @@ pub fn eval_cells(
         .iter()
         .map(|cell| {
             let defs = match cell.kind_token {
-                CellKindToken::Math => math_cell_defs(doc, cell, &mut resolved),
+                CellKindToken::Math => math_cell_defs(doc, cell, &mut resolved, &mut resolved_units),
                 CellKindToken::Table | CellKindToken::Js => Vec::new(),
             };
             let errors = errors_by_cell.remove(cell.id.as_str()).unwrap_or_default();
@@ -148,6 +154,10 @@ fn math_cell_defs(
     doc: &WorkbookDoc,
     cell: &CellDoc,
     resolved: &mut HashMap<super::resolve::DefKey, Result<crate::math::eval::EvalOutput, MathEvalError>>,
+    resolved_units: &mut HashMap<
+        super::resolve::DefKey,
+        (crate::math::units::Unit, Vec<crate::math::units::UnitNote>),
+    >,
 ) -> Vec<CellDefResult> {
     let mut own: Vec<&super::MathCellDef> = doc.defs.iter().filter(|d| d.cell_id == cell.id).collect();
     own.sort_by_key(|d| d.order);
@@ -159,18 +169,25 @@ fn math_cell_defs(
             // references it (its own doc comment) — a missing entry here is
             // that invariant broken, not a value this function can recover
             // from (never reachable for a def actually present in
-            // `doc.defs`, since `key` is built from that same def).
+            // `doc.defs`, since `key` is built from that same def). Same
+            // invariant holds for `resolve_workbook_units`.
             let key = (def.cell_id.clone(), def.name.clone());
             let result = resolved.remove(&key).expect("resolve_workbook_defs stores an entry for every (cell_id, name) key");
+            let (unit, unit_notes) = resolved_units
+                .remove(&key)
+                .expect("resolve_workbook_units stores an entry for every (cell_id, name) key");
+            let unit = crate::math::units::UnitLabel::from(&unit);
             match result {
                 Ok(out) => CellDefResult {
                     name: def.name.clone(),
                     label: def.label.clone(),
-                    value: Some(to_host_channel(&out.t_us, &out.samples)),
+                    value: Some(to_host_channel(&out.t_us, &out.samples, unit.clone())),
                     // 0.0 is EvalOutput::sample_rate_hz's own "scalar-as-channel /
                     // no rate" marker — normalize it to None so this field means
                     // "not applicable" the same way for a scalar as for a failure.
                     sample_rate_hz: if out.sample_rate_hz == 0.0 { None } else { Some(out.sample_rate_hz) },
+                    unit,
+                    unit_notes,
                     error: None,
                 },
                 Err(err) => CellDefResult {
@@ -178,6 +195,8 @@ fn math_cell_defs(
                     label: def.label.clone(),
                     value: None,
                     sample_rate_hz: None,
+                    unit,
+                    unit_notes,
                     error: Some(err),
                 },
             }
@@ -223,7 +242,14 @@ mod tests {
     }
 
     fn def(cell_id: &str, name: &str, expr_text: &str, order: usize) -> MathCellDef {
-        MathCellDef { cell_id: cell_id.to_string(), name: name.to_string(), expr_text: expr_text.to_string(), label: None, order }
+        MathCellDef {
+            cell_id: cell_id.to_string(),
+            name: name.to_string(),
+            expr_text: expr_text.to_string(),
+            label: None,
+            unit_annotation: None,
+            order,
+        }
     }
 
     fn doc(cells: Vec<CellDoc>, defs: Vec<MathCellDef>) -> WorkbookDoc {
