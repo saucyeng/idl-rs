@@ -2085,7 +2085,7 @@ mod tests {
         let lk = lookup(&[("a", vec![2.0; 5], 10.0)]);
 
         // Act
-        let v = eval_expr("integrate([a])", &lk).unwrap();
+        let v = eval_expr("cumulative_trapezoid([a])", &lk).unwrap();
 
         // Assert
         match v {
@@ -2300,7 +2300,7 @@ mod tests {
         let lk = lookup(&[("a", vec![1.0], 1.0)]);
 
         // Act
-        let err = eval_expr("integrate([a], 2)", &lk).unwrap_err();
+        let err = eval_expr("cumulative_trapezoid([a], 2)", &lk).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, crate::math::MathEvalErrorKind::ArgCount);
@@ -2717,7 +2717,7 @@ mod tests {
         let lk = lookup(&[("a", vec![-5.0, 0.5, 9.0], 1.0)]);
 
         // Act
-        let v = eval_expr("clamp([a], 0, 1)", &lk).unwrap();
+        let v = eval_expr("clip([a], 0, 1)", &lk).unwrap();
 
         // Assert
         assert!(matches!(v, Value::Channel(c) if c.samples == vec![0.0, 0.5, 1.0].into()));
@@ -2729,7 +2729,7 @@ mod tests {
         let lk = lookup(&[("a", vec![1.0, 2.0], 1.0)]);
 
         // Act
-        let err = eval_expr("clamp([a], 5, 1)", &lk).unwrap_err();
+        let err = eval_expr("clip([a], 5, 1)", &lk).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
@@ -2743,7 +2743,7 @@ mod tests {
         let lk = lookup(&[("a", vec![1.0, 2.0], 1.0)]);
 
         // Act
-        let err = eval_expr("clamp([a], sqrt(-1), 1)", &lk).unwrap_err();
+        let err = eval_expr("clip([a], sqrt(-1), 1)", &lk).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
@@ -2755,7 +2755,7 @@ mod tests {
         let lk = lookup(&[("a", vec![-2.0, 3.0, -1.0], 5.0)]);
 
         // Act
-        let v = eval_expr("if([a] > 0, 100, -1)", &lk).unwrap();
+        let v = eval_expr("where([a] > 0, 100, -1)", &lk).unwrap();
 
         // Assert — length and rate follow the condition channel.
         match v {
@@ -2774,7 +2774,7 @@ mod tests {
         let lk = timed(&[("c", vec![1.0, 0.0], 10.0, vec![0, 100_000])]);
 
         // Act
-        let v = eval_expr("if([c], 100, -1)", &lk).unwrap();
+        let v = eval_expr("where([c], 100, -1)", &lk).unwrap();
 
         // Assert
         match v {
@@ -2793,7 +2793,7 @@ mod tests {
         ]);
 
         // Act
-        let err = eval_expr("if([c], [t], -1)", &lk).unwrap_err();
+        let err = eval_expr("where([c], [t], -1)", &lk).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
