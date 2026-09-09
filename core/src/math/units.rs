@@ -13,17 +13,11 @@
 //! every `Ast::Call` yields `Unknown(Propagated)` until task 3 installs the
 //! per-function rule table.
 //!
-//! **Known gap, not resolved by the design or R154 (recorded, not
-//! guessed):** `core/src/math/parse.rs`'s `constant_value` substitutes a
-//! bare `g` to `Ast::Number(9.806_65)` **at parse time**, before any `Ast`
-//! this module's `infer` ever sees exists — indistinguishable from any
-//! other numeric literal. R154's open question 3 ("`g` carries `m/s²` —
-//! yes") assumed `infer` could recognise `g` textually; it cannot, without
-//! either a new `Ast` variant (a blast-radius decision beyond this task) or
-//! a second, separately-configured parse of the same source text (a
-//! deviation from "one walk of the same `Ast`"). `infer` therefore treats a
-//! literal `g` as `Scalar`, same as any other number, until the lead rules
-//! on one of those two changes.
+//! `g`/`pi`/`tau`/`e` survive parsing as `Ast::Constant { name, value }`
+//! (ruling R162) rather than collapsing to a bare `Ast::Number` — treating
+//! `g` as dimensionless would make `[body_accel] / g` infer the
+//! accelerometer's own unit, a confidently wrong label R152 forbids.
+//! `constant_unit` below is this module's only reader of `name`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -463,6 +457,19 @@ fn mul_div_unit(left: Unit, right: Unit, divide: bool) -> Unit {
     }
 }
 
+/// The unit of a universal named constant (R162): `pi`/`tau`/`e` are
+/// genuinely dimensionless numbers; `g` is standard gravity and carries
+/// `m/s²` (C2 §3.2). `name` is always one of `constant_value`'s four
+/// canonical names — an `Ast::Constant` the parser produces can never carry
+/// anything else — so an unrecognised name here is unreachable in practice,
+/// not a case this function guesses at.
+fn constant_unit(name: &str) -> Unit {
+    match name {
+        "g" => Unit::Known(UnitExpr::parse("m/s^2").expect("m/s^2 is a valid unit string")),
+        _ => Unit::Known(UnitExpr::dimensionless()),
+    }
+}
+
 /// Infers the unit of `ast` by walking it once, resolving `[Name]`
 /// references against `lookup` (`ChannelLookup::unit_of`, R154). Returns
 /// the inferred [`Unit`] plus any non-fatal diagnostics collected from
@@ -479,6 +486,7 @@ fn mul_div_unit(left: Unit, right: Unit, divide: bool) -> Unit {
 pub fn infer(ast: &Ast, lookup: &dyn ChannelLookup) -> (Unit, Vec<UnitNote>) {
     match ast {
         Ast::Number(_) => (Unit::Scalar, Vec::new()),
+        Ast::Constant { name, .. } => (constant_unit(name), Vec::new()),
         Ast::Str(_) => (Unit::Unknown(UnknownReason::NotNumeric), Vec::new()),
         Ast::ChannelRef(name) => {
             let unit = match lookup.unit_of(name) {
@@ -793,6 +801,50 @@ mod tests {
         // Assert
         assert_eq!(unit, Unit::Scalar);
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn infer_g_carries_m_per_s2() {
+        // Arrange — R162: g must not be a dimensionless Scalar, or
+        // [body_accel] / g would infer body_accel's own unit
+        let ast = parse("g");
+        let lk = units(&[]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::parse("m/s^2").unwrap()));
+    }
+
+    #[test]
+    fn infer_pi_is_dimensionless_not_scalar() {
+        // Arrange
+        let ast = parse("pi");
+        let lk = units(&[]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::dimensionless()));
+    }
+
+    #[test]
+    fn infer_accel_divided_by_g_does_not_collapse_to_the_accel_channel_unit() {
+        // Arrange — the exact confidently-wrong-label case R162 names:
+        // treating g as Scalar would make [BodyAccel] / g report "g" (the
+        // accelerometer's own unit), the wrong answer.
+        let ast = parse("[BodyAccel] / g");
+        let lk = units(&[("BodyAccel", "g")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert — the atom `g` (channel unit) and the constant's `m/s^2`
+        // are never equated (R154: never canonicalise, never convert), so
+        // the division is g/(m/s^2), not a bare "g".
+        assert_ne!(unit, Unit::Known(UnitExpr::atom("g")));
     }
 
     #[test]

@@ -322,6 +322,9 @@ pub fn eval(
 ) -> Result<Value, MathEvalError> {
     match ast {
         Ast::Number(v) => Ok(Value::Scalar(*v)),
+        // A named constant (pi/tau/e/g, R162) evaluates identically to a
+        // plain literal — only the unit-inference pass reads `name`.
+        Ast::Constant { value, .. } => Ok(Value::Scalar(*value)),
         Ast::Str(s) => Ok(Value::Str(s.clone())),
         Ast::ChannelRef(name) => {
             let ch = lookup.lookup(name).ok_or_else(|| {
