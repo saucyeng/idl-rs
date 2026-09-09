@@ -76,6 +76,18 @@ pub fn math_name_migrations() -> &'static [NameMigration] {
         // `numpy.angle` is complex phase, not the angle between two vectors
         // — a false friend (R143/R151 item 4).
         NameMigration { old: "angle", new: "angle_between", kind: Rename },
+        // The cosmetic four (task 10) — gratuitous renames, no behaviour
+        // change; `where`'s scalar-`cond` widening is additive, not a
+        // migration concern (an existing call's `cond` was always a
+        // channel).
+        NameMigration { old: "p", new: "percentile", kind: Rename },
+        NameMigration { old: "clamp", new: "clip", kind: Rename },
+        NameMigration { old: "if", new: "where", kind: Rename },
+        // `cumtrapz` is `cumulative_trapezoid`'s permanent second spelling
+        // (R151 item 6) — `integrate` migrates to the long form; a document
+        // already spelling it `cumtrapz` would need no migration in the
+        // first place, since that name didn't exist before this lane.
+        NameMigration { old: "integrate", new: "cumulative_trapezoid", kind: Rename },
     ]
 }
 
@@ -593,11 +605,15 @@ mod tests {
 
     #[test]
     fn migrate_expression_does_not_touch_a_string_argument_that_matches_a_retired_call_name() {
+        // Arrange — `mean` is not itself a retired name (unlike the outer
+        // call in the original version of this test, `p`, which task 10
+        // retired to `percentile` and would otherwise be rewritten too,
+        // defeating the point of this test).
         // Act
-        let (out, applied) = migrate_expression("p([X], \"variance_time\")");
+        let (out, applied) = migrate_expression("mean([X], \"variance_time\")");
 
         // Assert
-        assert_eq!(out, "p([X], \"variance_time\")");
+        assert_eq!(out, "mean([X], \"variance_time\")");
         assert!(applied.is_empty());
     }
 

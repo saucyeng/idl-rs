@@ -19,10 +19,14 @@
 //! and the grammar keywords `and`/`or`/`not` (parsed as operators in
 //! `math::parse`, never reach `call_function`'s dispatch at all) — the same
 //! three exclusions L6's `functionCatalog.ts` transcription already made,
-//! per that file's own doc comment. C2 §3.3 states 69 named functions total
-//! (63 `Implemented` + 6 `NotImplemented`); this catalog has exactly 69
-//! entries, none of the four exclusions above being §3.3 rows to begin
-//! with.
+//! per that file's own doc comment. C2 §3.3 originally stated 69 named
+//! functions total (63 `Implemented` + 6 `NotImplemented`); the
+//! scipy-alignment lane (`runs/2026-09-08/scipy-alignment-plan.md`) adds
+//! two entries without removing any — `fft` split into `periodogram` +
+//! `welch` (task 6) and `cumtrapz` added as `cumulative_trapezoid`'s
+//! permanent second spelling (task 10, R151 item 6) — so this catalog now
+//! has 71 entries; C2 §3.3 itself needs the matching row-count update
+//! (spec-during, not done in this lane's Rust-only scope).
 //!
 //! R64.2 requires this catalog's *name* set be checked against
 //! `eval::call_function`'s real dispatch table, "never a second hand
@@ -67,7 +71,7 @@ pub struct MathBuiltin {
     pub status: MathBuiltinStatus,
 }
 
-/// Returns the full 69-entry math builtin catalog (C2 §3.3, minus
+/// Returns the full 71-entry math builtin catalog (C2 §3.3, minus
 /// `main(col[])` and the `and`/`or`/`not` grammar keywords — see module
 /// doc). Order matches C2 §3.3's table row order.
 pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
@@ -76,7 +80,8 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
         MathBuiltin { name: "butter", arity: &[4], status: I },
         MathBuiltin { name: "sosfilt", arity: &[2], status: N },
         MathBuiltin { name: "declip", arity: &[1], status: I },
-        MathBuiltin { name: "integrate", arity: &[1], status: I },
+        MathBuiltin { name: "cumulative_trapezoid", arity: &[1], status: I },
+        MathBuiltin { name: "cumtrapz", arity: &[1], status: I },
         MathBuiltin { name: "differentiate", arity: &[1], status: I },
         MathBuiltin { name: "detrend", arity: &[1, 2], status: I },
         MathBuiltin { name: "rms", arity: &[1, 2], status: I },
@@ -87,7 +92,7 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
         MathBuiltin { name: "count", arity: &[1], status: I },
         MathBuiltin { name: "first", arity: &[1], status: I },
         MathBuiltin { name: "last", arity: &[1], status: I },
-        MathBuiltin { name: "p", arity: &[2], status: I },
+        MathBuiltin { name: "percentile", arity: &[2], status: I },
         MathBuiltin { name: "abs", arity: &[1], status: I },
         MathBuiltin { name: "sqrt", arity: &[1], status: I },
         MathBuiltin { name: "sign", arity: &[1], status: I },
@@ -97,7 +102,7 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
         MathBuiltin { name: "pow", arity: &[2], status: I },
         MathBuiltin { name: "min", arity: &[1, 2], status: I },
         MathBuiltin { name: "max", arity: &[1, 2], status: I },
-        MathBuiltin { name: "clamp", arity: &[3], status: I },
+        MathBuiltin { name: "clip", arity: &[3], status: I },
         MathBuiltin { name: "sin", arity: &[1], status: I },
         MathBuiltin { name: "cos", arity: &[1], status: I },
         MathBuiltin { name: "tan", arity: &[1], status: I },
@@ -110,13 +115,14 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
         MathBuiltin { name: "tanh", arity: &[1], status: I },
         MathBuiltin { name: "deg2rad", arity: &[1], status: I },
         MathBuiltin { name: "rad2deg", arity: &[1], status: I },
-        MathBuiltin { name: "fft", arity: &[2], status: I },
+        MathBuiltin { name: "periodogram", arity: &[1], status: I },
+        MathBuiltin { name: "welch", arity: &[1], status: I },
         MathBuiltin { name: "spectrogram", arity: &[1], status: N },
         MathBuiltin { name: "hilbert", arity: &[1], status: N },
         MathBuiltin { name: "correlate", arity: &[2], status: N },
         MathBuiltin { name: "convolve", arity: &[2], status: N },
         MathBuiltin { name: "resample", arity: &[2], status: N },
-        MathBuiltin { name: "if", arity: &[3], status: I },
+        MathBuiltin { name: "where", arity: &[3], status: I },
         MathBuiltin { name: "current_lap", arity: &[0], status: I },
         MathBuiltin { name: "lap_start_time", arity: &[1], status: I },
         MathBuiltin { name: "lap_start_distance", arity: &[1], status: I },
@@ -161,18 +167,21 @@ mod tests {
     }
 
     #[test]
-    fn math_builtin_catalog_len_is_69_matching_c2_3_3s_stated_total() {
+    fn math_builtin_catalog_len_is_71_after_the_scipy_alignment_lanes_splits() {
         // Arrange / Act
         let n = math_builtin_catalog().len();
 
-        // Assert — C2 §3.3 states 69 named functions total (63 Implemented +
-        // 6 NotImplemented); `main`/`and`/`or`/`not` are not §3.3 rows, so
-        // there is no further subtraction to make.
-        assert_eq!(n, 69);
+        // Assert — was 69 (C2 §3.3's original stated total: 63 Implemented +
+        // 6 NotImplemented); the scipy-alignment lane adds two entries
+        // without removing any (`runs/2026-09-08/scipy-alignment-plan.md`):
+        // `fft` split into `periodogram` + `welch` (net +1, task 6), and
+        // `cumtrapz` added as `cumulative_trapezoid`'s permanent second
+        // spelling (net +1, task 10, R151 item 6) — 69 + 2 = 71.
+        assert_eq!(n, 71);
     }
 
     #[test]
-    fn implemented_and_not_implemented_counts_split_63_and_6() {
+    fn implemented_and_not_implemented_counts_split_65_and_6() {
         // Arrange
         let catalog = math_builtin_catalog();
 
@@ -182,9 +191,11 @@ mod tests {
         let implemented =
             catalog.iter().filter(|b| b.status == MathBuiltinStatus::Implemented).count();
 
-        // Assert
+        // Assert — was 63/6; the scipy-alignment lane's two net-new entries
+        // (see the length test above) are both Implemented, so only that
+        // side of the split moves.
         assert_eq!(not_implemented, 6);
-        assert_eq!(implemented, 63);
+        assert_eq!(implemented, 65);
     }
 
     #[test]

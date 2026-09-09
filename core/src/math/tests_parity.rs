@@ -153,7 +153,7 @@ fn parity_if_branch_selection() {
         ("T", vec![10.0, 20.0, 30.0, 40.0], 100.0),
         ("F", vec![1.0, 2.0, 3.0, 4.0], 100.0),
     ]);
-    assert_samples("if([Cond], [T], [F])", &c, &[1.0, 20.0, 3.0, 40.0], 100.0);
+    assert_samples("where([Cond], [T], [F])", &c, &[1.0, 20.0, 3.0, 40.0], 100.0);
 }
 
 #[test]
@@ -187,7 +187,7 @@ fn parity_integrate_delegates_to_core() {
     // Dart test 6 (delegation). Real integration over a short ramp.
     let samples = vec![0.5, 1.0, 1.5, 2.0, 2.5];
     let c = ctx(&[("Accel", samples.clone(), 800.0)]);
-    let (got, rate) = eval_samples("integrate([Accel])", &c);
+    let (got, rate) = eval_samples("cumulative_trapezoid([Accel])", &c);
     let expected = crate::integration::integrate(&samples, 800.0);
     assert_eq!(rate, 800.0);
     assert_close("integrate", &got, &expected);
@@ -219,7 +219,10 @@ fn parity_fft_hann_delegates_to_core() {
     // Dart test 9 (delegation). Hann window FFT.
     let samples = sine(64, 64.0, 8.0);
     let c = ctx(&[("Sig", samples.clone(), 64.0)]);
-    let (got, _rate) = eval_samples("fft([Sig], \"hann\")", &c);
+    let (got, _rate) = eval_samples(
+        "periodogram([Sig], window=\"hann\", detrend=\"none\", scaling=\"raw_magnitude\")",
+        &c,
+    );
     let expected = crate::fft::fft(&samples, crate::fft::FftWindow::Hann);
     assert_close("fft hann", &got, &expected);
 }
@@ -243,7 +246,7 @@ fn parity_nested_integrate_of_highpass_applies_inner_first() {
     // Dart test 11: integrate(butter high) — highpass first, then integrate.
     let samples = sine(64, 200.0, 10.0);
     let c = ctx(&[("Accel", samples.clone(), 200.0)]);
-    let (got, _rate) = eval_samples("integrate(butter(2, 0.2, \"high\", [Accel]))", &c);
+    let (got, _rate) = eval_samples("cumulative_trapezoid(butter(2, 0.2, \"high\", [Accel]))", &c);
     let hp = crate::filters::highpass(&samples, 2, 0.2, 200.0).expect("valid cutoff");
     let expected = crate::integration::integrate(&hp, 200.0);
     assert_close("integrate(highpass)", &got, &expected);

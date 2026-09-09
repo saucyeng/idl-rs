@@ -1000,7 +1000,12 @@ fn call_function(
     }
     match name {
         // ---- A6: DSP-backed ----
-        "integrate" => {
+        // `cumtrapz` is a permanent second spelling, not a deprecated one —
+        // scipy itself carries both (`scipy.integrate.cumulative_trapezoid`
+        // and the older `cumtrapz`), so matching that costs nothing (R151
+        // item 6). Retired from `integrate` (R143): gratuitous rename, no
+        // behaviour change.
+        "cumulative_trapezoid" | "cumtrapz" => {
             require_arg_count(name, &args, 1)?;
             let ch = require_channel(&args[0], name)?;
             Ok(channel(
@@ -1330,14 +1335,16 @@ fn call_function(
                 Err(err(MathEvalErrorKind::NotImplemented, "not yet implemented: median".to_string()))
             }
         }
-        "p" => {
-            // p(channel, quantile) → linear-interpolated percentile (quantile
-            // in 0..=100), windowed per R123/R124.
+        // Retired from `p` (R143): gratuitous rename — matches
+        // `numpy.percentile`'s name, not just its behaviour.
+        "percentile" => {
+            // percentile(channel, quantile) → linear-interpolated percentile
+            // (quantile in 0..=100), windowed per R123/R124.
             if args.len() != 2 {
-                return Err(err(MathEvalErrorKind::ArgCount, "p(channel, quantile) takes 2 args"));
+                return Err(err(MathEvalErrorKind::ArgCount, "percentile(channel, quantile) takes 2 args"));
             }
-            let ch = require_channel(&args[0], "p")?;
-            let q = require_scalar(&args[1], "p quantile")?;
+            let ch = require_channel(&args[0], "percentile")?;
+            let q = require_scalar(&args[1], "percentile quantile")?;
             let (start, end) = window_index_range(lap_ctx, ch.sample_rate_hz, ch.samples.len());
             Ok(Value::Scalar(crate::math::aggregate::percentile(&ch.samples[start..end], q)))
         }
@@ -1347,8 +1354,10 @@ fn call_function(
             elemwise(it.next().unwrap(), it.next().unwrap(), "atan2", |a, b| Ok(a.atan2(b)))
         }
 
-        // ---- A9: clamp, if, deferred stubs ----
-        "clamp" => {
+        // ---- A9: clip, where, deferred stubs ----
+        // Retired from `clamp` (R143): gratuitous rename — matches
+        // `numpy.clip`'s name, not just its behaviour.
+        "clip" => {
             require_arg_count(name, &args, 3)?;
             let ch = require_channel(&args[0], name)?;
             let lo = require_scalar(&args[1], name)?;
@@ -1362,23 +1371,36 @@ fn call_function(
             if !(lo <= hi) {
                 return Err(err(
                     MathEvalErrorKind::Runtime,
-                    format!("clamp: lo ({lo}) and hi ({hi}) must not be NaN, and lo must be <= hi"),
+                    format!("clip: lo ({lo}) and hi ({hi}) must not be NaN, and lo must be <= hi"),
                 ));
             }
             let out = ch.samples.iter().map(|&x| x.clamp(lo, hi)).collect();
             Ok(channel(out, ch.sample_rate_hz, ch.t_us))
         }
-        "if" => {
+        // Retired from `if` (R143): gratuitous rename — matches
+        // `numpy.where`'s name. Also widens `cond` to accept a scalar
+        // (additive, plan §1 row 7): `numpy.where` never requires its
+        // condition to be array-shaped, and a scalar `cond` selecting a
+        // whole branch (rather than per-sample) is a strict superset of the
+        // old `if(cond,t,f)` behaviour — every existing per-sample call
+        // still takes the channel-cond path below, unchanged.
+        "where" => {
             require_arg_count(name, &args, 3)?;
-            let cond = require_channel(&args[0], "if(cond,t,f) — cond")?;
+            if let Value::Scalar(c) = &args[0] {
+                let cond_true = *c != 0.0;
+                let mut it = args.into_iter();
+                let (_cond, t, f) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+                return Ok(if cond_true { t } else { f });
+            }
+            let cond = require_channel(&args[0], "where(cond,t,f) — cond")?;
             let n = cond.samples.len();
             // L3-R33: cond's t_us no longer wins by default — it is folded via
             // combine_t_us against the t/f operands' own axes too (a scalar
             // operand contributes no axis, i.e. empty). Equal-or-empty passes
             // through; a genuine mismatch is the same typed Runtime error
             // combine_t_us already gives elemwise(), naming both spans.
-            let t_us = combine_t_us("if(cond,t,f)", &cond.t_us, &value_t_us(&args[1]))?;
-            let t_us = combine_t_us("if(cond,t,f)", &t_us, &value_t_us(&args[2]))?;
+            let t_us = combine_t_us("where(cond,t,f)", &cond.t_us, &value_t_us(&args[1]))?;
+            let t_us = combine_t_us("where(cond,t,f)", &t_us, &value_t_us(&args[2]))?;
             let mut out = vec![0.0; n];
             for i in 0..n {
                 out[i] = if cond.samples[i] != 0.0 {
@@ -3370,6 +3392,81 @@ mod tests {
 
         // Assert
         assert!(e.message.contains("IMU0"), "{}", e.message);
+    }
+
+    #[test]
+    fn clip_still_guards_against_nan_and_lo_greater_than_hi_under_its_new_name() {
+        // Arrange — R146's clamp→clip rename must not lose the panic fix
+        // (plan §4 Task 1).
+        let lk = lookup(&[("a", vec![0.0; 4], 10.0)]);
+
+        // Act
+        let err = eval_expr("clip([a], 5, 1)", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("clip"), "{}", err.message);
+    }
+
+    #[test]
+    fn percentile_dispatches_where_p_used_to() {
+        // Arrange
+        let lk = lookup(&[("a", vec![1.0, 2.0, 3.0, 4.0, 5.0], 10.0)]);
+
+        // Act
+        let v = eval_expr("percentile([a], 50)", &lk).unwrap();
+
+        // Assert
+        assert!(matches!(v, Value::Scalar(x) if (x - 3.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn where_with_a_scalar_cond_selects_the_whole_branch_additive_widening() {
+        // Arrange — plan §1 row 7: widening `cond` to accept a scalar is
+        // additive; every existing per-sample (channel-cond) call is
+        // untouched (see `where`'s own `parity_if_branch_selection`-derived
+        // coverage in `tests_parity.rs`).
+        let lk = lookup(&[("t", vec![1.0, 2.0, 3.0], 10.0), ("f", vec![4.0, 5.0, 6.0], 10.0)]);
+
+        // Act
+        let picked_t = eval_expr("where(1, [t], [f])", &lk).unwrap();
+        let picked_f = eval_expr("where(0, [t], [f])", &lk).unwrap();
+
+        // Assert
+        match (picked_t, picked_f) {
+            (Value::Channel(t), Value::Channel(f)) => {
+                assert_eq!(t.samples.as_ref(), &[1.0, 2.0, 3.0]);
+                assert_eq!(f.samples.as_ref(), &[4.0, 5.0, 6.0]);
+            }
+            other => panic!("expected two channels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cumtrapz_is_a_permanent_second_spelling_of_cumulative_trapezoid() {
+        // Arrange — R151 item 6: not deprecated, a real permanent alias.
+        let lk = lookup(&[("a", vec![0.5, 1.0, 1.5, 2.0], 10.0)]);
+
+        // Act
+        let long_form = eval_expr("cumulative_trapezoid([a])", &lk).unwrap();
+        let short_form = eval_expr("cumtrapz([a])", &lk).unwrap();
+
+        // Assert
+        match (long_form, short_form) {
+            (Value::Channel(a), Value::Channel(b)) => assert_eq!(a.samples, b.samples),
+            other => panic!("expected two channels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_cosmetic_four_retired_names_each_name_their_replacement() {
+        // Arrange / Act / Assert — R143/R151, plan §4 Task 10.
+        let lk = lookup(&[("a", vec![1.0, 2.0], 10.0)]);
+        for (old, new) in [("p", "percentile"), ("clamp", "clip"), ("if", "where"), ("integrate", "cumulative_trapezoid")] {
+            let err = eval_expr(&format!("{old}([a], [a], [a])"), &lk).unwrap_err();
+            assert_eq!(err.kind, crate::math::MathEvalErrorKind::UnknownFunction);
+            assert!(err.message.contains(new), "{old}: {}", err.message);
+        }
     }
 
     #[test]

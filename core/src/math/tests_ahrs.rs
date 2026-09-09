@@ -90,7 +90,7 @@ const AHRS_CHANNELS: &[(&str, &str)] = &[
     // estimator's own input adapter does.
     (
         "Roll reference (deg)",
-        "asin(clamp(butter(2, 0.2, \"low\", declip(-[IMU0_AccelY]) - [Speed (m/s)] * [IMU0_GyroZ] * pi / 180 / g), -1, 1)) * 180 / pi",
+        "asin(clip(butter(2, 0.2, \"low\", declip(-[IMU0_AccelY]) - [Speed (m/s)] * [IMU0_GyroZ] * pi / 180 / g), -1, 1)) * 180 / pi",
     ),
     // The complementary blend: the (already band-limited) reference carries the
     // level, high-passed integrated gyro carries the dynamics. `butter` is
@@ -101,7 +101,7 @@ const AHRS_CHANNELS: &[(&str, &str)] = &[
     // below cornering dynamics (~0.5–2 Hz) and well above drift.
     (
         "Roll (deg)",
-        "[Roll reference (deg)] + integrate([Roll rate (deg/s)]) - butter(2, 0.2, \"low\", integrate([Roll rate (deg/s)]))",
+        "[Roll reference (deg)] + cumulative_trapezoid([Roll rate (deg/s)]) - butter(2, 0.2, \"low\", cumulative_trapezoid([Roll rate (deg/s)]))",
     ),
     // Nose-up pitch rate, dps. **Not** simply the body Y rate: the Euler rate
     // is `θ̇ = cos φ·q − sin φ·r`, and our convention is nose-up-positive
@@ -119,11 +119,11 @@ const AHRS_CHANNELS: &[(&str, &str)] = &[
     // inside the asin for the same reason as the roll reference above.
     (
         "Pitch reference (deg)",
-        "asin(clamp(butter(2, 0.2, \"low\", declip(-[IMU0_AccelX]) - differentiate([Speed (m/s)]) / g), -1, 1)) * 180 / pi",
+        "asin(clip(butter(2, 0.2, \"low\", declip(-[IMU0_AccelX]) - differentiate([Speed (m/s)]) / g), -1, 1)) * 180 / pi",
     ),
     (
         "Pitch (deg)",
-        "[Pitch reference (deg)] + integrate([Pitch rate (deg/s)]) - butter(2, 0.2, \"low\", integrate([Pitch rate (deg/s)]))",
+        "[Pitch reference (deg)] + cumulative_trapezoid([Pitch rate (deg/s)]) - butter(2, 0.2, \"low\", cumulative_trapezoid([Pitch rate (deg/s)]))",
     ),
     // Gravity-removed body acceleration, g. Attitude is what tells us how much
     // of each accelerometer axis is gravity; subtracting it leaves the real
@@ -353,7 +353,7 @@ fn naive_accel_roll_is_blind_to_lean_in_a_turn() {
     let c = resolved_ride();
 
     // Act — level off the accelerometer with no turn compensation at all.
-    let naive = eval(&format!("asin(clamp({AY}, -1, 1)) * {R2D}"), &c);
+    let naive = eval(&format!("asin(clip({AY}, -1, 1)) * {R2D}"), &c);
 
     // Assert — physically: in a coordinated turn the resultant runs down the
     // bike's own vertical axis, so the accelerometer reports ~level despite 20°
@@ -414,7 +414,7 @@ fn roll_blend_rejects_a_constant_gyro_bias() {
     let c = resolved_ride();
 
     // Act
-    let gyro_only = eval(&format!("integrate({})", ahrs_expr("Roll rate (deg/s)")), &c);
+    let gyro_only = eval(&format!("cumulative_trapezoid({})", ahrs_expr("Roll rate (deg/s)")), &c);
     let blended = resolved(&c, "Roll (deg)");
 
     // Assert — raw integration walks away (0.5 dps × ~55 s ≈ 27° of phantom
@@ -454,7 +454,7 @@ fn naive_accel_pitch_reads_braking_as_phantom_nose_down() {
     let c = resolved_ride();
 
     // Act — level off the longitudinal axis with no compensation.
-    let naive = eval(&format!("asin(clamp({AX}, -1, 1)) * {R2D}"), &c);
+    let naive = eval(&format!("asin(clip({AX}, -1, 1)) * {R2D}"), &c);
 
     // Assert — physically: an accelerometer cannot tell braking from pitching
     // nose-down. 0.8 m/s² ≈ 0.082 g ≈ 4.7° of pitch that never happened.
