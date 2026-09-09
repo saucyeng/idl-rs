@@ -244,16 +244,36 @@ fn bump_version_to_4(front_matter_block: &str) -> String {
     }
 }
 
+/// One cell's kind dispatched to the matching rewriter — [`migrate_body`]'s
+/// per-cell primitive, exposed standalone for the merge-time normalisation
+/// (plan §3.4), which already holds parsed [`crate::workbook::v3::CellDoc`]
+/// values (`kind_token`/`id`/`raw_fence_body`) rather than a raw markdown
+/// document to re-scan. `js` cells are returned unchanged (R145: textual
+/// rewriting of arbitrary JS is out of scope).
+pub fn migrate_cell_body(
+    kind: crate::workbook::v3::CellKindToken,
+    cell_id: &str,
+    body: &str,
+) -> (String, Vec<DocumentRename>) {
+    use crate::workbook::v3::CellKindToken;
+
+    let mut renames = Vec::new();
+    let new_body = match kind {
+        CellKindToken::Math => rewrite_math_fence(cell_id, body, &mut renames),
+        CellKindToken::Table => rewrite_table_fence(cell_id, body, &mut renames),
+        CellKindToken::Js => body.to_string(),
+    };
+    (new_body, renames)
+}
+
 /// The document-walk half of [`migrate_document`], operating on `body` (the
 /// text after front matter, as [`crate::workbook::v3::front_matter::parse_front_matter`]
-/// returns it) — reused by the merge-time normalisation (plan §3.4), which
-/// only ever needs the renamed text, never a version bump. Every `math` and
-/// `table` cell's fence body is walked in document order and spliced back at
-/// its own byte range in `body`; `js` cells and every byte outside a fence
-/// (front matter already excluded, prose, fence delimiters) are copied
-/// through unchanged.
+/// returns it). Every `math` and `table` cell's fence body is walked in
+/// document order via [`migrate_cell_body`] and spliced back at its own byte
+/// range in `body`; `js` cells and every byte outside a fence (front matter
+/// already excluded, prose, fence delimiters) are copied through unchanged.
 pub fn migrate_body(body: &str) -> (String, Vec<DocumentRename>) {
-    use crate::workbook::v3::cell::{scan_cells, CellKindToken};
+    use crate::workbook::v3::cell::scan_cells;
 
     let (cells, _trailing_prose, _errors) = scan_cells(body);
     let mut out = String::with_capacity(body.len());
@@ -275,11 +295,8 @@ pub fn migrate_body(body: &str) -> (String, Vec<DocumentRename>) {
         let start = search_from + rel_start;
         let end = start + cell.raw_fence_body.len();
 
-        let new_fence_body = match cell.kind_token {
-            CellKindToken::Math => rewrite_math_fence(&cell.id, &cell.raw_fence_body, &mut renames),
-            CellKindToken::Table => rewrite_table_fence(&cell.id, &cell.raw_fence_body, &mut renames),
-            CellKindToken::Js => cell.raw_fence_body.clone(),
-        };
+        let (new_fence_body, cell_renames) = migrate_cell_body(cell.kind_token, &cell.id, &cell.raw_fence_body);
+        renames.extend(cell_renames);
 
         out.push_str(&body[copied_to..start]);
         out.push_str(&new_fence_body);

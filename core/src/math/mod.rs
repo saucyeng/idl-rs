@@ -16,8 +16,8 @@ pub mod variance_geom;
 pub mod vector;
 
 pub use alias::{
-    math_name_migrations, migrate_body, migrate_document, migrate_expression, AppliedRename,
-    DocumentRename, MigrationKind, NameMigration,
+    math_name_migrations, migrate_body, migrate_cell_body, migrate_document, migrate_expression,
+    AppliedRename, DocumentRename, MigrationKind, NameMigration,
 };
 pub use catalog::{math_builtin_catalog, MathBuiltin, MathBuiltinStatus};
 pub use channel_def::MathChannelDef;

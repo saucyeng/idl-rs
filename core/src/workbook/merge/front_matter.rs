@@ -43,10 +43,19 @@ fn constant_display(raw: &ConstantRaw) -> String {
 }
 
 /// Merges `local` and `peer` front matter against their common `base` (C2
-/// §7.1). `id`/`version` are immutable identity, not three-way merged: a
-/// mismatched `id` is refused outright (`Err`) rather than merged, and the
-/// merged document's `version` is `local`'s (both sides are already
-/// required to be schema version 3 to have parsed at all).
+/// §7.1, amended by R151 item 10 / plan §3.4 for the retired-name migration,
+/// `runs/2026-09-08/scipy-alignment-plan.md`). `id` is immutable identity: a
+/// mismatched `id` is refused outright (`Err`) rather than merged — not the
+/// same workbook. `version` is **not** refused on a mismatch: a `version: 3`
+/// side that has not yet been re-saved through the migration meeting a
+/// `version: 4` peer that has is not a different-file situation, it's what
+/// the migration in flight looks like — the merged document's `version` is
+/// the higher of the two (the migrating side wins, never the other way:
+/// nothing here ever produces a merged `version: 3` from a `version: 4`
+/// input). [`MergeError::VersionMismatch`] is kept as a typed error for a
+/// version pairing outside `{3, 4}`, which the parser's own version gate
+/// (C2 §3.5) should already prevent from reaching here — defensive, not
+/// reachable in practice today.
 ///
 /// `peer_name` (a human-readable label for the peer device/workbook,
 /// distinct from the `name` *field* being merged) is threaded through for
@@ -65,9 +74,14 @@ pub fn merge_front_matter(
     if local.id != peer.id {
         return Err(MergeError::IdMismatch { local_id: local.id.clone(), peer_id: peer.id.clone() });
     }
-    if local.version != peer.version {
+    // C2 §3.5's version gate only ever lets `3` or `4` reach a parsed
+    // `FrontMatter` — this is the defensive fallback for anything else, see
+    // this function's doc comment.
+    let known_version = |v: u32| v == 3 || v == 4;
+    if !known_version(local.version) || !known_version(peer.version) {
         return Err(MergeError::VersionMismatch { local_version: local.version, peer_version: peer.version });
     }
+    let version = local.version.max(peer.version);
 
     let mut warnings = Vec::new();
 
@@ -109,7 +123,7 @@ pub fn merge_front_matter(
 
     let unknown = merge_unknown(&local.unknown, &peer.unknown, &base.unknown, &mut warnings);
 
-    Ok((FrontMatter { id: local.id.clone(), name, constants, units, version: local.version, unknown }, warnings))
+    Ok((FrontMatter { id: local.id.clone(), name, constants, units, version, unknown }, warnings))
 }
 
 /// Merges every front-matter key this contract does not itself define (C2
@@ -204,6 +218,23 @@ mod tests {
 
         // Assert
         assert_eq!(err, MergeError::VersionMismatch { local_version: 3, peer_version: 2 });
+    }
+
+    #[test]
+    fn merge_front_matter_a_3_vs_4_version_pairing_merges_to_4_never_a_refusal() {
+        // Arrange — R151 item 10 / plan §3.4: one side has been re-saved
+        // through the retired-name migration (now `version: 4`), the other
+        // has not (`version: 3`). Not a different-file situation.
+        let base = fm("Fork tuning", HashMap::new());
+        let mut local = fm("Fork tuning", HashMap::new());
+        local.version = 4;
+        let peer = fm("Fork tuning", HashMap::new()); // still version 3
+
+        // Act
+        let (merged, _warnings) = merge_front_matter(&local, &peer, &base, "peer-laptop").unwrap();
+
+        // Assert — the migrating side wins; never the other way around.
+        assert_eq!(merged.version, 4);
     }
 
     #[test]

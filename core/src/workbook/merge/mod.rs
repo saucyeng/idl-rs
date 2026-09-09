@@ -144,6 +144,26 @@ pub struct MergedDoc {
     pub warnings: Vec<MergeWarning>,
 }
 
+/// Rewrites every `math`/`table` cell's raw fence body to its current
+/// spelling (R151 item 9's merge-time normalisation, plan §3.4): run on
+/// `local`/`peer`/`base` before any classification below, so a side that
+/// has not been re-saved through the retired-name migration since it
+/// shipped never conflicts a whole document against a peer that has,
+/// purely over a name the language no longer uses (C2 §3.8). A no-op clone
+/// (identical cell content) on a document that carries no retired names,
+/// including every already-`version: 4` document. Front matter (`version`
+/// among it) is untouched here — [`merge_front_matter`] decides that
+/// separately.
+fn normalize_migrations(doc: &WorkbookDoc) -> WorkbookDoc {
+    let mut doc = doc.clone();
+    for cell in &mut doc.cells {
+        let (new_body, _renames) =
+            crate::math::migrate_cell_body(cell.kind_token, &cell.id, &cell.raw_fence_body);
+        cell.raw_fence_body = new_body;
+    }
+    doc
+}
+
 /// Reads a [`WorkbookDoc`]'s identity/scalar fields out as a standalone
 /// [`FrontMatter`] value, `merge_front_matter`'s own input shape.
 fn to_front_matter(doc: &WorkbookDoc) -> FrontMatter {
@@ -227,6 +247,14 @@ fn recompute_derived_fields(
 /// rather than silently merged (nothing is decided or rendered in that
 /// case).
 pub fn merge(local: &WorkbookDoc, peer: &WorkbookDoc, base: &WorkbookDoc, peer_name: &str) -> Result<MergedDoc, MergeError> {
+    // R151 item 9 / plan §3.4: normalise retired function names on all three
+    // sides before any per-cell classification below — see
+    // `normalize_migrations`'s doc comment.
+    let local_norm = normalize_migrations(local);
+    let peer_norm = normalize_migrations(peer);
+    let base_norm = normalize_migrations(base);
+    let (local, peer, base) = (&local_norm, &peer_norm, &base_norm);
+
     let local_fm = to_front_matter(local);
     let peer_fm = to_front_matter(peer);
     let base_fm = to_front_matter(base);
@@ -500,6 +528,41 @@ mod merge_tests {
         assert_eq!(merged.doc.const_lines.len(), 2);
         assert!(merged.doc.const_lines.iter().any(|l| l.name == "k" && l.value == 2.0));
         assert!(merged.doc.const_lines.iter().any(|l| l.name == "k" && l.value == 3.0));
+    }
+
+    #[test]
+    fn merge_two_sides_differing_only_by_a_retired_function_name_zero_conflicts() {
+        // Arrange — plan §3.4's whole reason to exist: `base` was cached at
+        // a moment when it still said `variance_time`; `local` has been
+        // re-saved through the migration (`lap_delta_time`, `version: 4`)
+        // and touched nothing else; `peer` has not been re-saved yet and
+        // still says `variance_time` (`version: 3`), also untouched.
+        // Without merge-time normalisation this looks like every cell
+        // changed on both sides; normalised, the two sides agree.
+        let base = wb(&format!(
+            "{}```math id=aaaaaaaa\nv = variance_time([X])\n```\n",
+            front("version: 3\n")
+        ));
+        let local = wb(&format!(
+            "{}```math id=aaaaaaaa\nv = lap_delta_time([X])\n```\n",
+            front("version: 4\n")
+        ));
+        let peer = wb(&format!(
+            "{}```math id=aaaaaaaa\nv = variance_time([X])\n```\n",
+            front("version: 3\n")
+        ));
+
+        // Act
+        let merged = merge(&local, &peer, &base, "peer-laptop").unwrap();
+
+        // Assert — no conflict, one surviving cell, and the merged document
+        // is on the current spelling (never regressed back to the retired
+        // one by picking an unnormalised side's raw content).
+        assert_eq!(merged.conflicts, 0);
+        assert!(merged.warnings.is_empty());
+        assert_eq!(merged.doc.cells.len(), 1);
+        assert!(merged.doc.cells[0].raw_fence_body.contains("lap_delta_time"));
+        assert_eq!(merged.doc.version, 4);
     }
 
     #[test]
