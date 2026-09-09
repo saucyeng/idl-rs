@@ -1020,6 +1020,12 @@ impl crate::math::eval::ChannelLookup for SessionHandle {
         self.with_channel(name, |c| (c.len(), c.nominal_rate_hz))
     }
 
+    fn unit_of(&self, name: &str) -> Option<String> {
+        // Flatten "" (C1 §4.1's "no unit recorded") into None so the unit
+        // pass sees one absent-unit case, not two (R154).
+        self.with_channel(name, |c| c.unit.clone()).filter(|u| !u.is_empty())
+    }
+
     fn best_time_base_dims(&self) -> Option<(usize, f64)> {
         // Highest-rate non-event channel with the most samples, across base +
         // math store. Mirrors Dart `_resolveTimeBase`'s fallback scan.

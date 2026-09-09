@@ -5,12 +5,31 @@
 //! different atoms — that is what lets `[travel_mm] + [altitude_m]` be
 //! caught, which a dimension-vector model cannot do (R154 §1(b)).
 //!
-//! This module is task 1 of the design's 8-task plan: the algebra only.
-//! Inference over the `Ast` (the `Unit`/`UnitLabel` lattice, `infer`, the
-//! function rule table) is later tasks in this same module.
+//! Task 1 is the algebra (`UnitExpr`, `Ratio`) above; task 2 below adds the
+//! `Unit` lattice and `infer`, a second, cheap walk of the same `Ast`
+//! `evaluate` walks — not a field threaded through `Value`/`ChannelValue`,
+//! per R154's "inference is a separate pass" ruling. Task 2 covers
+//! literals, `[Name]`, unary/binary operators and the mismatch diagnostic;
+//! every `Ast::Call` yields `Unknown(Propagated)` until task 3 installs the
+//! per-function rule table.
+//!
+//! **Known gap, not resolved by the design or R154 (recorded, not
+//! guessed):** `core/src/math/parse.rs`'s `constant_value` substitutes a
+//! bare `g` to `Ast::Number(9.806_65)` **at parse time**, before any `Ast`
+//! this module's `infer` ever sees exists — indistinguishable from any
+//! other numeric literal. R154's open question 3 ("`g` carries `m/s²` —
+//! yes") assumed `infer` could recognise `g` textually; it cannot, without
+//! either a new `Ast` variant (a blast-radius decision beyond this task) or
+//! a second, separately-configured parse of the same source text (a
+//! deviation from "one walk of the same `Ast`"). `infer` therefore treats a
+//! literal `g` as `Scalar`, same as any other number, until the lead rules
+//! on one of those two changes.
 
 use std::collections::BTreeMap;
 use std::fmt;
+
+use crate::math::eval::ChannelLookup;
+use crate::math::parse::{Ast, BinOp, UnOp};
 
 /// A small rational number used as a unit exponent. `den` is always
 /// positive; the fraction is kept in lowest terms. Needed because `sqrt`
@@ -326,6 +345,228 @@ impl fmt::Display for UnitExpr {
     }
 }
 
+/// The unit lattice used during inference (R154 §1). `Scalar` is internal
+/// only — it never crosses the wire; a top-level `Scalar` result reports
+/// dimensionless (task 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unit {
+    /// A bare numeric literal, or arithmetic between literals only. Adapts
+    /// to the other operand's unit under `+ - min max clamp if`;
+    /// dimensionless under `* /`. Without this state, a literal is either
+    /// dimensionless (so every offset expression like `[travel] + 10`
+    /// reports a mismatch) or unknown (so every workbook loses its unit at
+    /// the first constant) — neither is honest.
+    Scalar,
+    /// A determined unit. `Known(UnitExpr::dimensionless())` is genuinely
+    /// dimensionless (a ratio, a count, a comparison result) — distinct
+    /// from `Scalar`, which is a number that has not yet met a unit.
+    Known(UnitExpr),
+    /// Could not be worked out; carries why, for display (task 4).
+    Unknown(UnknownReason),
+}
+
+/// Why [`Unit::infer`] could not determine a unit. See
+/// `runs/2026-09-08/unit-model.md` §4 — this set is closed; a new source of
+/// "unknown" is a design decision, not a call this module makes locally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnknownReason {
+    /// The channel's C1 §4.1 unit is `""` (no unit recorded), or a
+    /// `{cell}`/`{col[]}` reference (which has no recorded unit at all).
+    NoSourceUnit,
+    /// A `+`/`-` (or another unit-checked construct) combined two `Known`
+    /// operands whose units differ. `op` is the operator's display text,
+    /// e.g. `"+"`.
+    Mismatch { left: UnitExpr, right: UnitExpr, op: &'static str },
+    /// `pow(x, n)` where `n` is not a literal and `x`'s base is not
+    /// dimensionless — task 3's function table produces this; task 2 does
+    /// not yet, since every call yields `Propagated`.
+    NonLiteralExponent,
+    /// An operand was already `Unknown`; `of` names the channel or
+    /// sub-expression it started from (best-effort, for display — not
+    /// guaranteed unique). Also used, for now, as the yield of every
+    /// `Ast::Call` — task 3 replaces that with a real per-function rule.
+    Propagated { of: String },
+    /// A math-definition dependency cycle (task 4, once inference runs in
+    /// dependency order over `resolve_workbook_defs`). Unused by this
+    /// module's own `infer`, which does not walk definition references.
+    Cycle,
+    /// The AST node is not a numeric construct (currently: a string
+    /// literal, which only appears as a function argument, e.g.
+    /// `spectrogram(x, "density")`). Not one of the design's five listed
+    /// reasons — added because `infer` must be total over any `Ast` node
+    /// reachable from a `Call`'s `args`, and a bare string has no unit to
+    /// report. Small, safe judgment call (CLAUDE.md §1); flagged for the
+    /// lead rather than folded silently into an existing reason.
+    NotNumeric,
+}
+
+/// A non-fatal unit diagnostic produced during inference — most often the
+/// `+`/`-` mismatch of R154 §2.1. Never an evaluation failure: the value in
+/// `CellDefResult::value` (task 4) is unaffected by a `UnitNote`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitNote {
+    /// Display-ready English, e.g. "`+`: units differ (`bpm` and `km/h`);
+    /// result unit withheld".
+    pub message: String,
+}
+
+/// `a op b`'s unit under `+`/`-` (R154 §2's table row for `a + b`, `a - b`):
+/// `Scalar` on either side adopts the other's unit; two different `Known`s
+/// mismatch; anything touching `Unknown` propagates. Shared by both `Add`
+/// and `Sub`, which have the same unit rule.
+fn add_sub_unit(left: Unit, right: Unit, op: &'static str) -> (Unit, Option<UnitNote>) {
+    match (left, right) {
+        (Unit::Scalar, Unit::Scalar) => (Unit::Scalar, None),
+        (Unit::Scalar, Unit::Known(u)) | (Unit::Known(u), Unit::Scalar) => (Unit::Known(u), None),
+        (Unit::Known(l), Unit::Known(r)) if l == r => (Unit::Known(l), None),
+        (Unit::Known(l), Unit::Known(r)) => {
+            let note = UnitNote {
+                message: format!(
+                    "`{op}`: units differ (`{l}` and `{r}`); result unit withheld"
+                ),
+            };
+            (Unit::Unknown(UnknownReason::Mismatch { left: l, right: r, op }), Some(note))
+        }
+        (Unit::Unknown(_), other) | (other, Unit::Unknown(_)) => {
+            (Unit::Unknown(UnknownReason::Propagated { of: describe(&other) }), None)
+        }
+    }
+}
+
+/// A short, best-effort label for a `Unit` used only inside a `Propagated`
+/// reason's `of` field — not a full render, just enough for a diagnostic to
+/// point somewhere.
+fn describe(u: &Unit) -> String {
+    match u {
+        Unit::Scalar => "a scalar".to_string(),
+        Unit::Known(expr) if expr.is_dimensionless() => "a dimensionless value".to_string(),
+        Unit::Known(expr) => expr.to_string(),
+        Unit::Unknown(_) => "an unknown-unit value".to_string(),
+    }
+}
+
+/// `a * b` / `a / b`'s unit (R154 §2): `Scalar` combines as dimensionless,
+/// `Known` combines via [`UnitExpr::mul`]/[`UnitExpr::div`], anything
+/// touching `Unknown` propagates. `divide` selects `*` vs `/`.
+fn mul_div_unit(left: Unit, right: Unit, divide: bool) -> Unit {
+    let combine = |l: &UnitExpr, r: &UnitExpr| if divide { l.div(r) } else { l.mul(r) };
+    match (left, right) {
+        (Unit::Scalar, Unit::Scalar) => Unit::Scalar,
+        (Unit::Scalar, Unit::Known(u)) => {
+            Unit::Known(combine(&UnitExpr::dimensionless(), &u))
+        }
+        (Unit::Known(u), Unit::Scalar) => Unit::Known(u),
+        (Unit::Known(l), Unit::Known(r)) => Unit::Known(combine(&l, &r)),
+        (Unit::Unknown(_), other) | (other, Unit::Unknown(_)) => {
+            Unit::Unknown(UnknownReason::Propagated { of: describe(&other) })
+        }
+    }
+}
+
+/// Infers the unit of `ast` by walking it once, resolving `[Name]`
+/// references against `lookup` (`ChannelLookup::unit_of`, R154). Returns
+/// the inferred [`Unit`] plus any non-fatal diagnostics collected from
+/// nested sub-expressions (R154 §2.1) — a diagnostic never stops this
+/// function from also returning a `Unit` for the whole tree.
+///
+/// This is task 2 of the design's 8-task plan: literals, `[Name]`, unary
+/// `-`/`not`, `+ - * /`, comparisons, `and`/`or`. Every `Ast::Call` yields
+/// `Unknown(Propagated)` regardless of function — task 3 installs the real
+/// per-function rule table. Does not resolve a math-definition `[Name]` to
+/// that definition's own inferred unit (R154 §3's second `[Name]` row) —
+/// that requires dependency-order memoization over the workbook and is
+/// task 4's `resolve.rs`/`eval.rs` wiring, not this per-expression pass.
+pub fn infer(ast: &Ast, lookup: &dyn ChannelLookup) -> (Unit, Vec<UnitNote>) {
+    match ast {
+        Ast::Number(_) => (Unit::Scalar, Vec::new()),
+        Ast::Str(_) => (Unit::Unknown(UnknownReason::NotNumeric), Vec::new()),
+        Ast::ChannelRef(name) => {
+            let unit = match lookup.unit_of(name) {
+                Some(s) => match UnitExpr::parse(&s) {
+                    Ok(expr) => Unit::Known(expr),
+                    // A malformed C1 unit string is treated the same as no
+                    // unit at all — never a panic, never a guess at what
+                    // the author meant.
+                    Err(_) => Unit::Unknown(UnknownReason::NoSourceUnit),
+                },
+                None => Unit::Unknown(UnknownReason::NoSourceUnit),
+            };
+            (unit, Vec::new())
+        }
+        Ast::CellRef(_) => (Unit::Unknown(UnknownReason::NoSourceUnit), Vec::new()),
+        Ast::Unary { op: UnOp::Neg, expr } => infer(expr, lookup),
+        Ast::Unary { op: UnOp::Not, expr } => {
+            let (_, notes) = infer(expr, lookup);
+            (Unit::Known(UnitExpr::dimensionless()), notes)
+        }
+        Ast::Binary { op, left, right } => {
+            let (lu, mut notes) = infer(left, lookup);
+            let (ru, rnotes) = infer(right, lookup);
+            notes.extend(rnotes);
+            match op {
+                BinOp::Add | BinOp::Sub => {
+                    let op_sym = if *op == BinOp::Add { "+" } else { "-" };
+                    let (unit, note) = add_sub_unit(lu, ru, op_sym);
+                    notes.extend(note);
+                    (unit, notes)
+                }
+                BinOp::Mul => (mul_div_unit(lu, ru, false), notes),
+                BinOp::Div => (mul_div_unit(lu, ru, true), notes),
+                BinOp::Lt
+                | BinOp::Gt
+                | BinOp::LtEq
+                | BinOp::GtEq
+                | BinOp::EqEq
+                | BinOp::BangEq => {
+                    // The result is always Known(dimensionless) — a
+                    // comparison is a truth value — but the operands are
+                    // still checked, so a `mm` vs. `m` comparison raises
+                    // the same mismatch diagnostic `+` would, purely for
+                    // its side-effect note.
+                    let (_, note) = add_sub_unit(lu, ru, comparison_symbol(*op));
+                    notes.extend(note);
+                    (Unit::Known(UnitExpr::dimensionless()), notes)
+                }
+                BinOp::And | BinOp::Or => {
+                    // Operands are truthiness tests, not checked against
+                    // each other — only their own nested notes (already
+                    // collected above) surface.
+                    (Unit::Known(UnitExpr::dimensionless()), notes)
+                }
+            }
+        }
+        Ast::Call { name, args, kwargs } => {
+            // Task 2 stop-gap (design §7, task 2 row): every call is
+            // Unknown(Propagated) regardless of function, but nested
+            // mismatches inside its arguments are still surfaced.
+            let mut notes = Vec::new();
+            for arg in args {
+                let (_, arg_notes) = infer(arg, lookup);
+                notes.extend(arg_notes);
+            }
+            for (_, expr) in kwargs {
+                let (_, kw_notes) = infer(expr, lookup);
+                notes.extend(kw_notes);
+            }
+            (Unit::Unknown(UnknownReason::Propagated { of: format!("{name}(…)") }), notes)
+        }
+    }
+}
+
+/// Display text for a comparison [`BinOp`], used only inside a `Mismatch`
+/// reason's `op` field.
+fn comparison_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::LtEq => "<=",
+        BinOp::GtEq => ">=",
+        BinOp::EqEq => "==",
+        BinOp::BangEq => "!=",
+        _ => unreachable!("comparison_symbol called with a non-comparison BinOp"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,5 +751,267 @@ mod tests {
 
         // Assert
         assert_eq!(r, Ratio::new(1, 2));
+    }
+
+    // --- task 2: the `Unit` lattice and `infer` ---
+
+    use crate::math::eval::{ChannelLookup, LookupChannel};
+    use std::collections::HashMap;
+
+    /// A test double supplying only `unit_of`, from a `name -> C1 unit
+    /// string` map. `""` is stored the same way C1 does for "no unit
+    /// recorded"; the trait's own filtering (mirroring `SessionHandle`) is
+    /// reproduced here rather than exercised through it, since this module
+    /// must not depend on `session`.
+    struct UnitOnlyLookup(HashMap<&'static str, &'static str>);
+    impl ChannelLookup for UnitOnlyLookup {
+        fn lookup(&self, _name: &str) -> Option<LookupChannel> {
+            None
+        }
+        fn unit_of(&self, name: &str) -> Option<String> {
+            self.0.get(name).filter(|u| !u.is_empty()).map(|u| u.to_string())
+        }
+    }
+
+    fn units(pairs: &[(&'static str, &'static str)]) -> UnitOnlyLookup {
+        UnitOnlyLookup(pairs.iter().cloned().collect())
+    }
+
+    fn parse(src: &str) -> Ast {
+        crate::math::parse::parse(src).unwrap()
+    }
+
+    #[test]
+    fn infer_number_literal_is_scalar() {
+        // Arrange
+        let ast = parse("10");
+        let lk = units(&[]);
+
+        // Act
+        let (unit, notes) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Scalar);
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn infer_channel_ref_with_recorded_unit_is_known() {
+        // Arrange
+        let ast = parse("[Travel]");
+        let lk = units(&[("Travel", "mm")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::atom("mm")));
+    }
+
+    #[test]
+    fn infer_channel_ref_with_no_recorded_unit_is_unknown() {
+        // Arrange — C1's "" case, and a channel the lookup has never heard of
+        let ast = parse("[Raw]");
+        let lk = units(&[("Raw", "")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Unknown(UnknownReason::NoSourceUnit));
+    }
+
+    #[test]
+    fn infer_cell_ref_is_unknown_no_source_unit() {
+        // Arrange
+        let ast = parse("{cell}");
+        let lk = units(&[]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Unknown(UnknownReason::NoSourceUnit));
+    }
+
+    #[test]
+    fn infer_unary_neg_keeps_the_operand_unit() {
+        // Arrange
+        let ast = parse("-[Travel]");
+        let lk = units(&[("Travel", "mm")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::atom("mm")));
+    }
+
+    #[test]
+    fn infer_not_is_dimensionless() {
+        // Arrange
+        let ast = parse("not [Travel]");
+        let lk = units(&[("Travel", "mm")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::dimensionless()));
+    }
+
+    #[test]
+    fn infer_literal_plus_channel_adopts_the_channel_unit() {
+        // Arrange — the Scalar lattice: [travel] + 10 stays mm
+        let ast = parse("[Travel] + 10");
+        let lk = units(&[("Travel", "mm")]);
+
+        // Act
+        let (unit, notes) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::atom("mm")));
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn infer_mismatched_addition_is_unknown_with_a_visible_note() {
+        // Arrange — R154 §2.1: a diagnostic, not a hard error
+        let ast = parse("[HR] + [Speed]");
+        let lk = units(&[("HR", "bpm"), ("Speed", "km/h")]);
+
+        // Act
+        let (unit, notes) = infer(&ast, &lk);
+
+        // Assert
+        assert!(matches!(unit, Unit::Unknown(UnknownReason::Mismatch { .. })));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].message.contains("bpm"));
+        assert!(notes[0].message.contains("km/h"));
+    }
+
+    #[test]
+    fn infer_matching_addition_keeps_the_unit() {
+        // Arrange
+        let ast = parse("[A] + [B]");
+        let lk = units(&[("A", "mm"), ("B", "mm")]);
+
+        // Act
+        let (unit, notes) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::atom("mm")));
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn infer_multiplication_of_two_knowns_combines_units() {
+        // Arrange
+        let ast = parse("[Travel] * [Speed]");
+        let lk = units(&[("Travel", "mm"), ("Speed", "m/s")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::parse("m·mm/s").unwrap()));
+    }
+
+    #[test]
+    fn infer_division_by_scalar_keeps_the_unit() {
+        // Arrange
+        let ast = parse("[Travel] / 2");
+        let lk = units(&[("Travel", "mm")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::atom("mm")));
+    }
+
+    #[test]
+    fn infer_comparison_is_always_dimensionless_but_still_checks_operands() {
+        // Arrange — R154 §2: the result is unambiguous (Known(dimensionless)
+        // never Unknown) even though the operands mismatch
+        let ast = parse("[HR] < [Speed]");
+        let lk = units(&[("HR", "bpm"), ("Speed", "km/h")]);
+
+        // Act
+        let (unit, notes) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::dimensionless()));
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn infer_and_or_is_dimensionless_and_does_not_check_operands() {
+        // Arrange — mismatched operands, but `and` does not compare them to
+        // each other, only their own nested unit rules run
+        let ast = parse("[HR] and [Speed]");
+        let lk = units(&[("HR", "bpm"), ("Speed", "km/h")]);
+
+        // Act
+        let (unit, notes) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::dimensionless()));
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn infer_propagates_unknown_through_arithmetic() {
+        // Arrange
+        let ast = parse("[Raw] * 2");
+        let lk = units(&[("Raw", "")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert!(matches!(unit, Unit::Unknown(UnknownReason::Propagated { .. })));
+    }
+
+    #[test]
+    fn infer_call_is_unknown_propagated_regardless_of_function() {
+        // Arrange — task 2 stop-gap; task 3 installs the real per-function
+        // rule table
+        let ast = parse("sqrt([Travel])");
+        let lk = units(&[("Travel", "mm")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert!(matches!(unit, Unit::Unknown(UnknownReason::Propagated { .. })));
+    }
+
+    #[test]
+    fn infer_call_still_surfaces_a_mismatch_nested_in_its_arguments() {
+        // Arrange — the call itself yields Propagated, but a mismatch
+        // buried inside an argument must not be swallowed
+        let ast = parse("abs([HR] + [Speed])");
+        let lk = units(&[("HR", "bpm"), ("Speed", "km/h")]);
+
+        // Act
+        let (_, notes) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn infer_string_literal_is_not_numeric() {
+        // Arrange — only reachable as a function argument (e.g. a
+        // spectrogram scaling literal), never as a definition body itself
+        let ast = Ast::Str("density".to_string());
+        let lk = units(&[]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Unknown(UnknownReason::NotNumeric));
     }
 }
