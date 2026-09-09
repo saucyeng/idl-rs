@@ -1155,6 +1155,20 @@ fn call_function(
                 ch.t_us,
             ))
         }
+        // numpy.gradient's own central-difference formula (R151 item 3) —
+        // `differentiate` keeps its distinct, causal-difference meaning
+        // rather than being renamed to this name (see `differentiate`'s own
+        // doc comment for why changing the implementation under the name
+        // would have been the wrong fix).
+        "gradient" => {
+            require_arg_count(name, &args, 1)?;
+            let ch = require_channel(&args[0], name)?;
+            Ok(channel(
+                crate::statistics::gradient(&ch.samples, ch.sample_rate_hz),
+                ch.sample_rate_hz,
+                ch.t_us,
+            ))
+        }
         "detrend" => {
             // Global least-squares trend removal over the sample index (NOT
             // [Time]). 1-arg → linear (default); 2-arg → explicit mode string.

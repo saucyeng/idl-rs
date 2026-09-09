@@ -22,10 +22,11 @@
 //! per that file's own doc comment. C2 §3.3 originally stated 69 named
 //! functions total (63 `Implemented` + 6 `NotImplemented`); the
 //! scipy-alignment lane (`runs/2026-09-08/scipy-alignment-plan.md`) adds
-//! two entries without removing any — `fft` split into `periodogram` +
-//! `welch` (task 6) and `cumtrapz` added as `cumulative_trapezoid`'s
-//! permanent second spelling (task 10, R151 item 6) — so this catalog now
-//! has 71 entries; C2 §3.3 itself needs the matching row-count update
+//! three entries without removing any — `fft` split into `periodogram` +
+//! `welch` (task 6), `cumtrapz` added as `cumulative_trapezoid`'s permanent
+//! second spelling (task 10, R151 item 6), and `gradient` added alongside
+//! `differentiate` (task 11, R151 item 3) — so this catalog now has 72
+//! entries; C2 §3.3 itself needs the matching row-count update
 //! (spec-during, not done in this lane's Rust-only scope).
 //!
 //! R64.2 requires this catalog's *name* set be checked against
@@ -71,7 +72,7 @@ pub struct MathBuiltin {
     pub status: MathBuiltinStatus,
 }
 
-/// Returns the full 71-entry math builtin catalog (C2 §3.3, minus
+/// Returns the full 72-entry math builtin catalog (C2 §3.3, minus
 /// `main(col[])` and the `and`/`or`/`not` grammar keywords — see module
 /// doc). Order matches C2 §3.3's table row order.
 pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
@@ -83,6 +84,7 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
         MathBuiltin { name: "cumulative_trapezoid", arity: &[1], status: I },
         MathBuiltin { name: "cumtrapz", arity: &[1], status: I },
         MathBuiltin { name: "differentiate", arity: &[1], status: I },
+        MathBuiltin { name: "gradient", arity: &[1], status: I },
         MathBuiltin { name: "detrend", arity: &[1, 2], status: I },
         MathBuiltin { name: "rms", arity: &[1, 2], status: I },
         MathBuiltin { name: "mean", arity: &[1, 2], status: I },
@@ -167,21 +169,23 @@ mod tests {
     }
 
     #[test]
-    fn math_builtin_catalog_len_is_71_after_the_scipy_alignment_lanes_splits() {
+    fn math_builtin_catalog_len_is_72_after_the_scipy_alignment_lanes_splits() {
         // Arrange / Act
         let n = math_builtin_catalog().len();
 
         // Assert — was 69 (C2 §3.3's original stated total: 63 Implemented +
-        // 6 NotImplemented); the scipy-alignment lane adds two entries
+        // 6 NotImplemented); the scipy-alignment lane adds three entries
         // without removing any (`runs/2026-09-08/scipy-alignment-plan.md`):
-        // `fft` split into `periodogram` + `welch` (net +1, task 6), and
+        // `fft` split into `periodogram` + `welch` (net +1, task 6),
         // `cumtrapz` added as `cumulative_trapezoid`'s permanent second
-        // spelling (net +1, task 10, R151 item 6) — 69 + 2 = 71.
-        assert_eq!(n, 71);
+        // spelling (net +1, task 10, R151 item 6), and `gradient` added
+        // alongside `differentiate` (net +1, task 11, R151 item 3) —
+        // 69 + 3 = 72.
+        assert_eq!(n, 72);
     }
 
     #[test]
-    fn implemented_and_not_implemented_counts_split_65_and_6() {
+    fn implemented_and_not_implemented_counts_split_66_and_6() {
         // Arrange
         let catalog = math_builtin_catalog();
 
@@ -191,11 +195,11 @@ mod tests {
         let implemented =
             catalog.iter().filter(|b| b.status == MathBuiltinStatus::Implemented).count();
 
-        // Assert — was 63/6; the scipy-alignment lane's two net-new entries
-        // (see the length test above) are both Implemented, so only that
-        // side of the split moves.
+        // Assert — was 63/6; the scipy-alignment lane's three net-new
+        // entries (see the length test above) are all Implemented, so only
+        // that side of the split moves.
         assert_eq!(not_implemented, 6);
-        assert_eq!(implemented, 65);
+        assert_eq!(implemented, 66);
     }
 
     #[test]
