@@ -212,12 +212,25 @@ pub fn effective_rate_hz_from_t_us(t_us: &[i64]) -> Result<f64, FftError> {
 /// Output units of the spectrum.
 pub enum Scaling {
     /// RMS magnitude in input units (sqrt of mean power). Single-segment,
-    /// rectangular window, no detrend reproduces `fft()` bin-for-bin.
+    /// rectangular window, no detrend reproduces the legacy `fft()` bin-for-
+    /// bin. **Not** one of scipy's two `scaling` values (`"density"` /
+    /// `"spectrum"`) — the math language exposes this one only under the
+    /// deliberately-different name `"raw_magnitude"` (R151 item 1,
+    /// `runs/2026-09-08/scipy-alignment-plan.md` §5 Q1): the migration
+    /// pins every existing `fft()` call to it so no workbook's numbers move
+    /// under cover of the rename, and no *new* call defaults to it.
     Magnitude,
-    /// Power spectral density in input-units squared per Hz (window-power
-    /// normalised, one-sided x2 on interior bins). Comparable across segment
-    /// lengths.
+    /// Power spectral density in input-units squared per Hz — scipy's
+    /// `scaling="density"` (both `periodogram` and `welch`'s default):
+    /// `|X|² / (fs · Σ(window²))`, one-sided ×2 on interior bins.
+    /// Comparable across segment lengths.
     Density,
+    /// Power spectrum in input-units squared — scipy's `scaling="spectrum"`:
+    /// `|X|² / (Σwindow)²`, one-sided ×2 on interior bins. Comparable
+    /// across window functions at a fixed segment length (unlike `Density`,
+    /// this is *not* normalised by bandwidth, so it does not compare across
+    /// segment lengths).
+    Spectrum,
 }
 
 /// Frequencies and matching spectral values returned by [welch].
@@ -435,25 +448,37 @@ pub fn welch(
         }
     }
 
+    let win_sum: f64 = weights.iter().sum();
     let values: Vec<f64> = match scaling {
         // RMS magnitude: single-segment rect no-detrend gives sqrt(|X|^2) = |X|.
         Scaling::Magnitude => avg_power.iter().map(|p| p.sqrt()).collect(),
-        // PSD: normalise by fs * sum(w^2); double interior bins for one-sided.
-        Scaling::Density => {
-            let norm = sample_rate_hz * win_power;
-            (0..n_bins)
-                .map(|k| {
-                    let mut psd = avg_power[k] / norm;
-                    let is_nyquist = seg % 2 == 0 && k == seg / 2;
-                    if k != 0 && !is_nyquist {
-                        psd *= 2.0;
-                    }
-                    psd
-                })
-                .collect()
-        }
+        // scipy scaling="density": normalise by fs * sum(w^2).
+        Scaling::Density => one_sided_scale(&avg_power, sample_rate_hz * win_power, seg),
+        // scipy scaling="spectrum": normalise by sum(w)^2 (no `fs` — not
+        // bandwidth-normalised, so it doesn't compare across segment
+        // lengths the way `Density` does).
+        Scaling::Spectrum => one_sided_scale(&avg_power, win_sum * win_sum, seg),
     };
     WelchResult { freqs_hz: s.freqs_hz, values }
+}
+
+/// Normalises `power` by `norm` and doubles every one-sided interior bin
+/// (every bin except DC and, for an even segment length, the Nyquist bin) —
+/// the one-sided-spectrum step shared by scipy's `"density"` and
+/// `"spectrum"` scalings, differing only in what `norm` is.
+fn one_sided_scale(power: &[f64], norm: f64, seg: usize) -> Vec<f64> {
+    power
+        .iter()
+        .enumerate()
+        .map(|(k, p)| {
+            let mut v = p / norm;
+            let is_nyquist = seg % 2 == 0 && k == seg / 2;
+            if k != 0 && !is_nyquist {
+                v *= 2.0;
+            }
+            v
+        })
+        .collect()
 }
 
 #[cfg(test)]

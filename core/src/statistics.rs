@@ -12,12 +12,44 @@
 ///
 /// `result[0] = 0.0` (no prior sample); `result[i] = (data[i] - data[i-1]) * sample_rate_hz`.
 /// Output units = input units × Hz (e.g. m → m/s).
+///
+/// **Not `numpy.gradient`** (R143/R151 item 3): this is a one-sided, causal
+/// difference with a zero-filled leading sample — deliberately kept under
+/// its own name rather than renamed, because changing the *implementation*
+/// to a central difference under cover of a "naming" change would silently
+/// move every existing suspension-velocity number a workbook already
+/// carries. [`gradient`] is numpy's actual central-difference formula,
+/// added alongside as a distinct, honestly-named function.
 pub fn differentiate(data: &[f64], sample_rate_hz: f64) -> Vec<f64> {
     let n = data.len();
     let mut result = vec![0.0; n];
     for i in 1..n {
         result[i] = (data[i] - data[i - 1]) * sample_rate_hz;
     }
+    result
+}
+
+/// Central finite-difference derivative — `numpy.gradient`'s own formula for
+/// uniformly-spaced samples, `edge_order=1` (numpy's default): interior
+/// samples use the central difference `(data[i+1] - data[i-1]) / (2·dt)`;
+/// the two edges fall back to the one-sided forward/backward difference
+/// `(data[1]-data[0])/dt` and `(data[n-1]-data[n-2])/dt`. `dt = 1 /
+/// sample_rate_hz`. Output units = input units × Hz, same as
+/// [`differentiate`]. Fewer than 2 samples has no interior or edge to
+/// difference against, so every entry is `0.0` (an empty/single-sample
+/// channel has no derivative — matching `differentiate`'s own `result[0] =
+/// 0.0` "no prior sample" convention rather than erroring).
+pub fn gradient(data: &[f64], sample_rate_hz: f64) -> Vec<f64> {
+    let n = data.len();
+    let mut result = vec![0.0; n];
+    if n < 2 {
+        return result;
+    }
+    result[0] = (data[1] - data[0]) * sample_rate_hz;
+    for i in 1..n - 1 {
+        result[i] = (data[i + 1] - data[i - 1]) * 0.5 * sample_rate_hz;
+    }
+    result[n - 1] = (data[n - 1] - data[n - 2]) * sample_rate_hz;
     result
 }
 
@@ -187,6 +219,77 @@ mod tests {
         for v in &d[1..] {
             assert_relative_eq!(*v, 10.0, epsilon = 1e-12);
         }
+    }
+
+    #[test]
+    fn gradient_linear_ramp_yields_constant_slope_including_at_the_edges() {
+        // Arrange — same ramp as `differentiate_linear_ramp_...`, but a
+        // central difference gets the slope right at the edges too (no
+        // `differentiate`-style zero-filled first sample).
+        let data: Vec<f64> = (0..5).map(|i| i as f64).collect();
+
+        // Act
+        let g = gradient(&data, 10.0);
+
+        // Assert
+        assert_eq!(g.len(), 5);
+        for v in &g {
+            assert_relative_eq!(*v, 10.0, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn gradient_matches_numpys_own_worked_example() {
+        // Arrange — numpy.gradient([1, 2, 4, 7, 11, 16]) (unit spacing) is
+        // documented as [1. , 1.5, 2.5, 3.5, 4.5, 5. ]; `sample_rate_hz: 1.0`
+        // makes `dt = 1` so this reproduces that example exactly.
+        let data = vec![1.0, 2.0, 4.0, 7.0, 11.0, 16.0];
+
+        // Act
+        let g = gradient(&data, 1.0);
+
+        // Assert
+        let expected = [1.0, 1.5, 2.5, 3.5, 4.5, 5.0];
+        for (got, want) in g.iter().zip(expected.iter()) {
+            assert_relative_eq!(*got, *want, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn gradient_differs_from_differentiate_at_interior_samples() {
+        // Arrange — the whole reason `gradient` is a separate function
+        // (R151 item 3): a central difference is not the same computation
+        // as the causal backward difference, even on the same input.
+        let data = vec![0.0, 1.0, 4.0, 9.0, 16.0]; // x^2 samples
+        let sample_rate_hz = 1.0;
+
+        // Act
+        let backward = differentiate(&data, sample_rate_hz);
+        let central = gradient(&data, sample_rate_hz);
+
+        // Assert — differ at every interior index (2nd derivative is
+        // nonzero, so backward and central differences disagree).
+        assert_ne!(backward[2], central[2]);
+    }
+
+    #[test]
+    fn gradient_of_fewer_than_two_samples_is_all_zero_not_a_panic() {
+        // Arrange / Act / Assert
+        assert_eq!(gradient(&[], 10.0), Vec::<f64>::new());
+        assert_eq!(gradient(&[5.0], 10.0), vec![0.0]);
+    }
+
+    #[test]
+    fn gradient_of_exactly_two_samples_uses_the_one_sided_edge_formula_for_both() {
+        // Arrange — n=2 has no interior sample; both entries are the same
+        // one-sided (forward = backward here) difference.
+        let data = vec![3.0, 5.0];
+
+        // Act
+        let g = gradient(&data, 2.0);
+
+        // Assert — (5-3)*2 = 4 for both.
+        assert_eq!(g, vec![4.0, 4.0]);
     }
 
     #[test]

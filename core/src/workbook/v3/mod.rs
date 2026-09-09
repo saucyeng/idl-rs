@@ -28,7 +28,7 @@ pub use front_matter::{ConstantRaw, FrontMatter, UnitsPref};
 pub use host::{channel, host_constants, host_laps, host_session, to_host_channel, HostChannel, HostLap, HostSession};
 pub use host_channel_wire::encode_host_channel_idlh;
 pub use js_cell::{find_inline_exprs, InlineExpr};
-pub use math_cell::{parse_math_cell_body, MathCellLine};
+pub use math_cell::{parse_math_cell_body, rewrite_math_cell_body, MathCellLine};
 pub use prose::{render_prose_html, ProseSpanRef, RenderedProse};
 pub use resolve::resolve_workbook_defs;
 pub use table_cell::parse_table_cell;
@@ -92,8 +92,12 @@ pub struct WorkbookDoc {
     pub constants_raw: HashMap<String, ConstantRaw>,
     /// Editor unit-system preference (C2 §1); no effect on parsing/eval.
     pub units_pref: UnitsPref,
-    /// Schema version — always `3` for a document this function returns
-    /// `Ok` for (a non-`3` explicit value is fatal, see [`parse_workbook`]).
+    /// Schema version — `3` or `4` for a document this function returns
+    /// `Ok` for (any other explicit value is fatal, see [`parse_workbook`]).
+    /// A `3` document's [`Self::cells`]/[`Self::defs`] already have retired
+    /// builtin names rewritten to their current spelling (R151 item 9) —
+    /// this field is the only trace that the *source* was still `version:
+    /// 3`; the in-memory document itself is fully migrated.
     pub version: u32,
     /// Every recognised `math`/`table`/`js` cell, in document order.
     pub cells: Vec<CellDoc>,
@@ -148,9 +152,22 @@ pub struct WorkbookDoc {
 pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>), Vec<WorkbookError>> {
     let (front_matter, body) = front_matter::parse_front_matter(markdown).map_err(|e| vec![e])?;
 
-    if front_matter.version != 3 {
+    if front_matter.version != 3 && front_matter.version != 4 {
         return Err(vec![error::unsupported_workbook_version(front_matter.version)]);
     }
+
+    // A `version: 3` document is migrated in memory before anything below
+    // sees it, so it evaluates identically whether or not it has been saved
+    // since the update (R151 item 9) — retired names never become a second
+    // dispatch arm in `eval::call_function`. The file on disk is untouched;
+    // only this in-memory `body` is rewritten.
+    let migrated_body;
+    let body: &str = if front_matter.version == 3 {
+        migrated_body = crate::math::migrate_body(body).0;
+        &migrated_body
+    } else {
+        body
+    };
 
     let (mut cells, trailing_prose, mut errors) = cell::scan_cells(body);
 
@@ -320,6 +337,8 @@ pub fn render_workbook(doc: &WorkbookDoc) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests_migration;
 #[cfg(test)]
 mod tests_pipeline;
 

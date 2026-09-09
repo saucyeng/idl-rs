@@ -45,7 +45,20 @@ pub enum Ast {
     CellRef(String),
     Unary { op: UnOp, expr: Box<Ast> },
     Binary { op: BinOp, left: Box<Ast>, right: Box<Ast> },
-    Call { name: String, args: Vec<Ast> },
+    Call {
+        name: String,
+        args: Vec<Ast>,
+        /// `name=expr` keyword arguments (C2 §3.2, R143 item 1), in
+        /// call-site order — additive to `args`, never a replacement for
+        /// it (positional stays valid). Parsing enforces the grammar's two
+        /// purely syntactic rules: no keyword argument may precede a
+        /// positional one in the same call, and no name may be bound twice
+        /// by keyword. Binding a name both positionally *and* by keyword,
+        /// and an unknown keyword name, both require knowing the callee's
+        /// parameter names — `eval::call_function`'s job, not the
+        /// parser's, so neither is rejected here.
+        kwargs: Vec<(String, Ast)>,
+    },
 }
 
 fn parse_err(msg: impl Into<String>) -> MathEvalError {
@@ -267,8 +280,8 @@ impl<'a> Parser<'a> {
             let name = self.cur().str_val.clone();
             self.pos += 1;
             if self.match_kind(TokenKind::LParen) {
-                let args = self.parse_args()?;
-                return Ok(Ast::Call { name, args });
+                let (args, kwargs) = self.parse_args()?;
+                return Ok(Ast::Call { name, args, kwargs });
             }
             // A bare identifier that is a universal constant (pi / tau / e / g)
             // resolves to a literal; failing that, a threaded workbook
@@ -289,6 +302,15 @@ impl<'a> Parser<'a> {
             self.expect(TokenKind::RParen)?;
             return Ok(inner);
         }
+        // A bare `=` reaching here is not a keyword argument's separator
+        // (that form is consumed by `parse_one_arg`'s own lookahead before
+        // ever calling into an expression) — it's a genuinely misplaced
+        // `=`, most often a typo'd comparison (mirrors the tokenizer's
+        // former message, moved here per C2 §3.2 since only the parser
+        // knows an `=` wasn't a keyword name's separator).
+        if self.check(TokenKind::Equals) {
+            return Err(parse_err("Unexpected \"=\" in expression — did you mean \"==\"?"));
+        }
         Err(parse_err(format!(
             "Unexpected token {:?} (\"{}\") in expression",
             self.cur().kind,
@@ -297,16 +319,52 @@ impl<'a> Parser<'a> {
     }
 
     // Parses a comma-separated argument list, consuming the closing ')'.
-    fn parse_args(&mut self) -> Result<Vec<Ast>, MathEvalError> {
+    // Each argument is either a bare expression (positional) or
+    // `ident '=' expression` (keyword, C2 §3.2) — see `parse_one_arg`.
+    fn parse_args(&mut self) -> Result<(Vec<Ast>, Vec<(String, Ast)>), MathEvalError> {
         let mut args = Vec::new();
+        let mut kwargs: Vec<(String, Ast)> = Vec::new();
         if !self.check(TokenKind::RParen) {
-            args.push(self.parse_or()?);
+            self.parse_one_arg(&mut args, &mut kwargs)?;
             while self.match_kind(TokenKind::Comma) {
-                args.push(self.parse_or()?);
+                self.parse_one_arg(&mut args, &mut kwargs)?;
             }
         }
         self.expect(TokenKind::RParen)?;
-        Ok(args)
+        Ok((args, kwargs))
+    }
+
+    // One call argument: `ident '=' expr` (keyword) when the next two
+    // tokens are exactly that — a two-token lookahead so a bare identifier
+    // *expression* (a workbook constant, `mean([X], k)`'s `k`) is never
+    // mistaken for a keyword name — otherwise a positional expression.
+    // Enforces the grammar's two syntactic keyword-argument rules (see
+    // `Ast::Call::kwargs`'s doc comment); the two rules that need the
+    // callee's own parameter names are the evaluator's job.
+    fn parse_one_arg(&mut self, args: &mut Vec<Ast>, kwargs: &mut Vec<(String, Ast)>) -> Result<(), MathEvalError> {
+        if self.check(TokenKind::Ident) && self.peek_kind(1) == Some(TokenKind::Equals) {
+            let kw_name = self.cur().str_val.clone();
+            self.pos += 2; // the identifier, then '='
+            if kwargs.iter().any(|(bound, _)| bound == &kw_name) {
+                return Err(parse_err(format!(
+                    "keyword argument \"{kw_name}\" is bound more than once in this call"
+                )));
+            }
+            let value = self.parse_or()?;
+            kwargs.push((kw_name, value));
+            return Ok(());
+        }
+        if !kwargs.is_empty() {
+            return Err(parse_err(
+                "a positional argument can't follow a keyword argument in the same call",
+            ));
+        }
+        args.push(self.parse_or()?);
+        Ok(())
+    }
+
+    fn peek_kind(&self, ahead: usize) -> Option<TokenKind> {
+        self.tokens.get(self.pos + ahead).map(|t| t.kind)
     }
 }
 
@@ -367,14 +425,108 @@ mod tests {
 
         // Assert — Call("butter", [Number, Number, Str, ChannelRef]).
         match a {
-            Ast::Call { name, args } => {
+            Ast::Call { name, args, kwargs } => {
                 assert_eq!(name, "butter");
                 assert_eq!(args.len(), 4);
                 assert!(matches!(args[2], Ast::Str(ref s) if s == "high"));
                 assert!(matches!(args[3], Ast::ChannelRef(ref n) if n == "IMU1_AccelZ"));
+                assert!(kwargs.is_empty());
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_function_call_with_a_keyword_argument() {
+        // Arrange / Act
+        let a = ast("mean([X], window=5)");
+
+        // Assert — one positional arg, one keyword arg.
+        match a {
+            Ast::Call { name, args, kwargs } => {
+                assert_eq!(name, "mean");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0], Ast::ChannelRef(ref n) if n == "X"));
+                assert_eq!(kwargs.len(), 1);
+                assert_eq!(kwargs[0].0, "window");
+                assert!(matches!(kwargs[0].1, Ast::Number(v) if v == 5.0));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_function_call_with_only_keyword_arguments() {
+        // Arrange / Act
+        let a = ast("periodogram(ch=[X], window=\"hann\")");
+
+        // Assert
+        match a {
+            Ast::Call { name, args, kwargs } => {
+                assert_eq!(name, "periodogram");
+                assert!(args.is_empty());
+                assert_eq!(kwargs.len(), 2);
+                assert_eq!(kwargs[0].0, "ch");
+                assert_eq!(kwargs[1].0, "window");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_a_bare_identifier_expression_is_never_mistaken_for_a_keyword_name() {
+        // Arrange — a workbook constant `k` used as a positional argument
+        // must not be consumed as a keyword name just because it's an
+        // identifier; only `ident '=' ...` is a keyword argument.
+        let mut constants = HashMap::new();
+        constants.insert("k".to_string(), 3.0);
+
+        // Act
+        let a = parse_with_constants("mean([X], k)", &constants).unwrap();
+
+        // Assert
+        match a {
+            Ast::Call { args, kwargs, .. } => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[1], Ast::Number(v) if v == 3.0));
+                assert!(kwargs.is_empty());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_a_positional_argument_after_a_keyword_argument_is_a_parse_error() {
+        // Act
+        let err = parse("mean(window=5, [X])").unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::Parse);
+        assert!(err.message.contains("positional argument can't follow"));
+    }
+
+    #[test]
+    fn parse_bare_equals_where_an_expression_is_expected_says_did_you_mean_eqeq() {
+        // Arrange — C2 §3.2: the tokenizer no longer hard-errors on a bare
+        // `=` (it's a keyword argument's separator); a `=` that reaches
+        // `parse_primary` is genuinely misplaced, most often a typo'd `==`.
+        // Act — `=` appears where an operand was expected (right after
+        // `+`), so parsing reaches `parse_primary` with `=` as `cur()`.
+        let err = parse("1 + = 2").unwrap_err();
+
+        // Assert — mirrors the message the tokenizer used to raise.
+        assert_eq!(err.kind, MathEvalErrorKind::Parse);
+        assert!(err.message.contains("=="), "{}", err.message);
+    }
+
+    #[test]
+    fn parse_the_same_keyword_name_bound_twice_is_a_parse_error() {
+        // Act
+        let err = parse("mean([X], window=5, window=6)").unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::Parse);
+        assert!(err.message.contains("bound more than once"));
     }
 
     #[test]

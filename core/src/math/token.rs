@@ -31,6 +31,12 @@ pub enum TokenKind {
     GtEq,
     EqEq,
     BangEq,
+    /// A single `=` — a keyword argument's `name=expr` separator (C2 §3.2,
+    /// R143 item 1). Never an assignment operator; the grammar's only other
+    /// use of `=` (a `math`-cell `def_line`'s own `name = expr`) is split by
+    /// `workbook::v3::math_cell::classify_line` before this tokenizer ever
+    /// sees the line, so this token only ever appears inside a call's `(…)`.
+    Equals,
     Eof,
 }
 
@@ -205,9 +211,12 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, MathEvalError> {
                 if i + 1 < n && chars[i + 1] == '=' {
                     tokens.push(Token::simple(TokenKind::EqEq)); i += 2;
                 } else {
-                    return Err(parse_err(format!(
-                        "Unexpected \"=\" at position {i} — did you mean \"==\"?"
-                    )));
+                    // A bare `=` is a keyword argument's separator (C2 §3.2)
+                    // — no longer a hard tokenizer error. The parser raises
+                    // "did you mean ==?" itself when `=` shows up somewhere
+                    // an expression was expected, since only it knows
+                    // whether this `=` is following a keyword name.
+                    tokens.push(Token::simple(TokenKind::Equals)); i += 1;
                 }
             }
             '!' => {
@@ -302,13 +311,17 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_bare_equals_is_error() {
-        // Arrange / Act
-        let err = tokenize("a = b").unwrap_err();
+    fn tokenize_bare_equals_is_a_single_equals_token() {
+        // Arrange / Act — C2 §3.2, R143 item 1: a bare `=` is a keyword
+        // argument's separator, no longer a hard tokenizer error (the
+        // "did you mean ==?" message moved to the parser, which alone
+        // knows whether an `=` it hits is a keyword name's separator or
+        // truly misplaced — see `parse::tests::parse_bare_equals_...`).
+        let toks = tokenize("a = b").unwrap();
 
-        // Assert — mirrors Dart: "did you mean ==?"
-        assert_eq!(err.kind, MathEvalErrorKind::Parse);
-        assert!(err.message.contains("=="));
+        // Assert
+        assert_eq!(kinds("a = b"), vec![TokenKind::Ident, TokenKind::Equals, TokenKind::Ident, TokenKind::Eof]);
+        assert_eq!(toks[1].kind, TokenKind::Equals);
     }
 
     #[test]

@@ -363,12 +363,16 @@ pub fn eval(
             let r = eval(right, lookup, lap_ctx)?;
             apply_binary(*op, l, r)
         }
-        Ast::Call { name, args } => {
+        Ast::Call { name, args, kwargs } => {
             let argv: Vec<Value> = args
                 .iter()
                 .map(|a| eval(a, lookup, lap_ctx))
                 .collect::<Result<_, _>>()?;
-            call_function(name, argv, lookup, lap_ctx)
+            let kwargv: Kwargs = kwargs
+                .iter()
+                .map(|(k, a)| Ok((k.clone(), eval(a, lookup, lap_ctx)?)))
+                .collect::<Result<_, _>>()?;
+            call_function(name, argv, &kwargv, lookup, lap_ctx)
         }
     }
 }
@@ -848,17 +852,160 @@ fn dart_sign(x: f64) -> f64 {
     }
 }
 
+/// A parsed call's keyword arguments (C2 §3.2, R143 item 1), already
+/// evaluated to [`Value`]s — `Ast::Call::kwargs` after `eval` has run each
+/// value expression. Empty for a call written with none; keyword arguments
+/// are always additive, never required.
+type Kwargs = HashMap<String, Value>;
+
+/// Looks up `key` in `kwargs`, requiring it not *also* be supplied
+/// positionally in the same call (`positional_present`) — C2 §3.2's "bound
+/// both positionally and by keyword" rule. This can't live in the parser: a
+/// parser sees only a position index, never which parameter name that
+/// position maps to for a specific function. Returns `Ok(None)` when the
+/// caller didn't use the keyword form at all.
+fn take_kwarg<'a>(
+    fn_name: &str,
+    key: &str,
+    positional_present: bool,
+    kwargs: &'a Kwargs,
+) -> Result<Option<&'a Value>, MathEvalError> {
+    match kwargs.get(key) {
+        Some(_) if positional_present => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{fn_name}: \"{key}\" was given both positionally and by keyword"),
+        )),
+        found => Ok(found),
+    }
+}
+
+/// C2 §3.2's third keyword-argument rule: every name in `kwargs` must be
+/// one of `accepted` — an unknown keyword is a typed error, never silently
+/// dropped (a false friend in parameter form, plan §2). Call once per
+/// function, before inspecting any individual keyword.
+fn reject_unknown_kwargs(fn_name: &str, kwargs: &Kwargs, accepted: &[&str]) -> Result<(), MathEvalError> {
+    for key in kwargs.keys() {
+        if !accepted.contains(&key.as_str()) {
+            return Err(err(
+                MathEvalErrorKind::Runtime,
+                format!("{fn_name}: unknown keyword argument \"{key}\" (accepts: {})", accepted.join(", ")),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Functions with a documented keyword form (C2 §3.2) — grows as later
+/// tasks add one (`dim=` reductions, task 12). Every other function rejects
+/// any `kwargs` outright in [`call_function`]'s entry guard below, rather
+/// than each arm needing its own "I take no keywords" check.
+const KWARG_AWARE_FUNCTIONS: &[&str] = &["mean", "periodogram", "welch"];
+
+/// A keyword argument's string value, or `default` when the caller didn't
+/// supply it. Every `periodogram`/`welch` keyword is optional (scipy-style
+/// defaults) — none of them also has a positional form, so there is no
+/// "bound both ways" case to check here (unlike `mean`'s `window=`).
+fn kwarg_string<'a>(fn_name: &str, kwargs: &'a Kwargs, key: &str, default: &'static str) -> Result<&'a str, MathEvalError> {
+    match kwargs.get(key) {
+        Some(v) => require_string(v, fn_name),
+        None => Ok(default),
+    }
+}
+
+/// `periodogram`/`welch`'s `window=` (scipy names): `"boxcar"` is scipy's
+/// spelling for a rectangular window, kept alongside the legacy `fft()`
+/// arm's `"rect"`/`"rectangular"` so an already-migrated call still parses.
+fn parse_fft_window(s: &str, fn_name: &str) -> Result<crate::fft::FftWindow, MathEvalError> {
+    use crate::fft::FftWindow;
+    match s {
+        "hann" => Ok(FftWindow::Hann),
+        "hamming" => Ok(FftWindow::Hamming),
+        "rect" | "rectangular" | "boxcar" => Ok(FftWindow::Rectangular),
+        other => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{fn_name}: unknown window \"{other}\"; expected \"hann\", \"hamming\", or \"boxcar\""),
+        )),
+    }
+}
+
+/// `periodogram`/`welch`'s `detrend=` (scipy names `"constant"`/`"linear"`
+/// — scipy's boolean `False` becomes the string `"none"` here, since the
+/// language has no boolean literal).
+fn parse_fft_detrend(s: &str, fn_name: &str) -> Result<crate::fft::Detrend, MathEvalError> {
+    use crate::fft::Detrend;
+    match s {
+        "constant" => Ok(Detrend::Mean),
+        "linear" => Ok(Detrend::Linear),
+        "none" => Ok(Detrend::None),
+        other => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{fn_name}: unknown detrend \"{other}\"; expected \"constant\", \"linear\", or \"none\""),
+        )),
+    }
+}
+
+/// `periodogram`/`welch`'s `scaling=`. `"density"`/`"spectrum"` are scipy's
+/// own two values; `"raw_magnitude"` is deliberately not one of them (R151
+/// item 1) — it names the un-normalised value the legacy `fft()` computed,
+/// which the migration pins every existing call to so no workbook's
+/// numbers move.
+fn parse_fft_scaling(s: &str, fn_name: &str) -> Result<crate::fft::Scaling, MathEvalError> {
+    use crate::fft::Scaling;
+    match s {
+        "density" => Ok(Scaling::Density),
+        "spectrum" => Ok(Scaling::Spectrum),
+        "raw_magnitude" => Ok(Scaling::Magnitude),
+        other => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{fn_name}: unknown scaling \"{other}\"; expected \"density\", \"spectrum\", or \"raw_magnitude\""),
+        )),
+    }
+}
+
+/// `welch`'s `average=`. `"mean"`/`"median"` are scipy's own two values;
+/// `"max"`/`"none"` are idl1 extensions beyond scipy's API (ruling R63 (3))
+/// — kept reachable under the same keyword since they already existed on
+/// [`crate::fft::Averaging`], per R143's "diverge deliberately where not
+/// equivalent" rather than dropping them to fit scipy's smaller surface.
+fn parse_fft_averaging(s: &str, fn_name: &str) -> Result<crate::fft::Averaging, MathEvalError> {
+    use crate::fft::Averaging;
+    match s {
+        "mean" => Ok(Averaging::Mean),
+        "median" => Ok(Averaging::Median),
+        "max" => Ok(Averaging::Max),
+        "none" => Ok(Averaging::None),
+        other => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{fn_name}: unknown average \"{other}\"; expected \"mean\", \"median\", \"max\", or \"none\""),
+        )),
+    }
+}
+
 /// Function-call dispatch. Arms are grouped by task (A6 DSP; A7 stats; A8
 /// elementwise/trig; A9 clamp/if/stubs; A10 lap-aware).
 fn call_function(
     name: &str,
     args: Vec<Value>,
+    kwargs: &Kwargs,
     lookup: &dyn ChannelLookup,
     lap_ctx: &MathLapContext,
 ) -> Result<Value, MathEvalError> {
+    if !kwargs.is_empty() && !KWARG_AWARE_FUNCTIONS.contains(&name) {
+        let mut unknown: Vec<&str> = kwargs.keys().map(String::as_str).collect();
+        unknown.sort_unstable();
+        return Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{name}: unknown keyword argument \"{}\" — {name} takes no keyword arguments", unknown[0]),
+        ));
+    }
     match name {
         // ---- A6: DSP-backed ----
-        "integrate" => {
+        // `cumtrapz` is a permanent second spelling, not a deprecated one —
+        // scipy itself carries both (`scipy.integrate.cumulative_trapezoid`
+        // and the older `cumtrapz`), so matching that costs nothing (R151
+        // item 6). Retired from `integrate` (R143): gratuitous rename, no
+        // behaviour change.
+        "cumulative_trapezoid" | "cumtrapz" => {
             require_arg_count(name, &args, 1)?;
             let ch = require_channel(&args[0], name)?;
             Ok(channel(
@@ -913,31 +1060,80 @@ fn call_function(
                 )),
             }
         }
-        "fft" => {
-            require_arg_count(name, &args, 2)?;
+        // `fft` is retired (R146/R151 item 1, plan §1 row 3): it was never a
+        // true FFT surface, it was one un-normalised windowed magnitude
+        // spectrum with no segmentation or averaging — a false friend on
+        // top of a real inconsistency with the charts' `welch()`. Split
+        // into `periodogram` (this function's single-segment shape,
+        // scipy-named and scipy-scaled) and `welch` (segmented/averaged,
+        // what the charts already compute). A `version: 3` call migrates in
+        // memory to `periodogram(ch, window=.., scaling="raw_magnitude")`
+        // before it ever reaches here (plan §3.3) — no existing workbook's
+        // numbers move. `fft` itself is reserved for a future true complex
+        // DFT and dispatches nowhere below, so it now falls to the
+        // catch-all's [`unknown_function_error`], which names its
+        // replacement via [`crate::math::math_name_migrations`].
+        "periodogram" => {
+            require_arg_count(name, &args, 1)?;
+            reject_unknown_kwargs(name, kwargs, &["window", "detrend", "scaling"])?;
             let ch = require_channel(&args[0], name)?;
-            let window_str = require_string(&args[1], name)?;
-            let window = match window_str {
-                "hann" => crate::fft::FftWindow::Hann,
-                "hamming" => crate::fft::FftWindow::Hamming,
-                "rect" | "rectangular" => crate::fft::FftWindow::Rectangular,
-                other => {
-                    return Err(err(
-                        MathEvalErrorKind::Runtime,
-                        format!(
-                            "fft: unknown window \"{other}\"; expected \"hann\", \"hamming\", or \"rect\""
-                        ),
-                    ))
-                }
-            };
-            // Single-spectrum fft is a reduction (R123/R124): the selected
-            // window's samples only, so a lap's spectrum is the lap's
-            // spectrum, not the session's.
+            let window = parse_fft_window(kwarg_string(name, kwargs, "window", "boxcar")?, name)?;
+            let detrend = parse_fft_detrend(kwarg_string(name, kwargs, "detrend", "constant")?, name)?;
+            let scaling = parse_fft_scaling(kwarg_string(name, kwargs, "scaling", "density")?, name)?;
+            // Single-spectrum reduction (R123/R124): the selected window's
+            // samples only, so a lap's spectrum is the lap's spectrum, not
+            // the session's. `nperseg: 0` / `noverlap: 0` resolve to one
+            // full-record segment (`resolve_seg`), reproducing scipy's
+            // `periodogram` exactly; `averaging` is irrelevant with exactly
+            // one segment.
             let (start, end) = window_index_range(lap_ctx, ch.sample_rate_hz, ch.samples.len());
-            // Output is n/2+1 bins; preserve the original rate so the caller can
-            // compute freq[k] = k * sample_rate_hz / n. Bins are not per-sample
-            // time — no t_us axis applies (empty, not ch's, per L3-R12).
-            Ok(channel(crate::fft::fft(&ch.samples[start..end], window), ch.sample_rate_hz, Arc::from(&[] as &[i64])))
+            let result = crate::fft::welch(
+                ch.samples[start..end].to_vec(),
+                ch.sample_rate_hz,
+                window,
+                0,
+                0,
+                detrend,
+                crate::fft::Averaging::Mean,
+                scaling,
+            );
+            // Output is n/2+1 bins; preserve the original rate so the caller
+            // can compute freq[k] = k * sample_rate_hz / n. Bins are not
+            // per-sample time — no t_us axis applies (empty, not ch's, per
+            // L3-R12).
+            Ok(channel(result.values, ch.sample_rate_hz, Arc::from(&[] as &[i64])))
+        }
+        "welch" => {
+            require_arg_count(name, &args, 1)?;
+            reject_unknown_kwargs(name, kwargs, &["window", "nperseg", "noverlap", "detrend", "average", "scaling"])?;
+            let ch = require_channel(&args[0], name)?;
+            let (start, end) = window_index_range(lap_ctx, ch.sample_rate_hz, ch.samples.len());
+            let n = end - start;
+            let window = parse_fft_window(kwarg_string(name, kwargs, "window", "hann")?, name)?;
+            // scipy's own `welch` defaults: `nperseg` is 256 samples (or the
+            // whole record if shorter), `noverlap` is half of `nperseg`.
+            let nperseg = match kwargs.get("nperseg") {
+                Some(v) => require_scalar(v, name)?.round().max(0.0) as usize,
+                None => n.min(256),
+            };
+            let noverlap = match kwargs.get("noverlap") {
+                Some(v) => require_scalar(v, name)?.round().max(0.0) as usize,
+                None => nperseg / 2,
+            };
+            let detrend = parse_fft_detrend(kwarg_string(name, kwargs, "detrend", "constant")?, name)?;
+            let average = parse_fft_averaging(kwarg_string(name, kwargs, "average", "mean")?, name)?;
+            let scaling = parse_fft_scaling(kwarg_string(name, kwargs, "scaling", "density")?, name)?;
+            let result = crate::fft::welch(
+                ch.samples[start..end].to_vec(),
+                ch.sample_rate_hz,
+                window,
+                nperseg,
+                noverlap,
+                detrend,
+                average,
+                scaling,
+            );
+            Ok(channel(result.values, ch.sample_rate_hz, Arc::from(&[] as &[i64])))
         }
         "declip" => {
             require_arg_count(name, &args, 1)?;
@@ -955,6 +1151,20 @@ fn call_function(
             let ch = require_channel(&args[0], name)?;
             Ok(channel(
                 crate::statistics::differentiate(&ch.samples, ch.sample_rate_hz),
+                ch.sample_rate_hz,
+                ch.t_us,
+            ))
+        }
+        // numpy.gradient's own central-difference formula (R151 item 3) —
+        // `differentiate` keeps its distinct, causal-difference meaning
+        // rather than being renamed to this name (see `differentiate`'s own
+        // doc comment for why changing the implementation under the name
+        // would have been the wrong fix).
+        "gradient" => {
+            require_arg_count(name, &args, 1)?;
+            let ch = require_channel(&args[0], name)?;
+            Ok(channel(
+                crate::statistics::gradient(&ch.samples, ch.sample_rate_hz),
                 ch.sample_rate_hz,
                 ch.t_us,
             ))
@@ -1007,15 +1217,27 @@ fn call_function(
         }
         "mean" => {
             // 1-arg → scalar aggregate (windowed, R123/R124); 2-arg → rolling
-            // mean over a sample-count window (unaffected).
-            if args.len() == 1 {
-                let (samples, s, e) = one_channel_windowed(&args, "mean", lap_ctx)?;
-                Ok(Value::Scalar(crate::math::aggregate::mean(&samples[s..e])))
-            } else {
-                require_arg_count(name, &args, 2)?;
-                let ch = require_channel(&args[0], name)?;
-                let w = require_scalar(&args[1], name)?.round().max(0.0) as usize;
-                Ok(channel(crate::statistics::rolling_mean(&ch.samples, w), ch.sample_rate_hz, ch.t_us))
+            // mean over a sample-count window (unaffected). `mean(x,
+            // window=w)` (C2 §3.2, R143 item 1) is a non-overloaded spelling
+            // of the same rolling form, additive to the positional one.
+            reject_unknown_kwargs(name, kwargs, &["window"])?;
+            let window_kw = take_kwarg(name, "window", args.len() >= 2, kwargs)?;
+            match (args.len(), window_kw) {
+                (1, None) => {
+                    let (samples, s, e) = one_channel_windowed(&args, "mean", lap_ctx)?;
+                    Ok(Value::Scalar(crate::math::aggregate::mean(&samples[s..e])))
+                }
+                (1, Some(w_val)) => {
+                    let ch = require_channel(&args[0], name)?;
+                    let w = require_scalar(w_val, name)?.round().max(0.0) as usize;
+                    Ok(channel(crate::statistics::rolling_mean(&ch.samples, w), ch.sample_rate_hz, ch.t_us))
+                }
+                _ => {
+                    require_arg_count(name, &args, 2)?;
+                    let ch = require_channel(&args[0], name)?;
+                    let w = require_scalar(&args[1], name)?.round().max(0.0) as usize;
+                    Ok(channel(crate::statistics::rolling_mean(&ch.samples, w), ch.sample_rate_hz, ch.t_us))
+                }
             }
         }
         "std" => {
@@ -1127,14 +1349,16 @@ fn call_function(
                 Err(err(MathEvalErrorKind::NotImplemented, "not yet implemented: median".to_string()))
             }
         }
-        "p" => {
-            // p(channel, quantile) → linear-interpolated percentile (quantile
-            // in 0..=100), windowed per R123/R124.
+        // Retired from `p` (R143): gratuitous rename — matches
+        // `numpy.percentile`'s name, not just its behaviour.
+        "percentile" => {
+            // percentile(channel, quantile) → linear-interpolated percentile
+            // (quantile in 0..=100), windowed per R123/R124.
             if args.len() != 2 {
-                return Err(err(MathEvalErrorKind::ArgCount, "p(channel, quantile) takes 2 args"));
+                return Err(err(MathEvalErrorKind::ArgCount, "percentile(channel, quantile) takes 2 args"));
             }
-            let ch = require_channel(&args[0], "p")?;
-            let q = require_scalar(&args[1], "p quantile")?;
+            let ch = require_channel(&args[0], "percentile")?;
+            let q = require_scalar(&args[1], "percentile quantile")?;
             let (start, end) = window_index_range(lap_ctx, ch.sample_rate_hz, ch.samples.len());
             Ok(Value::Scalar(crate::math::aggregate::percentile(&ch.samples[start..end], q)))
         }
@@ -1144,8 +1368,10 @@ fn call_function(
             elemwise(it.next().unwrap(), it.next().unwrap(), "atan2", |a, b| Ok(a.atan2(b)))
         }
 
-        // ---- A9: clamp, if, deferred stubs ----
-        "clamp" => {
+        // ---- A9: clip, where, deferred stubs ----
+        // Retired from `clamp` (R143): gratuitous rename — matches
+        // `numpy.clip`'s name, not just its behaviour.
+        "clip" => {
             require_arg_count(name, &args, 3)?;
             let ch = require_channel(&args[0], name)?;
             let lo = require_scalar(&args[1], name)?;
@@ -1159,23 +1385,36 @@ fn call_function(
             if !(lo <= hi) {
                 return Err(err(
                     MathEvalErrorKind::Runtime,
-                    format!("clamp: lo ({lo}) and hi ({hi}) must not be NaN, and lo must be <= hi"),
+                    format!("clip: lo ({lo}) and hi ({hi}) must not be NaN, and lo must be <= hi"),
                 ));
             }
             let out = ch.samples.iter().map(|&x| x.clamp(lo, hi)).collect();
             Ok(channel(out, ch.sample_rate_hz, ch.t_us))
         }
-        "if" => {
+        // Retired from `if` (R143): gratuitous rename — matches
+        // `numpy.where`'s name. Also widens `cond` to accept a scalar
+        // (additive, plan §1 row 7): `numpy.where` never requires its
+        // condition to be array-shaped, and a scalar `cond` selecting a
+        // whole branch (rather than per-sample) is a strict superset of the
+        // old `if(cond,t,f)` behaviour — every existing per-sample call
+        // still takes the channel-cond path below, unchanged.
+        "where" => {
             require_arg_count(name, &args, 3)?;
-            let cond = require_channel(&args[0], "if(cond,t,f) — cond")?;
+            if let Value::Scalar(c) = &args[0] {
+                let cond_true = *c != 0.0;
+                let mut it = args.into_iter();
+                let (_cond, t, f) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+                return Ok(if cond_true { t } else { f });
+            }
+            let cond = require_channel(&args[0], "where(cond,t,f) — cond")?;
             let n = cond.samples.len();
             // L3-R33: cond's t_us no longer wins by default — it is folded via
             // combine_t_us against the t/f operands' own axes too (a scalar
             // operand contributes no axis, i.e. empty). Equal-or-empty passes
             // through; a genuine mismatch is the same typed Runtime error
             // combine_t_us already gives elemwise(), naming both spans.
-            let t_us = combine_t_us("if(cond,t,f)", &cond.t_us, &value_t_us(&args[1]))?;
-            let t_us = combine_t_us("if(cond,t,f)", &t_us, &value_t_us(&args[2]))?;
+            let t_us = combine_t_us("where(cond,t,f)", &cond.t_us, &value_t_us(&args[1]))?;
+            let t_us = combine_t_us("where(cond,t,f)", &t_us, &value_t_us(&args[2]))?;
             let mut out = vec![0.0; n];
             for i in 0..n {
                 out[i] = if cond.samples[i] != 0.0 {
@@ -1312,17 +1551,17 @@ fn call_function(
         // elementwise mean across all N (mean_across_overlays, R73) — a rider
         // comparing against several ghosts sees the average deviation, not
         // just the first ghost's.
-        "variance_time" => {
+        "lap_delta_time" => {
             require_arg_count(name, &args, 1)?;
             if lap_ctx.overlay.is_empty() || lap_ctx.main_lap_number.is_none() {
                 return Err(err(
                     MathEvalErrorKind::NoLapContext,
-                    "variance_time(): requires a main lap AND at least one overlay lap to be \
+                    "lap_delta_time(): requires a main lap AND at least one overlay lap to be \
                      designated. Pick both in the Analyze lap table.",
                 ));
             }
             let (main_samples, main_rate, main_t_us, channel_id) =
-                require_ref_channel(&args[0], "variance_time")?;
+                require_ref_channel(&args[0], "lap_delta_time")?;
             let window = main_lap_window(lap_ctx);
             let mut series = Vec::with_capacity(lap_ctx.overlay.len());
             for overlay in &lap_ctx.overlay {
@@ -1347,17 +1586,17 @@ fn call_function(
                 t_us: main_t_us,
             }))
         }
-        "variance_dist" => {
+        "lap_delta_dist" => {
             require_arg_count(name, &args, 1)?;
             if lap_ctx.overlay.is_empty() || lap_ctx.main_lap_number.is_none() {
                 return Err(err(
                     MathEvalErrorKind::NoLapContext,
-                    "variance_dist(): requires a main lap AND at least one overlay lap to be \
+                    "lap_delta_dist(): requires a main lap AND at least one overlay lap to be \
                      designated. Pick both in the Analyze lap table.",
                 ));
             }
             let (main_samples, main_rate, main_t_us, channel_id) =
-                require_ref_channel(&args[0], "variance_dist")?;
+                require_ref_channel(&args[0], "lap_delta_dist")?;
             let window = main_lap_window(lap_ctx);
             let mut series = Vec::with_capacity(lap_ctx.overlay.len());
             for overlay in &lap_ctx.overlay {
@@ -1428,7 +1667,11 @@ fn call_function(
             require_arg_count(name, &args, 1)?;
             crate::math::vector::normalize(&args[0], name)
         }
-        "angle" => {
+        // Retired as `angle` (R143/R151 item 4): `numpy.angle` is complex
+        // phase, not the angle between two vectors — a false friend.
+        // `vector::angle`'s own Rust fn name is unchanged (internal, R151's
+        // "internal fn names may stay" precedent from `variance_geom.rs`).
+        "angle_between" => {
             require_arg_count(name, &args, 2)?;
             crate::math::vector::angle(&args[0], &args[1], name)
         }
@@ -1456,7 +1699,30 @@ fn call_function(
             crate::math::vector::rotate_euler(&args[0], &args[1], &args[2], &args[3], name)
         }
 
-        _ => Err(err(MathEvalErrorKind::UnknownFunction, format!("unknown function \"{name}\""))),
+        _ => Err(unknown_function_error(name)),
+    }
+}
+
+/// [`MathEvalErrorKind::UnknownFunction`] for an unrecognised call name —
+/// drawn from [`crate::math::math_name_migrations`] when `name` is a
+/// retired spelling (plan §3.3, C2 §3.8), so the error stays helpful after
+/// the one-revision compatibility window closes rather than just saying the
+/// name doesn't exist. A `version: 3` document never reaches this arm for a
+/// retired name at all — `migrate_document` rewrites it in memory before
+/// evaluation (plan §3.3) — so every call here is either a genuine typo or
+/// a `version: 4` document deliberately reusing a name the language retired
+/// (R151 item 10: never silently accepted).
+fn unknown_function_error(name: &str) -> MathEvalError {
+    match crate::math::math_name_migrations().iter().find(|m| m.old == name) {
+        // `fft` retired to two functions, not one (R146) — `new` is only
+        // the migration's own rewrite target (`periodogram`, the shape that
+        // reproduces `fft`'s old numbers); the error names both, since a
+        // v4-only author reaching for `fft` may equally want `welch`.
+        Some(m) if m.old == "fft" => {
+            err(MathEvalErrorKind::UnknownFunction, "\"fft\" was retired — see \"periodogram\" / \"welch\"")
+        }
+        Some(m) => err(MathEvalErrorKind::UnknownFunction, format!("\"{name}\" was retired — see \"{}\"", m.new)),
+        None => err(MathEvalErrorKind::UnknownFunction, format!("unknown function \"{name}\"")),
     }
 }
 
@@ -1884,15 +2150,148 @@ mod tests {
     }
 
     #[test]
-    fn fft_unknown_window_errors() {
+    fn fft_is_retired_and_names_both_replacements() {
+        // Arrange — R146/R151 item 1, plan §1 row 3: `fft` is retired and
+        // reserved, never a second dispatch arm.
+        let lk = lookup(&[("a", vec![0.0; 8], 100.0)]);
+
+        // Act
+        let err = eval_expr("fft([a], \"hann\")", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::UnknownFunction);
+        assert!(err.message.contains("periodogram"), "{}", err.message);
+        assert!(err.message.contains("welch"), "{}", err.message);
+    }
+
+    #[test]
+    fn periodogram_raw_magnitude_scaling_reproduces_the_legacy_ffts_numbers_exactly() {
+        // Arrange — R151 item 1: the exact combination the migration pins
+        // an existing `fft(ch, window)` call to, so this must reproduce the
+        // legacy `crate::fft::fft` bin-for-bin.
+        let samples = vec![1.0, 2.0, -1.0, 0.5, 3.0, -2.0, 1.5, 0.0];
+        let lk = lookup(&[("a", samples.clone(), 100.0)]);
+
+        // Act
+        let v = eval_expr(
+            "periodogram([a], window=\"hann\", detrend=\"none\", scaling=\"raw_magnitude\")",
+            &lk,
+        )
+        .unwrap();
+
+        // Assert
+        let expected = crate::fft::fft(&samples, crate::fft::FftWindow::Hann);
+        match v {
+            Value::Channel(c) => {
+                assert_eq!(c.samples.len(), expected.len());
+                for (got, want) in c.samples.iter().zip(expected.iter()) {
+                    assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+                }
+                assert_eq!(c.sample_rate_hz, 100.0);
+                assert!(c.t_us.is_empty());
+            }
+            other => panic!("expected a channel: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn periodogram_defaults_to_scipys_own_boxcar_window_and_density_scaling() {
+        // Arrange — scipy.signal.periodogram's defaults: window="boxcar",
+        // detrend="constant", scaling="density". `"boxcar"` must resolve to
+        // the same rectangular window `"rect"`/`"rectangular"` already did.
+        let samples = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let lk = lookup(&[("a", samples, 8.0)]);
+
+        // Act
+        let default_call = eval_expr("periodogram([a])", &lk).unwrap();
+        let spelled_out = eval_expr("periodogram([a], window=\"boxcar\", detrend=\"constant\", scaling=\"density\")", &lk).unwrap();
+
+        // Assert
+        match (default_call, spelled_out) {
+            (Value::Channel(a), Value::Channel(b)) => assert_eq!(a.samples, b.samples),
+            other => panic!("expected two channels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn periodogram_unknown_window_errors() {
         // Arrange
         let lk = lookup(&[("a", vec![0.0; 8], 100.0)]);
 
         // Act
-        let err = eval_expr("fft([a], \"blackman\")", &lk).unwrap_err();
+        let err = eval_expr("periodogram([a], window=\"blackman\")", &lk).unwrap_err();
 
         // Assert
-        assert!(err.message.contains("unknown window"));
+        assert!(err.message.contains("unknown window"), "{}", err.message);
+        assert!(err.message.contains("periodogram"), "{}", err.message);
+    }
+
+    #[test]
+    fn periodogram_an_unknown_keyword_argument_is_a_typed_error() {
+        // Arrange
+        let lk = lookup(&[("a", vec![0.0; 8], 100.0)]);
+
+        // Act
+        let err = eval_expr("periodogram([a], nperseg=4)", &lk).unwrap_err();
+
+        // Assert — `nperseg` is `welch`'s keyword, not `periodogram`'s (a
+        // periodogram is single-segment by definition).
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("nperseg"), "{}", err.message);
+    }
+
+    #[test]
+    fn welch_averaging_mean_over_multiple_segments_differs_from_a_single_segment_periodogram() {
+        // Arrange — the whole reason the split exists (R146): `welch` and
+        // `periodogram` are different computations, not two names for one.
+        let n = 512;
+        let samples: Vec<f64> =
+            (0..n).map(|i| (2.0 * std::f64::consts::PI * 8.0 * i as f64 / 64.0).sin()).collect();
+        let lk = lookup(&[("a", samples, 64.0)]);
+
+        // Act
+        let periodogram = eval_expr("periodogram([a])", &lk).unwrap();
+        let welch = eval_expr("welch([a], nperseg=64, noverlap=32)", &lk).unwrap();
+
+        // Assert — different segmentation, so different bin counts.
+        match (periodogram, welch) {
+            (Value::Channel(p), Value::Channel(w)) => assert_ne!(p.samples.len(), w.samples.len()),
+            other => panic!("expected two channels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn welch_defaults_to_scipys_own_hann_window_mean_averaging_and_density_scaling() {
+        // Arrange
+        let samples: Vec<f64> = (0..300).map(|i| i as f64).collect();
+        let lk = lookup(&[("a", samples, 100.0)]);
+
+        // Act
+        let default_call = eval_expr("welch([a])", &lk).unwrap();
+        let spelled_out = eval_expr(
+            "welch([a], window=\"hann\", nperseg=256, noverlap=128, detrend=\"constant\", average=\"mean\", scaling=\"density\")",
+            &lk,
+        )
+        .unwrap();
+
+        // Assert
+        match (default_call, spelled_out) {
+            (Value::Channel(a), Value::Channel(b)) => assert_eq!(a.samples, b.samples),
+            other => panic!("expected two channels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn welch_unknown_average_value_errors() {
+        // Arrange
+        let lk = lookup(&[("a", vec![0.0; 64], 100.0)]);
+
+        // Act
+        let err = eval_expr("welch([a], average=\"rms\")", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("unknown average"), "{}", err.message);
     }
 
     #[test]
@@ -2534,7 +2933,7 @@ mod tests {
         };
 
         // Act
-        let v = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &main, &ctx)
+        let v = eval(&crate::math::parse::parse("lap_delta_time([LapTime])").unwrap(), &main, &ctx)
             .unwrap();
 
         // Assert — identity main==overlay, single-entry overlay_laps: diff ≈ 0
@@ -2597,7 +2996,7 @@ mod tests {
         };
 
         // Act
-        let v = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &main, &ctx)
+        let v = eval(&crate::math::parse::parse("lap_delta_time([LapTime])").unwrap(), &main, &ctx)
             .unwrap();
 
         // Assert — mean of (+i, -i) is ~0 in-window, not the first entry's `i`.
@@ -2655,7 +3054,7 @@ mod tests {
         };
 
         // Act
-        let v = eval(&crate::math::parse::parse("variance_dist([LapTime])").unwrap(), &main, &ctx)
+        let v = eval(&crate::math::parse::parse("lap_delta_dist([LapTime])").unwrap(), &main, &ctx)
             .unwrap();
 
         // Assert — mean of (+i, -i) is ~0 in-window, not the first entry's `i`.
@@ -2684,7 +3083,7 @@ mod tests {
         };
 
         // Act
-        let err = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &lk, &ctx)
+        let err = eval(&crate::math::parse::parse("lap_delta_time([LapTime])").unwrap(), &lk, &ctx)
             .unwrap_err();
 
         // Assert
@@ -2735,7 +3134,7 @@ mod tests {
         };
 
         // Act
-        let v = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &main, &ctx)
+        let v = eval(&crate::math::parse::parse("lap_delta_time([LapTime])").unwrap(), &main, &ctx)
             .unwrap();
 
         // Assert — the single bounds entry gates the window regardless of
@@ -2891,7 +3290,7 @@ mod tests {
         let ctx = laps_ctx(vec![(0.0, 2.0)]);
 
         // Act
-        let err = eval(&crate::math::parse::parse("variance_time([LapTime])").unwrap(), &lk, &ctx)
+        let err = eval(&crate::math::parse::parse("lap_delta_time([LapTime])").unwrap(), &lk, &ctx)
             .unwrap_err();
 
         // Assert
@@ -2929,6 +3328,7 @@ mod tests {
         let v = call_function(
             "attitude",
             vec![Value::Str("roll".into())],
+            &Kwargs::new(),
             &FakeEstimator,
             &MathLapContext::empty(),
         )
@@ -2950,6 +3350,7 @@ mod tests {
         let v = call_function(
             "body_accel",
             vec![Value::Str("lat".into())],
+            &Kwargs::new(),
             &FakeEstimator,
             &MathLapContext::empty(),
         );
@@ -2964,6 +3365,7 @@ mod tests {
         let v = call_function(
             "wheel_travel",
             vec![Value::Str("front".into())],
+            &Kwargs::new(),
             &FakeEstimator,
             &MathLapContext::empty(),
         );
@@ -2978,6 +3380,7 @@ mod tests {
         let e = call_function(
             "attitude",
             vec![Value::Str("yaw".into())],
+            &Kwargs::new(),
             &FakeEstimator,
             &MathLapContext::empty(),
         )
@@ -2995,6 +3398,7 @@ mod tests {
         let e = call_function(
             "attitude",
             vec![Value::Str("roll".into())],
+            &Kwargs::new(),
             &NoEstimator,
             &MathLapContext::empty(),
         )
@@ -3002,6 +3406,199 @@ mod tests {
 
         // Assert
         assert!(e.message.contains("IMU0"), "{}", e.message);
+    }
+
+    #[test]
+    fn clip_still_guards_against_nan_and_lo_greater_than_hi_under_its_new_name() {
+        // Arrange — R146's clamp→clip rename must not lose the panic fix
+        // (plan §4 Task 1).
+        let lk = lookup(&[("a", vec![0.0; 4], 10.0)]);
+
+        // Act
+        let err = eval_expr("clip([a], 5, 1)", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("clip"), "{}", err.message);
+    }
+
+    #[test]
+    fn percentile_dispatches_where_p_used_to() {
+        // Arrange
+        let lk = lookup(&[("a", vec![1.0, 2.0, 3.0, 4.0, 5.0], 10.0)]);
+
+        // Act
+        let v = eval_expr("percentile([a], 50)", &lk).unwrap();
+
+        // Assert
+        assert!(matches!(v, Value::Scalar(x) if (x - 3.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn where_with_a_scalar_cond_selects_the_whole_branch_additive_widening() {
+        // Arrange — plan §1 row 7: widening `cond` to accept a scalar is
+        // additive; every existing per-sample (channel-cond) call is
+        // untouched (see `where`'s own `parity_if_branch_selection`-derived
+        // coverage in `tests_parity.rs`).
+        let lk = lookup(&[("t", vec![1.0, 2.0, 3.0], 10.0), ("f", vec![4.0, 5.0, 6.0], 10.0)]);
+
+        // Act
+        let picked_t = eval_expr("where(1, [t], [f])", &lk).unwrap();
+        let picked_f = eval_expr("where(0, [t], [f])", &lk).unwrap();
+
+        // Assert
+        match (picked_t, picked_f) {
+            (Value::Channel(t), Value::Channel(f)) => {
+                assert_eq!(t.samples.as_ref(), &[1.0, 2.0, 3.0]);
+                assert_eq!(f.samples.as_ref(), &[4.0, 5.0, 6.0]);
+            }
+            other => panic!("expected two channels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cumtrapz_is_a_permanent_second_spelling_of_cumulative_trapezoid() {
+        // Arrange — R151 item 6: not deprecated, a real permanent alias.
+        let lk = lookup(&[("a", vec![0.5, 1.0, 1.5, 2.0], 10.0)]);
+
+        // Act
+        let long_form = eval_expr("cumulative_trapezoid([a])", &lk).unwrap();
+        let short_form = eval_expr("cumtrapz([a])", &lk).unwrap();
+
+        // Assert
+        match (long_form, short_form) {
+            (Value::Channel(a), Value::Channel(b)) => assert_eq!(a.samples, b.samples),
+            other => panic!("expected two channels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_cosmetic_four_retired_names_each_name_their_replacement() {
+        // Arrange / Act / Assert — R143/R151, plan §4 Task 10.
+        let lk = lookup(&[("a", vec![1.0, 2.0], 10.0)]);
+        for (old, new) in [("p", "percentile"), ("clamp", "clip"), ("if", "where"), ("integrate", "cumulative_trapezoid")] {
+            let err = eval_expr(&format!("{old}([a], [a], [a])"), &lk).unwrap_err();
+            assert_eq!(err.kind, crate::math::MathEvalErrorKind::UnknownFunction);
+            assert!(err.message.contains(new), "{old}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn angle_between_orthogonal_channels_is_half_pi() {
+        // Arrange — R143/R151 item 4: `numpy.angle` is complex phase, so
+        // the language's own angle-between-vectors function takes a
+        // deliberately different name.
+        let lk = lookup(&[("dummy", vec![0.0], 1.0)]);
+        let ast = crate::math::parse::parse(
+            "angle_between(vec(1, 0, 0), vec(0, 1, 0))",
+        )
+        .unwrap();
+
+        // Act
+        let result = eval(&ast, &lk, &no_laps()).unwrap();
+
+        // Assert
+        assert!(matches!(result, Value::Scalar(x) if (x - std::f64::consts::FRAC_PI_2).abs() < 1e-9));
+    }
+
+    #[test]
+    fn angle_is_retired_and_names_its_replacement() {
+        // Arrange / Act
+        let lk = lookup(&[("Ax", vec![1.0], 1.0)]);
+        let err = eval_expr("angle([Ax], [Ax])", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::UnknownFunction);
+        assert!(err.message.contains("angle_between"), "{}", err.message);
+    }
+
+    #[test]
+    fn unknown_function_a_genuine_typo_gets_the_plain_message() {
+        // Arrange / Act
+        let lk = lookup(&[("X", vec![1.0], 10.0)]);
+        let err = eval_expr("meen([X])", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::UnknownFunction);
+        assert!(err.message.contains("meen"), "{}", err.message);
+        assert!(!err.message.contains("retired"), "{}", err.message);
+    }
+
+    #[test]
+    fn unknown_function_a_retired_name_names_its_replacement() {
+        // Arrange — plan §3.3: a `version: 4` document reusing a retired
+        // name is a typed error naming the replacement, drawn from the
+        // same table C2 §3.8 mirrors (R151 item 10).
+        let lk = lookup(&[("X", vec![1.0], 10.0)]);
+
+        // Act
+        let err = eval_expr("variance_time([X])", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::UnknownFunction);
+        assert!(err.message.contains("variance_time"), "{}", err.message);
+        assert!(err.message.contains("lap_delta_time"), "{}", err.message);
+        assert!(err.message.contains("retired"), "{}", err.message);
+    }
+
+    #[test]
+    fn kwarg_mean_window_eq_matches_the_positional_rolling_form() {
+        // Arrange — `mean(x, window=w)` (C2 §3.2, R143 item 1) is additive
+        // to `mean(x, w)`, never a replacement — same result either way.
+        let lk = lookup(&[("X", vec![1.0, 2.0, 3.0, 4.0], 10.0)]);
+
+        // Act
+        let positional = eval_expr("mean([X], 2)", &lk).unwrap();
+        let keyword = eval_expr("mean([X], window=2)", &lk).unwrap();
+
+        // Assert
+        match (positional, keyword) {
+            (Value::Channel(a), Value::Channel(b)) => assert_eq!(a.samples, b.samples),
+            other => panic!("expected two channels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kwarg_mean_an_unrecognised_keyword_name_is_a_typed_error_naming_the_function() {
+        // Arrange — C2 §3.2's third binding rule: an unknown keyword is
+        // never silently dropped.
+        let lk = lookup(&[("X", vec![1.0, 2.0, 3.0], 10.0)]);
+
+        // Act
+        let err = eval_expr("mean([X], prominence=2)", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("mean"), "{}", err.message);
+        assert!(err.message.contains("prominence"), "{}", err.message);
+    }
+
+    #[test]
+    fn kwarg_mean_bound_both_positionally_and_by_keyword_is_a_typed_error() {
+        // Arrange — the second binding rule: a parameter can't be given
+        // both ways in the same call.
+        let lk = lookup(&[("X", vec![1.0, 2.0, 3.0], 10.0)]);
+
+        // Act
+        let err = eval_expr("mean([X], 2, window=3)", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("both positionally and by keyword"), "{}", err.message);
+    }
+
+    #[test]
+    fn kwarg_a_function_with_no_keyword_form_rejects_any_keyword_argument() {
+        // Arrange — every function not in `KWARG_AWARE_FUNCTIONS` rejects
+        // any `kwargs` at `call_function`'s entry guard, not per-arm.
+        let lk = lookup(&[("X", vec![1.0, 2.0, 3.0], 10.0)]);
+
+        // Act
+        let err = eval_expr("abs([X], scale=2)", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("scale"), "{}", err.message);
     }
 
     #[test]

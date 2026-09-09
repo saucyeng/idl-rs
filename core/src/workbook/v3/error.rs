@@ -149,7 +149,7 @@ pub fn missing_front_matter_id() -> WorkbookError {
 pub fn unsupported_workbook_version(n: u32) -> WorkbookError {
     WorkbookError::front_matter(
         WorkbookErrorKind::UnsupportedWorkbookVersion,
-        format!("Workbook version {n} is not supported (expected 3)"),
+        format!("Workbook version {n} is not supported (expected 3 or 4)"),
     )
 }
 
@@ -255,7 +255,7 @@ mod tests {
         let e = unsupported_workbook_version(5);
 
         // Assert
-        assert_eq!(e.message, "Workbook version 5 is not supported (expected 3)");
+        assert_eq!(e.message, "Workbook version 5 is not supported (expected 3 or 4)");
         assert_eq!(e.kind, WorkbookErrorKind::UnsupportedWorkbookVersion);
         assert_eq!(e.cell_id, "front-matter");
     }

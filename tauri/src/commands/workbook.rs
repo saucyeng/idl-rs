@@ -174,6 +174,29 @@ pub struct LapContext {
     pub overlay_laps: Vec<u32>,
 }
 
+/// One retired function name rewritten by [`save_workbook_via`] (applied) or
+/// [`read_workbook_via`] (pending — not yet written) — wire shape for
+/// [`idl_rs::math::DocumentRename`] (C2 §3.8, plan §3.2). `line` is 1-based,
+/// scoped to the cell named by `cell_id` (see `DocumentRename`'s own doc
+/// comment for what it is 1-based *within*).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RenamedFunction {
+    /// The fence's `id=hex8` (C2 §2.2) the rename was found in.
+    pub cell_id: String,
+    /// u32, 1-based.
+    pub line: u32,
+    /// The retired spelling that was found.
+    pub old: String,
+    /// What it was rewritten to.
+    pub new: String,
+}
+
+impl From<idl_rs::math::DocumentRename> for RenamedFunction {
+    fn from(r: idl_rs::math::DocumentRename) -> Self {
+        Self { cell_id: r.cell_id, line: r.line as u32, old: r.old, new: r.new }
+    }
+}
+
 /// `save_workbook`'s return (C3 §3.4).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SaveResult {
@@ -181,6 +204,12 @@ pub struct SaveResult {
     pub hash: String,
     /// i64, wall-clock at the moment the write completed.
     pub saved_utc_ms: i64,
+    /// Retired function names this save rewrote to their current spelling
+    /// (R151 item 9, C2 §3.8) — `[]` when the document carried none. The
+    /// bytes actually written (and hashed into `hash` above) are the
+    /// *migrated* markdown, never the caller's original text with an old
+    /// name still in it.
+    pub migrations: Vec<RenamedFunction>,
 }
 
 /// One file-watcher event for a subscribed workbook (C3 §3.4, design §7).
@@ -315,6 +344,15 @@ pub struct WorkbookSource {
     pub hash: String,
     /// Absolute path, under `<data>/workbooks/`.
     pub path: String,
+    /// Retired function names this file would be rewritten to on the next
+    /// save (R151 item 9's passive on-open notice, plan §3.2) — `[]` when
+    /// `markdown` carries none, including every `version: 4` document.
+    /// Read-only: nothing here has been written, and this list plays no
+    /// part in `hash` (`markdown` above is unmigrated). Computed with
+    /// [`idl_rs::math::migrate_document`], which never fails a malformed
+    /// front matter (it just reports no migrations) — so it cannot regress
+    /// this command's "read anyway" contract described below.
+    pub pending_migrations: Vec<RenamedFunction>,
 }
 
 /// Transport-agnostic core of `read_workbook`. Deliberately does **not**
@@ -328,7 +366,9 @@ fn read_workbook_via(data_dir: &Path, id_or_path: &str) -> Result<WorkbookSource
     let markdown = std::fs::read_to_string(&path)
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
     let hash = sha256_hex(markdown.as_bytes());
-    Ok(WorkbookSource { markdown, hash, path: path.display().to_string() })
+    let (_, pending) = idl_rs::math::migrate_document(&markdown);
+    let pending_migrations = pending.into_iter().map(RenamedFunction::from).collect();
+    Ok(WorkbookSource { markdown, hash, path: path.display().to_string(), pending_migrations })
 }
 
 /// The "no session bound" `ChannelLookup` (ledger R41): every `[Channel]`
@@ -699,9 +739,12 @@ fn table_cell_value(kind: CellKindToken, cell_doc: &CellDoc, session_bound: bool
 }
 
 /// Transport-agnostic core of `save_workbook`. Order of operations (C4 §4):
-/// resolve the target, parse (an `Err` writes nothing), hash, register the
+/// resolve the target, parse (an `Err` writes nothing), migrate any retired
+/// function name to its current spelling (R151 item 9), hash, register the
 /// expected hash **before** the write (step 3's load-bearing ordering), then
-/// `write_atomic`.
+/// `write_atomic`. `hash` and the written bytes are always the *migrated*
+/// markdown — a caller-supplied `based_on_hash` still refers to the file's
+/// previous on-disk bytes, never to this call's own input.
 fn save_workbook_via(
     data_dir: &Path,
     hashes: &ExpectedHashSet,
@@ -718,6 +761,16 @@ fn save_workbook_via(
     let Ok((doc, _)) = parse_workbook(markdown) else {
         return Err(IpcError::new(IpcErrorKind::InvalidArgument, "workbook markdown front matter failed to parse"));
     };
+
+    // Step 1b (R151 item 9, plan §3.2): rewrite any retired function name to
+    // its current spelling — save is the only door this happens through
+    // (opening a workbook is not consent to modify it, decision 75). A no-op
+    // (same bytes back, empty `migrations`) on a document that carries none,
+    // including every `version: 4` document (`migrate_document` only acts on
+    // `version: 3`). `doc.id`/`doc.name` above are unaffected by a rename, so
+    // the target-resolution step below still uses the original parse.
+    let (markdown, migrations) = idl_rs::math::migrate_document(markdown);
+    let markdown = markdown.as_str();
 
     // Step 2: resolve the target. `id` matches an existing workbook (path or
     // scanned front-matter id) whenever one exists; when it does not *and*
@@ -763,7 +816,7 @@ fn save_workbook_via(
 
     let saved_utc_ms =
         SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    Ok(SaveResult { hash, saved_utc_ms })
+    Ok(SaveResult { hash, saved_utc_ms, migrations: migrations.into_iter().map(RenamedFunction::from).collect() })
 }
 
 /// After writing `target` (a `.idl1wb` file, from `create_workbook_via` or
@@ -1019,6 +1072,12 @@ pub struct MathBuiltinDto {
     /// `unit_rule` field — dropped by that ruling, no source defines its
     /// vocabulary).
     pub status: String,
+    /// Retired names that now migrate to this one (C2 §3.8), drawn from
+    /// [`idl_rs::math::math_name_migrations`] — added so the notebook's
+    /// function reference and completion catalog can show "was `X`"
+    /// (plan `runs/2026-09-08/scipy-alignment-plan.md` §4 Task 3). `[]` for
+    /// every function nothing was ever renamed from.
+    pub renamed_from: Vec<String>,
 }
 
 impl From<&idl_rs::math::MathBuiltin> for MathBuiltinDto {
@@ -1027,7 +1086,12 @@ impl From<&idl_rs::math::MathBuiltin> for MathBuiltinDto {
             idl_rs::math::MathBuiltinStatus::Implemented => "implemented",
             idl_rs::math::MathBuiltinStatus::NotImplemented => "not_implemented",
         };
-        Self { name: b.name.to_string(), arity: b.arity.to_vec(), status: status.to_string() }
+        let renamed_from = idl_rs::math::math_name_migrations()
+            .iter()
+            .filter(|m| m.new == b.name)
+            .map(|m| m.old.to_string())
+            .collect();
+        Self { name: b.name.to_string(), arity: b.arity.to_vec(), status: status.to_string(), renamed_from }
     }
 }
 
@@ -1271,6 +1335,48 @@ mod tests {
         // Assert
         assert_eq!(source.markdown, markdown);
         assert_eq!(source.hash, sha256_hex(markdown.as_bytes()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_workbook_via_a_retired_function_name_is_reported_pending_but_not_written() {
+        // Arrange — R151 item 9's passive on-open notice: `read_workbook`
+        // reports what a save *would* rewrite, without touching the file.
+        let root = temp_root();
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Fork tuning\nversion: 3\n---\n\n```math id=aaaaaaaa\nv = variance_time([X])\n```\n"
+        );
+        let path = write_workbook(&root, "fork-tuning.idl1wb", &markdown);
+
+        // Act
+        let source = read_workbook_via(&root, path.to_str().unwrap()).unwrap();
+
+        // Assert — the raw text on disk is untouched (still `version: 3`,
+        // still the retired name) even though a pending migration is
+        // reported.
+        assert_eq!(source.markdown, markdown);
+        assert_eq!(source.hash, sha256_hex(markdown.as_bytes()));
+        assert_eq!(source.pending_migrations.len(), 1);
+        assert_eq!(source.pending_migrations[0].old, "variance_time");
+        assert_eq!(source.pending_migrations[0].new, "lap_delta_time");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), markdown);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_workbook_via_a_document_with_no_retired_names_reports_no_pending_migrations() {
+        // Arrange
+        let root = temp_root();
+        let markdown = two_cell_markdown();
+        let path = write_workbook(&root, "fork-tuning.idl1wb", &markdown);
+
+        // Act
+        let source = read_workbook_via(&root, path.to_str().unwrap()).unwrap();
+
+        // Assert
+        assert!(source.pending_migrations.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1612,6 +1718,52 @@ mod tests {
         // so nothing under `workbooks/` exists at all.
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
         assert!(!root.join("workbooks").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_workbook_a_retired_function_name_is_migrated_and_reported() {
+        // Arrange — R151 item 9, plan §3.2: a `version: 3` document using a
+        // retired name is rewritten to its current spelling on save, and
+        // the rewrite is reported through `SaveResult.migrations`.
+        let root = temp_root();
+        let hashes = ExpectedHashSet::new();
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Fork tuning\nversion: 3\n---\n\n```math id=aaaaaaaa\nv = variance_time([X])\n```\n"
+        );
+
+        // Act
+        let result = save_workbook_via(&root, &hashes, WB_ID, &markdown, None).unwrap();
+
+        // Assert — the written bytes and the reported hash are the migrated
+        // markdown, never the caller's original text.
+        let target = root.join("workbooks").join("Fork tuning.idl1wb");
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert!(written.contains("v = lap_delta_time([X])"));
+        assert!(written.contains("version: 4"));
+        assert_eq!(result.hash, sha256_hex(written.as_bytes()));
+        assert_eq!(result.migrations.len(), 1);
+        assert_eq!(result.migrations[0].cell_id, "aaaaaaaa");
+        assert_eq!(result.migrations[0].old, "variance_time");
+        assert_eq!(result.migrations[0].new, "lap_delta_time");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_workbook_a_document_with_no_retired_names_reports_no_migrations() {
+        // Arrange
+        let root = temp_root();
+        let hashes = ExpectedHashSet::new();
+        let markdown = two_cell_markdown();
+
+        // Act
+        let result = save_workbook_via(&root, &hashes, WB_ID, &markdown, None).unwrap();
+
+        // Assert
+        assert!(result.migrations.is_empty());
+        assert_eq!(result.hash, sha256_hex(markdown.as_bytes()));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2356,5 +2508,20 @@ mod tests {
             assert_eq!(dto.name, entry.name);
             assert_eq!(dto.arity, entry.arity.to_vec());
         }
+    }
+
+    #[test]
+    fn list_math_builtins_lap_delta_time_reports_its_retired_name() {
+        // Arrange / Act
+        let dtos = list_math_builtins();
+
+        // Assert — C2 §3.8's retired-names table, mirrored on the wire so
+        // the notebook's function reference can show "was `variance_time`".
+        let lap_delta_time = dtos.iter().find(|d| d.name == "lap_delta_time").unwrap();
+        assert_eq!(lap_delta_time.renamed_from, vec!["variance_time".to_string()]);
+
+        // A function nothing was ever renamed from reports none.
+        let mean = dtos.iter().find(|d| d.name == "mean").unwrap();
+        assert!(mean.renamed_from.is_empty());
     }
 }
