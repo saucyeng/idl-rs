@@ -35,12 +35,31 @@ pub struct PeerStatusDto {
     pub paired_at_ms: i64,
 }
 
+/// This device's own sync identity, as seen by peers (C3 §3.9, ruling
+/// R172). Both fields are non-optional: `identity::load_or_create` mints
+/// the identity on first launch, so there is no state where it is absent.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ThisDeviceDto {
+    /// This device's stable id on the wire. Shown here — not guessed by
+    /// the app — because ruling R104 requires a user pairing two of their
+    /// own machines to read it off this device's own screen.
+    pub peer_id: String,
+    /// This device's display name, as sent in outgoing `PairRequest`s and
+    /// as last set by `set_sync_device_name`.
+    pub name: String,
+}
+
 /// `sync_status`'s return (C3 §3.9).
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SyncStatusDto {
     pub paired_peers: Vec<PeerStatusDto>,
     /// `None` if never synced with any peer.
     pub last_sync_utc_ms: Option<i64>,
+    /// This device's own id and name (ruling R172). Renaming via
+    /// `set_sync_device_name` is not retroactive: it does not change what
+    /// an already-paired peer displays for us, only what this field (and
+    /// future pairings) reports from here on.
+    pub this_device: ThisDeviceDto,
 }
 
 /// `sync_now`'s return (C3 §3.9, all six fields per ruling R102).
@@ -100,16 +119,20 @@ pub(crate) fn peer_status_dto(peer: &Peer, discovered: &HashMap<String, Discover
 }
 
 /// Transport-agnostic core of `sync_status`: every paired peer with
-/// `online` set from the latest browse results, plus the most recent
-/// successful sync across every peer (`None` if none has ever completed).
+/// `online` set from the latest browse results, the most recent successful
+/// sync across every peer (`None` if none has ever completed), and this
+/// device's own id and name (ruling R172).
 fn sync_status_via(
     peers: &[Peer],
     discovered: &HashMap<String, DiscoveredPeer>,
     last_sync: &HashMap<String, i64>,
+    this_peer_id: &str,
+    this_name: &str,
 ) -> SyncStatusDto {
     let paired_peers = peers.iter().map(|p| peer_status_dto(p, discovered)).collect();
     let last_sync_utc_ms = last_sync.values().copied().max();
-    SyncStatusDto { paired_peers, last_sync_utc_ms }
+    let this_device = ThisDeviceDto { peer_id: this_peer_id.to_string(), name: this_name.to_string() };
+    SyncStatusDto { paired_peers, last_sync_utc_ms, this_device }
 }
 
 /// C3 §3.9 `sync_status()`.
@@ -118,7 +141,8 @@ pub async fn sync_status(state: tauri::State<'_, SyncState>) -> Result<SyncStatu
     let peers = state.peers.lock().unwrap_or_else(|e| e.into_inner());
     let discovered = state.discovered.lock().unwrap_or_else(|e| e.into_inner());
     let last_sync = state.last_sync.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(sync_status_via(&peers, &discovered, &last_sync))
+    let name = state.name.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(sync_status_via(&peers, &discovered, &last_sync, &state.peer_id, &name))
 }
 
 /// Transport-agnostic core of `start_pairing`: mints a fresh offer on
@@ -402,7 +426,7 @@ mod tests {
         let last_sync = HashMap::new();
 
         // Act
-        let status = sync_status_via(&peers, &discovered, &last_sync);
+        let status = sync_status_via(&peers, &discovered, &last_sync, "peer-self", "idl1");
 
         // Assert
         assert!(status.paired_peers.is_empty());
@@ -423,7 +447,7 @@ mod tests {
         last_sync.insert("peer-2".to_string(), 2_000);
 
         // Act
-        let status = sync_status_via(&peers, &discovered, &last_sync);
+        let status = sync_status_via(&peers, &discovered, &last_sync, "peer-self", "idl1");
 
         // Assert
         let p1 = status.paired_peers.iter().find(|p| p.peer_id == "peer-1").unwrap();
@@ -431,6 +455,61 @@ mod tests {
         assert!(p1.online);
         assert!(!p2.online);
         assert_eq!(status.last_sync_utc_ms, Some(2_000));
+    }
+
+    #[test]
+    fn sync_status_a_freshly_minted_identity_this_device_carries_its_peer_id_and_name() {
+        // Arrange
+        let peers: Vec<Peer> = Vec::new();
+        let discovered = HashMap::new();
+        let last_sync = HashMap::new();
+
+        // Act
+        let status = sync_status_via(&peers, &discovered, &last_sync, "peer-self", "idl1");
+
+        // Assert
+        assert_eq!(status.this_device.peer_id, "peer-self");
+        assert_eq!(status.this_device.name, "idl1");
+    }
+
+    #[test]
+    fn sync_status_after_set_sync_device_name_reports_the_new_name() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.json");
+        let name_lock = std::sync::Mutex::new("idl1".to_string());
+        let peers: Vec<Peer> = Vec::new();
+        let discovered = HashMap::new();
+        let last_sync = HashMap::new();
+
+        // Act
+        set_sync_device_name_via(&identity_path, "peer-self", &name_lock, "Pit Wall Laptop".to_string()).unwrap();
+        let name = name_lock.lock().unwrap().clone();
+        let status = sync_status_via(&peers, &discovered, &last_sync, "peer-self", &name);
+
+        // Assert
+        assert_eq!(status.this_device.peer_id, "peer-self");
+        assert_eq!(status.this_device.name, "Pit Wall Laptop");
+    }
+
+    #[test]
+    fn sync_status_a_rejected_blank_rename_still_reports_the_old_name() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.json");
+        let name_lock = std::sync::Mutex::new("idl1".to_string());
+        let peers: Vec<Peer> = Vec::new();
+        let discovered = HashMap::new();
+        let last_sync = HashMap::new();
+
+        // Act
+        let rename = set_sync_device_name_via(&identity_path, "peer-self", &name_lock, "   ".to_string());
+        let name = name_lock.lock().unwrap().clone();
+        let status = sync_status_via(&peers, &discovered, &last_sync, "peer-self", &name);
+
+        // Assert
+        assert_eq!(rename.unwrap_err().kind, IpcErrorKind::InvalidArgument);
+        assert_eq!(status.this_device.name, "idl1");
     }
 
     // -- start_pairing --------------------------------------------------
@@ -660,7 +739,8 @@ mod tests {
     fn dtos_serialise_with_exactly_c3_3_9s_field_names() {
         // Arrange
         let peer_status = PeerStatusDto { peer_id: "p1".to_string(), name: "Pit Tablet".to_string(), online: true, protocol_version: 1, paired_at_ms: 42 };
-        let sync_status = SyncStatusDto { paired_peers: vec![peer_status.clone()], last_sync_utc_ms: Some(7) };
+        let this_device = ThisDeviceDto { peer_id: "self".to_string(), name: "idl1".to_string() };
+        let sync_status = SyncStatusDto { paired_peers: vec![peer_status.clone()], last_sync_utc_ms: Some(7), this_device };
         let sync_result = SyncResultDto { blobs_transferred: 1, workbooks_merged: 2, conflicts: 3, sessions_updated: 4, tracks_updated: 5, profiles_updated: 6 };
         let pairing_offer = PairingOfferDto { code: "004200".to_string(), expires_at_ms: 99 };
 
@@ -677,7 +757,7 @@ mod tests {
 
         let mut status_keys: Vec<&str> = status_json.as_object().unwrap().keys().map(String::as_str).collect();
         status_keys.sort();
-        assert_eq!(status_keys, vec!["last_sync_utc_ms", "paired_peers"]);
+        assert_eq!(status_keys, vec!["last_sync_utc_ms", "paired_peers", "this_device"]);
 
         let mut result_keys: Vec<&str> = result_json.as_object().unwrap().keys().map(String::as_str).collect();
         result_keys.sort();
