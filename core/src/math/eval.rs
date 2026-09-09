@@ -896,11 +896,90 @@ fn reject_unknown_kwargs(fn_name: &str, kwargs: &Kwargs, accepted: &[&str]) -> R
 }
 
 /// Functions with a documented keyword form (C2 §3.2) — grows as later
-/// tasks add one (the `fft` split's `window=`/`scaling=`/…, task 6; `dim=`
-/// reductions, task 12). Every other function rejects any `kwargs` outright
-/// in [`call_function`]'s entry guard below, rather than each arm needing
-/// its own "I take no keywords" check.
-const KWARG_AWARE_FUNCTIONS: &[&str] = &["mean"];
+/// tasks add one (`dim=` reductions, task 12). Every other function rejects
+/// any `kwargs` outright in [`call_function`]'s entry guard below, rather
+/// than each arm needing its own "I take no keywords" check.
+const KWARG_AWARE_FUNCTIONS: &[&str] = &["mean", "periodogram", "welch"];
+
+/// A keyword argument's string value, or `default` when the caller didn't
+/// supply it. Every `periodogram`/`welch` keyword is optional (scipy-style
+/// defaults) — none of them also has a positional form, so there is no
+/// "bound both ways" case to check here (unlike `mean`'s `window=`).
+fn kwarg_string<'a>(fn_name: &str, kwargs: &'a Kwargs, key: &str, default: &'static str) -> Result<&'a str, MathEvalError> {
+    match kwargs.get(key) {
+        Some(v) => require_string(v, fn_name),
+        None => Ok(default),
+    }
+}
+
+/// `periodogram`/`welch`'s `window=` (scipy names): `"boxcar"` is scipy's
+/// spelling for a rectangular window, kept alongside the legacy `fft()`
+/// arm's `"rect"`/`"rectangular"` so an already-migrated call still parses.
+fn parse_fft_window(s: &str, fn_name: &str) -> Result<crate::fft::FftWindow, MathEvalError> {
+    use crate::fft::FftWindow;
+    match s {
+        "hann" => Ok(FftWindow::Hann),
+        "hamming" => Ok(FftWindow::Hamming),
+        "rect" | "rectangular" | "boxcar" => Ok(FftWindow::Rectangular),
+        other => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{fn_name}: unknown window \"{other}\"; expected \"hann\", \"hamming\", or \"boxcar\""),
+        )),
+    }
+}
+
+/// `periodogram`/`welch`'s `detrend=` (scipy names `"constant"`/`"linear"`
+/// — scipy's boolean `False` becomes the string `"none"` here, since the
+/// language has no boolean literal).
+fn parse_fft_detrend(s: &str, fn_name: &str) -> Result<crate::fft::Detrend, MathEvalError> {
+    use crate::fft::Detrend;
+    match s {
+        "constant" => Ok(Detrend::Mean),
+        "linear" => Ok(Detrend::Linear),
+        "none" => Ok(Detrend::None),
+        other => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{fn_name}: unknown detrend \"{other}\"; expected \"constant\", \"linear\", or \"none\""),
+        )),
+    }
+}
+
+/// `periodogram`/`welch`'s `scaling=`. `"density"`/`"spectrum"` are scipy's
+/// own two values; `"raw_magnitude"` is deliberately not one of them (R151
+/// item 1) — it names the un-normalised value the legacy `fft()` computed,
+/// which the migration pins every existing call to so no workbook's
+/// numbers move.
+fn parse_fft_scaling(s: &str, fn_name: &str) -> Result<crate::fft::Scaling, MathEvalError> {
+    use crate::fft::Scaling;
+    match s {
+        "density" => Ok(Scaling::Density),
+        "spectrum" => Ok(Scaling::Spectrum),
+        "raw_magnitude" => Ok(Scaling::Magnitude),
+        other => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{fn_name}: unknown scaling \"{other}\"; expected \"density\", \"spectrum\", or \"raw_magnitude\""),
+        )),
+    }
+}
+
+/// `welch`'s `average=`. `"mean"`/`"median"` are scipy's own two values;
+/// `"max"`/`"none"` are idl1 extensions beyond scipy's API (ruling R63 (3))
+/// — kept reachable under the same keyword since they already existed on
+/// [`crate::fft::Averaging`], per R143's "diverge deliberately where not
+/// equivalent" rather than dropping them to fit scipy's smaller surface.
+fn parse_fft_averaging(s: &str, fn_name: &str) -> Result<crate::fft::Averaging, MathEvalError> {
+    use crate::fft::Averaging;
+    match s {
+        "mean" => Ok(Averaging::Mean),
+        "median" => Ok(Averaging::Median),
+        "max" => Ok(Averaging::Max),
+        "none" => Ok(Averaging::None),
+        other => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{fn_name}: unknown average \"{other}\"; expected \"mean\", \"median\", \"max\", or \"none\""),
+        )),
+    }
+}
 
 /// Function-call dispatch. Arms are grouped by task (A6 DSP; A7 stats; A8
 /// elementwise/trig; A9 clamp/if/stubs; A10 lap-aware).
@@ -976,31 +1055,80 @@ fn call_function(
                 )),
             }
         }
-        "fft" => {
-            require_arg_count(name, &args, 2)?;
+        // `fft` is retired (R146/R151 item 1, plan §1 row 3): it was never a
+        // true FFT surface, it was one un-normalised windowed magnitude
+        // spectrum with no segmentation or averaging — a false friend on
+        // top of a real inconsistency with the charts' `welch()`. Split
+        // into `periodogram` (this function's single-segment shape,
+        // scipy-named and scipy-scaled) and `welch` (segmented/averaged,
+        // what the charts already compute). A `version: 3` call migrates in
+        // memory to `periodogram(ch, window=.., scaling="raw_magnitude")`
+        // before it ever reaches here (plan §3.3) — no existing workbook's
+        // numbers move. `fft` itself is reserved for a future true complex
+        // DFT and dispatches nowhere below, so it now falls to the
+        // catch-all's [`unknown_function_error`], which names its
+        // replacement via [`crate::math::math_name_migrations`].
+        "periodogram" => {
+            require_arg_count(name, &args, 1)?;
+            reject_unknown_kwargs(name, kwargs, &["window", "detrend", "scaling"])?;
             let ch = require_channel(&args[0], name)?;
-            let window_str = require_string(&args[1], name)?;
-            let window = match window_str {
-                "hann" => crate::fft::FftWindow::Hann,
-                "hamming" => crate::fft::FftWindow::Hamming,
-                "rect" | "rectangular" => crate::fft::FftWindow::Rectangular,
-                other => {
-                    return Err(err(
-                        MathEvalErrorKind::Runtime,
-                        format!(
-                            "fft: unknown window \"{other}\"; expected \"hann\", \"hamming\", or \"rect\""
-                        ),
-                    ))
-                }
-            };
-            // Single-spectrum fft is a reduction (R123/R124): the selected
-            // window's samples only, so a lap's spectrum is the lap's
-            // spectrum, not the session's.
+            let window = parse_fft_window(kwarg_string(name, kwargs, "window", "boxcar")?, name)?;
+            let detrend = parse_fft_detrend(kwarg_string(name, kwargs, "detrend", "constant")?, name)?;
+            let scaling = parse_fft_scaling(kwarg_string(name, kwargs, "scaling", "density")?, name)?;
+            // Single-spectrum reduction (R123/R124): the selected window's
+            // samples only, so a lap's spectrum is the lap's spectrum, not
+            // the session's. `nperseg: 0` / `noverlap: 0` resolve to one
+            // full-record segment (`resolve_seg`), reproducing scipy's
+            // `periodogram` exactly; `averaging` is irrelevant with exactly
+            // one segment.
             let (start, end) = window_index_range(lap_ctx, ch.sample_rate_hz, ch.samples.len());
-            // Output is n/2+1 bins; preserve the original rate so the caller can
-            // compute freq[k] = k * sample_rate_hz / n. Bins are not per-sample
-            // time — no t_us axis applies (empty, not ch's, per L3-R12).
-            Ok(channel(crate::fft::fft(&ch.samples[start..end], window), ch.sample_rate_hz, Arc::from(&[] as &[i64])))
+            let result = crate::fft::welch(
+                ch.samples[start..end].to_vec(),
+                ch.sample_rate_hz,
+                window,
+                0,
+                0,
+                detrend,
+                crate::fft::Averaging::Mean,
+                scaling,
+            );
+            // Output is n/2+1 bins; preserve the original rate so the caller
+            // can compute freq[k] = k * sample_rate_hz / n. Bins are not
+            // per-sample time — no t_us axis applies (empty, not ch's, per
+            // L3-R12).
+            Ok(channel(result.values, ch.sample_rate_hz, Arc::from(&[] as &[i64])))
+        }
+        "welch" => {
+            require_arg_count(name, &args, 1)?;
+            reject_unknown_kwargs(name, kwargs, &["window", "nperseg", "noverlap", "detrend", "average", "scaling"])?;
+            let ch = require_channel(&args[0], name)?;
+            let (start, end) = window_index_range(lap_ctx, ch.sample_rate_hz, ch.samples.len());
+            let n = end - start;
+            let window = parse_fft_window(kwarg_string(name, kwargs, "window", "hann")?, name)?;
+            // scipy's own `welch` defaults: `nperseg` is 256 samples (or the
+            // whole record if shorter), `noverlap` is half of `nperseg`.
+            let nperseg = match kwargs.get("nperseg") {
+                Some(v) => require_scalar(v, name)?.round().max(0.0) as usize,
+                None => n.min(256),
+            };
+            let noverlap = match kwargs.get("noverlap") {
+                Some(v) => require_scalar(v, name)?.round().max(0.0) as usize,
+                None => nperseg / 2,
+            };
+            let detrend = parse_fft_detrend(kwarg_string(name, kwargs, "detrend", "constant")?, name)?;
+            let average = parse_fft_averaging(kwarg_string(name, kwargs, "average", "mean")?, name)?;
+            let scaling = parse_fft_scaling(kwarg_string(name, kwargs, "scaling", "density")?, name)?;
+            let result = crate::fft::welch(
+                ch.samples[start..end].to_vec(),
+                ch.sample_rate_hz,
+                window,
+                nperseg,
+                noverlap,
+                detrend,
+                average,
+                scaling,
+            );
+            Ok(channel(result.values, ch.sample_rate_hz, Arc::from(&[] as &[i64])))
         }
         "declip" => {
             require_arg_count(name, &args, 1)?;
@@ -1531,7 +1659,30 @@ fn call_function(
             crate::math::vector::rotate_euler(&args[0], &args[1], &args[2], &args[3], name)
         }
 
-        _ => Err(err(MathEvalErrorKind::UnknownFunction, format!("unknown function \"{name}\""))),
+        _ => Err(unknown_function_error(name)),
+    }
+}
+
+/// [`MathEvalErrorKind::UnknownFunction`] for an unrecognised call name —
+/// drawn from [`crate::math::math_name_migrations`] when `name` is a
+/// retired spelling (plan §3.3, C2 §3.8), so the error stays helpful after
+/// the one-revision compatibility window closes rather than just saying the
+/// name doesn't exist. A `version: 3` document never reaches this arm for a
+/// retired name at all — `migrate_document` rewrites it in memory before
+/// evaluation (plan §3.3) — so every call here is either a genuine typo or
+/// a `version: 4` document deliberately reusing a name the language retired
+/// (R151 item 10: never silently accepted).
+fn unknown_function_error(name: &str) -> MathEvalError {
+    match crate::math::math_name_migrations().iter().find(|m| m.old == name) {
+        // `fft` retired to two functions, not one (R146) — `new` is only
+        // the migration's own rewrite target (`periodogram`, the shape that
+        // reproduces `fft`'s old numbers); the error names both, since a
+        // v4-only author reaching for `fft` may equally want `welch`.
+        Some(m) if m.old == "fft" => {
+            err(MathEvalErrorKind::UnknownFunction, "\"fft\" was retired — see \"periodogram\" / \"welch\"")
+        }
+        Some(m) => err(MathEvalErrorKind::UnknownFunction, format!("\"{name}\" was retired — see \"{}\"", m.new)),
+        None => err(MathEvalErrorKind::UnknownFunction, format!("unknown function \"{name}\"")),
     }
 }
 
@@ -1959,15 +2110,148 @@ mod tests {
     }
 
     #[test]
-    fn fft_unknown_window_errors() {
+    fn fft_is_retired_and_names_both_replacements() {
+        // Arrange — R146/R151 item 1, plan §1 row 3: `fft` is retired and
+        // reserved, never a second dispatch arm.
+        let lk = lookup(&[("a", vec![0.0; 8], 100.0)]);
+
+        // Act
+        let err = eval_expr("fft([a], \"hann\")", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::UnknownFunction);
+        assert!(err.message.contains("periodogram"), "{}", err.message);
+        assert!(err.message.contains("welch"), "{}", err.message);
+    }
+
+    #[test]
+    fn periodogram_raw_magnitude_scaling_reproduces_the_legacy_ffts_numbers_exactly() {
+        // Arrange — R151 item 1: the exact combination the migration pins
+        // an existing `fft(ch, window)` call to, so this must reproduce the
+        // legacy `crate::fft::fft` bin-for-bin.
+        let samples = vec![1.0, 2.0, -1.0, 0.5, 3.0, -2.0, 1.5, 0.0];
+        let lk = lookup(&[("a", samples.clone(), 100.0)]);
+
+        // Act
+        let v = eval_expr(
+            "periodogram([a], window=\"hann\", detrend=\"none\", scaling=\"raw_magnitude\")",
+            &lk,
+        )
+        .unwrap();
+
+        // Assert
+        let expected = crate::fft::fft(&samples, crate::fft::FftWindow::Hann);
+        match v {
+            Value::Channel(c) => {
+                assert_eq!(c.samples.len(), expected.len());
+                for (got, want) in c.samples.iter().zip(expected.iter()) {
+                    assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+                }
+                assert_eq!(c.sample_rate_hz, 100.0);
+                assert!(c.t_us.is_empty());
+            }
+            other => panic!("expected a channel: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn periodogram_defaults_to_scipys_own_boxcar_window_and_density_scaling() {
+        // Arrange — scipy.signal.periodogram's defaults: window="boxcar",
+        // detrend="constant", scaling="density". `"boxcar"` must resolve to
+        // the same rectangular window `"rect"`/`"rectangular"` already did.
+        let samples = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let lk = lookup(&[("a", samples, 8.0)]);
+
+        // Act
+        let default_call = eval_expr("periodogram([a])", &lk).unwrap();
+        let spelled_out = eval_expr("periodogram([a], window=\"boxcar\", detrend=\"constant\", scaling=\"density\")", &lk).unwrap();
+
+        // Assert
+        match (default_call, spelled_out) {
+            (Value::Channel(a), Value::Channel(b)) => assert_eq!(a.samples, b.samples),
+            other => panic!("expected two channels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn periodogram_unknown_window_errors() {
         // Arrange
         let lk = lookup(&[("a", vec![0.0; 8], 100.0)]);
 
         // Act
-        let err = eval_expr("fft([a], \"blackman\")", &lk).unwrap_err();
+        let err = eval_expr("periodogram([a], window=\"blackman\")", &lk).unwrap_err();
 
         // Assert
-        assert!(err.message.contains("unknown window"));
+        assert!(err.message.contains("unknown window"), "{}", err.message);
+        assert!(err.message.contains("periodogram"), "{}", err.message);
+    }
+
+    #[test]
+    fn periodogram_an_unknown_keyword_argument_is_a_typed_error() {
+        // Arrange
+        let lk = lookup(&[("a", vec![0.0; 8], 100.0)]);
+
+        // Act
+        let err = eval_expr("periodogram([a], nperseg=4)", &lk).unwrap_err();
+
+        // Assert — `nperseg` is `welch`'s keyword, not `periodogram`'s (a
+        // periodogram is single-segment by definition).
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("nperseg"), "{}", err.message);
+    }
+
+    #[test]
+    fn welch_averaging_mean_over_multiple_segments_differs_from_a_single_segment_periodogram() {
+        // Arrange — the whole reason the split exists (R146): `welch` and
+        // `periodogram` are different computations, not two names for one.
+        let n = 512;
+        let samples: Vec<f64> =
+            (0..n).map(|i| (2.0 * std::f64::consts::PI * 8.0 * i as f64 / 64.0).sin()).collect();
+        let lk = lookup(&[("a", samples, 64.0)]);
+
+        // Act
+        let periodogram = eval_expr("periodogram([a])", &lk).unwrap();
+        let welch = eval_expr("welch([a], nperseg=64, noverlap=32)", &lk).unwrap();
+
+        // Assert — different segmentation, so different bin counts.
+        match (periodogram, welch) {
+            (Value::Channel(p), Value::Channel(w)) => assert_ne!(p.samples.len(), w.samples.len()),
+            other => panic!("expected two channels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn welch_defaults_to_scipys_own_hann_window_mean_averaging_and_density_scaling() {
+        // Arrange
+        let samples: Vec<f64> = (0..300).map(|i| i as f64).collect();
+        let lk = lookup(&[("a", samples, 100.0)]);
+
+        // Act
+        let default_call = eval_expr("welch([a])", &lk).unwrap();
+        let spelled_out = eval_expr(
+            "welch([a], window=\"hann\", nperseg=256, noverlap=128, detrend=\"constant\", average=\"mean\", scaling=\"density\")",
+            &lk,
+        )
+        .unwrap();
+
+        // Assert
+        match (default_call, spelled_out) {
+            (Value::Channel(a), Value::Channel(b)) => assert_eq!(a.samples, b.samples),
+            other => panic!("expected two channels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn welch_unknown_average_value_errors() {
+        // Arrange
+        let lk = lookup(&[("a", vec![0.0; 64], 100.0)]);
+
+        // Act
+        let err = eval_expr("welch([a], average=\"rms\")", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("unknown average"), "{}", err.message);
     }
 
     #[test]
@@ -3082,6 +3366,35 @@ mod tests {
 
         // Assert
         assert!(e.message.contains("IMU0"), "{}", e.message);
+    }
+
+    #[test]
+    fn unknown_function_a_genuine_typo_gets_the_plain_message() {
+        // Arrange / Act
+        let lk = lookup(&[("X", vec![1.0], 10.0)]);
+        let err = eval_expr("meen([X])", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::UnknownFunction);
+        assert!(err.message.contains("meen"), "{}", err.message);
+        assert!(!err.message.contains("retired"), "{}", err.message);
+    }
+
+    #[test]
+    fn unknown_function_a_retired_name_names_its_replacement() {
+        // Arrange — plan §3.3: a `version: 4` document reusing a retired
+        // name is a typed error naming the replacement, drawn from the
+        // same table C2 §3.8 mirrors (R151 item 10).
+        let lk = lookup(&[("X", vec![1.0], 10.0)]);
+
+        // Act
+        let err = eval_expr("variance_time([X])", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::UnknownFunction);
+        assert!(err.message.contains("variance_time"), "{}", err.message);
+        assert!(err.message.contains("lap_delta_time"), "{}", err.message);
+        assert!(err.message.contains("retired"), "{}", err.message);
     }
 
     #[test]

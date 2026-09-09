@@ -54,7 +54,7 @@ pub struct NameMigration {
 /// `version: 4` document's [`crate::math::error::MathEvalErrorKind::UnknownFunction`]
 /// message for a name that appears here.
 pub fn math_name_migrations() -> &'static [NameMigration] {
-    use MigrationKind::Rename;
+    use MigrationKind::{Rename, Rewrite};
     &[
         // `variance_time`/`variance_dist` never compute a variance (σ²) —
         // they compute a lap's delta against an overlay lap (R143's worst
@@ -62,6 +62,17 @@ pub fn math_name_migrations() -> &'static [NameMigration] {
         // statistics library a model has read).
         NameMigration { old: "variance_time", new: "lap_delta_time", kind: Rename },
         NameMigration { old: "variance_dist", new: "lap_delta_dist", kind: Rename },
+        // `fft(ch, window)` was one un-normalised windowed magnitude
+        // spectrum, no segmentation, no averaging — not the Welch spectrum
+        // the charts already compute under the same word (R146). Split into
+        // `periodogram` (this shape, scipy-named/scaled) and `welch`
+        // (segmented/averaged); `fft` itself is retired and reserved for a
+        // true complex DFT. `rewrite_call_args` pins every migrated call to
+        // `scaling="raw_magnitude"` so no existing workbook's spectrum
+        // moves (R151 item 1) — `new` here is the migration's primary
+        // target, not the only function `fft` retired in favour of;
+        // `unknown_function_error`'s message additionally names `welch`.
+        NameMigration { old: "fft", new: "periodogram", kind: Rewrite },
     ]
 }
 
@@ -79,8 +90,13 @@ pub struct AppliedRename {
 
 /// Rewrites every retired builtin call in `src` to its current spelling,
 /// leaving every other byte untouched (see the module doc's "byte splice,
-/// not a re-serialisation"). Idempotent: running this on already-current
-/// source finds nothing and returns `(src.to_string(), vec![])`.
+/// not a re-serialisation"). A [`MigrationKind::Rename`] entry only ever
+/// touches the identifier itself; a [`MigrationKind::Rewrite`] entry (only
+/// `fft`, task 6) replaces the whole call — identifier *and* argument list —
+/// with [`rewrite_call_args`]'s reshaped text, still leaving every byte
+/// outside that one call site untouched. Idempotent: running this on
+/// already-current source finds nothing and returns `(src.to_string(),
+/// vec![])`.
 pub fn migrate_expression(src: &str) -> (String, Vec<AppliedRename>) {
     let table = math_name_migrations();
     let mut out = String::with_capacity(src.len());
@@ -92,14 +108,140 @@ pub fn migrate_expression(src: &str) -> (String, Vec<AppliedRename>) {
         let Some(m) = table.iter().find(|m| m.old == ident) else {
             continue;
         };
+        let (call_end, replacement) = match m.kind {
+            MigrationKind::Rename => (end, m.new.to_string()),
+            MigrationKind::Rewrite => match rewrite_call_args(src, end, m.old, m.new) {
+                Some((call_end, text)) => (call_end, text),
+                // Defensive: the call's own argument shape doesn't match
+                // what this migration expects (e.g. already hand-edited to
+                // a wrong arity) — leave the whole call untouched rather
+                // than emit a half-rewritten one; it surfaces as a normal
+                // typed evaluation error instead (`unknown_function_error`,
+                // `eval::call_function`) rather than a corrupted document.
+                None => continue,
+            },
+        };
         out.push_str(&src[copied_to..start]);
-        out.push_str(m.new);
+        out.push_str(&replacement);
         renames.push(AppliedRename { old: m.old.to_string(), new: m.new.to_string(), position: start });
-        copied_to = end;
+        copied_to = call_end;
     }
     out.push_str(&src[copied_to..]);
 
     (out, renames)
+}
+
+/// [`MigrationKind::Rewrite`]'s whole-call reshaping, for the one entry that
+/// uses it today: `fft(ch, window)` → `periodogram(ch, window=window,
+/// detrend="none", scaling="raw_magnitude")` (R151 item 1) — pinning every
+/// existing call to the scaling *and* detrend that reproduce its old,
+/// un-normalised numbers exactly, so adopting scipy's name never moves a
+/// workbook's existing values. `detrend="none"` is load-bearing here: the
+/// legacy `fft()` never detrended, but `periodogram`'s own new-caller
+/// default is scipy's `detrend="constant"` — leaving it off the migrated
+/// call would silently subtract each segment's mean under cover of a
+/// rename, exactly the defect class this migration exists to prevent.
+/// `ident_end` is the byte offset right after `old`'s identifier (the `(`
+/// that must follow it, per [`call_site_idents`], may have whitespace
+/// before it). Returns `(byte offset right after the call's closing ')',
+/// replacement text)`, or `None` when the call's argument list isn't the
+/// shape this rewrite expects (see [`migrate_expression`]'s fallback).
+fn rewrite_call_args(src: &str, ident_end: usize, old: &str, new: &str) -> Option<(usize, String)> {
+    // Only `fft`'s 2-positional-argument shape exists today; a future
+    // second `Rewrite` entry would need its own arm here.
+    if old != "fft" {
+        return None;
+    }
+    let open = src[ident_end..].find('(')? + ident_end;
+    let close = matching_close_paren(src, open)?;
+    let args = split_top_level_args(&src[open + 1..close]);
+    let [channel_arg, window_arg] = args.as_slice() else { return None };
+    let text = format!("{new}({channel_arg}, window={window_arg}, detrend=\"none\", scaling=\"raw_magnitude\")");
+    Some((close + 1, text))
+}
+
+/// Finds the `)` matching the `(` at byte offset `open` in `src`, skipping
+/// the interior of any `'…'`/`"…"` string, `[…]` channel reference or
+/// `{…}` cell reference (none can contain an unbalanced paren of their
+/// own) and accounting for nested nested parens — an argument can itself be
+/// a call, e.g. `fft(butter(...), "hann")`.
+fn matching_close_paren(src: &str, open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut chars = src[open..].char_indices();
+    while let Some((rel, c)) = chars.next() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + rel);
+                }
+            }
+            '\'' | '"' => {
+                let quote = c;
+                for (_, c2) in chars.by_ref() {
+                    if c2 == quote {
+                        break;
+                    }
+                }
+            }
+            '[' => {
+                for (_, c2) in chars.by_ref() {
+                    if c2 == ']' {
+                        break;
+                    }
+                }
+            }
+            '{' => {
+                for (_, c2) in chars.by_ref() {
+                    if c2 == '}' {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Splits `text` (a call's argument-list interior, exclusive of the
+/// surrounding parens) at top-level commas — i.e. not inside a nested
+/// `(...)`, `[...]`, `{...}`, or `'...'`/`"..."` string — trimming
+/// surrounding whitespace off each piece. Used only by [`rewrite_call_args`]
+/// today, where every produced piece is re-embedded verbatim into a brand
+/// new call, so trimming (rather than preserving original inter-argument
+/// spacing) is the right call: the whole call site is being reshaped, not
+/// spliced byte-for-byte.
+fn split_top_level_args(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '\'' | '"' => {
+                let quote = c;
+                for (_, c2) in chars.by_ref() {
+                    if c2 == quote {
+                        break;
+                    }
+                }
+            }
+            ',' if depth == 0 => {
+                parts.push(text[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = text[start..].trim();
+    if !tail.is_empty() || !parts.is_empty() {
+        parts.push(tail);
+    }
+    parts
 }
 
 /// Finds every `(start, end)` byte span of an identifier immediately
@@ -493,6 +635,70 @@ mod tests {
 
         // Assert
         assert_eq!(olds.len(), before);
+    }
+
+    #[test]
+    fn migrate_expression_rewrites_fft_to_periodogram_pinning_the_old_numbers() {
+        // Arrange / Act — R151 item 1: the migration must pin both the
+        // scaling *and* the detrend that reproduce `fft()`'s old numbers,
+        // not just rename the call.
+        let (out, applied) = migrate_expression("fft([X], \"hann\")");
+
+        // Assert
+        assert_eq!(out, "periodogram([X], window=\"hann\", detrend=\"none\", scaling=\"raw_magnitude\")");
+        assert_eq!(applied, vec![AppliedRename { old: "fft".to_string(), new: "periodogram".to_string(), position: 0 }]);
+    }
+
+    #[test]
+    fn migrate_expression_rewrites_fft_nested_inside_an_operator_expression() {
+        // Act
+        let (out, applied) = migrate_expression("2 * fft([X], \"rect\") + 1");
+
+        // Assert — only the call site is reshaped; the surrounding operator
+        // expression's bytes are untouched.
+        assert_eq!(out, "2 * periodogram([X], window=\"rect\", detrend=\"none\", scaling=\"raw_magnitude\") + 1");
+        assert_eq!(applied.len(), 1);
+    }
+
+    #[test]
+    fn migrate_expression_fft_with_a_channel_argument_that_is_itself_a_call_result() {
+        // Arrange — the argument-splitting must respect nested parens, not
+        // just split on every top-level-looking comma naively.
+        let (out, applied) = migrate_expression("fft(butter(2, 0.3, \"low\", [X]), \"hann\")");
+
+        // Assert
+        assert_eq!(
+            out,
+            "periodogram(butter(2, 0.3, \"low\", [X]), window=\"hann\", detrend=\"none\", scaling=\"raw_magnitude\")"
+        );
+        assert_eq!(applied.len(), 1);
+    }
+
+    #[test]
+    fn migrate_expression_an_fft_call_with_the_wrong_arity_is_left_untouched() {
+        // Arrange — defensive: a malformed call (already-hand-edited, wrong
+        // arg count) is left byte-for-byte rather than half-rewritten.
+        let src = "fft([X])";
+
+        // Act
+        let (out, applied) = migrate_expression(src);
+
+        // Assert
+        assert_eq!(out, src);
+        assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn migrate_expression_is_idempotent_after_migrating_fft() {
+        // Arrange
+        let (once, _) = migrate_expression("fft([X], \"hann\")");
+
+        // Act
+        let (twice, applied) = migrate_expression(&once);
+
+        // Assert
+        assert_eq!(twice, once);
+        assert!(applied.is_empty());
     }
 
     fn wb(version_line: &str, body: &str) -> String {

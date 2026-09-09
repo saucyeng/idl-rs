@@ -9,7 +9,8 @@ use crate::fft::{stft, Detrend, FftWindow, Scaling};
 /// `power` is flat **row-major** `n_times × n_freqs`: frame `t`, bin `f` is at
 /// `power[t * n_freqs + f]`. Units follow `Scaling` exactly as in [`crate::fft::welch`]
 /// (Magnitude = `|X|`, the bin's complex modulus (amplitude) in input units;
-/// Density = PSD in input-units²/Hz).
+/// Density = PSD in input-units²/Hz; Spectrum = power in input-units², scipy's
+/// `scaling="spectrum"`).
 /// 2-D arrays do not cross FRB, hence the flat buffer + explicit dims.
 pub struct SpectrogramResult {
     /// Bin-centre frequencies in Hz (Y axis), length `n_freqs`.
@@ -56,24 +57,28 @@ pub fn spectrogram(
     let seg = crate::fft::resolve_seg(nperseg, n);
     let win_power: f64 = crate::fft::window_weights_for(&window, seg).iter().map(|w| w * w).sum();
 
+    let win_sum: f64 = crate::fft::window_weights_for(&window, seg).iter().sum();
     let s = stft(data, sample_rate_hz, window, nperseg, noverlap, detrend);
     let n_freqs = s.freqs_hz.len();
     let n_times = s.frames.len();
     let mut power = Vec::with_capacity(n_times * n_freqs);
     let density_norm = sample_rate_hz * win_power;
+    let spectrum_norm = win_sum * win_sum;
     for frame in &s.frames {
         for (k, c) in frame.iter().enumerate() {
             let p = c.norm_sqr();
+            let is_nyquist = seg % 2 == 0 && k == seg / 2;
+            let one_sided = |norm: f64| {
+                let mut v = p / norm;
+                if k != 0 && !is_nyquist {
+                    v *= 2.0;
+                }
+                v
+            };
             let v = match scaling {
                 Scaling::Magnitude => p.sqrt(),
-                Scaling::Density => {
-                    let mut psd = p / density_norm;
-                    let is_nyquist = seg % 2 == 0 && k == seg / 2;
-                    if k != 0 && !is_nyquist {
-                        psd *= 2.0;
-                    }
-                    psd
-                }
+                Scaling::Density => one_sided(density_norm),
+                Scaling::Spectrum => one_sided(spectrum_norm),
             };
             power.push(v);
         }
