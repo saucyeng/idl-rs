@@ -1177,9 +1177,9 @@ pub fn create_workbook(name: String, data_dir: tauri::State<'_, DataDir>) -> Res
 }
 
 /// C3 §3.4 `watch_workbook(id, channel)`. Parks the started watcher in
-/// [`Watchers`] keyed by `id` for the app's lifetime — re-subscribing to the
-/// same id replaces (and so stops) the previous one. No unsubscribe command
-/// in wave 1 (Tauri v2 gives no observable channel-close signal).
+/// [`Watchers`] keyed by `id` until [`unwatch_workbook`] removes it (or the
+/// app exits) — re-subscribing to the same id replaces (and so stops) the
+/// previous one, the backstop for a frontend that never calls unwatch.
 #[tauri::command]
 pub fn watch_workbook(
     id: String,
@@ -1193,6 +1193,35 @@ pub fn watch_workbook(
     })?;
     watchers.0.lock().unwrap().insert(id, watcher);
     Ok(())
+}
+
+/// C3 §3.4 `unwatch_workbook(id)`. Removes `id` from [`Watchers`]; dropping
+/// the removed [`WorkbookWatcher`] stops the watch (see [`Watchers`]'s doc
+/// comment). Unwatching an id that is not currently watched — never
+/// subscribed, already unwatched, or already replaced by a later
+/// `watch_workbook` for the same id — is `Ok(())`, not an error: the
+/// frontend calls this on close/unmount, a path that must be idempotent and
+/// must not depend on whether a watch was ever established (a workbook
+/// closed before `watch_workbook` resolved, a double unmount in React
+/// strict mode, an unwatch racing a re-subscribe). An error return here
+/// would make correct frontend code log spurious failures.
+///
+/// Takes the entry out under the lock and releases it before the value
+/// drops: `WorkbookWatcher` has no explicit `Drop` impl of its own, but its
+/// `notify::RecommendedWatcher` field does, and that can block briefly
+/// joining the watcher's background thread — holding [`Watchers`]'s mutex
+/// across that would stall every other watcher command contending on it.
+#[tauri::command]
+pub fn unwatch_workbook(id: String, watchers: tauri::State<'_, Watchers>) -> Result<(), IpcError> {
+    unwatch_workbook_via(&watchers.0, &id);
+    Ok(())
+}
+
+/// Removes `id` from `watchers`, dropping the removed entry (if any) after
+/// releasing the lock. See [`unwatch_workbook`] for the idempotence rule.
+fn unwatch_workbook_via(watchers: &std::sync::Mutex<HashMap<String, WorkbookWatcher>>, id: &str) {
+    let removed = watchers.lock().unwrap().remove(id);
+    drop(removed);
 }
 
 #[cfg(test)]
