@@ -332,6 +332,24 @@ pub fn render_workbook(doc: &WorkbookDoc) -> String {
             if let Some(prose_after) = &cell.prose_after {
                 out.push_str(prose_after);
             }
+        } else {
+            // R103's invariant (this function's doc comment) holds only
+            // when the next cell's `prose_before` was captured from real
+            // source text, which always starts with the newline that
+            // terminates this closing fence's own line. A merge-minted
+            // cell's `prose_before` (a conflict copy's marker line, C2
+            // §7.2) is built fresh from a marker string instead and does
+            // not carry that leading byte — without it, this closing
+            // "```" and the next line's first character share one line,
+            // which is not a valid CommonMark closing fence, and
+            // `scan_cells` fuses this cell with everything up to the next
+            // one it can find. Supplying the missing newline only when it
+            // is actually missing keeps every real round trip byte-exact.
+            let next_starts_with_newline =
+                doc.cells[i + 1].prose_before.as_deref().is_some_and(|p| p.starts_with('\n'));
+            if !next_starts_with_newline {
+                out.push('\n');
+            }
         }
     }
     out
@@ -435,6 +453,60 @@ mod tests {
         assert_eq!(back.cells.len(), 1);
         assert_eq!(back.cells[0].id, "aaaaaaaa");
         assert!(back.cells[0].raw_fence_body.contains("x = 1"));
+    }
+
+    #[test]
+    fn render_workbook_a_second_cell_with_no_prose_before_still_parses_back_to_two_cells() {
+        // Arrange — mirrors a merge-minted conflict copy (C2 §7.2): a cell
+        // whose `prose_before` starts with content, not a newline, spliced
+        // in immediately after another cell's closing fence. Without a
+        // separator of its own, `render_workbook`'s bare closing "```" runs
+        // straight into this cell's first character on the same line,
+        // which is not a valid CommonMark closing fence — the parser then
+        // keeps consuming past it, silently fusing both cells into one.
+        let doc = WorkbookDoc {
+            id: "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d".to_string(),
+            name: "Test".to_string(),
+            constants_raw: HashMap::new(),
+            units_pref: Default::default(),
+            version: 3,
+            cells: vec![
+                CellDoc {
+                    id: "aaaaaaaa".to_string(),
+                    kind_token: CellKindToken::Math,
+                    prose_before: None,
+                    prose_after: None,
+                    raw_fence_body: "x = 2\n".to_string(),
+                    table: None,
+                },
+                CellDoc {
+                    id: "bbbbbbbb".to_string(),
+                    kind_token: CellKindToken::Math,
+                    prose_before: Some("<!-- conflict from peer-laptop -->\n".to_string()),
+                    prose_after: None,
+                    raw_fence_body: "x = 3\n".to_string(),
+                    table: None,
+                },
+            ],
+            trailing_prose: None,
+            const_lines: Vec::new(),
+            defs: Vec::new(),
+            constants: HashMap::new(),
+            front_matter_unknown: std::collections::BTreeMap::new(),
+        };
+
+        // Act
+        let rendered = render_workbook(&doc);
+        let (back, _errors) = parse_workbook(&rendered).unwrap();
+
+        // Assert — both cells survive the round trip, not fused into one.
+        // (`x` is defined in both bodies, on purpose, mirroring a real
+        // same-cell conflict — `_errors` carries the expected
+        // `DuplicateDefinition` this always raises, C2 §2.6, unrelated to
+        // the fence-fusion bug this test guards against.)
+        assert_eq!(back.cells.len(), 2);
+        assert!(back.cells[0].raw_fence_body.contains("x = 2"));
+        assert!(back.cells[1].raw_fence_body.contains("x = 3"));
     }
 
     /// R103's fixed-point suite (`runs/2026-09-03/decisions.md`): every
