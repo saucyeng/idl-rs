@@ -606,19 +606,415 @@ pub fn infer(ast: &Ast, lookup: &dyn ChannelLookup) -> (Unit, Vec<UnitNote>) {
             }
         }
         Ast::Call { name, args, kwargs } => {
-            // Task 2 stop-gap (design §7, task 2 row): every call is
-            // Unknown(Propagated) regardless of function, but nested
-            // mismatches inside its arguments are still surfaced.
+            // Task 3 (C2 §3.3/§3.3.1, transcribed — R162's own ruling that
+            // the rule column, not this table, is normative where the two
+            // could ever disagree): each positional argument is inferred
+            // first (so a nested mismatch always surfaces, function rule
+            // or not), then the named function's own rule combines them.
             let mut notes = Vec::new();
-            for arg in args {
-                let (_, arg_notes) = infer(arg, lookup);
-                notes.extend(arg_notes);
-            }
+            let arg_units: Vec<Unit> = args
+                .iter()
+                .map(|arg| {
+                    let (u, arg_notes) = infer(arg, lookup);
+                    notes.extend(arg_notes);
+                    u
+                })
+                .collect();
             for (_, expr) in kwargs {
                 let (_, kw_notes) = infer(expr, lookup);
                 notes.extend(kw_notes);
             }
-            (Unit::Unknown(UnknownReason::Propagated { of: format!("{name}(…)") }), notes)
+
+            // `pow(x, y)` is the one rule whose branch depends on `y`'s own
+            // literal *value*, not any argument's unit — not modelled as a
+            // generic `FnUnitRule` case (nothing else needs that), handled
+            // directly here instead.
+            let unit = if name == "pow" {
+                pow_call_unit(&arg_units, args.get(1))
+            } else {
+                let (rule, checks) = function_unit_rule(name, args.len());
+                apply_fn_checks(&checks, &arg_units, &mut notes);
+                let (unit, rule_notes) = eval_fn_rule(&rule, &arg_units, kwargs);
+                notes.extend(rule_notes);
+                unit
+            };
+            (unit, notes)
+        }
+    }
+}
+
+/// A named-function unit rule (C2 §3.3.1) — this module's transcription of
+/// §3.3's **Unit rule** column, which is the normative source (R162): where
+/// this table and that column could ever disagree, the column wins and
+/// this table is the bug. Argument positions are 0-based over the
+/// positional arguments, matching §3.3.1 exactly.
+enum FnUnitRule {
+    /// The output carries positional argument `n`'s unit.
+    SameAsArg(usize),
+    /// A constant unit regardless of the arguments — a C1-style string,
+    /// parsed once per evaluation (not cached: this is metadata inference,
+    /// never the hot per-sample path).
+    Fixed(&'static str),
+    /// The empty unit product. Never a stand-in for "we don't know".
+    Dimensionless,
+    /// Exponents added.
+    Product(Box<FnUnitRule>, Box<FnUnitRule>),
+    /// Exponents subtracted.
+    Quotient(Box<FnUnitRule>, Box<FnUnitRule>),
+    /// The inner rule's exponents multiplied by the rational `k`.
+    PowN(Box<FnUnitRule>, Ratio),
+    /// Every listed positional argument must share one unit, which is also
+    /// the output's — a mismatch is the §3.3.1 diagnostic (a `UnitNote`)
+    /// and the output is `Unknown(Mismatch)`.
+    AllMatch(Vec<usize>),
+    /// A string-literal **keyword** argument (`kwarg`) selects which rule
+    /// applies. Absent → `default`'s rule. Present but not a string
+    /// literal → `Unknown(NonLiteralExponent)`-shaped (this module's
+    /// nearest existing reason; §3.3.1 calls it "non-literal selector",
+    /// the same family of problem). Present, a literal, but not one of
+    /// `cases` — not reachable through a workbook that also evaluates,
+    /// since `eval`'s own scaling parser rejects it first; falls back to
+    /// `default`'s rule rather than inventing a new reason for a state
+    /// that cannot survive to a rendered cell.
+    SelectByLiteral { kwarg: &'static str, cases: Vec<(&'static str, FnUnitRule)>, default: &'static str },
+    /// Not derivable — reserved for a function this table cannot yet rule
+    /// on (none, today; §3.3 covers all 72).
+    Unknown,
+}
+
+/// A non-fatal §3.3.1 "check" — constrains what an argument *should* be
+/// without ever changing the output unit or the evaluated value. A
+/// violation is a `UnitNote`, the same non-fatal treatment as a mismatched
+/// `+` (R154 §2.1).
+enum FnUnitCheck {
+    /// Argument `n`, if `Known`, should be the atom `unit`.
+    Expect(usize, &'static str),
+    /// Argument `n`, if `Known`, should be dimensionless.
+    ExpectDimensionless(usize),
+    /// Arguments `a` and `b`, if both `Known`, should share a unit.
+    SameUnit(usize, usize),
+}
+
+fn same(n: usize) -> Box<FnUnitRule> {
+    Box::new(FnUnitRule::SameAsArg(n))
+}
+
+fn fixed(u: &'static str) -> Box<FnUnitRule> {
+    Box::new(FnUnitRule::Fixed(u))
+}
+
+/// C2 §3.3's per-function unit rule, by name and positional argument count
+/// (only `min`/`max` vary by count — 1-arg aggregate vs. 2-arg
+/// elementwise). Every one of the 72 `math_builtin_catalog` entries has a
+/// case; task 3's own catalog-completeness test (below) fails loudly if a
+/// future function is added here without one, rather than silently
+/// defaulting every unlisted name to `Unknown`.
+fn function_unit_rule(name: &str, arg_count: usize) -> (FnUnitRule, Vec<FnUnitCheck>) {
+    use FnUnitRule::*;
+    let no_checks = Vec::new();
+    match name {
+        "butter" => (SameAsArg(3), no_checks),
+        "sosfilt" => (SameAsArg(1), no_checks),
+        "declip" => (SameAsArg(0), no_checks),
+        "cumulative_trapezoid" | "cumtrapz" => (Product(same(0), fixed("s")), no_checks),
+        "differentiate" | "gradient" => (Quotient(same(0), fixed("s")), no_checks),
+        "detrend" => (SameAsArg(0), no_checks),
+        "rms" | "mean" | "std" => (SameAsArg(0), no_checks),
+        "median" => (SameAsArg(0), no_checks),
+        "sum" => (SameAsArg(0), no_checks),
+        "count" => (Dimensionless, no_checks),
+        "first" | "last" => (SameAsArg(0), no_checks),
+        "percentile" => (SameAsArg(0), no_checks),
+        "abs" => (SameAsArg(0), no_checks),
+        "sqrt" => (PowN(same(0), Ratio::new(1, 2)), no_checks),
+        "sign" => (Dimensionless, no_checks),
+        "floor" | "ceil" | "round" => (SameAsArg(0), no_checks),
+        "pow" => (pow_rule(), no_checks),
+        "min" | "max" => {
+            if arg_count <= 1 {
+                (SameAsArg(0), no_checks)
+            } else {
+                (AllMatch(vec![0, 1]), no_checks)
+            }
+        }
+        "clip" => (SameAsArg(0), no_checks),
+        "sin" | "cos" | "tan" => (Dimensionless, vec![FnUnitCheck::Expect(0, "rad")]),
+        "asin" | "acos" | "atan" => (Fixed("rad"), vec![FnUnitCheck::ExpectDimensionless(0)]),
+        "atan2" => (Fixed("rad"), vec![FnUnitCheck::SameUnit(0, 1)]),
+        "sinh" | "cosh" | "tanh" => (Dimensionless, vec![FnUnitCheck::ExpectDimensionless(0)]),
+        "deg2rad" => (Fixed("rad"), vec![FnUnitCheck::Expect(0, "deg")]),
+        "rad2deg" => (Fixed("deg"), vec![FnUnitCheck::Expect(0, "rad")]),
+        "periodogram" | "welch" | "spectrogram" => (spectral_rule(), no_checks),
+        "hilbert" => (SameAsArg(0), no_checks),
+        "correlate" | "convolve" => (Product(same(0), same(1)), no_checks),
+        "resample" => (SameAsArg(0), no_checks),
+        "where" => (AllMatch(vec![1, 2]), no_checks),
+        "current_lap" => (Dimensionless, no_checks),
+        "lap_start_time" => (Fixed("s"), no_checks),
+        "lap_start_distance" => (Fixed("m"), no_checks),
+        "sector_number" => (Dimensionless, no_checks),
+        // A difference of two [ch] series, not a duration/distance —
+        // corrected from the original brief's Fixed(s)/Fixed(m) (lead
+        // ruling, this dispatch's message).
+        "lap_delta_time" | "lap_delta_dist" => (SameAsArg(0), no_checks),
+        "attitude" => (Fixed("deg"), no_checks),
+        "body_accel" => (Fixed("g"), no_checks),
+        "wheel_travel" => (Fixed("mm"), no_checks),
+        "wheel_velocity" => (Fixed("mm/s"), no_checks),
+        "vec" => (AllMatch(vec![0, 1, 2]), no_checks),
+        "vx" | "vy" | "vz" => (SameAsArg(0), no_checks),
+        "vadd" | "vsub" => (AllMatch(vec![0, 1]), no_checks),
+        "vscale" => (Product(same(0), same(1)), no_checks),
+        "cross" | "dot" => (Product(same(0), same(1)), no_checks),
+        // Formally PowN(Product(0, 0), 1/2) (§3.3.1); simplified here to
+        // the equivalent SameAsArg(0) — squaring an atom's exponents then
+        // halving them is the identity, and a Vec3 carries exactly one
+        // unit, so there is nothing PowN/Product could disagree with
+        // SameAsArg about. Documented rather than expanded literally,
+        // since expanding it changes no observable output.
+        "norm" => (SameAsArg(0), no_checks),
+        "normalize" => (Dimensionless, no_checks),
+        // Formally Fixed(rad) because atan2's Product(0, 1) operands are
+        // identical and cancel (§3.3.1); the cancellation has no
+        // observable effect, so this is Fixed(rad) directly.
+        "angle_between" => (Fixed("rad"), no_checks),
+        "rotate_mat" | "rotate_axis" | "rotate_euler" => (SameAsArg(0), no_checks),
+        _ => (Unknown, no_checks),
+    }
+}
+
+/// `pow(x, y)`'s catalog placeholder — never evaluated. `infer`'s `Ast::Call`
+/// arm special-cases `"pow"` before ever consulting `function_unit_rule`
+/// (see [`pow_call_unit`]), because `y`'s value, not any argument's *unit*,
+/// selects the branch (§3.3: `PowN(0, y)` when `y` is a numeric literal;
+/// otherwise `Dimensionless` if `x` is dimensionless, else
+/// `Unknown(NonLiteralExponent)`) — no other rule needs a raw `Ast` value,
+/// so it is not modelled generically in `FnUnitRule`. This entry exists
+/// only so the catalog-completeness test below finds `"pow"` accounted
+/// for, not `Unknown` by omission.
+fn pow_rule() -> FnUnitRule {
+    FnUnitRule::Unknown
+}
+
+/// `pow(x, y)`'s real rule (§3.3), computed directly from the call's own
+/// `Ast` rather than through [`FnUnitRule`] (see [`pow_rule`]'s doc
+/// comment for why). `y_ast` is `args.get(1)` — absent when `pow` was
+/// called with the wrong arity, which is a separate `ArgCount` evaluation
+/// error this function does not need to duplicate; it simply reports
+/// `Unknown` in that case.
+fn pow_call_unit(arg_units: &[Unit], y_ast: Option<&Ast>) -> Unit {
+    let x = arg_units.first().cloned().unwrap_or(Unit::Unknown(UnknownReason::NoSourceUnit));
+    let literal_exponent = match y_ast {
+        Some(Ast::Number(y)) => ratio_from_f64(*y),
+        _ => None,
+    };
+    match literal_exponent {
+        Some(k) => pow_unit(x, k),
+        None => match x {
+            Unit::Scalar => Unit::Scalar,
+            Unit::Known(u) if u.is_dimensionless() => Unit::Known(u),
+            _ => Unit::Unknown(UnknownReason::NonLiteralExponent),
+        },
+    }
+}
+
+/// Recovers a small exact [`Ratio`] from a literal `pow` exponent, when one
+/// exists within floating-point tolerance — an integer (`2`, `-1`) or a
+/// half-integer (`0.5`, `-1.5`, the `sqrt`/`cbrt`-shaped exponents authors
+/// actually write via `pow` instead of `sqrt`). `y` is an arbitrary `f64`
+/// in general (any workbook literal), which has no exact rational form in
+/// general — rather than guess a rational for something like `0.301` (an
+/// author's `log10`-flavoured exponent, not really an exact rational),
+/// this recovers only the two shapes real workbooks demonstrably need and
+/// reports `None` otherwise, which `pow_call_unit` turns into the honest
+/// `Unknown(NonLiteralExponent)` rather than a wrong-looking unit. A
+/// judgment call (CLAUDE.md §1) narrower than "any rational `y`", not a
+/// guess at what that broader rule should be.
+fn ratio_from_f64(y: f64) -> Option<Ratio> {
+    const TOL: f64 = 1e-9;
+    if (y - y.round()).abs() < TOL {
+        return Some(Ratio::from_int(y.round() as i64));
+    }
+    let doubled = y * 2.0;
+    if (doubled - doubled.round()).abs() < TOL {
+        return Some(Ratio::new(doubled.round() as i64, 2));
+    }
+    None
+}
+
+/// `periodogram`/`welch`/`spectrogram`'s shared three-scaling rule (§3.3.1):
+/// `scaling="density"` → `[ch]²/Hz`, `"spectrum"` → `[ch]²`,
+/// `"raw_magnitude"` → `[ch]` (magnitude, unnormalised). Default
+/// `"density"`, matching the engine's own default. `spectrogram`'s rule is
+/// contingent (§3.3.1 Open 1 — it is `NotImplemented`, so this is read off
+/// `periodogram`'s prose, not an implementation) and shares this function
+/// rather than duplicating it, so the day it lands the two do not silently
+/// drift apart.
+fn spectral_rule() -> FnUnitRule {
+    FnUnitRule::SelectByLiteral {
+        kwarg: "scaling",
+        cases: vec![
+            ("density", FnUnitRule::Quotient(Box::new(FnUnitRule::PowN(same(0), Ratio::from_int(2))), fixed("Hz"))),
+            ("spectrum", FnUnitRule::PowN(same(0), Ratio::from_int(2))),
+            ("raw_magnitude", FnUnitRule::SameAsArg(0)),
+        ],
+        default: "density",
+    }
+}
+
+/// Reads a keyword argument's value as a string literal, if `kwargs`
+/// carries `name` and its value is a bare `Ast::Str`.
+fn literal_kwarg<'a>(kwargs: &'a [(String, Ast)], name: &str) -> Option<&'a str> {
+    kwargs.iter().find(|(k, _)| k == name).and_then(|(_, v)| match v {
+        Ast::Str(s) => Some(s.as_str()),
+        _ => None,
+    })
+}
+
+/// Evaluates `rule` against `arg_units` (already-inferred positional
+/// argument units) and `kwargs` (for `SelectByLiteral`'s selector).
+fn eval_fn_rule(rule: &FnUnitRule, arg_units: &[Unit], kwargs: &[(String, Ast)]) -> (Unit, Vec<UnitNote>) {
+    match rule {
+        FnUnitRule::SameAsArg(n) => (
+            arg_units
+                .get(*n)
+                .cloned()
+                .unwrap_or_else(|| Unit::Unknown(UnknownReason::Propagated { of: "a missing argument".to_string() })),
+            Vec::new(),
+        ),
+        FnUnitRule::Fixed(u) => (
+            Unit::Known(UnitExpr::parse(u).unwrap_or_else(|_| panic!("fixed unit literal '{u}' must parse"))),
+            Vec::new(),
+        ),
+        FnUnitRule::Dimensionless => (Unit::Known(UnitExpr::dimensionless()), Vec::new()),
+        FnUnitRule::Product(a, b) => {
+            let (ua, mut notes) = eval_fn_rule(a, arg_units, kwargs);
+            let (ub, notes_b) = eval_fn_rule(b, arg_units, kwargs);
+            notes.extend(notes_b);
+            (mul_div_unit(ua, ub, false), notes)
+        }
+        FnUnitRule::Quotient(a, b) => {
+            let (ua, mut notes) = eval_fn_rule(a, arg_units, kwargs);
+            let (ub, notes_b) = eval_fn_rule(b, arg_units, kwargs);
+            notes.extend(notes_b);
+            (mul_div_unit(ua, ub, true), notes)
+        }
+        FnUnitRule::PowN(inner, k) => {
+            let (u, notes) = eval_fn_rule(inner, arg_units, kwargs);
+            (pow_unit(u, *k), notes)
+        }
+        FnUnitRule::AllMatch(idxs) => {
+            let (unit, note) = all_match(idxs, arg_units);
+            (unit, note.into_iter().collect())
+        }
+        FnUnitRule::SelectByLiteral { kwarg, cases, default } => {
+            let present = kwargs.iter().any(|(k, _)| k == kwarg);
+            match literal_kwarg(kwargs, kwarg) {
+                Some(selector) => {
+                    let picked = cases.iter().find(|(lit, _)| *lit == selector).map(|(_, r)| r).unwrap_or_else(|| {
+                        // A literal but not one of the recognised options —
+                        // eval's own scaling parser rejects this before a
+                        // cell can render, so fall back to `default` rather
+                        // than invent a reason nothing can ever observe.
+                        &cases.iter().find(|(lit, _)| lit == default).expect("default case must exist").1
+                    });
+                    eval_fn_rule(picked, arg_units, kwargs)
+                }
+                None if present => (Unit::Unknown(UnknownReason::NonLiteralExponent), Vec::new()),
+                None => {
+                    let default_rule = &cases.iter().find(|(lit, _)| lit == default).expect("default case must exist").1;
+                    eval_fn_rule(default_rule, arg_units, kwargs)
+                }
+            }
+        }
+        FnUnitRule::Unknown => {
+            (Unit::Unknown(UnknownReason::Propagated { of: "this function".to_string() }), Vec::new())
+        }
+    }
+}
+
+/// `Unit::pow` — the `PowN` combinator's leaf operation, mirroring
+/// [`UnitExpr::pow`]/[`UnitExpr::sqrt`] but over the three-state lattice.
+fn pow_unit(u: Unit, k: Ratio) -> Unit {
+    match u {
+        Unit::Scalar => Unit::Scalar,
+        Unit::Known(expr) => Unit::Known(expr.pow(k)),
+        Unit::Unknown(reason) => Unit::Unknown(reason),
+    }
+}
+
+/// `AllMatch(idxs)`'s rule: every listed argument must share one `Known`
+/// unit (Scalars adopt it; all-`Scalar` stays `Scalar`); a disagreement
+/// among two or more `Known` units is the §3.3.1 diagnostic, output
+/// `Unknown(Mismatch)`. Any `Unknown` operand propagates.
+fn all_match(idxs: &[usize], arg_units: &[Unit]) -> (Unit, Option<UnitNote>) {
+    let units: Vec<Unit> = idxs
+        .iter()
+        .map(|&i| {
+            arg_units
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| Unit::Unknown(UnknownReason::Propagated { of: "a missing argument".to_string() }))
+        })
+        .collect();
+
+    if let Some(Unit::Unknown(reason)) = units.iter().find(|u| matches!(u, Unit::Unknown(_))) {
+        return (Unit::Unknown(reason.clone()), None);
+    }
+
+    let known: Vec<&UnitExpr> = units.iter().filter_map(|u| if let Unit::Known(e) = u { Some(e) } else { None }).collect();
+    let Some(first) = known.first() else {
+        return (Unit::Scalar, None);
+    };
+    match known.iter().find(|e| **e != *first) {
+        None => (Unit::Known((*first).clone()), None),
+        Some(other) => {
+            let note = UnitNote {
+                message: format!("arguments must share one unit; found `{first}` and `{other}`"),
+            };
+            (
+                Unit::Unknown(UnknownReason::Mismatch {
+                    left: (*first).clone(),
+                    right: (*other).clone(),
+                    op: "call",
+                }),
+                Some(note),
+            )
+        }
+    }
+}
+
+/// Applies §3.3.1's non-fatal checks, appending a [`UnitNote`] for each
+/// violation. Never changes an already-computed output unit.
+fn apply_fn_checks(checks: &[FnUnitCheck], arg_units: &[Unit], notes: &mut Vec<UnitNote>) {
+    for check in checks {
+        match check {
+            FnUnitCheck::Expect(n, atom) => {
+                if let Some(Unit::Known(u)) = arg_units.get(*n) {
+                    let expected = UnitExpr::atom(atom);
+                    if u != &expected {
+                        notes.push(UnitNote { message: format!("argument {n}: expected `{atom}`, found `{u}`") });
+                    }
+                }
+            }
+            FnUnitCheck::ExpectDimensionless(n) => {
+                if let Some(Unit::Known(u)) = arg_units.get(*n) {
+                    if !u.is_dimensionless() {
+                        notes.push(UnitNote {
+                            message: format!("argument {n}: expected dimensionless, found `{u}`"),
+                        });
+                    }
+                }
+            }
+            FnUnitCheck::SameUnit(a, b) => {
+                if let (Some(Unit::Known(ua)), Some(Unit::Known(ub))) = (arg_units.get(*a), arg_units.get(*b)) {
+                    if ua != ub {
+                        notes.push(UnitNote {
+                            message: format!("arguments {a} and {b}: units differ (`{ua}` and `{ub}`)"),
+                        });
+                    }
+                }
+            }
         }
     }
 }
@@ -1088,17 +1484,17 @@ mod tests {
     }
 
     #[test]
-    fn infer_call_is_unknown_propagated_regardless_of_function() {
-        // Arrange — task 2 stop-gap; task 3 installs the real per-function
-        // rule table
-        let ast = parse("sqrt([Travel])");
-        let lk = units(&[("Travel", "mm")]);
+    fn infer_call_propagates_an_unknown_operand_through_same_as_arg() {
+        // Arrange — task 3's real rule table still propagates Unknown
+        // through a SameAsArg function when the operand itself is unknown
+        let ast = parse("abs([Raw])");
+        let lk = units(&[("Raw", "")]);
 
         // Act
         let (unit, _) = infer(&ast, &lk);
 
         // Assert
-        assert!(matches!(unit, Unit::Unknown(UnknownReason::Propagated { .. })));
+        assert!(matches!(unit, Unit::Unknown(UnknownReason::NoSourceUnit)));
     }
 
     #[test]
@@ -1180,5 +1576,305 @@ mod tests {
             label,
             UnitLabel::Unknown { reason: "no unit recorded for this channel".to_string() }
         );
+    }
+
+    // --- task 3: the function unit-rule table (C2 §3.3/§3.3.1) ---
+
+    #[test]
+    fn function_unit_rule_catalog_completeness_every_builtin_has_a_real_rule() {
+        // Arrange — task 3's own required test: a function added to
+        // call_function with no entry here must fail loudly, not silently
+        // report Unknown by omission.
+        for builtin in crate::math::catalog::math_builtin_catalog() {
+            // Act
+            let (rule, _) = function_unit_rule(builtin.name, builtin.arity[0] as usize);
+
+            // Assert — "pow" is the one deliberate FnUnitRule::Unknown
+            // placeholder (special-cased directly in `infer`, see
+            // `pow_rule`'s doc comment); every other name must have a real
+            // rule.
+            if builtin.name != "pow" {
+                assert!(
+                    !matches!(rule, FnUnitRule::Unknown),
+                    "'{}' has no unit rule in function_unit_rule",
+                    builtin.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn infer_cumulative_trapezoid_multiplies_by_the_atom_s() {
+        // Arrange
+        let ast = parse("cumulative_trapezoid([Travel])");
+        let lk = units(&[("Travel", "mm")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::parse("mm*s").unwrap()));
+    }
+
+    #[test]
+    fn infer_differentiate_divides_by_the_atom_s() {
+        // Arrange
+        let ast = parse("differentiate([Travel])");
+        let lk = units(&[("Travel", "mm")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::parse("mm/s").unwrap()));
+    }
+
+    #[test]
+    fn infer_sqrt_call_halves_the_exponent() {
+        // Arrange
+        let ast = parse("sqrt([PsdG])");
+        let lk = units(&[("PsdG", "g^2/Hz")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::parse("g/Hz^(1/2)").unwrap()));
+    }
+
+    #[test]
+    fn infer_body_accel_is_fixed_g_regardless_of_argument() {
+        // Arrange
+        let ast = parse("body_accel(\"long\")");
+        let lk = units(&[]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::atom("g")));
+    }
+
+    #[test]
+    fn infer_count_is_dimensionless_not_the_atom_count() {
+        // Arrange — a channel whose C1 unit happens to be the string
+        // "count" is Known(count); count(ch) is Dimensionless regardless.
+        let ast = parse("count([Wheel])");
+        let lk = units(&[("Wheel", "count")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::dimensionless()));
+    }
+
+    #[test]
+    fn infer_min_one_arg_is_same_as_arg_min_two_args_is_all_match() {
+        // Arrange
+        let one_arg = parse("min([Travel])");
+        let two_args_ok = parse("min([A], [B])");
+        let two_args_mismatch = parse("min([A], [C])");
+        let lk = units(&[("Travel", "mm"), ("A", "mm"), ("B", "mm"), ("C", "km/h")]);
+
+        // Act
+        let (u1, _) = infer(&one_arg, &lk);
+        let (u2, n2) = infer(&two_args_ok, &lk);
+        let (u3, n3) = infer(&two_args_mismatch, &lk);
+
+        // Assert
+        assert_eq!(u1, Unit::Known(UnitExpr::atom("mm")));
+        assert_eq!(u2, Unit::Known(UnitExpr::atom("mm")));
+        assert!(n2.is_empty());
+        assert!(matches!(u3, Unit::Unknown(UnknownReason::Mismatch { .. })));
+        assert_eq!(n3.len(), 1);
+    }
+
+    #[test]
+    fn infer_where_takes_the_matching_branch_unit_cond_is_unconstrained() {
+        // Arrange — cond ([HR], bpm) is unrelated to t/f's shared mm
+        let ast = parse("where([HR] > 0, [A], [B])");
+        let lk = units(&[("HR", "bpm"), ("A", "mm"), ("B", "mm")]);
+
+        // Act
+        let (unit, notes) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::atom("mm")));
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn infer_sin_of_a_degree_argument_is_a_diagnostic_not_a_conversion() {
+        // Arrange — §3.3.1's own headline example
+        let ast = parse("sin([AngleDeg])");
+        let lk = units(&[("AngleDeg", "deg")]);
+
+        // Act
+        let (unit, notes) = infer(&ast, &lk);
+
+        // Assert — result is still Dimensionless, never blocked or converted
+        assert_eq!(unit, Unit::Known(UnitExpr::dimensionless()));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].message.contains("rad"));
+    }
+
+    #[test]
+    fn infer_sin_of_a_radian_argument_is_clean() {
+        // Arrange
+        let ast = parse("sin([AngleRad])");
+        let lk = units(&[("AngleRad", "rad")]);
+
+        // Act
+        let (unit, notes) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::dimensionless()));
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn infer_atan2_mismatched_operands_is_a_diagnostic_result_still_fixed_rad() {
+        // Arrange
+        let ast = parse("atan2([Y], [X])");
+        let lk = units(&[("Y", "mm"), ("X", "m")]);
+
+        // Act
+        let (unit, notes) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::atom("rad")));
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn infer_periodogram_density_scaling_is_ch_squared_per_hz() {
+        // Arrange
+        let ast = parse("periodogram([AccelG], scaling=\"density\")");
+        let lk = units(&[("AccelG", "g")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::parse("g^2/Hz").unwrap()));
+    }
+
+    #[test]
+    fn infer_periodogram_spectrum_scaling_is_ch_squared() {
+        // Arrange
+        let ast = parse("periodogram([AccelG], scaling=\"spectrum\")");
+        let lk = units(&[("AccelG", "g")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::parse("g^2").unwrap()));
+    }
+
+    #[test]
+    fn infer_periodogram_raw_magnitude_scaling_is_same_as_arg() {
+        // Arrange
+        let ast = parse("periodogram([AccelG], scaling=\"raw_magnitude\")");
+        let lk = units(&[("AccelG", "g")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::atom("g")));
+    }
+
+    #[test]
+    fn infer_periodogram_omitted_scaling_defaults_to_density() {
+        // Arrange
+        let ast = parse("periodogram([AccelG])");
+        let lk = units(&[("AccelG", "g")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::parse("g^2/Hz").unwrap()));
+    }
+
+    #[test]
+    fn infer_welch_shares_periodograms_scaling_rule() {
+        // Arrange
+        let ast = parse("welch([AccelG], scaling=\"spectrum\")");
+        let lk = units(&[("AccelG", "g")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::parse("g^2").unwrap()));
+    }
+
+    #[test]
+    fn infer_pow_with_integer_literal_exponent() {
+        // Arrange
+        let ast = parse("pow([Travel], 2)");
+        let lk = units(&[("Travel", "mm")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::parse("mm^2").unwrap()));
+    }
+
+    #[test]
+    fn infer_pow_with_half_literal_exponent() {
+        // Arrange
+        let ast = parse("pow([PsdG], 0.5)");
+        let lk = units(&[("PsdG", "g^2")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::atom("g")));
+    }
+
+    #[test]
+    fn infer_pow_with_non_literal_exponent_on_a_dimensioned_base_is_non_literal_exponent() {
+        // Arrange
+        let ast = parse("pow([Travel], [N])");
+        let lk = units(&[("Travel", "mm"), ("N", "count")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Unknown(UnknownReason::NonLiteralExponent));
+    }
+
+    #[test]
+    fn infer_pow_with_non_literal_exponent_on_a_dimensionless_base_is_dimensionless() {
+        // Arrange — 0 * anything = 0: a dimensionless base stays
+        // dimensionless under any exponent, literal or not. `count([Wheel])`
+        // is genuinely `Known(dimensionless)` (the *function*, not a
+        // channel whose atom happens to be the string "count" — those are
+        // different claims, §3.3.1's own "count and the atom count" note).
+        let ast = parse("pow(count([Wheel]), [N])");
+        let lk = units(&[("Wheel", "pulse"), ("N", "count")]);
+
+        // Act
+        let (unit, _) = infer(&ast, &lk);
+
+        // Assert
+        assert_eq!(unit, Unit::Known(UnitExpr::dimensionless()));
+    }
+
+    #[test]
+    fn ratio_from_f64_recovers_integers_and_halves_not_arbitrary_fractions() {
+        // Arrange / Act / Assert
+        assert_eq!(ratio_from_f64(2.0), Some(Ratio::from_int(2)));
+        assert_eq!(ratio_from_f64(-1.0), Some(Ratio::from_int(-1)));
+        assert_eq!(ratio_from_f64(0.5), Some(Ratio::new(1, 2)));
+        assert_eq!(ratio_from_f64(-1.5), Some(Ratio::new(-3, 2)));
+        assert_eq!(ratio_from_f64(0.3), None);
     }
 }
