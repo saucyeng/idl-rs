@@ -348,6 +348,44 @@ mod tests {
     }
 
     #[test]
+    fn def_line_a_call_with_a_keyword_argument_containing_its_own_eq_still_classifies_as_one_def(
+    ) {
+        // Arrange — keyword arguments (C2 §3.2, R143 item 1) put a second
+        // `=` inside a def_line's right-hand side. `classify_line` splits on
+        // the line's *first* `=` (`main.find('=')`), which is always the
+        // def_line's own separator — the call's own `=` can only ever come
+        // later, inside the already-opened `(...)`.
+        let (lines, errors) =
+            parse_math_cell_body("aaaaaaaa", "x = where([a] > 0, mean([b], dim=\"t\"), 0)");
+
+        // Assert — one Def, the whole call (with its keyword argument)
+        // captured verbatim as `expr_text`, not split at the keyword's `=`.
+        assert!(errors.is_empty());
+        assert_eq!(
+            lines,
+            vec![MathCellLine::Def {
+                name: "x".to_string(),
+                expr_text: "where([a] > 0, mean([b], dim=\"t\"), 0)".to_string(),
+                label: None
+            }]
+        );
+    }
+
+    #[test]
+    fn const_line_a_keyword_style_eq_never_appears_in_a_bare_number_rhs_unaffected() {
+        // Arrange — a `const` line's right-hand side is always a bare
+        // number (no calls, so no keyword-argument `=` can ever appear
+        // here); this is a regression guard that the `const`-prefix
+        // dispatch above `classify_line`'s own `find('=')` fallback is
+        // unaffected by the keyword-argument grammar addition.
+        let (lines, errors) = parse_math_cell_body("aaaaaaaa", "const k = 9.81");
+
+        // Assert
+        assert!(errors.is_empty());
+        assert_eq!(lines, vec![MathCellLine::Const { name: "k".to_string(), value: 9.81, unit_display: None }]);
+    }
+
+    #[test]
     fn const_line_const_k_eq_9_81_const() {
         // Act
         let (lines, errors) = parse_math_cell_body("aaaaaaaa", "const k = 9.81");

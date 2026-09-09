@@ -363,12 +363,16 @@ pub fn eval(
             let r = eval(right, lookup, lap_ctx)?;
             apply_binary(*op, l, r)
         }
-        Ast::Call { name, args } => {
+        Ast::Call { name, args, kwargs } => {
             let argv: Vec<Value> = args
                 .iter()
                 .map(|a| eval(a, lookup, lap_ctx))
                 .collect::<Result<_, _>>()?;
-            call_function(name, argv, lookup, lap_ctx)
+            let kwargv: Kwargs = kwargs
+                .iter()
+                .map(|(k, a)| Ok((k.clone(), eval(a, lookup, lap_ctx)?)))
+                .collect::<Result<_, _>>()?;
+            call_function(name, argv, &kwargv, lookup, lap_ctx)
         }
     }
 }
@@ -848,14 +852,73 @@ fn dart_sign(x: f64) -> f64 {
     }
 }
 
+/// A parsed call's keyword arguments (C2 §3.2, R143 item 1), already
+/// evaluated to [`Value`]s — `Ast::Call::kwargs` after `eval` has run each
+/// value expression. Empty for a call written with none; keyword arguments
+/// are always additive, never required.
+type Kwargs = HashMap<String, Value>;
+
+/// Looks up `key` in `kwargs`, requiring it not *also* be supplied
+/// positionally in the same call (`positional_present`) — C2 §3.2's "bound
+/// both positionally and by keyword" rule. This can't live in the parser: a
+/// parser sees only a position index, never which parameter name that
+/// position maps to for a specific function. Returns `Ok(None)` when the
+/// caller didn't use the keyword form at all.
+fn take_kwarg<'a>(
+    fn_name: &str,
+    key: &str,
+    positional_present: bool,
+    kwargs: &'a Kwargs,
+) -> Result<Option<&'a Value>, MathEvalError> {
+    match kwargs.get(key) {
+        Some(_) if positional_present => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{fn_name}: \"{key}\" was given both positionally and by keyword"),
+        )),
+        found => Ok(found),
+    }
+}
+
+/// C2 §3.2's third keyword-argument rule: every name in `kwargs` must be
+/// one of `accepted` — an unknown keyword is a typed error, never silently
+/// dropped (a false friend in parameter form, plan §2). Call once per
+/// function, before inspecting any individual keyword.
+fn reject_unknown_kwargs(fn_name: &str, kwargs: &Kwargs, accepted: &[&str]) -> Result<(), MathEvalError> {
+    for key in kwargs.keys() {
+        if !accepted.contains(&key.as_str()) {
+            return Err(err(
+                MathEvalErrorKind::Runtime,
+                format!("{fn_name}: unknown keyword argument \"{key}\" (accepts: {})", accepted.join(", ")),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Functions with a documented keyword form (C2 §3.2) — grows as later
+/// tasks add one (the `fft` split's `window=`/`scaling=`/…, task 6; `dim=`
+/// reductions, task 12). Every other function rejects any `kwargs` outright
+/// in [`call_function`]'s entry guard below, rather than each arm needing
+/// its own "I take no keywords" check.
+const KWARG_AWARE_FUNCTIONS: &[&str] = &["mean"];
+
 /// Function-call dispatch. Arms are grouped by task (A6 DSP; A7 stats; A8
 /// elementwise/trig; A9 clamp/if/stubs; A10 lap-aware).
 fn call_function(
     name: &str,
     args: Vec<Value>,
+    kwargs: &Kwargs,
     lookup: &dyn ChannelLookup,
     lap_ctx: &MathLapContext,
 ) -> Result<Value, MathEvalError> {
+    if !kwargs.is_empty() && !KWARG_AWARE_FUNCTIONS.contains(&name) {
+        let mut unknown: Vec<&str> = kwargs.keys().map(String::as_str).collect();
+        unknown.sort_unstable();
+        return Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{name}: unknown keyword argument \"{}\" — {name} takes no keyword arguments", unknown[0]),
+        ));
+    }
     match name {
         // ---- A6: DSP-backed ----
         "integrate" => {
@@ -1007,15 +1070,27 @@ fn call_function(
         }
         "mean" => {
             // 1-arg → scalar aggregate (windowed, R123/R124); 2-arg → rolling
-            // mean over a sample-count window (unaffected).
-            if args.len() == 1 {
-                let (samples, s, e) = one_channel_windowed(&args, "mean", lap_ctx)?;
-                Ok(Value::Scalar(crate::math::aggregate::mean(&samples[s..e])))
-            } else {
-                require_arg_count(name, &args, 2)?;
-                let ch = require_channel(&args[0], name)?;
-                let w = require_scalar(&args[1], name)?.round().max(0.0) as usize;
-                Ok(channel(crate::statistics::rolling_mean(&ch.samples, w), ch.sample_rate_hz, ch.t_us))
+            // mean over a sample-count window (unaffected). `mean(x,
+            // window=w)` (C2 §3.2, R143 item 1) is a non-overloaded spelling
+            // of the same rolling form, additive to the positional one.
+            reject_unknown_kwargs(name, kwargs, &["window"])?;
+            let window_kw = take_kwarg(name, "window", args.len() >= 2, kwargs)?;
+            match (args.len(), window_kw) {
+                (1, None) => {
+                    let (samples, s, e) = one_channel_windowed(&args, "mean", lap_ctx)?;
+                    Ok(Value::Scalar(crate::math::aggregate::mean(&samples[s..e])))
+                }
+                (1, Some(w_val)) => {
+                    let ch = require_channel(&args[0], name)?;
+                    let w = require_scalar(w_val, name)?.round().max(0.0) as usize;
+                    Ok(channel(crate::statistics::rolling_mean(&ch.samples, w), ch.sample_rate_hz, ch.t_us))
+                }
+                _ => {
+                    require_arg_count(name, &args, 2)?;
+                    let ch = require_channel(&args[0], name)?;
+                    let w = require_scalar(&args[1], name)?.round().max(0.0) as usize;
+                    Ok(channel(crate::statistics::rolling_mean(&ch.samples, w), ch.sample_rate_hz, ch.t_us))
+                }
             }
         }
         "std" => {
@@ -2929,6 +3004,7 @@ mod tests {
         let v = call_function(
             "attitude",
             vec![Value::Str("roll".into())],
+            &Kwargs::new(),
             &FakeEstimator,
             &MathLapContext::empty(),
         )
@@ -2950,6 +3026,7 @@ mod tests {
         let v = call_function(
             "body_accel",
             vec![Value::Str("lat".into())],
+            &Kwargs::new(),
             &FakeEstimator,
             &MathLapContext::empty(),
         );
@@ -2964,6 +3041,7 @@ mod tests {
         let v = call_function(
             "wheel_travel",
             vec![Value::Str("front".into())],
+            &Kwargs::new(),
             &FakeEstimator,
             &MathLapContext::empty(),
         );
@@ -2978,6 +3056,7 @@ mod tests {
         let e = call_function(
             "attitude",
             vec![Value::Str("yaw".into())],
+            &Kwargs::new(),
             &FakeEstimator,
             &MathLapContext::empty(),
         )
@@ -2995,6 +3074,7 @@ mod tests {
         let e = call_function(
             "attitude",
             vec![Value::Str("roll".into())],
+            &Kwargs::new(),
             &NoEstimator,
             &MathLapContext::empty(),
         )
@@ -3002,6 +3082,66 @@ mod tests {
 
         // Assert
         assert!(e.message.contains("IMU0"), "{}", e.message);
+    }
+
+    #[test]
+    fn kwarg_mean_window_eq_matches_the_positional_rolling_form() {
+        // Arrange — `mean(x, window=w)` (C2 §3.2, R143 item 1) is additive
+        // to `mean(x, w)`, never a replacement — same result either way.
+        let lk = lookup(&[("X", vec![1.0, 2.0, 3.0, 4.0], 10.0)]);
+
+        // Act
+        let positional = eval_expr("mean([X], 2)", &lk).unwrap();
+        let keyword = eval_expr("mean([X], window=2)", &lk).unwrap();
+
+        // Assert
+        match (positional, keyword) {
+            (Value::Channel(a), Value::Channel(b)) => assert_eq!(a.samples, b.samples),
+            other => panic!("expected two channels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kwarg_mean_an_unrecognised_keyword_name_is_a_typed_error_naming_the_function() {
+        // Arrange — C2 §3.2's third binding rule: an unknown keyword is
+        // never silently dropped.
+        let lk = lookup(&[("X", vec![1.0, 2.0, 3.0], 10.0)]);
+
+        // Act
+        let err = eval_expr("mean([X], prominence=2)", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("mean"), "{}", err.message);
+        assert!(err.message.contains("prominence"), "{}", err.message);
+    }
+
+    #[test]
+    fn kwarg_mean_bound_both_positionally_and_by_keyword_is_a_typed_error() {
+        // Arrange — the second binding rule: a parameter can't be given
+        // both ways in the same call.
+        let lk = lookup(&[("X", vec![1.0, 2.0, 3.0], 10.0)]);
+
+        // Act
+        let err = eval_expr("mean([X], 2, window=3)", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("both positionally and by keyword"), "{}", err.message);
+    }
+
+    #[test]
+    fn kwarg_a_function_with_no_keyword_form_rejects_any_keyword_argument() {
+        // Arrange — every function not in `KWARG_AWARE_FUNCTIONS` rejects
+        // any `kwargs` at `call_function`'s entry guard, not per-arm.
+        let lk = lookup(&[("X", vec![1.0, 2.0, 3.0], 10.0)]);
+
+        // Act
+        let err = eval_expr("abs([X], scale=2)", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("scale"), "{}", err.message);
     }
 
     #[test]
