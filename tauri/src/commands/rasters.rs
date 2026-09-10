@@ -287,7 +287,25 @@ pub struct RasterMetaOut {
     /// bin count and has no unit. Metadata only — R165 stands, `fetch_fft`'s
     /// byte payload stays samples and framing.
     pub magnitude_unit: Option<crate::commands::workbook::UnitLabel>,
+    /// The colour ramp this raster's pixels were encoded with, sampled at
+    /// evenly spaced `t` including both endpoints (C3 §3.6, ruling R177):
+    /// stop `i` of `n` is the ramp at `t = i / (n - 1)`. Each stop is opaque
+    /// RGBA8 `[r, g, b, a]`; the ramp's transparent non-finite case is not a
+    /// stop (see `transparent_zero`). Both raster kinds encode with the same
+    /// Turbo ramp (`idl_rs::colormap`), so this is
+    /// [`idl_rs::colormap::turbo_stops`] at [`RAMP_STOP_COUNT`] for either.
+    ///
+    /// Carried per raster rather than by a one-time command so a legend can
+    /// only ever describe the encoder that produced the pixels beside it: the
+    /// app builds a CSS gradient from these stops and never reimplements
+    /// Turbo in TypeScript.
+    pub ramp_stops: Vec<[u8; 4]>,
 }
+
+/// How many stops `RasterMetaOut.ramp_stops` carries. C3 §3.6 requires
+/// `n >= 16`; sixteen is visually continuous for a legend bar (R177) and
+/// costs ~100 bytes of JSON per meta call.
+const RAMP_STOP_COUNT: usize = 16;
 
 impl RasterMetaOut {
     fn from_core(
@@ -304,6 +322,7 @@ impl RasterMetaOut {
             scale: RasterMetaScale { vmin: meta.vmin, vmax: meta.vmax, kind: "linear".to_string() },
             transparent_zero: meta.transparent_zero,
             magnitude_unit,
+            ramp_stops: idl_rs::colormap::turbo_stops(RAMP_STOP_COUNT),
         }
     }
 }
@@ -1000,6 +1019,97 @@ mod tests {
         assert_eq!(meta.x_label, "Speed (m/s)");
         assert_eq!(meta.y_label, "Cadence (rpm)");
         assert!(meta.transparent_zero);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Every opaque (alpha 255) pixel of a raster's byte payload, deduplicated.
+    // The 16-byte C3 §3.6 header is skipped; transparent pixels (the ramp's
+    // non-finite case) are not ramp colours and are excluded.
+    fn opaque_pixels(bytes: &[u8]) -> Vec<[u8; 4]> {
+        let mut seen: Vec<[u8; 4]> = Vec::new();
+        for px in bytes[16..].chunks_exact(4) {
+            let px = [px[0], px[1], px[2], px[3]];
+            if px[3] == 255 && !seen.contains(&px) {
+                seen.push(px);
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn fetch_raster_meta_spectrogram_ramp_stops_are_sixteen_turbo_samples() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root);
+
+        // Act
+        let meta = fetch_raster_meta_via(&root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+
+        // Assert — C3 §3.6: n >= 16, endpoints included, every stop opaque,
+        // and the stops are core's ramp, never a second table here.
+        assert_eq!(meta.ramp_stops, idl_rs::colormap::turbo_stops(16));
+        assert!(meta.ramp_stops.len() >= 16);
+        assert_eq!(meta.ramp_stops[0], idl_rs::colormap::turbo_rgba8(0.0));
+        assert_eq!(*meta.ramp_stops.last().unwrap(), idl_rs::colormap::turbo_rgba8(1.0));
+        assert!(meta.ramp_stops.iter().all(|s| s[3] == 255));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_raster_meta_histogram2d_ramp_stops_match_the_spectrograms() {
+        // Arrange — both kinds encode with the same Turbo ramp, so a legend
+        // built from either kind's stops describes the other's pixels too.
+        let root = temp_root();
+        seed_session(&root);
+
+        // Act
+        let hist = fetch_raster_meta_via(&root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let spec = fetch_raster_meta_via(&root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+
+        // Assert
+        assert_eq!(hist.ramp_stops, spec.ramp_stops);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ramp_stops_describe_the_pixels_a_histogram2d_raster_actually_encodes() {
+        // Arrange — bins == pixels for a histogram2d (R42), so the vmax bin
+        // survives into the payload and must carry the ramp's t = 1.0 colour.
+        let root = temp_root();
+        seed_session(&root);
+        let meta = fetch_raster_meta_via(&root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+
+        // Act
+        let bytes = fetch_raster_via(&root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let pixels = opaque_pixels(&bytes);
+
+        // Assert — the legend's top end is a colour the picture really uses.
+        assert!(!pixels.is_empty());
+        assert!(pixels.contains(meta.ramp_stops.last().unwrap()), "no pixel carries the last ramp stop");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ramp_stops_describe_the_pixels_a_spectrogram_raster_actually_encodes() {
+        // Arrange — a fine sampling of the same ramp the stops come from;
+        // every opaque pixel the encoder emits must be a colour on it.
+        let root = temp_root();
+        seed_session(&root);
+        let ramp: Vec<[u8; 4]> = (0..=4096).map(|i| idl_rs::colormap::turbo_rgba8(i as f64 / 4096.0)).collect();
+
+        // Act
+        let bytes = fetch_raster_via(&root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+        let pixels = opaque_pixels(&bytes);
+
+        // Assert — Turbo, not some other ramp, encoded these pixels.
+        assert!(!pixels.is_empty());
+        for px in &pixels {
+            assert!(ramp.contains(px), "pixel {px:?} is not a Turbo colour");
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
