@@ -49,10 +49,47 @@ pub struct ThisDeviceDto {
     pub name: String,
 }
 
+/// One peer visible on the LAN via mDNS that this device has not paired
+/// with (C3 §3.9, L11 Task 14). Lets a Settings pane prefill `peer_id` for
+/// `pair_peer` (ruling R104) instead of Isaac typing a 32-character id read
+/// off another screen.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DiscoveredPeerDto {
+    pub peer_id: String,
+    /// Display name advertised by the peer. May be empty.
+    pub name: String,
+    /// The peer's mDNS TXT-record `v` value, as broadcast (may differ from
+    /// this device's own `PROTOCOL_VERSION`).
+    pub protocol_version: u32,
+    /// IP address the peer's sync server was last seen at.
+    pub address: String,
+    /// Port the peer's sync server was last seen at.
+    pub port: u16,
+}
+
+/// Converts a raw LAN sighting into its DTO. Carries only what an unpaired
+/// peer's row may show — no pairing token, nothing else a paired peer's
+/// [`PeerStatusDto`] holds and an unpaired one has no business knowing.
+fn discovered_peer_dto(peer: &DiscoveredPeer) -> DiscoveredPeerDto {
+    DiscoveredPeerDto {
+        peer_id: peer.peer_id.clone(),
+        name: peer.name.clone(),
+        protocol_version: peer.protocol_version,
+        address: peer.addr.ip().to_string(),
+        port: peer.addr.port(),
+    }
+}
+
 /// `sync_status`'s return (C3 §3.9).
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SyncStatusDto {
     pub paired_peers: Vec<PeerStatusDto>,
+    /// Peers currently visible on the LAN via mDNS that are NOT in
+    /// `paired_peers` (L11 Task 14). Disjoint from `paired_peers` by
+    /// construction: a peer that is paired appears there and only there —
+    /// letting a peer appear in both would leave every consumer to decide
+    /// which list wins, and not all would decide the same way.
+    pub discovered_peers: Vec<DiscoveredPeerDto>,
     /// `None` if never synced with any peer.
     pub last_sync_utc_ms: Option<i64>,
     /// This device's own id and name (ruling R172). Renaming via
@@ -119,7 +156,9 @@ pub(crate) fn peer_status_dto(peer: &Peer, discovered: &HashMap<String, Discover
 }
 
 /// Transport-agnostic core of `sync_status`: every paired peer with
-/// `online` set from the latest browse results, the most recent successful
+/// `online` set from the latest browse results, every other browse
+/// sighting as a `discovered_peers` entry (disjoint from `paired_peers` —
+/// see [`SyncStatusDto::discovered_peers`]), the most recent successful
 /// sync across every peer (`None` if none has ever completed), and this
 /// device's own id and name (ruling R172).
 fn sync_status_via(
@@ -130,9 +169,14 @@ fn sync_status_via(
     this_name: &str,
 ) -> SyncStatusDto {
     let paired_peers = peers.iter().map(|p| peer_status_dto(p, discovered)).collect();
+    let discovered_peers = discovered
+        .values()
+        .filter(|d| !peers.iter().any(|p| p.peer_id == d.peer_id))
+        .map(discovered_peer_dto)
+        .collect();
     let last_sync_utc_ms = last_sync.values().copied().max();
     let this_device = ThisDeviceDto { peer_id: this_peer_id.to_string(), name: this_name.to_string() };
-    SyncStatusDto { paired_peers, last_sync_utc_ms, this_device }
+    SyncStatusDto { paired_peers, discovered_peers, last_sync_utc_ms, this_device }
 }
 
 /// C3 §3.9 `sync_status()`.
@@ -458,6 +502,67 @@ mod tests {
     }
 
     #[test]
+    fn sync_status_a_discovered_peer_that_is_not_paired_appears_in_discovered_peers_not_paired_peers() {
+        // Arrange
+        let peers: Vec<Peer> = Vec::new();
+        let mut discovered = HashMap::new();
+        discovered.insert(
+            "peer-1".to_string(),
+            DiscoveredPeer { peer_id: "peer-1".to_string(), name: "Pit Tablet".to_string(), protocol_version: 1, addr: "127.0.0.1:9000".parse().unwrap() },
+        );
+        let last_sync = HashMap::new();
+
+        // Act
+        let status = sync_status_via(&peers, &discovered, &last_sync, "peer-self", "idl1");
+
+        // Assert
+        assert!(status.paired_peers.is_empty());
+        assert_eq!(status.discovered_peers.len(), 1);
+        let d = &status.discovered_peers[0];
+        assert_eq!(d.peer_id, "peer-1");
+        assert_eq!(d.name, "Pit Tablet");
+        assert_eq!(d.protocol_version, 1);
+        assert_eq!(d.address, "127.0.0.1");
+        assert_eq!(d.port, 9000);
+    }
+
+    #[test]
+    fn sync_status_a_discovered_peer_that_is_paired_appears_only_in_paired_peers() {
+        // Arrange
+        let peers = vec![peer("peer-1")];
+        let mut discovered = HashMap::new();
+        discovered.insert(
+            "peer-1".to_string(),
+            DiscoveredPeer { peer_id: "peer-1".to_string(), name: "Pit Tablet".to_string(), protocol_version: 1, addr: "127.0.0.1:9000".parse().unwrap() },
+        );
+        let last_sync = HashMap::new();
+
+        // Act
+        let status = sync_status_via(&peers, &discovered, &last_sync, "peer-self", "idl1");
+
+        // Assert
+        assert_eq!(status.paired_peers.len(), 1);
+        assert!(status.discovered_peers.is_empty());
+    }
+
+    #[test]
+    fn sync_status_nothing_discovered_discovered_peers_is_empty_not_absent() {
+        // Arrange
+        let peers: Vec<Peer> = Vec::new();
+        let discovered = HashMap::new();
+        let last_sync = HashMap::new();
+
+        // Act
+        let status = sync_status_via(&peers, &discovered, &last_sync, "peer-self", "idl1");
+        let json = serde_json::to_value(&status).unwrap();
+
+        // Assert
+        assert!(status.discovered_peers.is_empty());
+        assert!(json.get("discovered_peers").is_some());
+        assert_eq!(json["discovered_peers"], serde_json::json!([]));
+    }
+
+    #[test]
     fn sync_status_a_freshly_minted_identity_this_device_carries_its_peer_id_and_name() {
         // Arrange
         let peers: Vec<Peer> = Vec::new();
@@ -740,7 +845,7 @@ mod tests {
         // Arrange
         let peer_status = PeerStatusDto { peer_id: "p1".to_string(), name: "Pit Tablet".to_string(), online: true, protocol_version: 1, paired_at_ms: 42 };
         let this_device = ThisDeviceDto { peer_id: "self".to_string(), name: "idl1".to_string() };
-        let sync_status = SyncStatusDto { paired_peers: vec![peer_status.clone()], last_sync_utc_ms: Some(7), this_device };
+        let sync_status = SyncStatusDto { paired_peers: vec![peer_status.clone()], discovered_peers: Vec::new(), last_sync_utc_ms: Some(7), this_device };
         let sync_result = SyncResultDto { blobs_transferred: 1, workbooks_merged: 2, conflicts: 3, sessions_updated: 4, tracks_updated: 5, profiles_updated: 6 };
         let pairing_offer = PairingOfferDto { code: "004200".to_string(), expires_at_ms: 99 };
 
@@ -757,7 +862,7 @@ mod tests {
 
         let mut status_keys: Vec<&str> = status_json.as_object().unwrap().keys().map(String::as_str).collect();
         status_keys.sort();
-        assert_eq!(status_keys, vec!["last_sync_utc_ms", "paired_peers", "this_device"]);
+        assert_eq!(status_keys, vec!["discovered_peers", "last_sync_utc_ms", "paired_peers", "this_device"]);
 
         let mut result_keys: Vec<&str> = result_json.as_object().unwrap().keys().map(String::as_str).collect();
         result_keys.sort();
