@@ -395,6 +395,11 @@ fn index_session_body(
     // `session.json`'s own filesystem mtime.
     let sj_meta = std::fs::metadata(&sj_path).map_err(io_err)?;
     let created_at_ms = file_mtime_ms(&sj_meta);
+    // A user-supplied start (`doc.timestamp_source == "user"`) overrides
+    // the parquet origin for display/sorting (R194); every other source
+    // catalogues the parquet value unchanged.
+    let effective_timestamp_utc_ms =
+        crate::store::session_json::effective_start_ms(&doc, fields.timestamp_utc_ms);
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO sessions (session_id, blob_sha256, source_format, device_id, config_checksum, importer_version, seam_correction_version, engine_version, timestamp_utc_ms, created_at_ms, rider, bike, venue_name, event_name, event_session, short_comment, tag, lap_count, duration_ms) \
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
@@ -407,7 +412,7 @@ fn index_session_body(
             fields.importer_version,
             fields.seam_correction_version,
             fields.engine_version,
-            fields.timestamp_utc_ms,
+            effective_timestamp_utc_ms,
             created_at_ms,
             doc.rider,
             doc.bike,
@@ -460,6 +465,10 @@ fn index_session_body(
                 )?;
                 *laps_indexed += 1;
             }
+            // Deliberately the raw parquet `fields.timestamp_utc_ms`, NOT
+            // `effective_timestamp_utc_ms`: the cached laps' epoch stamps
+            // were computed against the parquet origin, so swapping in a
+            // user-supplied start here would shift every lap window.
             index_lap_summary(conn, dir, session_id, fields.timestamp_utc_ms, &doc.laps, lap_summary_indexed, skipped)?;
             Ok(SessionBodyOutcome::Indexed)
         }
@@ -832,6 +841,19 @@ pub fn delete_session(conn: &Connection, session_id: &str) -> Result<bool, Catal
     Ok(rows_deleted > 0)
 }
 
+/// Updates `session_id`'s `sessions.timestamp_utc_ms` in place — the
+/// catalog-agrees-with-the-file half of `set_session_start` (C3 §3.3,
+/// ruling R194), so sorting/listing see a user-supplied start without a
+/// full re-index. Returns `true` if a `sessions` row existed and was
+/// updated, `false` if `session_id` had no row.
+pub fn update_session_timestamp(conn: &Connection, session_id: &str, timestamp_utc_ms: i64) -> Result<bool, CatalogError> {
+    let rows_updated = conn.execute(
+        "UPDATE sessions SET timestamp_utc_ms = ?2 WHERE session_id = ?1",
+        rusqlite::params![session_id, timestamp_utc_ms],
+    )?;
+    Ok(rows_updated > 0)
+}
+
 /// Upserts one `tracks` row for `track` (C4 §5, ruling R86 §4 — `save_track`
 /// calls this only when `catalog.sqlite` already exists). `full_json` is the
 /// exact `.idl0t` file text just written by
@@ -935,7 +957,7 @@ mod tests {
     use crate::store::derived::{write_derived_parquet, DerivedOutput};
     use crate::store::parquet::write_session_parquet;
     use crate::store::session_json::{empty_session_json, write_session_json, LapJson, TrackVisitJson};
-    use crate::session::{Channel, RawColumn, Session, SourceFormat};
+    use crate::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
 
     fn temp_root() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("idl-rs-test-{}", Uuid::new_v4()));
@@ -978,6 +1000,7 @@ mod tests {
             session_id: session_id.to_string(),
             device_id: None,
             timestamp_utc_ms,
+            timestamp_source: TimestampSource::Header,
             config_checksum: None,
             source_format: SourceFormat::Idl0,
             blob_sha256,
@@ -1022,6 +1045,28 @@ mod tests {
         let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebuild_catalog_session_json_says_user_the_sessions_row_carries_the_user_value() {
+        // Arrange — parquet start is `0` (unknown), but `session.json`
+        // carries a user-supplied start.
+        let root = temp_root();
+        let mut doc = empty_session_json("s1");
+        doc.timestamp_utc_ms = Some(1_700_000_000_000);
+        doc.timestamp_source = Some(TimestampSource::User);
+        write_full_session(&root, "s1", 0, &doc);
+
+        // Act
+        rebuild_catalog(&root).unwrap();
+
+        // Assert
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+        let timestamp_utc_ms: i64 =
+            conn.query_row("SELECT timestamp_utc_ms FROM sessions WHERE session_id = 's1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(timestamp_utc_ms, 1_700_000_000_000);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1311,6 +1356,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn update_session_timestamp_an_existing_row_takes_the_user_supplied_start() {
+        // Arrange — a catalogued session whose importer left the start at 0
+        // (C1 §3.1: unknown), the case `set_session_start` exists for.
+        let root = temp_root();
+        let doc = empty_session_json("s1");
+        write_full_session(&root, "s1", 0, &doc);
+        rebuild_catalog(&root).unwrap();
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+
+        // Act
+        let updated = update_session_timestamp(&conn, "s1", 1_700_000_000_000).unwrap();
+
+        // Assert
+        assert!(updated);
+        let stored: i64 = conn
+            .query_row("SELECT timestamp_utc_ms FROM sessions WHERE session_id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 1_700_000_000_000);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn update_session_timestamp_an_unknown_session_id_returns_false_and_changes_nothing() {
+        // Arrange
+        let root = temp_root();
+        let doc = empty_session_json("s1");
+        write_full_session(&root, "s1", 10_000, &doc);
+        rebuild_catalog(&root).unwrap();
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+
+        // Act
+        let updated = update_session_timestamp(&conn, "nope", 1_700_000_000_000).unwrap();
+
+        // Assert
+        assert!(!updated);
+        let stored: i64 = conn
+            .query_row("SELECT timestamp_utc_ms FROM sessions WHERE session_id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 10_000);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Minimal domain `Track` for [`upsert_track`] tests — `store::catalog`
     /// has no reason to exercise gate/timing fields, only the five scalar
     /// columns `upsert_track` writes.
@@ -1460,6 +1550,7 @@ mod tests {
             session_id: session_id.to_string(),
             device_id: None,
             timestamp_utc_ms: 1_700_000_000_000,
+            timestamp_source: TimestampSource::Header,
             config_checksum: None,
             source_format: SourceFormat::Idl0,
             blob_sha256,

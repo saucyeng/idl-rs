@@ -18,7 +18,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use idl_rs::session::{Channel, RawColumn, Session, SourceFormat};
+use idl_rs::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
 use idl_rs::store::atomic::{sha256_hex, write_atomic};
 use idl_rs::store::blob::{blob_path, write_blob};
 use idl_rs::store::parquet::write_session_parquet;
@@ -162,6 +162,7 @@ fn seed_session(data_root: &Path, session_id: &str) -> String {
         session_id: session_id.to_string(),
         device_id: None,
         timestamp_utc_ms: 0,
+        timestamp_source: TimestampSource::Header,
         config_checksum: None,
         source_format: SourceFormat::Idl0,
         blob_sha256: blob_sha.clone(),

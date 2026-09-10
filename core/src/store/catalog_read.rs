@@ -19,6 +19,8 @@
 
 use std::path::Path;
 
+use rusqlite::Connection;
+
 use crate::store::catalog::{open_catalog, rebuild_catalog, CatalogError, CatalogErrorKind, RebuildReport};
 use crate::store::parquet::{read_session_metadata, read_session_parquet};
 use crate::store::session_json::{
@@ -287,6 +289,57 @@ pub fn list_sessions(data_root: &Path) -> Result<Vec<SessionSummary>, CatalogErr
     rows.collect::<Result<Vec<_>, _>>().map_err(CatalogError::from)
 }
 
+/// One catalogued session whose `data.parquet` was written by a different
+/// importer version than this build runs (C3 §3.3 `list_stale_sessions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleSession {
+    pub session_id: String,
+    /// == `sessions.source_format` — the importer id this session was
+    /// imported with (C1 `Session.source_format`).
+    pub importer_id: String,
+    /// The `importer_version` string stamped on this session's `data.parquet`
+    /// when it was (re)imported (C1 §4.3), SemVer as the importer stamps it.
+    pub stored_version: String,
+    /// The running build's `importer_version` for `importer_id`
+    /// ([`crate::import::current_importer_version`]), SemVer as the importer
+    /// stamps it.
+    pub current_version: String,
+}
+
+/// C3 §3.3 `list_stale_sessions()` — every catalogued session whose stored
+/// `importer_version` differs from the running build's constant for its
+/// importer, ordered by `session_id` for a deterministic result. A cheap
+/// catalog-only query: one `SELECT` over `sessions`, no file reads. A row
+/// whose `source_format` has no current version (an importer this build
+/// does not know) is skipped, not reported stale — there is nothing to
+/// compare it against.
+pub fn list_stale_sessions(conn: &Connection) -> Result<Vec<StaleSession>, CatalogError> {
+    let mut stmt = conn.prepare("SELECT session_id, source_format, importer_version FROM sessions")?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(CatalogError::from)?;
+
+    let mut out: Vec<StaleSession> = rows
+        .into_iter()
+        .filter_map(|(session_id, importer_id, stored_version)| {
+            let current_version = crate::import::current_importer_version(&importer_id)?;
+            if stored_version == current_version {
+                None
+            } else {
+                Some(StaleSession {
+                    session_id,
+                    importer_id,
+                    stored_version,
+                    current_version: current_version.to_string(),
+                })
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    Ok(out)
+}
+
 /// C3 §3.2 `get_session(session_id)` — C1 `Session` metadata plus
 /// `session.json` content, read from canonical files only, never the
 /// catalog (C4 §5).
@@ -318,7 +371,7 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
     Ok(SessionDetail {
         session_id: session_id.to_string(),
         device_id: metadata.device_id,
-        timestamp_utc_ms: metadata.timestamp_utc_ms,
+        timestamp_utc_ms: crate::store::session_json::effective_start_ms(&doc, metadata.timestamp_utc_ms),
         config_checksum: metadata.config_checksum,
         source_format: session.source_format.as_str().to_string(),
         blob_sha256: metadata.blob_sha256,
@@ -480,7 +533,7 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
-    use crate::session::{Channel, RawColumn, Session, SourceFormat};
+    use crate::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
     use crate::store::blob::write_blob;
     use crate::store::derived::{write_derived_parquet, DerivedOutput};
     use crate::store::parquet::write_session_parquet;
@@ -503,6 +556,7 @@ mod tests {
             session_id: session_id.to_string(),
             device_id: Some("d1".to_string()),
             timestamp_utc_ms,
+            timestamp_source: TimestampSource::Header,
             config_checksum: Some("cafef00d".to_string()),
             source_format: SourceFormat::Idl0,
             blob_sha256,
@@ -582,6 +636,79 @@ mod tests {
     }
 
     #[test]
+    fn list_stale_sessions_a_row_stamped_with_an_older_importer_version_is_listed_as_strings() {
+        // Arrange — `write_full_session` always stamps `"0.1.0"`
+        // (`crate::parse::IDL0_IMPORTER_VERSION`'s current value); overwrite
+        // it with an older string directly in the catalog, simulating a
+        // session imported by a previous build.
+        let root = temp_root();
+        write_full_session(&root, "s1", 1_700_000_000_000, &empty_session_json("s1"));
+        rebuild_catalog(&root).unwrap();
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+        conn.execute("UPDATE sessions SET importer_version = '0.0.1' WHERE session_id = 's1'", []).unwrap();
+
+        // Act
+        let out = list_stale_sessions(&conn).unwrap();
+
+        // Assert
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "s1");
+        assert_eq!(out[0].importer_id, "idl0");
+        assert_eq!(out[0].stored_version, "0.0.1");
+        assert_eq!(out[0].current_version, crate::parse::IDL0_IMPORTER_VERSION);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_stale_sessions_a_row_stamped_with_the_running_version_is_not_listed() {
+        // Arrange — `write_full_session` stamps the running
+        // `IDL0_IMPORTER_VERSION` as-is, nothing overwritten.
+        let root = temp_root();
+        write_full_session(&root, "s1", 1_700_000_000_000, &empty_session_json("s1"));
+        rebuild_catalog(&root).unwrap();
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+
+        // Act
+        let out = list_stale_sessions(&conn).unwrap();
+
+        // Assert
+        assert!(out.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_stale_sessions_a_row_whose_source_format_has_no_known_importer_is_skipped() {
+        // Arrange — an unrecognised `source_format` value has nothing to
+        // compare against (`current_importer_version` returns `None`), so it
+        // must be skipped rather than reported stale.
+        let root = temp_root();
+        write_full_session(&root, "s1", 1_700_000_000_000, &empty_session_json("s1"));
+        rebuild_catalog(&root).unwrap();
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+        // `sessions.source_format` carries a `CHECK (... IN ('idl0','fit','gpx','csv'))`
+        // (this build's own known set) — disabling constraint enforcement for
+        // this one write is how this test reaches a state that otherwise only
+        // a future build's importer id, synced in from elsewhere, could put
+        // this build's catalog into.
+        conn.execute("PRAGMA ignore_check_constraints = 1", []).unwrap();
+        conn.execute(
+            "UPDATE sessions SET source_format = 'unknown-importer', importer_version = '0.0.1' WHERE session_id = 's1'",
+            [],
+        )
+        .unwrap();
+
+        // Act
+        let out = list_stale_sessions(&conn).unwrap();
+
+        // Assert
+        assert!(out.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn get_session_unknown_id_is_not_found() {
         // Arrange
         let root = temp_root();
@@ -591,6 +718,40 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, CatalogErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_session_a_session_whose_parquet_start_is_zero_after_set_session_start_reports_the_user_value() {
+        // Arrange
+        let root = temp_root();
+        let doc = empty_session_json("s1");
+        write_full_session(&root, "s1", 0, &doc);
+
+        // Act
+        crate::store::session_json::set_session_start(&root, "s1", 1_700_000_000_000).unwrap();
+        let detail = get_session(&root, "s1").unwrap();
+
+        // Assert
+        assert_eq!(detail.timestamp_utc_ms, 1_700_000_000_000);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_session_a_session_with_no_user_value_and_zero_parquet_start_reads_as_zero() {
+        // Arrange — parquet start unknown (`0`) and `session.json` carries
+        // no user-supplied start: unknown stays unknown.
+        let root = temp_root();
+        let doc = empty_session_json("s1");
+        write_full_session(&root, "s1", 0, &doc);
+
+        // Act
+        let detail = get_session(&root, "s1").unwrap();
+
+        // Assert
+        assert_eq!(detail.timestamp_utc_ms, 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }

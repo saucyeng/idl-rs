@@ -13,10 +13,14 @@ use crate::import::hook::PostImportHook;
 use crate::import::ImporterError;
 use crate::session::handle::SessionHandle;
 use crate::session::{ParseError, Session};
+use crate::store::atomic::sha256_hex;
 use crate::store::blob::{self, BlobStoreError};
 use crate::store::catalog::{index_session, open_catalog};
+use crate::store::derived::remove_session_derived;
 use crate::store::lap_index::{index_laps, LapIndexReport};
-use crate::store::parquet::{read_session_metadata, write_session_parquet, ParquetStoreError, SessionParquetMetadata};
+use crate::store::parquet::{
+    read_session_metadata, write_session_parquet, write_session_parquet_replacing, ParquetStoreError, SessionParquetMetadata,
+};
 use crate::store::session_json::{empty_session_json, write_session_json, SessionJsonError};
 
 /// What [`plan_import`] decided to do, and (via [`ImportReport::plan`]) what
@@ -229,6 +233,13 @@ pub struct ImportReport {
     /// successful import or a `rebuild_catalog`. Always `None` when no
     /// catalog exists yet, since this pipeline never creates one.
     pub catalog_index_warning: Option<String>,
+    /// Set to [`crate::store::derived::DerivedStoreError`]'s `Display` when
+    /// [`reimport_session`]'s `derived/` cleanup step failed — the rebuild
+    /// itself still succeeds; the stale `derived/` files just become
+    /// harmless orphans (design doc §5) until the next successful rebuild.
+    /// Always `None` on [`import_idl0`]/[`import_file`] reports, which never
+    /// run this step.
+    pub derived_warning: Option<String>,
 }
 
 /// Imports one `.idl0` buffer into `data_root` (contract C4 §2 layout):
@@ -309,6 +320,40 @@ pub fn import_file(data_root: &Path, extension: &str, bytes: &[u8]) -> Result<Im
     finish_import(data_root, outcome.session, blob_sha256, importer.importer_version(), warnings)
 }
 
+/// Shared tail of [`finish_import`] and [`reimport_session`]: runs lap
+/// indexing (IDL0_SPEC §17.4) then the incremental catalog update (C4 §5,
+/// task L2b T4), both non-fatal exactly as [`finish_import`]'s doc comment
+/// on its own former inline version of these two steps describes — a
+/// failure in either recovers on the next import/rescan/rebuild rather than
+/// failing the call that reached this point.
+fn index_and_catalog(
+    data_root: &Path,
+    session_id: &str,
+    handle: &SessionHandle,
+) -> (Option<LapIndexReport>, Option<String>, Option<String>) {
+    let (lap_index, lap_index_warning) = match index_laps(data_root, session_id, handle, false) {
+        Ok(report) => (Some(report), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+
+    // Only when `catalog.sqlite` already exists — this pipeline never
+    // creates one (a bare `<data>` stays catalog-less until something runs
+    // `rebuild_catalog`, per the catalog's own "deletable, rebuildable,
+    // never synced" contract). A missing catalog is therefore not a warning
+    // either; it's simply not this function's concern.
+    let catalog_path = data_root.join("catalog.sqlite");
+    let catalog_index_warning = if catalog_path.is_file() {
+        match open_catalog(&catalog_path).and_then(|conn| index_session(&conn, data_root, session_id)) {
+            Ok(_) => None,
+            Err(e) => Some(e.to_string()),
+        }
+    } else {
+        None
+    };
+
+    (lap_index, lap_index_warning, catalog_index_warning)
+}
+
 /// Shared tail of [`import_idl0`] and [`import_file`]: decides via
 /// [`plan_import`] whether `data.parquet` needs writing/skipping/
 /// regenerating, writes it accordingly, and creates an empty `session.json`
@@ -366,7 +411,11 @@ fn finish_import(
 
     let sj_path = data_root.join("sessions").join(&session_id).join("session.json");
     let session_json_created = if !sj_path.is_file() {
-        let doc = empty_session_json(&session_id);
+        let mut doc = empty_session_json(&session_id);
+        // Stamps the importer's provenance (R194) on a fresh `session.json`
+        // only — an existing file is never overwritten (see this fn's doc
+        // comment), so a user's start always survives re-import.
+        doc.timestamp_source = Some(session.timestamp_source);
         write_session_json(data_root, &session_id, &doc, None)?;
         true
     } else {
@@ -383,27 +432,7 @@ fn finish_import(
     // the last thing this function does with it — the sessions this pipeline
     // imports are hundreds of MB, so a clone here is not an option.
     let handle = SessionHandle::from_session(session);
-    let (lap_index, lap_index_warning) = match index_laps(data_root, &session_id, &handle, false) {
-        Ok(report) => (Some(report), None),
-        Err(e) => (None, Some(e.to_string())),
-    };
-
-    // Incremental catalog update (C4 §5, task L2b T4), non-fatal like the
-    // lap-index step above: only when `catalog.sqlite` already exists —
-    // this pipeline never creates one (a bare `<data>` stays catalog-less
-    // until something runs `rebuild_catalog`, per the catalog's own
-    // "deletable, rebuildable, never synced" contract). A missing catalog
-    // is therefore not a warning either; it's simply not this function's
-    // concern.
-    let catalog_path = data_root.join("catalog.sqlite");
-    let catalog_index_warning = if catalog_path.is_file() {
-        match open_catalog(&catalog_path).and_then(|conn| index_session(&conn, data_root, &session_id)) {
-            Ok(_) => None,
-            Err(e) => Some(e.to_string()),
-        }
-    } else {
-        None
-    };
+    let (lap_index, lap_index_warning, catalog_index_warning) = index_and_catalog(data_root, &session_id, &handle);
 
     Ok(ImportReport {
         session_id,
@@ -416,6 +445,119 @@ fn finish_import(
         lap_index,
         lap_index_warning,
         catalog_index_warning,
+        derived_warning: None,
+    })
+}
+
+/// Rebuilds `data.parquet` for an already-catalogued session from its
+/// existing blob (C3 §3.3 `reimport_sessions`): re-runs the *current*
+/// importer over the same bytes the session was originally imported from,
+/// replaces `data.parquet` in one atomic rename, and drops `derived/` for
+/// this session (its inputs just changed). Never reads or writes
+/// `session.json` — every human-owned field (`venue_name`, comments, `tag`,
+/// lap gates, a user-supplied start) survives untouched simply because this
+/// function never touches the file that holds them.
+///
+/// Ordering matters: every step before the rename in step 6 below leaves
+/// the old `data.parquet` byte-for-byte intact on failure — only the rename
+/// itself can replace it, and even that fails closed (`RenameConflict`)
+/// rather than corrupt the file, per C4 §4's atomic-write primitive.
+///
+/// 1. reads the existing `data.parquet`'s file metadata for its
+///    `blob_sha256`/`source_format`;
+/// 2. hashes the existing `data.parquet`'s bytes — the rename's
+///    optimistic-concurrency `based_on_hash` (step 6);
+/// 3. reads the blob those bytes point at from the CAS (a missing blob is
+///    an error here; nothing has been touched yet);
+/// 4. re-runs the current importer for `source_format` over the blob bytes,
+///    without writing anything (a parse/import failure returns here, old
+///    parquet intact);
+/// 5. checks the rebuilt session's `session_id` still matches `session_id`
+///    (refuses to overwrite a different session on a mismatch);
+/// 6. atomically replaces `data.parquet` ([`write_session_parquet_replacing`]);
+/// 7. drops `derived/` for this session — non-fatal, like `finish_import`'s
+///    lap-index/catalog steps ([`ImportReport::derived_warning`]);
+/// 8. re-runs lap indexing and the incremental catalog update, exactly as
+///    `finish_import` does ([`index_and_catalog`]).
+pub fn reimport_session(data_root: &Path, session_id: &str) -> Result<ImportReport, ImportError> {
+    let data_parquet_path = data_root.join("sessions").join(session_id).join("data.parquet");
+    if !data_parquet_path.is_file() {
+        return Err(ImportError::new(
+            ImportErrorKind::Io,
+            format!("session {session_id} has no data.parquet to rebuild"),
+        ));
+    }
+    let existing_meta = read_session_metadata(&data_parquet_path)?;
+
+    // Step 2 — the bytes on disk right now, hashed before any further I/O
+    // that could itself race an external writer between this read and the
+    // eventual rename (C4 §4).
+    let existing_bytes = std::fs::read(&data_parquet_path)
+        .map_err(|e| ImportError::new(ImportErrorKind::Io, format!("reading {}: {e}", data_parquet_path.display())))?;
+    let based_on_hash = sha256_hex(&existing_bytes);
+
+    let blob_bytes = blob::read_blob(data_root, &existing_meta.blob_sha256)?;
+
+    let mut session = if existing_meta.source_format == "idl0" {
+        let mut parsed = crate::parse::parse(&blob_bytes)?;
+        crate::session::synthesis::synthesize_base_channels(&mut parsed.session);
+        parsed.session
+    } else {
+        let Some(importer) = crate::import::importer_for_id(&existing_meta.source_format) else {
+            return Err(ImportError::new(
+                ImportErrorKind::UnknownExtension,
+                format!("no importer covers source_format \"{}\"", existing_meta.source_format),
+            ));
+        };
+        let mut outcome = importer.import(&blob_bytes, &existing_meta.blob_sha256)?;
+        crate::session::synthesis::synthesize_base_channels(&mut outcome.session);
+        outcome.session
+    };
+    session.blob_sha256 = existing_meta.blob_sha256.clone();
+
+    // Step 5 — a rebuilt session claiming a different id than the one this
+    // call was asked to rebuild would silently overwrite an unrelated
+    // session's data.parquet were this check skipped.
+    if session.session_id != session_id {
+        return Err(ImportError::new(
+            ImportErrorKind::Collision,
+            format!(
+                "rebuilding session {session_id} from its own blob produced session_id {} instead — refusing to overwrite a different session",
+                session.session_id
+            ),
+        ));
+    }
+
+    let current_version = crate::import::current_importer_version(&existing_meta.source_format).ok_or_else(|| {
+        ImportError::new(
+            ImportErrorKind::UnknownExtension,
+            format!("no current importer version for source_format \"{}\"", existing_meta.source_format),
+        )
+    })?;
+
+    let data_parquet_path =
+        write_session_parquet_replacing(data_root, &session, current_version, Some(&based_on_hash))?;
+
+    // Step 7 — non-fatal: the derived files' inputs just changed, but a
+    // failure to remove them leaves stale-but-harmless orphans, never wrong
+    // data (design doc §5).
+    let derived_warning = remove_session_derived(data_root, session_id).err().map(|e| e.to_string());
+
+    let handle = SessionHandle::from_session(session);
+    let (lap_index, lap_index_warning, catalog_index_warning) = index_and_catalog(data_root, session_id, &handle);
+
+    Ok(ImportReport {
+        session_id: session_id.to_string(),
+        blob_sha256: existing_meta.blob_sha256,
+        data_parquet: data_parquet_path,
+        outcome: ImportOutcome::Regenerated,
+        session_json_created: false,
+        truncation_warning: None,
+        import_warnings: Vec::new(),
+        lap_index,
+        lap_index_warning,
+        catalog_index_warning,
+        derived_warning,
     })
 }
 
@@ -425,6 +567,8 @@ mod tests {
     use crate::gps::GpsFix;
     use crate::laps::model::{Gate, LapTiming};
     use crate::parse::test_buffers::*;
+    use crate::store::blob::blob_path;
+    use crate::store::derived::{write_derived_parquet, DerivedOutput};
     use crate::store::parquet::read_session_parquet;
     use crate::store::session_json::read_session_json;
     use crate::track_artifact::{write_track, Track};
@@ -773,6 +917,23 @@ mod tests {
     }
 
     #[test]
+    fn import_file_gpx_fresh_session_writes_timestamp_source_matching_importer() {
+        // Arrange
+        let root = temp_root();
+        let bytes = minimal_gpx_with_warning();
+
+        // Act
+        let report = import_file(&root, "gpx", &bytes).unwrap();
+
+        // Assert — the GPX importer always assigns `SourceFile` (Task item 3).
+        let sj_path = root.join("sessions").join(&report.session_id).join("session.json");
+        let doc = read_session_json(&sj_path).unwrap();
+        assert_eq!(doc.timestamp_source, Some(crate::session::TimestampSource::SourceFile));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn import_file_fit_writes_parquet_and_session_json_with_warnings_and_time_channel() {
         // Arrange
         let root = temp_root();
@@ -1055,6 +1216,110 @@ mod tests {
         // Assert — this pipeline never creates a catalog as a side effect.
         assert!(report.catalog_index_warning.is_none());
         assert!(!root.join("catalog.sqlite").is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Imports `synthetic_idl0_bytes()` into a fresh root and fills every
+    /// human-owned `session.json` field a rebuild must survive, including a
+    /// user-supplied start (C1 §6, ruling R194). Returns `(root, session_id)`.
+    fn imported_session_with_human_fields() -> (PathBuf, String) {
+        let root = temp_root();
+        let report = import_idl0(&root, &synthetic_idl0_bytes()).unwrap();
+        let session_id = report.session_id.clone();
+
+        let json_path = root.join("sessions").join(&session_id).join("session.json");
+        let based_on = crate::store::atomic::sha256_hex(&std::fs::read(&json_path).unwrap());
+        let mut doc = read_session_json(&json_path).unwrap();
+        doc.venue_name = "Cadwell Park".to_string();
+        doc.long_comment = "front too soft on the mountain".to_string();
+        doc.tag = "wet".to_string();
+        doc.timestamp_utc_ms = Some(1_700_000_000_000);
+        doc.timestamp_source = Some(crate::session::TimestampSource::User);
+        write_session_json(&root, &session_id, &doc, Some(&based_on)).unwrap();
+
+        (root, session_id)
+    }
+
+    #[test]
+    fn reimport_session_a_session_with_human_fields_rebuilds_and_keeps_every_one_of_them() {
+        // Arrange
+        let (root, session_id) = imported_session_with_human_fields();
+
+        // Act
+        let report = reimport_session(&root, &session_id).unwrap();
+
+        // Assert — the parquet was replaced, no new `session.json` written,
+        // and every human-owned field (a user start included) is untouched.
+        assert_eq!(report.outcome, ImportOutcome::Regenerated);
+        assert!(!report.session_json_created);
+        assert!(report.data_parquet.is_file());
+        let doc = read_session_json(&root.join("sessions").join(&session_id).join("session.json")).unwrap();
+        assert_eq!(doc.venue_name, "Cadwell Park");
+        assert_eq!(doc.long_comment, "front too soft on the mountain");
+        assert_eq!(doc.tag, "wet");
+        assert_eq!(doc.timestamp_utc_ms, Some(1_700_000_000_000));
+        assert_eq!(doc.timestamp_source, Some(crate::session::TimestampSource::User));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reimport_session_a_session_with_derived_files_drops_the_derived_directory() {
+        // Arrange
+        let (root, session_id) = imported_session_with_human_fields();
+        let output = DerivedOutput {
+            channel_id: "Roll (deg)".to_string(),
+            t_us: vec![0, 1_250],
+            values: vec![0.0, 1.0],
+            nominal_rate_hz: 800.0,
+            unit: "deg".to_string(),
+        };
+        write_derived_parquet(&root, &session_id, "attitude", &[], &serde_json::json!({}), &[output], 0).unwrap();
+        let derived_dir = root.join("sessions").join(&session_id).join("derived");
+        assert!(derived_dir.is_dir());
+
+        // Act
+        let report = reimport_session(&root, &session_id).unwrap();
+
+        // Assert — the new `data.parquet` invalidates every derived file's
+        // input hashes, so the whole directory goes.
+        assert!(report.derived_warning.is_none());
+        assert!(!derived_dir.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reimport_session_whose_blob_is_missing_fails_and_leaves_the_old_parquet_intact() {
+        // Arrange — remove the CAS blob the rebuild would read, so step 3
+        // fails while the old `data.parquet` is still the only copy.
+        let (root, session_id) = imported_session_with_human_fields();
+        let parquet_path = root.join("sessions").join(&session_id).join("data.parquet");
+        let before = std::fs::read(&parquet_path).unwrap();
+        let meta = read_session_metadata(&parquet_path).unwrap();
+        std::fs::remove_file(blob_path(&root, &meta.blob_sha256)).unwrap();
+
+        // Act
+        let result = reimport_session(&root, &session_id);
+
+        // Assert
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&parquet_path).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reimport_session_an_unknown_session_id_is_an_io_error() {
+        // Arrange — nothing under `sessions/nope/`.
+        let root = temp_root();
+
+        // Act
+        let result = reimport_session(&root, "nope");
+
+        // Assert
+        assert!(matches!(result, Err(ImportError { kind: ImportErrorKind::Io, .. })));
 
         let _ = std::fs::remove_dir_all(&root);
     }

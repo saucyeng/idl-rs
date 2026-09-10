@@ -151,6 +151,7 @@ mod tests {
             session_id: String::new(),
             device_id: None,
             timestamp_utc_ms: 0,
+            timestamp_source: crate::session::TimestampSource::Header,
             config_checksum: None,
             source_format: crate::session::SourceFormat::Idl0,
             blob_sha256: String::new(),

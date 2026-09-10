@@ -63,6 +63,34 @@ pub fn parse(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     }
 }
 
+/// Byte offset of the v3 header's `session start UTC ms` field: magic (4) +
+/// schema version (1) + session UUID (16) + device id (6)
+/// ([`v3::parse_v3`]'s own read order).
+const V3_SESSION_START_MS_OFFSET: usize = 4 + 1 + 16 + 6;
+
+/// Reads the v3 header's `session start UTC ms` (UTC milliseconds since the
+/// Unix epoch, `0` = the firmware never had a clock) out of the *first bytes*
+/// of an `.idl0` file, without decoding a single record — the header peek C3
+/// §3.3's `scan_folder` shows in its preview. `None` when `head` is not an
+/// `IDL0` schema-3 file or is shorter than the fixed header prefix; a caller
+/// with a real file need only pass the first
+/// [`V3_SESSION_START_MS_OFFSET`] + 8 bytes.
+///
+/// Deliberately *not* the back-filled `effective_start_ms` [`v3::parse_v3`]
+/// computes (C1 §3.1 `gps_backfill`): recovering that requires decoding GPS
+/// records, which a folder scan must not do.
+pub fn peek_session_start_ms(head: &[u8]) -> Option<i64> {
+    if head.len() < V3_SESSION_START_MS_OFFSET + 8 {
+        return None;
+    }
+    if &head[0..4] != b"IDL0" || head[4] != 3 {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&head[V3_SESSION_START_MS_OFFSET..V3_SESSION_START_MS_OFFSET + 8]);
+    Some(i64::from_le_bytes(buf))
+}
+
 #[cfg(test)]
 mod dispatch_tests {
     use super::parse;
@@ -114,5 +142,45 @@ mod dispatch_tests {
     fn too_short_for_magic_returns_truncated() {
         let buf = vec![0x49, 0x44];
         assert!(matches!(parse(&buf), Err(ParseError::TruncatedRecord(_))));
+    }
+
+    #[test]
+    fn peek_session_start_ms_a_v3_header_returns_the_headers_own_value() {
+        // Arrange
+        let buf = cat(&[
+            Header { schema_version: 3, session_start_ms: 1_700_000_000_000, ..Default::default() }.build(&[]),
+            session_end(),
+        ]);
+
+        // Act
+        let start = super::peek_session_start_ms(&buf);
+
+        // Assert
+        assert_eq!(start, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn peek_session_start_ms_a_header_with_no_clock_returns_zero_not_none() {
+        // Arrange — `0` means "the firmware had no clock", which is a peek
+        // result, not a failure to peek.
+        let buf =
+            cat(&[Header { schema_version: 3, session_start_ms: 0, ..Default::default() }.build(&[]), session_end()]);
+
+        // Act
+        let start = super::peek_session_start_ms(&buf);
+
+        // Assert
+        assert_eq!(start, Some(0));
+    }
+
+    #[test]
+    fn peek_session_start_ms_a_non_idl0_or_short_buffer_is_none() {
+        // Arrange
+        let not_idl0 = vec![0xDE; 64];
+        let too_short = vec![0x49, 0x44, 0x4C, 0x30, 3, 0, 0];
+
+        // Act / Assert
+        assert_eq!(super::peek_session_start_ms(&not_idl0), None);
+        assert_eq!(super::peek_session_start_ms(&too_short), None);
     }
 }

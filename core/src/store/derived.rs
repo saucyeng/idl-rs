@@ -230,6 +230,21 @@ pub fn write_derived_parquet(
     Ok(target)
 }
 
+/// Removes `<data_root>/sessions/<session_id>/derived/` and everything under
+/// it — used after a rebuild (C3 §3.3 `reimport_sessions`) whose new
+/// `data.parquet` invalidates every derived file's input-column hashes for
+/// this session (design doc §5: derived files are a pure cache of a function
+/// of their inputs, never authoritative on their own). A directory that does
+/// not exist is treated as already-removed, not an error.
+pub fn remove_session_derived(data_root: &Path, session_id: &str) -> Result<(), DerivedStoreError> {
+    let dir = data_root.join("sessions").join(session_id).join("derived");
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(DerivedStoreError::new(DerivedStoreErrorKind::Io, format!("removing {}: {e}", dir.display()))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

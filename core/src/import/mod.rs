@@ -182,6 +182,32 @@ pub fn importer_for_extension(ext: &str) -> Option<Box<dyn Importer>> {
         .map(|e| (e.construct)())
 }
 
+/// Selects an importer by its stable id (`ImporterInfo::id`, e.g. `"gpx"`) —
+/// `importer_for_extension`'s counterpart for callers that already know the
+/// id (C3 §3.3 `reimport_sessions`, which reads a session's catalogued
+/// `source_format` rather than a file extension). `None` for anything this
+/// module does not cover, including `"idl0"` — same exclusion as
+/// [`importer_for_extension`] (SPEC §15a.1, [`ImporterInfo`]'s own doc
+/// comment).
+pub fn importer_for_id(importer_id: &str) -> Option<Box<dyn Importer>> {
+    IMPORTER_TABLE.iter().find(|e| e.info.id == importer_id).map(|e| (e.construct)())
+}
+
+/// The running build's importer-version string for `importer_id`, the one
+/// place that unifies `.idl0`'s own entry point (`crate::parse`, outside
+/// this module's [`IMPORTER_TABLE`] by design — [`ImporterInfo`]'s doc
+/// comment) with [`IMPORTER_TABLE`]'s own `"gpx"`/`"fit"`/`"csv"` entries,
+/// mirroring what L5's `list_importers` Tauri command already does when it
+/// adds an `"idl0"` row of its own (C3 §3.3 `list_stale_sessions`, which
+/// compares a catalogued session's stored version against this). `None` for
+/// any other id.
+pub fn current_importer_version(importer_id: &str) -> Option<&'static str> {
+    if importer_id == "idl0" {
+        return Some(crate::parse::IDL0_IMPORTER_VERSION);
+    }
+    IMPORTER_TABLE.iter().find(|e| e.info.id == importer_id).map(|e| (e.construct)().importer_version())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +226,7 @@ mod tests {
                     session_id: session_id_from_blob_hash(blob_sha256),
                     device_id: None,
                     timestamp_utc_ms: 0,
+                    timestamp_source: crate::session::TimestampSource::SourceFile,
                     config_checksum: None,
                     source_format: SourceFormat::Fit,
                     blob_sha256: blob_sha256.to_string(),

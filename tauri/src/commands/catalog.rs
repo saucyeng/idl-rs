@@ -903,6 +903,10 @@ pub struct SessionMetadataPatch {
 /// neither `parse_config`'s nor `SessionJsonError`'s own message carries it
 /// for the `Parse`/`UnsupportedVersion` cases, and the lead ruling requires
 /// the parse reason and the path both be diagnosable from `IpcError.message`).
+/// `InvalidArgument` (added by R194's `set_session_start`, whose IPC glue is
+/// not this task's — that command is C3 §3.3's own `invalid_argument`) maps
+/// straight through for exhaustiveness; neither of this fn's two callers can
+/// produce it today.
 fn map_session_json_error(e: idl_rs::store::session_json::SessionJsonError, path: &Path) -> IpcError {
     use idl_rs::store::session_json::SessionJsonErrorKind;
     match e.kind {
@@ -910,6 +914,7 @@ fn map_session_json_error(e: idl_rs::store::session_json::SessionJsonError, path
         SessionJsonErrorKind::Parse | SessionJsonErrorKind::UnsupportedVersion => {
             IpcError::new(IpcErrorKind::Internal, format!("{}: {}", path.display(), e.message))
         }
+        SessionJsonErrorKind::InvalidArgument => IpcError::new(IpcErrorKind::InvalidArgument, e.message),
     }
 }
 
@@ -1056,7 +1061,7 @@ pub fn delete_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat};
+    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
     use idl_rs::store::blob::write_blob;
     use idl_rs::store::catalog::rebuild_catalog as core_rebuild_catalog;
     use idl_rs::store::parquet::write_session_parquet;
@@ -1080,6 +1085,7 @@ mod tests {
             session_id: session_id.to_string(),
             device_id: None,
             timestamp_utc_ms: 0,
+            timestamp_source: TimestampSource::Header,
             config_checksum: None,
             source_format: SourceFormat::Idl0,
             blob_sha256,
@@ -1112,6 +1118,7 @@ mod tests {
             session_id: session_id.to_string(),
             device_id: None,
             timestamp_utc_ms: 0,
+            timestamp_source: TimestampSource::Header,
             config_checksum: None,
             source_format: SourceFormat::Idl0,
             blob_sha256: blob_sha256.clone(),
@@ -1250,6 +1257,7 @@ mod tests {
             session_id: session_id.to_string(),
             device_id: Some("device-Q".to_string()),
             timestamp_utc_ms: 5_000,
+            timestamp_source: TimestampSource::Header,
             config_checksum: Some("checksum-R".to_string()),
             source_format: SourceFormat::Idl0,
             blob_sha256: blob_sha256.clone(),
@@ -2165,6 +2173,7 @@ mod tests {
                 session_id: session_id.to_string(),
                 device_id: None,
                 timestamp_utc_ms: 0,
+                timestamp_source: TimestampSource::SourceFile,
                 config_checksum: None,
                 source_format: SourceFormat::Gpx,
                 blob_sha256,

@@ -7,7 +7,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{parse_config, read_config, ConfigError, VersionedConfig};
-use crate::store::atomic::{write_atomic, AtomicWriteError};
+use crate::store::atomic::{sha256_hex, write_atomic, AtomicWriteError};
 
 /// The schema version this build of `idl-rs` writes and accepts for
 /// `session.json` (C1 §6).
@@ -90,6 +90,22 @@ pub struct SessionJson {
     /// [`SessionJson::track_visits`], if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track_visits_library_hash: Option<String>,
+    /// User-supplied session start, UTC milliseconds since the Unix epoch
+    /// (C1 §6, ruling R194). Additive; present **only** when
+    /// [`SessionJson::timestamp_source`] is `Some(TimestampSource::User)` —
+    /// then it is the displayed/catalogued start and overrides
+    /// `data.parquet` §4.3's value. Omitted for every other source (the
+    /// parquet value is the truth); see [`effective_start_ms`], the single
+    /// reader of this rule. Does not bump `schema_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_utc_ms: Option<i64>,
+    /// Provenance of [`SessionJson::timestamp_utc_ms`] (C1 §6, ruling
+    /// R194). Additive; `None`/omitted means a legacy file — read as the
+    /// importer's source with the parquet value. Only `Some(User)` makes a
+    /// reader prefer this file's `timestamp_utc_ms`. Does not bump
+    /// `schema_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_source: Option<crate::session::TimestampSource>,
     /// The `store::lap_index::LAP_DETECTOR_VERSION` stamped by whichever
     /// import/rescan last wrote [`SessionJson::laps`]/
     /// [`SessionJson::track_visits`], if any. Additive C1 §6 field (ruling
@@ -227,10 +243,14 @@ pub enum SessionJsonErrorKind {
     Parse,
     /// The file's schema version exceeds what this engine supports.
     UnsupportedVersion,
+    /// A caller-supplied argument was invalid (e.g. [`set_session_start`]'s
+    /// `timestamp_utc_ms <= 0`, C3 §3.3's `invalid_argument`).
+    InvalidArgument,
 }
 
 /// Error from [`read_session_json`] / [`parse_session_json`] /
-/// [`write_session_json`]. Never `Err(String)` (CLAUDE.md §5).
+/// [`write_session_json`] / [`set_session_start`]. Never `Err(String)`
+/// (CLAUDE.md §5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionJsonError {
     pub kind: SessionJsonErrorKind,
@@ -314,8 +334,62 @@ pub fn empty_session_json(session_id: impl Into<String>) -> SessionJson {
         starred_lap_number: None,
         track_visits: Vec::new(),
         track_visits_library_hash: None,
+        timestamp_utc_ms: None,
+        timestamp_source: None,
         lap_detector_version: None,
     }
+}
+
+/// The single rule for a session's effective start (C1 §6, ruling R194):
+/// `doc`'s `timestamp_utc_ms` overrides `data.parquet`'s only when
+/// `doc.timestamp_source` is `Some(TimestampSource::User)` — every other
+/// case (including an omitted `timestamp_source`, i.e. a legacy file)
+/// returns `parquet_timestamp_utc_ms` unchanged. Every reader of a
+/// session's start (catalog indexing, `get_session`) calls this instead of
+/// duplicating the rule.
+pub fn effective_start_ms(doc: &SessionJson, parquet_timestamp_utc_ms: i64) -> i64 {
+    if doc.timestamp_source == Some(crate::session::TimestampSource::User) {
+        doc.timestamp_utc_ms.unwrap_or(parquet_timestamp_utc_ms)
+    } else {
+        parquet_timestamp_utc_ms
+    }
+}
+
+/// Writes a user-supplied wall-clock session start (C3 §3.3
+/// `set_session_start`): reads the existing `session.json`, sets
+/// `timestamp_utc_ms = Some(timestamp_utc_ms)` and
+/// `timestamp_source = Some(TimestampSource::User)`, and writes it back
+/// atomically (C4 §4) using the hash of the file it just read as the
+/// optimistic-concurrency `based_on_hash`. Returns the updated document.
+///
+/// # Errors
+/// [`SessionJsonErrorKind::InvalidArgument`] when `timestamp_utc_ms <= 0`
+/// (the file is left untouched); [`SessionJsonErrorKind::Io`]/
+/// [`SessionJsonErrorKind::Parse`]/[`SessionJsonErrorKind::UnsupportedVersion`]
+/// propagate from the read/write as usual.
+pub fn set_session_start(
+    data_root: &Path,
+    session_id: &str,
+    timestamp_utc_ms: i64,
+) -> Result<SessionJson, SessionJsonError> {
+    if timestamp_utc_ms <= 0 {
+        return Err(SessionJsonError {
+            kind: SessionJsonErrorKind::InvalidArgument,
+            message: format!("timestamp_utc_ms must be > 0, got {timestamp_utc_ms}"),
+        });
+    }
+
+    let target = data_root.join("sessions").join(session_id).join("session.json");
+    let raw = std::fs::read(&target)
+        .map_err(|e| SessionJsonError { kind: SessionJsonErrorKind::Io, message: e.to_string() })?;
+    let based_on_hash = sha256_hex(&raw);
+    let mut doc = parse_session_json(&raw)?;
+
+    doc.timestamp_utc_ms = Some(timestamp_utc_ms);
+    doc.timestamp_source = Some(crate::session::TimestampSource::User);
+    write_session_json(data_root, session_id, &doc, Some(&based_on_hash))?;
+
+    Ok(doc)
 }
 
 #[cfg(test)]
@@ -398,5 +472,84 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, SessionJsonErrorKind::UnsupportedVersion);
+    }
+
+    #[test]
+    fn session_json_with_a_user_start_round_trips_through_write_and_read() {
+        // Arrange
+        let root = temp_root();
+        let mut doc = empty_session_json("abc123");
+        doc.timestamp_utc_ms = Some(1_700_000_000_000);
+        doc.timestamp_source = Some(crate::session::TimestampSource::User);
+
+        // Act
+        write_session_json(&root, "abc123", &doc, None).unwrap();
+        let back = read_session_json(&root.join("sessions").join("abc123").join("session.json")).unwrap();
+
+        // Assert
+        assert_eq!(back.timestamp_utc_ms, Some(1_700_000_000_000));
+        assert_eq!(back.timestamp_source, Some(crate::session::TimestampSource::User));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_json_with_neither_timestamp_key_parses_as_legacy() {
+        // Arrange — a pre-R194 file with neither key present.
+        let json = r#"{"schema_version":1,"session_id":"legacy"}"#;
+
+        // Act
+        let doc = parse_session_json(json.as_bytes()).unwrap();
+
+        // Assert
+        assert_eq!(doc.timestamp_utc_ms, None);
+        assert_eq!(doc.timestamp_source, None);
+    }
+
+    #[test]
+    fn effective_start_ms_source_is_user_returns_the_files_value() {
+        // Arrange
+        let mut doc = empty_session_json("abc123");
+        doc.timestamp_utc_ms = Some(1_700_000_000_000);
+        doc.timestamp_source = Some(crate::session::TimestampSource::User);
+
+        // Act
+        let start = effective_start_ms(&doc, 0);
+
+        // Assert
+        assert_eq!(start, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn effective_start_ms_source_omitted_or_header_returns_the_parquet_value() {
+        // Arrange — file carries a `timestamp_utc_ms` but a non-"user" source.
+        let mut header_doc = empty_session_json("abc123");
+        header_doc.timestamp_utc_ms = Some(1_700_000_000_000);
+        header_doc.timestamp_source = Some(crate::session::TimestampSource::Header);
+        let legacy_doc = empty_session_json("legacy");
+
+        // Act + Assert
+        assert_eq!(effective_start_ms(&header_doc, 42), 42);
+        assert_eq!(effective_start_ms(&legacy_doc, 42), 42);
+    }
+
+    #[test]
+    fn set_session_start_zero_or_negative_is_rejected_file_unchanged() {
+        // Arrange
+        let root = temp_root();
+        let doc = empty_session_json("abc123");
+        write_session_json(&root, "abc123", &doc, None).unwrap();
+
+        // Act
+        let zero_err = set_session_start(&root, "abc123", 0).unwrap_err();
+        let negative_err = set_session_start(&root, "abc123", -1).unwrap_err();
+
+        // Assert
+        assert_eq!(zero_err.kind, SessionJsonErrorKind::InvalidArgument);
+        assert_eq!(negative_err.kind, SessionJsonErrorKind::InvalidArgument);
+        let back = read_session_json(&root.join("sessions").join("abc123").join("session.json")).unwrap();
+        assert_eq!(back, doc);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

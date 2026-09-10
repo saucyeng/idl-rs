@@ -426,7 +426,7 @@ mod tests {
     use crate::laps::model::{Gate, LapTiming};
     use crate::session::handle::{ChannelInput, SessionMetaInput};
     use crate::gps::GpsFix;
-    use crate::session::{Channel, RawColumn, Session, SourceFormat};
+    use crate::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
     use crate::store::parquet::write_session_parquet;
     use crate::store::session_json::{read_session_json, OverlayLapKeyJson};
     use crate::track_artifact::write_track;
@@ -588,6 +588,7 @@ mod tests {
             session_id: session_id.to_string(),
             device_id: None,
             timestamp_utc_ms: 0,
+            timestamp_source: TimestampSource::SourceFile,
             config_checksum: None,
             source_format: SourceFormat::Gpx,
             blob_sha256: String::new(),

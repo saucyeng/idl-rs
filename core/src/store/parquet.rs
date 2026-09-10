@@ -243,6 +243,25 @@ pub fn write_session_parquet(
     session: &Session,
     importer_version: &str,
 ) -> Result<PathBuf, ParquetStoreError> {
+    write_session_parquet_replacing(data_root, session, importer_version, None)
+}
+
+/// [`write_session_parquet`]'s general form: `data.parquet` is write-once
+/// for a fresh import (that function always passes `based_on_hash: None`,
+/// since nothing exists yet to conflict with), but a rebuild (C3 §3.3
+/// `reimport_sessions`) must replace an *existing* file in one rename so a
+/// failed rebuild leaves the old file intact (C4 §4's optimistic-concurrency
+/// primitive, `write_atomic`) — this is that replace path. `based_on_hash`
+/// is the sha256 hex of the `data.parquet` bytes the caller read before
+/// deciding to rebuild; a mismatch at rename time (another writer landed in
+/// between) surfaces as `AtomicWriteErrorKind::RenameConflict` via
+/// [`write_atomic`], leaving the on-disk file untouched.
+pub fn write_session_parquet_replacing(
+    data_root: &Path,
+    session: &Session,
+    importer_version: &str,
+    based_on_hash: Option<&str>,
+) -> Result<PathBuf, ParquetStoreError> {
     let t = union_t_axis(session);
     let n_rows = t.len();
 
@@ -349,7 +368,7 @@ pub fn write_session_parquet(
     }
 
     let target = data_root.join("sessions").join(&session.session_id).join("data.parquet");
-    write_atomic(data_root, &target, &buf, None)
+    write_atomic(data_root, &target, &buf, based_on_hash)
         .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Io, e.to_string()))?;
     Ok(target)
 }
@@ -461,6 +480,16 @@ pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
             return Err(ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("unknown source_format {other}")))
         }
     };
+    // `timestamp_source` is deliberately not among `data.parquet`'s C1 §4.3
+    // metadata keys (it lives only in `session.json`, R194) — this read-back
+    // path has no recorded provenance to recover, so it approximates from
+    // `source_format` the same way importer-absent test fixtures do
+    // (`Idl0` -> `Header`, everything else -> `SourceFile`). Nothing today
+    // reads this field off a parquet-round-tripped `Session`.
+    let timestamp_source = match source_format {
+        SourceFormat::Idl0 => crate::session::TimestampSource::Header,
+        _ => crate::session::TimestampSource::SourceFile,
+    };
     let device_id = meta.device_id;
     let config_checksum = meta.config_checksum;
 
@@ -516,7 +545,7 @@ pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
         });
     }
 
-    Ok(Session { session_id, device_id, timestamp_utc_ms, config_checksum, source_format, blob_sha256, channels })
+    Ok(Session { session_id, device_id, timestamp_utc_ms, timestamp_source, config_checksum, source_format, blob_sha256, channels })
 }
 
 /// Filters `col`'s non-null rows, pairing each with `t`'s value at that row
@@ -637,6 +666,7 @@ mod tests {
             session_id: "0102030405060708090a0b0c0d0e0f10".to_string(),
             device_id: Some("b0b1b2b3b4b5".to_string()),
             timestamp_utc_ms: 1_756_857_600_000,
+            timestamp_source: crate::session::TimestampSource::Header,
             config_checksum: Some("cafebabe".to_string()),
             source_format: SourceFormat::Idl0,
             blob_sha256: "0".repeat(64),
@@ -838,6 +868,7 @@ mod tests {
             session_id: "1112131415161718191a1b1c1d1e1f20".to_string(),
             device_id: None,
             timestamp_utc_ms: 0,
+            timestamp_source: crate::session::TimestampSource::SourceFile,
             config_checksum: None,
             source_format: SourceFormat::Fit,
             blob_sha256: "1".repeat(64),
