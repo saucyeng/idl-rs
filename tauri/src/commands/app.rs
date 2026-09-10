@@ -377,13 +377,17 @@ fn is_usable_move_target(target: &Path) -> Result<bool, IpcError> {
 /// the source in place, untouched: the destination copy is the one that is
 /// wrong, and deleting the original on the strength of it is the one
 /// unrecoverable mistake this function can make.
-fn move_one_file(src: &Path, dst: &Path, rel: &Path) -> Result<(), IpcError> {
+/// `allow_rename` is `false` only from a test, to force the cross-volume
+/// branch: two temp directories on one developer machine share a volume, so
+/// a rename always succeeds there and the verification path — the only part
+/// that can refuse — would never run.
+fn move_one_file(src: &Path, dst: &Path, rel: &Path, allow_rename: bool) -> Result<(), IpcError> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("creating {}: {e}", parent.display())))?;
     }
     // Same volume: atomic, no second copy on disk, nothing to verify.
-    if std::fs::rename(src, dst).is_ok() {
+    if allow_rename && std::fs::rename(src, dst).is_ok() {
         return Ok(());
     }
     copy_verify_delete(src, dst, rel)
@@ -514,6 +518,23 @@ fn move_data_dir_via(
     new_root: &str,
     progress: impl Fn(&str, u64, u64),
 ) -> Result<DataDirInfo, IpcError> {
+    move_data_dir_with(settings_path, app_data_dir, app_config_dir, resolved_data_dir, new_root, true, progress)
+}
+
+/// [`move_data_dir_via`]'s body, with the same-volume rename made optional.
+/// `allow_rename: false` is a test-only affordance that forces every file
+/// down the copy-verify-delete branch, so the whole command — refusals,
+/// verification, the untouched override on failure — can be exercised as a
+/// cross-volume move on a machine that has only one volume.
+fn move_data_dir_with(
+    settings_path: &Path,
+    app_data_dir: &Path,
+    app_config_dir: &Path,
+    resolved_data_dir: &Path,
+    new_root: &str,
+    allow_rename: bool,
+    progress: impl Fn(&str, u64, u64),
+) -> Result<DataDirInfo, IpcError> {
     let invalid = |message: String| IpcError::new(IpcErrorKind::InvalidArgument, message);
 
     let new_root_path = Path::new(new_root);
@@ -546,7 +567,7 @@ fn move_data_dir_via(
             std::fs::remove_file(&src)
                 .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("removing {}: {e}", src.display())))?;
         } else {
-            move_one_file(&src, &dst, rel)?;
+            move_one_file(&src, &dst, rel, allow_rename)?;
         }
         progress("move", index as u64 + 1, total);
     }
@@ -1261,6 +1282,68 @@ mod tests {
         assert_eq!(err.kind, IpcErrorKind::Io);
         assert_eq!(err.detail.unwrap()["reason"], serde_json::json!("blob_hash_mismatch"));
         assert_eq!(std::fs::read(old_data.join(&blob_rel)).unwrap(), b"tampered bytes");
+    }
+
+    #[test]
+    fn move_data_dir_across_volumes_a_corrupted_blob_leaves_the_source_and_the_override_alone() {
+        // Arrange — `allow_rename: false` forces every file down the
+        // copy-verify-delete branch, standing in for a destination on another
+        // volume. The blob no longer hashes to the name it is filed under.
+        let app_data = temp_root();
+        let app_config = temp_root();
+        let settings = settings_path(&app_config);
+        let old_data = crate::paths::resolve_data_dir(&app_data, &app_config).unwrap();
+        let blob_rel = seed_library(&old_data);
+        std::fs::write(old_data.join(&blob_rel), b"tampered bytes").unwrap();
+        let new_root = temp_root();
+
+        // Act
+        let result = move_data_dir_with(
+            &settings,
+            &app_data,
+            &app_config,
+            &old_data,
+            &new_root.display().to_string(),
+            false,
+            |_, _, _| {},
+        );
+
+        // Assert — the two things that must survive a bad copy: the original,
+        // and the override still pointing at the root that still holds it.
+        let err = result.expect_err("a blob that does not hash to its own name must stop the move");
+        assert_eq!(err.kind, IpcErrorKind::Io);
+        assert_eq!(err.detail.unwrap()["reason"], serde_json::json!("blob_hash_mismatch"));
+        assert_eq!(idl_rs::store::settings::load(&settings).data_dir, None);
+        assert_eq!(std::fs::read(old_data.join(&blob_rel)).unwrap(), b"tampered bytes");
+    }
+
+    #[test]
+    fn move_data_dir_across_volumes_a_clean_library_moves_and_the_old_root_is_emptied() {
+        // Arrange — same forced cross-volume path, nothing corrupted.
+        let app_data = temp_root();
+        let app_config = temp_root();
+        let settings = settings_path(&app_config);
+        let old_data = crate::paths::resolve_data_dir(&app_data, &app_config).unwrap();
+        let blob_rel = seed_library(&old_data);
+        let new_root = temp_root();
+
+        // Act
+        let info = move_data_dir_with(
+            &settings,
+            &app_data,
+            &app_config,
+            &old_data,
+            &new_root.display().to_string(),
+            false,
+            |_, _, _| {},
+        )
+        .unwrap();
+
+        // Assert
+        assert_eq!(info.override_path, Some(new_root.display().to_string()));
+        assert_eq!(std::fs::read(new_root.join("data").join(&blob_rel)).unwrap(), b"raw ride log bytes");
+        assert!(!old_data.join("blobs").exists());
+        assert!(old_data.join("tmp").join("scratch").is_file());
     }
 
     #[test]
