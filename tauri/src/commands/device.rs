@@ -297,7 +297,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// flow) — the prerequisite for every WiFi-side call below (`list_files`,
 /// `download`); `BleTransport` has no file-listing method of its own (SPEC
 /// §6/§7 put file transfer on the WiFi side entirely).
-async fn switch_to_wifi_mode(ble: &impl BleTransport) -> Result<(), IpcError> {
+pub(crate) async fn switch_to_wifi_mode(ble: &impl BleTransport) -> Result<(), IpcError> {
     ble.send_command(ControlCommand::WifiOn).await.map_err(IpcError::from)?;
     for _ in 0..WIFI_ON_POLL_ATTEMPTS {
         let status = ble.read_status().await.map_err(IpcError::from)?;
@@ -337,7 +337,7 @@ async fn connect_via(ble: &mut impl BleTransport, device_id: &str) -> Result<Con
 /// `BtleplugBle` (this module's own doc comment on tests, and L4's own
 /// `StubBle` precedent). `state::Connections` is this type instantiated at
 /// `BtleplugBle`.
-type ConnectionMap<T> = StdMutex<HashMap<String, Arc<tokio::sync::Mutex<T>>>>;
+pub(crate) type ConnectionMap<T> = StdMutex<HashMap<String, Arc<tokio::sync::Mutex<T>>>>;
 
 /// Transport-agnostic core of `connect_device`: connects `ble`, then inserts
 /// it into `connections` under `device_id`, replacing any existing entry —
@@ -875,7 +875,7 @@ pub fn preview_channel_registry(config_json: String) -> Result<Vec<RegistryRow>,
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -892,31 +892,31 @@ mod tests {
     /// mirrors L4's own `StubBle` (`idl-transport`'s `ble_transport.rs::
     /// sequencing`, `#[cfg(test)]`-private to that crate, not reusable from
     /// here).
-    struct StubBle {
-        scan_devices: Vec<idl_transport::DiscoveredDevice>,
-        connect_result: Result<idl_transport::ConnectionInfo, TransportError>,
-        send_command_result: Result<(), TransportError>,
-        push_config_result: Result<(), TransportError>,
+    pub(crate) struct StubBle {
+        pub(crate) scan_devices: Vec<idl_transport::DiscoveredDevice>,
+        pub(crate) connect_result: Result<idl_transport::ConnectionInfo, TransportError>,
+        pub(crate) send_command_result: Result<(), TransportError>,
+        pub(crate) push_config_result: Result<(), TransportError>,
         /// One entry consumed per `read_status` call; the last entry repeats
         /// once the queue is drained. Ignored once `status_override` is `Some`.
-        wifi_on_reads: StdMutex<VecDeque<Option<bool>>>,
+        pub(crate) wifi_on_reads: StdMutex<VecDeque<Option<bool>>>,
         /// Same convention as `wifi_on_reads`, for `device_control`'s
         /// `logging`-flip tests (start/stop recording).
-        logging_reads: StdMutex<VecDeque<Option<bool>>>,
+        pub(crate) logging_reads: StdMutex<VecDeque<Option<bool>>>,
         /// When `Some`, `read_status` returns this directly instead of
         /// consulting `wifi_on_reads`/`logging_reads` — the managed-connection
         /// `device_status` tests need a full `DeviceStatus`, not just one field.
-        status_override: StdMutex<Option<DeviceStatus>>,
+        pub(crate) status_override: StdMutex<Option<DeviceStatus>>,
         /// `read_config`'s canned result (Task 7's `pull_config` tests).
-        read_config_result: Result<Vec<u8>, TransportError>,
+        pub(crate) read_config_result: Result<Vec<u8>, TransportError>,
         /// `Arc`-shared so a test can hold a clone after a `StubBle` built
         /// inside a `device_status_via` factory closure is moved and dropped.
-        connect_calls: Arc<AtomicUsize>,
-        disconnect_calls: Arc<AtomicUsize>,
-        send_command_calls: AtomicUsize,
+        pub(crate) connect_calls: Arc<AtomicUsize>,
+        pub(crate) disconnect_calls: Arc<AtomicUsize>,
+        pub(crate) send_command_calls: AtomicUsize,
         /// The most recent `ControlCommand` passed to `send_command`, for
         /// `device_control`'s command-mapping tests.
-        last_command: StdMutex<Option<ControlCommand>>,
+        pub(crate) last_command: StdMutex<Option<ControlCommand>>,
     }
 
     impl Default for StubBle {
@@ -996,9 +996,11 @@ mod tests {
 
     /// `WifiTransport` test double, same "unconfigured methods error"
     /// convention as `StubBle`.
-    struct StubWifi {
-        list_files_result: Result<Vec<idl_transport::DeviceFile>, TransportError>,
-        download_bytes: Result<Vec<u8>, TransportError>,
+    pub(crate) struct StubWifi {
+        pub(crate) list_files_result: Result<Vec<idl_transport::DeviceFile>, TransportError>,
+        pub(crate) download_bytes: Result<Vec<u8>, TransportError>,
+        /// `push_ota`'s canned result (the OTA lane's `push_firmware` tests).
+        pub(crate) push_ota_result: Result<(), idl_transport::wifi_transport::OtaPushError>,
     }
 
     impl Default for StubWifi {
@@ -1006,6 +1008,9 @@ mod tests {
             Self {
                 list_files_result: Err(TransportError::new(TransportErrorKind::Wifi, "StubWifi::list_files not configured")),
                 download_bytes: Err(TransportError::new(TransportErrorKind::Wifi, "StubWifi::download not configured")),
+                push_ota_result: Err(idl_transport::wifi_transport::OtaPushError::transport(
+                    "StubWifi::push_ota not configured",
+                )),
             }
         }
     }
@@ -1051,12 +1056,18 @@ mod tests {
             Err(TransportError::new(TransportErrorKind::Wifi, "StubWifi::push_config not exercised"))
         }
 
+        /// Reports progress in four even steps so a caller can prove its
+        /// own percentage arithmetic without a real socket.
         async fn push_ota(
             &self,
-            _firmware_image: &[u8],
-            _on_progress: &mut (dyn FnMut(u64, u64) + Send),
+            firmware_image: &[u8],
+            on_progress: &mut (dyn FnMut(u64, u64) + Send),
         ) -> Result<(), idl_transport::wifi_transport::OtaPushError> {
-            Err(idl_transport::wifi_transport::OtaPushError::transport("StubWifi::push_ota not exercised"))
+            let total_bytes = firmware_image.len() as u64;
+            for step in 1..=4u64 {
+                on_progress(total_bytes * step / 4, total_bytes);
+            }
+            self.push_ota_result.clone()
         }
     }
 
@@ -1471,6 +1482,7 @@ mod tests {
         let wifi = StubWifi {
             list_files_result: Ok(vec![idl_transport::DeviceFile { name: "session_001.idl0".to_string(), size_bytes: content.len() as u64, session_id: None }]),
             download_bytes: Ok(content.clone()),
+            ..StubWifi::default()
         };
         let mut progress_calls = Vec::new();
 
@@ -1512,6 +1524,7 @@ mod tests {
         let wifi = StubWifi {
             list_files_result: Ok(vec![idl_transport::DeviceFile { name: "shard.idl0".to_string(), size_bytes: content.len() as u64, session_id: None }]),
             download_bytes: Ok(content.clone()),
+            ..StubWifi::default()
         };
 
         // Act
@@ -1532,6 +1545,7 @@ mod tests {
         let make_wifi = || StubWifi {
             list_files_result: Ok(vec![idl_transport::DeviceFile { name: "a.idl0".to_string(), size_bytes: content.len() as u64, session_id: None }]),
             download_bytes: Ok(content.clone()),
+            ..StubWifi::default()
         };
 
         // Act

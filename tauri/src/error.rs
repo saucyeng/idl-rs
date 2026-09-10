@@ -147,7 +147,7 @@ pub enum IpcErrorKind {
 /// ever serialize this — but for `inbox/failed/<name>.error.txt`, the one
 /// place an `IpcError` is written to disk and read back (C3 §3.3
 /// `inbox_status`, ruling R191).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IpcError {
     pub kind: IpcErrorKind,
     /// Human-readable text. No stack traces (CLAUDE.md §5).

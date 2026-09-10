@@ -37,6 +37,19 @@ pub struct Connections(
     pub Mutex<HashMap<String, Arc<tokio::sync::Mutex<idl_transport::ble_transport::BtleplugBle>>>>,
 );
 
+/// The firmware/OTA state machine's current state (C3 §3.8, ruling R198).
+/// One per app: only one device can be updated at a time, and the sequence
+/// owns the BLE link while it runs. `push_firmware`/`confirm_firmware` write
+/// it (and emit `ota_state_changed` with the same value); `ota_state` reads
+/// it, so a UI mounting mid-flight sees where the sequence got to.
+pub struct Ota(pub Mutex<crate::commands::firmware::OtaState>);
+
+impl Default for Ota {
+    fn default() -> Self {
+        Self(Mutex::new(crate::commands::firmware::OtaState::Idle))
+    }
+}
+
 /// LAN-sync managed state (C3 §3.9, PLAN §2 "server and discovery lifecycle
 /// in state"): the running server, the browse task's latest peer set, the
 /// pairing state, and the loaded paired-peer list. Constructed once at
