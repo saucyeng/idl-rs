@@ -9,6 +9,10 @@
 //! ```
 
 pub mod commands;
+/// Build-time guard over the engine's delete sites (ruling R196). Test-only
+/// — it contains no runtime code, only the scan and the audited allowlist.
+#[cfg(test)]
+mod delete_guard;
 pub mod error;
 /// `<data>/inbox` watching (C4 §2, ruling R191). Desktop only — the inbox
 /// does not exist on mobile, where `inbox_status` returns
@@ -78,6 +82,7 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::app::set_settings,
         commands::app::get_data_dir,
         commands::app::set_data_dir,
+        commands::app::move_data_dir,
         commands::app::list_profiles,
         commands::app::save_profile,
         commands::app::delete_profile,
