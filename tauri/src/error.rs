@@ -10,7 +10,7 @@
 /// Machine-readable failure class. Frontend code routes on the serialized
 /// string, never on `IpcError::message`. Variants are additive-only once
 /// shipped (C3 §5) — never renamed or removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcErrorKind {
     /// `TransportErrorKind::Ble` — device: `ble_scan`, `ble_connect`, `list_device_files`, `download_file`, `push_config`.
@@ -132,16 +132,27 @@ pub enum IpcErrorKind {
     /// `ConfigErrorKind::UnsupportedVersion` — Device: `preview_channel_registry`
     /// (C3 §3.8, `config_version` exceeds `DeviceConfig::SUPPORTED_VERSION`).
     ConfigUnsupportedVersion,
+    /// C3 §2 (added 2026-09-10, ruling R183): the command exists in the
+    /// contract but this build has no implementation of it on the platform
+    /// it is running on — neither a failure (`Internal`) nor a caller
+    /// mistake (`InvalidArgument`); the UI greys the feature out. First use
+    /// here: `inbox_status` on mobile (C3 §3.3, ruling R191 — the inbox is
+    /// desktop only). `detail` carries `{ platform }`.
+    UnsupportedPlatform,
 }
 
 /// One JSON error crossing every fallible command (C3 §2). `detail`'s shape
 /// depends on `kind`; absent when there is nothing structured to add.
-#[derive(Debug, Clone, serde::Serialize)]
+/// `Deserialize` (added 2026-09-10, M4c) is not for the wire — commands only
+/// ever serialize this — but for `inbox/failed/<name>.error.txt`, the one
+/// place an `IpcError` is written to disk and read back (C3 §3.3
+/// `inbox_status`, ruling R191).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IpcError {
     pub kind: IpcErrorKind,
     /// Human-readable text. No stack traces (CLAUDE.md §5).
     pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
 }
 
@@ -303,6 +314,21 @@ impl From<idl_rs::store::quarantine::QuarantineError> for IpcError {
             QuarantineErrorKind::Occupied => IpcErrorKind::InvalidArgument,
             QuarantineErrorKind::Io => IpcErrorKind::Io,
             QuarantineErrorKind::Encode => IpcErrorKind::Internal,
+        };
+        IpcError::new(kind, e.message)
+    }
+}
+
+/// C3 §3.3 `scan_folder` (added 2026-09-10, ruling R191): the folder-scan
+/// error folds two ways — `NotFound` (the folder is gone, or is not a
+/// directory) and `Io` (the directory listing failed). `internal` is never
+/// produced by core here.
+impl From<idl_rs::store::scan::ScanError> for IpcError {
+    fn from(e: idl_rs::store::scan::ScanError) -> Self {
+        use idl_rs::store::scan::ScanErrorKind;
+        let kind = match e.kind {
+            ScanErrorKind::NotFound => IpcErrorKind::NotFound,
+            ScanErrorKind::Io => IpcErrorKind::Io,
         };
         IpcError::new(kind, e.message)
     }

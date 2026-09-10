@@ -10,6 +10,11 @@
 
 pub mod commands;
 pub mod error;
+/// `<data>/inbox` watching (C4 §2, ruling R191). Desktop only — the inbox
+/// does not exist on mobile, where `inbox_status` returns
+/// `unsupported_platform`.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod inbox;
 pub mod paths;
 pub mod session_source;
 pub mod state;
@@ -64,6 +69,11 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::tiles::fetch_tile,
         commands::import::list_importers,
         commands::import::import_file,
+        commands::library::set_session_start,
+        commands::library::scan_folder,
+        commands::library::list_stale_sessions,
+        commands::library::reimport_sessions,
+        commands::library::inbox_status,
         commands::app::get_settings,
         commands::app::set_settings,
         commands::app::get_data_dir,

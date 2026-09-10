@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod cursor;
 pub mod device;
 pub mod import;
+pub mod library;
 pub mod maintenance;
 pub mod rasters;
 pub mod sync;
