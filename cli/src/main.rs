@@ -1,7 +1,8 @@
 //! `idl-rs` — command-line front end for the idl-rs engine.
 //!
 //! `info` and `channels` inspect a log; `export` writes its channel set to
-//! CSV (long/tidy) or JSON. All commands read through `SessionHandle`, so the
+//! CSV (long/tidy) or JSON; the `library` group (see [`library`]) manages a
+//! whole data directory. All commands read through `SessionHandle`, so the
 //! synthesized `Time`/`Distance` channels are visible everywhere.
 //!
 //! Every command speaks the JSON envelope (see [`envelope`]): structured
@@ -12,6 +13,7 @@
 //! on failure. See `docs/IDL0_SPEC.md` (CLI section) for the contract.
 
 mod envelope;
+mod library;
 mod recover;
 mod table_cmd;
 
@@ -256,6 +258,14 @@ enum Command {
         /// Stop scanning after this many bytes (default: the whole device).
         #[arg(long)]
         scan_limit: Option<u64>,
+    },
+    /// Bulk library management for a data directory (ruling R197): fold a
+    /// folder in, preview a scan, list stale sessions, rebuild them. Every
+    /// action is a wrapper over the core functions the app's own commands
+    /// call, so the CLI and the app can never drift.
+    Library {
+        #[command(subcommand)]
+        action: library::LibraryAction,
     },
     /// Evaluate, list, or validate a workbook's tables (the `table` group).
     Table {
@@ -559,6 +569,7 @@ fn main() -> ExitCode {
             "scan",
             recover::scan_all(&device, out_dir.as_deref(), scan_limit.unwrap_or(u64::MAX)),
         ),
+        Command::Library { action } => library::run(action),
         Command::Table { action } => table_cmd::run(action),
         Command::Import { file, data_dir } => cmd_import(&file, &data_dir),
         Command::Sessions { data_dir, format } => cmd_sessions(&data_dir, format),
