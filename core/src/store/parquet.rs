@@ -74,30 +74,26 @@ fn union_t_axis(session: &Session) -> Vec<i64> {
     set.into_iter().collect()
 }
 
-/// Scatters `values` — one per sample of the channel whose ascending
-/// timestamps are `c_t_us` — into a dense `n_rows` buffer plus the validity
-/// mask marking the rows that channel actually sampled.
+/// Calls `f(row, value)` for each of a channel's samples, `row` being that
+/// sample's index on the union axis `t`.
 ///
-/// Both `t` (the sorted, deduplicated union axis) and `c_t_us` (C1 §3.5
+/// Both `t` (sorted and deduplicated) and a well-formed `c_t_us` (C1 §3.5
 /// invariant 1) ascend, so this is one merge walk rather than a binary
 /// search per sample, and it never materialises the per-sample row-index
-/// vector the previous version built (8 B/sample — at session scale a
-/// bigger allocation than the samples themselves; ruling R203.3 counts it).
-/// `already` is the mask of rows a previous call already filled, for the
-/// merged `<source>_t_recorded_us` columns where first-fill-wins; pass
-/// `None` when nothing may already be set.
+/// vector the previous version built — 8 B/sample, which at session scale
+/// is a bigger allocation than the samples themselves (ruling R203.3
+/// counts it).
 ///
-/// A timestamp missing from `t` is a bug, not user data (`t` is the union
-/// of every channel's `t_us`), so it is a hard [`ParquetStoreError`] rather
-/// than a silently dropped sample.
-fn scatter_into<T: Copy + Default>(
+/// Samples are visited in the channel's own order and a row may be visited
+/// more than once (a channel with repeated timestamps); what that means is
+/// `f`'s decision, not this function's.
+fn for_each_row<T>(
     channel_id: &str,
     c_t_us: &[i64],
     t: &[i64],
     n_rows: usize,
     values: impl Iterator<Item = T>,
-    dest: &mut [T],
-    valid: &mut BooleanBufferBuilder,
+    mut f: impl FnMut(usize, T),
 ) -> Result<(), ParquetStoreError> {
     let mut row = 0usize;
     for (i, v) in values.enumerate() {
@@ -105,16 +101,26 @@ fn scatter_into<T: Copy + Default>(
         while row < n_rows && t[row] < ts {
             row += 1;
         }
-        if row >= n_rows || t[row] != ts {
-            return Err(ParquetStoreError::new(
-                ParquetStoreErrorKind::Schema,
-                format!("channel {channel_id} has t_us={ts} not present in the union axis (internal bug)"),
-            ));
-        }
-        if !valid.get_bit(row) {
-            dest[row] = v;
-            valid.set_bit(row, true);
-        }
+        // The forward walk covers a strictly increasing `t_us` (C1 §3.5
+        // invariant 1) in one pass. Not every real source honours that
+        // invariant, though — an event-driven channel like `HR_RR` can
+        // report two intervals at one timestamp, or report them slightly
+        // out of order — so a walk miss falls back to a search over the
+        // whole axis rather than failing. Only then is a miss a genuine
+        // internal bug: `t` is the union of every channel's own `t_us`, so
+        // a timestamp the search cannot find was never in the union.
+        let hit = if row < n_rows && t[row] == ts {
+            row
+        } else {
+            t.binary_search(&ts).map_err(|_| {
+                ParquetStoreError::new(
+                    ParquetStoreErrorKind::Schema,
+                    format!("channel {channel_id} has t_us={ts} not present in the union axis (internal bug)"),
+                )
+            })?
+        };
+        row = hit;
+        f(hit, v);
     }
     Ok(())
 }
@@ -139,11 +145,16 @@ fn finish_column<T: ArrowPrimitiveType>(values: Vec<T::Native>, mut valid: Boole
 /// columns (never called with those variants; synthesized channels are
 /// excluded from `data.parquet` entirely, see [`write_session_parquet`]).
 fn channel_array(c: &Channel, t: &[i64], n_rows: usize) -> Result<ArrayRef, ParquetStoreError> {
+    // A row a channel samples twice keeps the later value, which is what
+    // the `vals[row] = Some(v)` scatter this replaced did.
     macro_rules! scatter {
         ($ty:ty, $arrow:ty, $data:expr) => {{
             let mut vals: Vec<$ty> = vec![<$ty>::default(); n_rows];
             let mut valid = new_validity(n_rows);
-            scatter_into(&c.channel_id, &c.t_us, t, n_rows, $data.iter().copied(), &mut vals, &mut valid)?;
+            for_each_row(&c.channel_id, &c.t_us, t, n_rows, $data.iter().copied(), |row, v| {
+                vals[row] = v;
+                valid.set_bit(row, true);
+            })?;
             Ok(finish_column::<$arrow>(vals, valid))
         }};
     }
@@ -216,8 +227,20 @@ fn recorded_us_array(
     let mut vals: Vec<i64> = vec![0; n_rows];
     let mut valid = new_validity(n_rows);
     for c in session.channels.iter().filter(|c| c.source_kind == source_kind) {
+        // `own` marks the rows *this* channel filled, so a repeated
+        // timestamp within one channel keeps its later value while a row an
+        // earlier channel already filled is left alone — exactly what the
+        // per-channel scatter plus first-fill-wins merge this replaced did.
+        // A bitmask, so it costs one bit per row, not eight bytes.
+        let mut own = new_validity(n_rows);
         let recorded = c.t_recorded_us_or_t_us();
-        scatter_into(&c.channel_id, &c.t_us, t, n_rows, recorded.iter().copied(), &mut vals, &mut valid)?;
+        for_each_row(&c.channel_id, &c.t_us, t, n_rows, recorded.iter().copied(), |row, v| {
+            if !valid.get_bit(row) || own.get_bit(row) {
+                vals[row] = v;
+                valid.set_bit(row, true);
+                own.set_bit(row, true);
+            }
+        })?;
     }
     Ok(finish_column::<Int64Type>(vals, valid))
 }
@@ -1629,6 +1652,61 @@ mod streaming_write_parity_tests {
 
         // Assert
         assert_eq!(streamed, reference_bytes(&session, "0.1.0"));
+    }
+
+    /// A channel whose `t_us` is neither strictly increasing nor unique.
+    ///
+    /// Found by importing a real 377 MB log: `HR_RR` reports heart-rate
+    /// intervals whose recorded timestamps repeat and step backwards, so
+    /// C1 §3.5 invariant 1 does not hold for every source in practice. The
+    /// column writer must place those samples exactly where the previous
+    /// binary-search scatter did — later sample wins a repeated row — and
+    /// must not reject the session.
+    fn session_with_unordered_timestamps() -> Session {
+        let mut session = sample_session();
+        session.channels = vec![Channel {
+            channel_id: "HR_RR".to_string(),
+            t_us: vec![0, 3000, 1000, 1000, 2000, 3000],
+            t_recorded_us: None,
+            nominal_rate_hz: 0.0,
+            column: RawColumn::F64(vec![10.0, 40.0, 20.0, 21.0, 30.0, 41.0]),
+            source_kind: "hr".to_string(),
+            unit: "ms".to_string(),
+            gaps: Vec::new(),
+        }];
+        session
+    }
+
+    #[test]
+    fn streaming_writer_a_channel_whose_timestamps_repeat_and_step_backwards_writes_the_same_bytes() {
+        // Arrange
+        let session = session_with_unordered_timestamps();
+
+        // Act
+        let streamed = written_bytes(&session, "0.1.0");
+
+        // Assert
+        assert_eq!(streamed, reference_bytes(&session, "0.1.0"));
+    }
+
+    #[test]
+    fn streaming_writer_a_channel_whose_timestamps_repeat_and_step_backwards_round_trips_the_later_value() {
+        // Arrange
+        let root = temp_root();
+        let session = session_with_unordered_timestamps();
+
+        // Act
+        let path = write_session_parquet(&root, &session, "0.1.0").unwrap();
+        let back = read_session_parquet(&path).unwrap();
+
+        // Assert — four distinct timestamps; the repeated ones keep the
+        // later of the two samples written to them.
+        let ch = back.channels.iter().find(|c| c.channel_id == "HR_RR").unwrap();
+        assert_eq!(ch.t_us, vec![0, 1000, 2000, 3000]);
+        let RawColumn::F64(values) = &ch.column else { panic!("not F64") };
+        assert_eq!(values, &vec![10.0, 21.0, 30.0, 41.0]);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
