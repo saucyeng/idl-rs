@@ -98,7 +98,7 @@ pub fn cursor_readout_via(
 
 /// C3 §3.7 `cursor_readout(session_id, channels, t_us)`. Settle-bound only,
 /// never a hot path (C3 §4) — nothing in wave 1 calls it from a hover path.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cursor_readout(
     session_id: String,
     channels: Vec<String>,

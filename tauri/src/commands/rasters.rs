@@ -476,7 +476,7 @@ pub fn fetch_raster_meta_via(
 
 /// Fetches and encodes one raster (C3 §3.6). `params` is
 /// [`SpectrogramParams`] or [`Histogram2dParams`] JSON, matching `kind`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fetch_raster(
     session_id: String,
     channel: String,
@@ -494,7 +494,7 @@ pub fn fetch_raster(
 /// Fetches one raster's axis domains and colour scale without decoding
 /// pixel bytes (C3 §3.6, added post-sign, ledger R25). Same arguments as
 /// `fetch_raster`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fetch_raster_meta(
     session_id: String,
     channel: String,
@@ -588,7 +588,7 @@ pub fn fetch_fft_via(
 /// R63 (3), R76, R83). `lap: null` is the whole channel; `lap: n` is that
 /// lap's recording-time window, resolved from `session.json`'s `laps[]` (see
 /// [`fetch_fft_via`]).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fetch_fft(
     session_id: String,
     channel: String,
@@ -658,7 +658,7 @@ pub fn fetch_fft_v2_via(
 /// R117.7). The `_v1` `fetch_fft` stays registered, deprecated for one
 /// revision (R117.3); see [`fetch_fft_v2_via`] for resolution and error
 /// mapping.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fetch_fft_v2(
     window: WindowDto,
     channel: String,

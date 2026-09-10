@@ -27,9 +27,11 @@ pub struct ScanEntry {
     /// Importer id by extension (`list_importers`' vocabulary), `null` when
     /// no importer covers this file.
     pub importer_id: Option<String>,
-    /// `true` when this file's sha256 is already a blob under
-    /// `<data>/blobs` (C4 §3) — re-importing it would be a no-op.
-    pub already_imported: bool,
+    /// `null` = not checked; import de-duplicates by content hash
+    /// regardless (C3 §3.3, ruling R201 item 2). Always `null` from this
+    /// command, which never hashes; the field stays on the wire because
+    /// core's hashing scan (the CLI's) still answers it.
+    pub already_imported: Option<bool>,
     /// Session start from a header peek, UTC milliseconds (`0` = the header
     /// has no clock value); `null` when the format offers no peek.
     pub session_start_utc_ms: Option<i64>,
@@ -144,10 +146,12 @@ fn map_session_json_error(e: idl_rs::store::session_json::SessionJsonError) -> I
 }
 
 /// Transport-agnostic core of `scan_folder` (C3 §3.3): core's own
-/// non-recursive folder scan, with `data_dir`'s `blobs/` answering
-/// `already_imported`, converted to the wire shape.
-fn scan_folder_via(data_dir: &Path, path: &str) -> Result<Vec<ScanEntry>, IpcError> {
-    let entries = idl_rs::store::scan::scan_folder(data_dir, Path::new(path))?;
+/// non-recursive folder scan, converted to the wire shape. Nothing is
+/// hashed and no file body is read, so this returns from directory
+/// metadata alone however large the folder is (ruling R201 item 2) —
+/// hence no `data_dir` argument: there is no blob store to consult.
+fn scan_folder_via(path: &str) -> Result<Vec<ScanEntry>, IpcError> {
+    let entries = idl_rs::store::scan::scan_folder(Path::new(path))?;
     Ok(entries.into_iter().map(ScanEntry::from).collect())
 }
 
@@ -188,7 +192,7 @@ fn reimport_sessions_via(
 }
 
 /// C3 §3.3 `set_session_start(session_id, timestamp_utc_ms)`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_session_start(
     session_id: String,
     timestamp_utc_ms: i64,
@@ -198,19 +202,19 @@ pub fn set_session_start(
 }
 
 /// C3 §3.3 `scan_folder(path)`.
-#[tauri::command]
-pub fn scan_folder(path: String, data_dir: tauri::State<'_, DataDir>) -> Result<Vec<ScanEntry>, IpcError> {
-    scan_folder_via(&data_dir.0, &path)
+#[tauri::command(async)]
+pub fn scan_folder(path: String) -> Result<Vec<ScanEntry>, IpcError> {
+    scan_folder_via(&path)
 }
 
 /// C3 §3.3 `list_stale_sessions()`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_stale_sessions(data_dir: tauri::State<'_, DataDir>) -> Result<Vec<StaleSession>, IpcError> {
     list_stale_sessions_via(&data_dir.0)
 }
 
 /// C3 §3.3 `reimport_sessions(session_ids, progress)`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn reimport_sessions(
     session_ids: Vec<String>,
     progress: tauri::ipc::Channel<Progress>,
@@ -233,7 +237,7 @@ pub fn reimport_sessions(
 /// exist at all (ruling R191), so this is `unsupported_platform` rather than
 /// an empty status, which would claim a working, empty inbox.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn inbox_status(inbox: tauri::State<'_, crate::inbox::InboxState>) -> Result<crate::inbox::InboxStatus, IpcError> {
     Ok(inbox.status())
 }
@@ -241,7 +245,7 @@ pub fn inbox_status(inbox: tauri::State<'_, crate::inbox::InboxState>) -> Result
 /// C3 §3.3 `inbox_status()` on mobile — see the desktop version's doc
 /// comment.
 #[cfg(any(target_os = "android", target_os = "ios"))]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn inbox_status() -> Result<serde_json::Value, IpcError> {
     Err(IpcError::with_detail(
         IpcErrorKind::UnsupportedPlatform,
@@ -332,25 +336,28 @@ mod tests {
     }
 
     #[test]
-    fn scan_folder_via_reports_importer_ids_and_already_imported_against_this_data_dir() {
-        // Arrange — the same bytes are both imported and left in the folder.
+    fn scan_folder_via_reports_importer_ids_and_never_answers_already_imported() {
+        // Arrange — the same bytes are both imported and left in the folder,
+        // so a hashing scan would report this row as already imported.
         let (root, _session_id) = imported_root();
         let folder = temp_root();
         std::fs::write(folder.join("a.idl0"), idl0_bytes()).unwrap();
         std::fs::write(folder.join("b.txt"), b"notes").unwrap();
 
         // Act
-        let entries = scan_folder_via(&root, folder.to_str().unwrap()).unwrap();
+        let entries = scan_folder_via(folder.to_str().unwrap()).unwrap();
 
         // Assert
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].importer_id.as_deref(), Some("idl0"));
-        assert!(entries[0].already_imported);
+        // R201 item 2: never hashed, so `null` — "not checked", not "not
+        // imported"; import de-duplicates by content hash regardless.
+        assert_eq!(entries[0].already_imported, None);
         // The header peek reports the fixture header's own start, with no
         // record decoding at all.
         assert_eq!(entries[0].session_start_utc_ms, Some(idl_rs::parse::test_buffers::RMC_UTC_MS));
         assert_eq!(entries[1].importer_id, None);
-        assert!(!entries[1].already_imported);
+        assert_eq!(entries[1].already_imported, None);
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&folder);
@@ -362,7 +369,7 @@ mod tests {
         let root = temp_root();
 
         // Act
-        let err = scan_folder_via(&root, root.join("nope").to_str().unwrap()).unwrap_err();
+        let err = scan_folder_via(root.join("nope").to_str().unwrap()).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::NotFound);

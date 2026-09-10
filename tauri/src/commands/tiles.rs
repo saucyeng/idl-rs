@@ -65,7 +65,7 @@ pub fn fetch_tile_via(
 
 /// Fetches and encodes one chart tile (C3 §3.5, v2 layout). `column_count`
 /// is the caller's own chart width in pixel columns (ruling R43).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fetch_tile(
     session_id: String,
     channel: String,

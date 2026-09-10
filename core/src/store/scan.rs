@@ -3,10 +3,19 @@
 //! folder — non-recursive, no import run, no catalog write — so the app can
 //! show a preview table and then enqueue `import_file` per chosen row.
 //!
-//! "Cheap" here means cheap in *decisions*, not in I/O: answering
-//! `already_imported` hashes each file's bytes (R191 — a folder of large
-//! files is allowed to be slow, because this runs once per picker use and
-//! never on a timer).
+//! Two entry points, differing only in whether they answer
+//! `already_imported` (ruling R201 item 2):
+//!
+//! - [`scan_folder`] never reads a file body — one `read_dir`, one `stat`
+//!   per entry and, for `.idl0`, a [`HEADER_PEEK_BYTES`]-byte head read. It
+//!   leaves `already_imported: None`, because deciding it means hashing
+//!   whole files: on the 6.9 GB folder that produced R201 that was minutes
+//!   of a frozen picker, and import de-duplicates by content hash anyway.
+//!   This is what C3 §3.3's `scan_folder` command calls.
+//! - [`scan_folder_with_blob_check`] is the old behaviour, hashing each
+//!   file's bytes against `<data>/blobs`, for callers that are allowed to
+//!   be slow and want the answer up front (the `idl-rs` CLI's `library
+//!   scan`, which has no UI to freeze).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -61,10 +70,12 @@ pub struct ScanEntry {
     /// `"csv"`), or `None` when no importer covers it — such a row is listed
     /// but not importable.
     pub importer_id: Option<String>,
-    /// `true` when `sha256(file bytes)` is already a blob under
+    /// `Some(true)` when `sha256(file bytes)` is already a blob under
     /// `<data>/blobs` (C4 §3), i.e. importing this file again would be a
-    /// no-op. `false` for a file that could not be read.
-    pub already_imported: bool,
+    /// no-op; `Some(false)` when it is not, or when the file could not be
+    /// read. Always `None` from [`scan_folder`], which never hashes —
+    /// "not checked", not "not imported" (ruling R201 item 2).
+    pub already_imported: Option<bool>,
     /// Session start from a header peek, UTC milliseconds
     /// ([`peek_session_start_ms`]; `0` = the header has no clock value).
     /// `None` when the format offers no peek — every importer except
@@ -72,18 +83,44 @@ pub struct ScanEntry {
     pub session_start_utc_ms: Option<i64>,
 }
 
+/// Bytes read from the head of an `.idl0` file for the header peek. Far
+/// more than [`peek_session_start_ms`] needs (35 bytes) and still one
+/// sequential read, so the scan's cost per file is a `stat` plus one short
+/// read regardless of how large the file is.
+pub const HEADER_PEEK_BYTES: usize = 4096;
+
 /// C3 §3.3 `scan_folder(path)` — every file directly inside `folder`
 /// (non-recursive; sub-directories are skipped, not descended), ordered by
-/// `file_name` for a deterministic preview. `data_root` is the C4 data
-/// directory whose `blobs/` decides [`ScanEntry::already_imported`].
+/// `file_name` for a deterministic preview. Returns from directory metadata
+/// alone: no file body is read, nothing is hashed, and
+/// [`ScanEntry::already_imported`] is always `None` (ruling R201 item 2 —
+/// import de-duplicates by content hash regardless, so the picker does not
+/// need the answer to be correct up front). The only read is the
+/// [`HEADER_PEEK_BYTES`]-byte head of an `.idl0` file, for its start time.
 ///
 /// Files this build has no importer for are still listed (with
 /// `importer_id: None`) so the user can see why the folder's other contents
-/// were not offered. A file that cannot be read at all (a permissions
-/// failure, or a file deleted between the listing and the hash) is listed
-/// with `already_imported: false` and no header peek rather than failing the
-/// whole scan.
-pub fn scan_folder(data_root: &Path, folder: &Path) -> Result<Vec<ScanEntry>, ScanError> {
+/// were not offered. A file whose head cannot be read (a permissions
+/// failure, or a file deleted between the listing and the read) is listed
+/// with no header peek rather than failing the whole scan.
+pub fn scan_folder(folder: &Path) -> Result<Vec<ScanEntry>, ScanError> {
+    scan_folder_inner(None, folder)
+}
+
+/// [`scan_folder`] plus the `already_imported` answer: every file's bytes
+/// are read and sha256'd against `data_root`'s `blobs/` (C4 §3), so every
+/// entry carries `Some(_)`. Costs one full read per file — minutes on a
+/// folder of large logs — and so is for callers with no UI to freeze (the
+/// CLI's `library scan`). The C3 §3.3 command calls [`scan_folder`]
+/// instead (ruling R201 item 2).
+pub fn scan_folder_with_blob_check(data_root: &Path, folder: &Path) -> Result<Vec<ScanEntry>, ScanError> {
+    scan_folder_inner(Some(data_root), folder)
+}
+
+/// The shared body of [`scan_folder`] and [`scan_folder_with_blob_check`]:
+/// `data_root` is `Some` exactly when the caller wants `already_imported`
+/// decided, which is also what decides whether whole files are read.
+fn scan_folder_inner(data_root: Option<&Path>, folder: &Path) -> Result<Vec<ScanEntry>, ScanError> {
     if !folder.is_dir() {
         return Err(ScanError::new(
             ScanErrorKind::NotFound,
@@ -107,12 +144,20 @@ pub fn scan_folder(data_root: &Path, folder: &Path) -> Result<Vec<ScanEntry>, Sc
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         let importer_id = importer_id_for_extension(&ext);
 
-        // One read of the whole file: it answers `already_imported` (the
-        // blob digest is over the file's full bytes, C4 §3) and, for
-        // `.idl0`, the header peek as well.
-        let bytes = std::fs::read(&path).ok();
-        let already_imported = bytes.as_ref().is_some_and(|b| blob_exists(data_root, &sha256_hex(b)));
-        let session_start_utc_ms = match (importer_id.as_deref(), bytes.as_ref()) {
+        // With a `data_root` the whole file is read once and serves both
+        // `already_imported` (the blob digest is over the file's full
+        // bytes, C4 §3) and the header peek; without one, only the head is
+        // read and `already_imported` stays unanswered.
+        let (already_imported, head) = match data_root {
+            Some(root) => {
+                let bytes = std::fs::read(&path).ok();
+                let already = bytes.as_ref().is_some_and(|b| blob_exists(root, &sha256_hex(b)));
+                (Some(already), bytes)
+            }
+            None if importer_id.as_deref() == Some("idl0") => (None, read_head(&path)),
+            None => (None, None),
+        };
+        let session_start_utc_ms = match (importer_id.as_deref(), head.as_ref()) {
             (Some("idl0"), Some(b)) => peek_session_start_ms(b),
             _ => None,
         };
@@ -122,6 +167,28 @@ pub fn scan_folder(data_root: &Path, folder: &Path) -> Result<Vec<ScanEntry>, Sc
 
     entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
     Ok(entries)
+}
+
+/// The first [`HEADER_PEEK_BYTES`] bytes of `path` (fewer for a shorter
+/// file), or `None` when the file cannot be opened or read — a scan lists
+/// such a file without a header peek rather than failing. Loops over
+/// `read` because one call may return a short count on any platform.
+fn read_head(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; HEADER_PEEK_BYTES];
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    buf.truncate(filled);
+    Some(buf)
 }
 
 /// Extension (lowercase, no dot) → importer id, unifying `.idl0`'s own entry
@@ -171,7 +238,7 @@ mod tests {
         std::fs::write(folder.join("d_subdir").join("e.idl0"), idl0_bytes(0)).unwrap();
 
         // Act
-        let entries = scan_folder(&data_root, &folder).unwrap();
+        let entries = scan_folder(&folder).unwrap();
 
         // Assert — three files, alphabetical, the sub-directory's contents
         // never descended into.
@@ -193,7 +260,7 @@ mod tests {
         std::fs::write(folder.join("b.gpx"), b"<gpx/>").unwrap();
 
         // Act
-        let entries = scan_folder(&data_root, &folder).unwrap();
+        let entries = scan_folder(&folder).unwrap();
 
         // Assert
         assert_eq!(entries[0].session_start_utc_ms, Some(1_700_000_000_000));
@@ -214,11 +281,53 @@ mod tests {
         std::fs::write(folder.join("b.idl0"), idl0_bytes(1_700_000_000_000)).unwrap();
 
         // Act
-        let entries = scan_folder(&data_root, &folder).unwrap();
+        let entries = scan_folder_with_blob_check(&data_root, &folder).unwrap();
 
         // Assert — same bytes → already imported; different bytes → not.
-        assert!(entries[0].already_imported);
-        assert!(!entries[1].already_imported);
+        assert_eq!(entries[0].already_imported, Some(true));
+        assert_eq!(entries[1].already_imported, Some(false));
+
+        let _ = std::fs::remove_dir_all(&data_root);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn scan_folder_a_file_whose_bytes_are_already_a_blob_is_left_unchecked() {
+        // Arrange — the same buffer imported first, so the hashing scan
+        // would answer `Some(true)` for it.
+        let data_root = temp_dir();
+        let folder = temp_dir();
+        let bytes = idl0_bytes(0);
+        crate::store::import::import_idl0(&data_root, &bytes).unwrap();
+        std::fs::write(folder.join("a.idl0"), &bytes).unwrap();
+
+        // Act
+        let entries = scan_folder(&folder).unwrap();
+
+        // Assert — R201 item 2: never hashed, so never answered.
+        assert_eq!(entries[0].already_imported, None);
+        assert_eq!(entries[0].session_start_utc_ms, Some(0));
+
+        let _ = std::fs::remove_dir_all(&data_root);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn scan_folder_an_idl0_file_larger_than_the_peek_still_reports_its_header_start() {
+        // Arrange — a file whose body runs well past HEADER_PEEK_BYTES, so
+        // a passing peek proves the head read is enough on its own.
+        let data_root = temp_dir();
+        let folder = temp_dir();
+        let mut bytes = idl0_bytes(1_700_000_000_000);
+        bytes.extend(std::iter::repeat(0u8).take(HEADER_PEEK_BYTES * 4));
+        std::fs::write(folder.join("a.idl0"), &bytes).unwrap();
+
+        // Act
+        let entries = scan_folder(&folder).unwrap();
+
+        // Assert
+        assert_eq!(entries[0].session_start_utc_ms, Some(1_700_000_000_000));
+        assert_eq!(entries[0].size_bytes, bytes.len() as u64);
 
         let _ = std::fs::remove_dir_all(&data_root);
         let _ = std::fs::remove_dir_all(&folder);
@@ -230,7 +339,7 @@ mod tests {
         let data_root = temp_dir();
 
         // Act
-        let result = scan_folder(&data_root, &data_root.join("nope"));
+        let result = scan_folder(&data_root.join("nope"));
 
         // Assert
         assert!(matches!(result, Err(ScanError { kind: ScanErrorKind::NotFound, .. })));
