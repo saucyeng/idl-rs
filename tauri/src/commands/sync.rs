@@ -144,6 +144,22 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// The widened `peer_appeared` event's payload (C3 §3.9, L11 Task 14, lead
+/// ruling on task 2): a LAN sighting that is either an already-paired peer
+/// or one this device has not paired with, distinguished by the `status`
+/// tag so a listener never has to make a second `sync_status` call to tell
+/// the two apart. An enum, not a `paired: bool` on a single shape, because
+/// `PeerStatusDto::paired_at_ms` is a fact an unpaired sighting has not
+/// earned — flattening it to `Option<i64>` would leave every consumer
+/// distinguishing "not paired" from "not paired but the flag lied" instead
+/// of the compiler ruling it out.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PeerSightingDto {
+    Paired(PeerStatusDto),
+    Discovered(DiscoveredPeerDto),
+}
+
 /// Converts one paired `Peer` plus the latest browse results into its DTO.
 pub(crate) fn peer_status_dto(peer: &Peer, discovered: &HashMap<String, DiscoveredPeer>) -> PeerStatusDto {
     PeerStatusDto {
@@ -152,6 +168,18 @@ pub(crate) fn peer_status_dto(peer: &Peer, discovered: &HashMap<String, Discover
         online: discovered.contains_key(&peer.peer_id),
         protocol_version: peer.protocol_version,
         paired_at_ms: peer.paired_at_ms,
+    }
+}
+
+/// Builds the widened `peer_appeared` payload for one LAN sighting:
+/// `Paired` if `sighting.peer_id` is in `peers`, `Discovered` otherwise.
+/// The variant follows current membership, not the state at first
+/// sighting — a peer that pairs mid-session arrives as `Paired` on its next
+/// sighting regardless of how it arrived on its first.
+pub(crate) fn peer_sighting_dto(sighting: &DiscoveredPeer, peers: &[Peer], discovered: &HashMap<String, DiscoveredPeer>) -> PeerSightingDto {
+    match peers.iter().find(|p| p.peer_id == sighting.peer_id) {
+        Some(paired) => PeerSightingDto::Paired(peer_status_dto(paired, discovered)),
+        None => PeerSightingDto::Discovered(discovered_peer_dto(sighting)),
     }
 }
 
@@ -560,6 +588,65 @@ mod tests {
         assert!(status.discovered_peers.is_empty());
         assert!(json.get("discovered_peers").is_some());
         assert_eq!(json["discovered_peers"], serde_json::json!([]));
+    }
+
+    // -- peer_sighting_dto (the widened peer_appeared payload) ----------
+
+    fn sighting(id: &str) -> DiscoveredPeer {
+        DiscoveredPeer { peer_id: id.to_string(), name: "Pit Tablet".to_string(), protocol_version: 1, addr: "127.0.0.1:9000".parse().unwrap() }
+    }
+
+    #[test]
+    fn peer_sighting_dto_an_unpaired_sighting_is_the_discovered_variant() {
+        // Arrange
+        let peers: Vec<Peer> = Vec::new();
+        let discovered = HashMap::new();
+        let s = sighting("peer-1");
+
+        // Act
+        let dto = peer_sighting_dto(&s, &peers, &discovered);
+        let json = serde_json::to_value(&dto).unwrap();
+
+        // Assert
+        assert!(matches!(dto, PeerSightingDto::Discovered(_)));
+        assert_eq!(json["status"], "discovered");
+        assert_eq!(json["peer_id"], "peer-1");
+        assert!(json.get("paired_at_ms").is_none());
+    }
+
+    #[test]
+    fn peer_sighting_dto_a_paired_sighting_is_the_paired_variant() {
+        // Arrange
+        let peers = vec![peer("peer-1")];
+        let discovered = HashMap::new();
+        let s = sighting("peer-1");
+
+        // Act
+        let dto = peer_sighting_dto(&s, &peers, &discovered);
+        let json = serde_json::to_value(&dto).unwrap();
+
+        // Assert
+        assert!(matches!(dto, PeerSightingDto::Paired(_)));
+        assert_eq!(json["status"], "paired");
+        assert_eq!(json["peer_id"], "peer-1");
+        assert!(json.get("paired_at_ms").is_some());
+    }
+
+    #[test]
+    fn peer_sighting_dto_a_peer_that_pairs_mid_session_arrives_as_paired_on_its_next_sighting() {
+        // Arrange: same peer_id, first seen while unpaired
+        let s = sighting("peer-1");
+        let no_peers: Vec<Peer> = Vec::new();
+        let discovered = HashMap::new();
+        let first = peer_sighting_dto(&s, &no_peers, &discovered);
+
+        // Act: now pairs, then is seen again
+        let now_paired = vec![peer("peer-1")];
+        let second = peer_sighting_dto(&s, &now_paired, &discovered);
+
+        // Assert
+        assert!(matches!(first, PeerSightingDto::Discovered(_)));
+        assert!(matches!(second, PeerSightingDto::Paired(_)));
     }
 
     #[test]
