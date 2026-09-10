@@ -149,6 +149,19 @@ pub fn open_catalog(path: &Path) -> Result<Connection, CatalogError> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
+    // A brand-new file (first launch on a fresh data root, ruling R200) has
+    // no tables and `user_version` 0: bootstrap the schema here rather than
+    // leaving every query to fail with "no such table" until someone runs a
+    // rebuild. Only a *completely empty* database is touched; a populated
+    // one, whatever its version, is left to the rebuild/migration paths.
+    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if user_version == 0 {
+        let tables: i64 =
+            conn.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))?;
+        if tables == 0 {
+            create_schema(&conn)?;
+        }
+    }
     Ok(conn)
 }
 
@@ -1985,5 +1998,21 @@ mod tests {
         assert_eq!(blobs_after, 1);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_catalog_on_a_fresh_empty_file_creates_the_schema() {
+        // Arrange
+        let root = temp_root();
+        let path = root.join("catalog.sqlite");
+
+        // Act
+        let conn = open_catalog(&path).unwrap();
+
+        // Assert
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(user_version, CATALOG_SCHEMA_VERSION);
+        let workbooks: i64 = conn.query_row("SELECT count(*) FROM workbooks", [], |r| r.get(0)).unwrap();
+        assert_eq!(workbooks, 0);
     }
 }
