@@ -16,6 +16,11 @@
 //! trivially auditable would be worse. The cost is that the `#[cfg(test)]`
 //! skipping is brace-counting rather than parsing — good enough for a repo
 //! whose test modules are all `#[cfg(test)] mod tests { … }`.
+//!
+//! One known sharp edge: a delete call inside a nested `fn` is attributed to
+//! that nested name, which is usually meaningless in an allowlist. The test
+//! still fails — it just names something an auditor cannot find — so the fix
+//! is to hoist the helper out, not to allowlist the inner name.
 
 #[cfg(test)]
 mod tests {
@@ -69,6 +74,16 @@ mod tests {
         // track" action, path-validated first. Added to the audit on
         // 2026-09-10 — this scan is what found it missing from it.
         ("core/src/track_artifact/write.rs", "delete_track"),
+        // (h) `move_data_dir` (C3 §3.10 as amended by R197: move, not copy).
+        // `copy_verify_delete` removes a source file only after its copy has
+        // verified at the destination; `move_data_dir_via` removes a source
+        // whose destination copy already verifies, resuming an interrupted
+        // run; `prune_emptied_dirs` uses `remove_dir`, which fails on a
+        // non-empty directory by construction, so it can only remove what the
+        // move itself emptied.
+        ("tauri/src/commands/app.rs", "copy_verify_delete"),
+        ("tauri/src/commands/app.rs", "move_data_dir_via"),
+        ("tauri/src/commands/app.rs", "prune_emptied_dirs"),
         // (e) the one and only blob-deleting path: `delete_session` with
         // `delete_blob: true`, after confirming no other session references
         // the same content hash.
