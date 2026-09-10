@@ -195,13 +195,20 @@ fn os_hostname() -> Option<String> {
 }
 
 /// The background browse-consuming loop (PLAN §2's "the browse task's
-/// latest peer set"): for every LAN sighting, refreshes `discovered`,
-/// emits `peer_appeared` (C3 §3.9) for a sighting that is already paired,
-/// and runs the pure `should_auto_sync` decision (`commands::sync`) —
-/// starting a sync itself only when it says yes, never from a command
-/// handler (this task's brief, "Do not"). Ends when `browse()`'s receiver
-/// closes (the daemon shut down) — there is no other exit, matching
-/// `SyncState`'s own lifetime.
+/// latest peer set"): for every LAN sighting, refreshes `discovered` and
+/// emits `peer_appeared` (C3 §3.9, widened by L11 Task 14 to any sighting,
+/// paired or not) if — and only if — the sighting is new or differs from
+/// what `discovered` already held for that `peer_id` (lead ruling R176).
+/// A sighting byte-identical to the stored one is still inserted (refreshes
+/// nothing observable, but keeps the map current) but emits nothing: the
+/// underlying mDNS resolve re-fires far more often than a peer's actual
+/// name/version/address/port changes, and re-announcing unchanged data on
+/// every resolve would be a per-tick firehose into the frontend on any LAN
+/// with several other devices on it. Also runs the pure `should_auto_sync`
+/// decision (`commands::sync`) — starting a sync itself only when it says
+/// yes, never from a command handler (this task's brief, "Do not"). Ends
+/// when `browse()`'s receiver closes (the daemon shut down) — there is no
+/// other exit, matching `SyncState`'s own lifetime.
 async fn run_discovery_loop<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     mut rx: tokio::sync::mpsc::Receiver<idl_transport::sync::DiscoveredPeer>,
@@ -214,13 +221,17 @@ async fn run_discovery_loop<R: tauri::Runtime>(
     use tauri::Emitter;
 
     while let Some(sighting) = rx.recv().await {
-        discovered.lock().unwrap_or_else(|e| e.into_inner()).insert(sighting.peer_id.clone(), sighting.clone());
+        let previous = discovered.lock().unwrap_or_else(|e| e.into_inner()).insert(sighting.peer_id.clone(), sighting.clone());
+
+        if should_emit_peer_appeared(previous.as_ref(), &sighting) {
+            let peers_snapshot = peers.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let discovered_snapshot = discovered.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let payload = crate::commands::sync::peer_sighting_dto(&sighting, &peers_snapshot, &discovered_snapshot);
+            let _ = app.emit("peer_appeared", payload);
+        }
 
         let paired_peer = peers.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|p| p.peer_id == sighting.peer_id).cloned();
         let Some(paired_peer) = paired_peer else { continue };
-
-        let discovered_snapshot = discovered.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let _ = app.emit("peer_appeared", crate::commands::sync::peer_status_dto(&paired_peer, &discovered_snapshot));
 
         let last = last_sync.lock().unwrap_or_else(|e| e.into_inner()).get(&sighting.peer_id).copied();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
@@ -241,5 +252,89 @@ async fn run_discovery_loop<R: tauri::Runtime>(
                 let _ = crate::commands::sync::run_one_sync(&running, &last_sync, &data_root, &peer, addr, &no_progress).await;
             });
         }
+    }
+}
+
+/// Whether a LAN `sighting` should re-emit `peer_appeared`, given what
+/// `discovered` already held for that `peer_id` immediately before this
+/// sighting overwrote it (lead ruling R176, L11 Task 14). `true` for a
+/// genuine appearance (`previous` is `None`) or a change in anything the
+/// event's DTO carries (name, protocol_version, address, port — everything
+/// `DiscoveredPeer`'s `PartialEq` compares); `false` for a byte-identical
+/// re-resolve, so a peer that stays visible without changing does not
+/// re-fire the event on every underlying mDNS resolve. Pure so this rule is
+/// testable without the mDNS daemon or a Tauri `AppHandle`.
+fn should_emit_peer_appeared(previous: Option<&idl_transport::sync::DiscoveredPeer>, sighting: &idl_transport::sync::DiscoveredPeer) -> bool {
+    previous != Some(sighting)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use idl_transport::sync::DiscoveredPeer;
+
+    fn discovered_peer(addr: &str) -> DiscoveredPeer {
+        DiscoveredPeer { peer_id: "peer-1".to_string(), name: "Pit Tablet".to_string(), protocol_version: 1, addr: addr.parse().unwrap() }
+    }
+
+    // -- should_emit_peer_appeared (lead ruling R176) --------------------
+
+    #[test]
+    fn should_emit_peer_appeared_a_genuine_first_appearance_yes() {
+        // Arrange
+        let sighting = discovered_peer("127.0.0.1:9000");
+
+        // Act
+        let result = should_emit_peer_appeared(None, &sighting);
+
+        // Assert
+        assert!(result);
+    }
+
+    #[test]
+    fn should_emit_peer_appeared_seen_twice_unchanged_the_second_resolve_no() {
+        // Arrange
+        let first = discovered_peer("127.0.0.1:9000");
+        let second = first.clone();
+
+        // Act
+        let first_result = should_emit_peer_appeared(None, &first);
+        let second_result = should_emit_peer_appeared(Some(&first), &second);
+
+        // Assert
+        assert!(first_result);
+        assert!(!second_result);
+    }
+
+    #[test]
+    fn should_emit_peer_appeared_seen_twice_with_a_changed_address_both_times_yes() {
+        // Arrange
+        let first = discovered_peer("127.0.0.1:9000");
+        let second = discovered_peer("127.0.0.1:9001");
+
+        // Act
+        let first_result = should_emit_peer_appeared(None, &first);
+        let second_result = should_emit_peer_appeared(Some(&first), &second);
+
+        // Assert
+        assert!(first_result);
+        assert!(second_result);
+    }
+
+    #[test]
+    fn should_emit_peer_appeared_disappears_then_reappears_unchanged_yes() {
+        // Arrange: `discovered` loses its entry between sightings (this
+        // lane adds no disappearance event — sync_status polling is the
+        // backstop — but the map entry itself can still be cleared, e.g. by
+        // a future eviction), so the second sighting sees `previous: None`
+        // again despite being identical in content to the first.
+        let first = discovered_peer("127.0.0.1:9000");
+        let reappearance = first.clone();
+
+        // Act
+        let result = should_emit_peer_appeared(None, &reappearance);
+
+        // Assert
+        assert!(result);
     }
 }
