@@ -243,6 +243,25 @@ pub fn write_session_parquet(
     session: &Session,
     importer_version: &str,
 ) -> Result<PathBuf, ParquetStoreError> {
+    write_session_parquet_replacing(data_root, session, importer_version, None)
+}
+
+/// [`write_session_parquet`]'s general form: `data.parquet` is write-once
+/// for a fresh import (that function always passes `based_on_hash: None`,
+/// since nothing exists yet to conflict with), but a rebuild (C3 §3.3
+/// `reimport_sessions`) must replace an *existing* file in one rename so a
+/// failed rebuild leaves the old file intact (C4 §4's optimistic-concurrency
+/// primitive, `write_atomic`) — this is that replace path. `based_on_hash`
+/// is the sha256 hex of the `data.parquet` bytes the caller read before
+/// deciding to rebuild; a mismatch at rename time (another writer landed in
+/// between) surfaces as `AtomicWriteErrorKind::RenameConflict` via
+/// [`write_atomic`], leaving the on-disk file untouched.
+pub fn write_session_parquet_replacing(
+    data_root: &Path,
+    session: &Session,
+    importer_version: &str,
+    based_on_hash: Option<&str>,
+) -> Result<PathBuf, ParquetStoreError> {
     let t = union_t_axis(session);
     let n_rows = t.len();
 
@@ -349,7 +368,7 @@ pub fn write_session_parquet(
     }
 
     let target = data_root.join("sessions").join(&session.session_id).join("data.parquet");
-    write_atomic(data_root, &target, &buf, None)
+    write_atomic(data_root, &target, &buf, based_on_hash)
         .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Io, e.to_string()))?;
     Ok(target)
 }
