@@ -408,13 +408,22 @@ fn tmp_part_path(data_root: &Path, item: &SyncItem) -> PathBuf {
 /// `.part` it was writing to and returns `Err` rather than leaving a
 /// cap-sized (or larger) unusable partial on disk.
 async fn download_item(client: &reqwest::Client, base_url: &str, token: &str, data_root: &Path, item: &SyncItem) -> Result<Vec<u8>, TransportError> {
+    download_item_with_cap(client, base_url, token, data_root, item, body_cap(item.class)).await
+}
+
+/// [`download_item`]'s body, with `cap` taken as a parameter instead of
+/// derived from `item.class` — production always calls it through
+/// `download_item` with the real [`MAX_DOCUMENT_BODY_BYTES`]/
+/// [`MAX_RAW_FILE_BODY_BYTES`] cap; this seam exists only so a test can
+/// exercise the cap-refusal paths with a small `cap` instead of allocating
+/// hundreds of MiB (R178).
+async fn download_item_with_cap(client: &reqwest::Client, base_url: &str, token: &str, data_root: &Path, item: &SyncItem, cap: u64) -> Result<Vec<u8>, TransportError> {
     let url = item_url(base_url, item)?;
     let tmp_path = tmp_part_path(data_root, item);
     let tmp_dir = tmp_path.parent().expect("tmp_part_path always has a tmp/ parent");
     tokio::fs::create_dir_all(tmp_dir).await.map_err(|e| sync_error(format!("creating {}: {e}", tmp_dir.display())))?;
 
     let existing_len = tokio::fs::metadata(&tmp_path).await.map(|m| m.len()).unwrap_or(0);
-    let cap = body_cap(item.class);
 
     let mut request = client.get(&url).bearer_auth(token);
     if existing_len > 0 {
@@ -651,6 +660,49 @@ mod tests {
     }
 
     fn no_progress(_p: SyncProgress) {}
+
+    /// Spawns a one-shot raw HTTP/1.1 server that writes `raw_response`
+    /// verbatim to the first connection it accepts, then closes it — R178:
+    /// the cap-refusal tests need a peer that *advertises* an over-cap body
+    /// (or streams past a small cap with no honest `Content-Length`)
+    /// without this test process itself ever allocating a large buffer, so
+    /// they cannot use `start_test_server`'s real `serve_file` (which reads
+    /// the whole file off disk and reports its true length). Returns the
+    /// bound address; the caller is responsible for awaiting the client
+    /// call that connects to it before the function returns (nothing joins
+    /// the spawned task — it is a `tokio::test`, single connection, and the
+    /// process tears down the socket at test end).
+    async fn spawn_raw_response_server(raw_response: Vec<u8>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                // Drain the request headers before responding — otherwise
+                // this end can close the socket while the client is still
+                // writing its request, which some stacks turn into an RST
+                // instead of a graceful close, failing the client's send
+                // before it ever reads a response.
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 4096];
+                let mut seen = Vec::new();
+                loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            seen.extend_from_slice(&buf[..n]);
+                            if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = socket.write_all(&raw_response).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        addr
+    }
 
     /// Milliseconds since the Unix epoch — this test module's own copy of
     /// the same clock read `server.rs`'s tests keep locally, needed because
@@ -1169,70 +1221,133 @@ mod tests {
     /// (`server.rs`'s `MAX_DOCUMENT_BODY_BYTES`). Calls `download_item`
     /// directly (no `plan_sync` involved) so the oversized response is
     /// requested deliberately rather than relying on a manifest walk to
-    /// surface it.
+    /// surface it. R178: `bounded_bytes`/`download_item` refuse on an
+    /// advertised `Content-Length` alone, before a single byte is read — so
+    /// the peer here is a raw one-shot server that *claims*
+    /// `MAX_DOCUMENT_BODY_BYTES + 1` and sends a handful of bytes, never a
+    /// real 16 MiB+ allocation.
     #[tokio::test]
     async fn download_item_a_document_tier_response_over_the_cap_is_refused_and_nothing_is_written() {
         // Arrange
         let local_root = temp_data_root();
-        let remote_root = temp_data_root();
         let track_id = "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d";
-        let oversized = vec![b'a'; (MAX_DOCUMENT_BODY_BYTES + 1) as usize];
-        let track_path = remote_root.join("tracks").join(format!("{track_id}.idl0t"));
-        std::fs::create_dir_all(track_path.parent().unwrap()).unwrap();
-        std::fs::write(&track_path, &oversized).unwrap();
-        let token = "tok-1";
-        let server = start_test_server(remote_root.clone(), token).await;
-        let addr = server.local_addr();
+        let claimed_len = MAX_DOCUMENT_BODY_BYTES + 1;
+        let raw_response = format!("HTTP/1.1 200 OK\r\nContent-Length: {claimed_len}\r\nConnection: close\r\n\r\nnope").into_bytes();
+        let addr = spawn_raw_response_server(raw_response).await;
         let base_url = format!("http://{addr}/idl1/v1");
-        let item = SyncItem { class: SyncClass::Track, key: track_id.to_string(), session_id: None, size_bytes: oversized.len() as u64 };
+        let item = SyncItem { class: SyncClass::Track, key: track_id.to_string(), session_id: None, size_bytes: claimed_len };
         let client = reqwest::Client::new();
 
         // Act
-        let err = download_item(&client, &base_url, token, &local_root, &item).await.unwrap_err();
+        let err = download_item(&client, &base_url, "tok-1", &local_root, &item).await.unwrap_err();
 
         // Assert
         assert_eq!(err.kind, TransportErrorKind::Sync);
         assert!(err.message.contains("cap"), "{}", err.message);
         assert!(!tmp_part_path(&local_root, &item).exists());
 
-        server.shutdown().await;
         let _ = std::fs::remove_dir_all(&local_root);
-        let _ = std::fs::remove_dir_all(&remote_root);
     }
 
     /// R102 finding 1, raw-file tier: `Blob` (`server.rs`'s
     /// `MAX_RAW_FILE_BODY_BYTES`) — the direct mirror of `server.rs`'s own
     /// `blob_put_over_the_raw_file_body_cap_is_413_and_nothing_is_written`,
-    /// same size, other direction (a `GET` this client is pulling, not a
-    /// `PUT` it is accepting).
+    /// same bound, other direction (a `GET` this client is pulling, not a
+    /// `PUT` it is accepting). R178: see the document-tier test above for
+    /// why this is a raw claimed-`Content-Length` response rather than a
+    /// real 512 MiB+ file.
     #[tokio::test]
     async fn download_item_a_raw_file_tier_response_over_the_cap_is_refused_and_nothing_is_written() {
         // Arrange
         let local_root = temp_data_root();
-        let remote_root = temp_data_root();
         let placeholder_digest = "a".repeat(64);
-        let oversized = vec![b'a'; (MAX_RAW_FILE_BODY_BYTES + 1) as usize];
-        let blob_write_path = blob_path(&remote_root, &placeholder_digest);
-        std::fs::create_dir_all(blob_write_path.parent().unwrap()).unwrap();
-        std::fs::write(&blob_write_path, &oversized).unwrap();
-        let token = "tok-1";
-        let server = start_test_server(remote_root.clone(), token).await;
-        let addr = server.local_addr();
+        let claimed_len = MAX_RAW_FILE_BODY_BYTES + 1;
+        let raw_response = format!("HTTP/1.1 200 OK\r\nContent-Length: {claimed_len}\r\nConnection: close\r\n\r\nnope").into_bytes();
+        let addr = spawn_raw_response_server(raw_response).await;
         let base_url = format!("http://{addr}/idl1/v1");
-        let item = SyncItem { class: SyncClass::Blob, key: placeholder_digest.clone(), session_id: None, size_bytes: oversized.len() as u64 };
+        let item = SyncItem { class: SyncClass::Blob, key: placeholder_digest.clone(), session_id: None, size_bytes: claimed_len };
         let client = reqwest::Client::new();
 
         // Act
-        let err = download_item(&client, &base_url, token, &local_root, &item).await.unwrap_err();
+        let err = download_item(&client, &base_url, "tok-1", &local_root, &item).await.unwrap_err();
 
         // Assert
         assert_eq!(err.kind, TransportErrorKind::Sync);
         assert!(err.message.contains("cap"), "{}", err.message);
         assert!(!tmp_part_path(&local_root, &item).exists());
 
-        server.shutdown().await;
         let _ = std::fs::remove_dir_all(&local_root);
-        let _ = std::fs::remove_dir_all(&remote_root);
+    }
+
+    /// R178, the second requirement `bounded_bytes`'s header check does not
+    /// cover: a peer that omits `Content-Length` (here, chunked transfer
+    /// encoding) and streams past the cap is caught by the running-total
+    /// check inside `download_item`'s read loop, which deletes the `.part`
+    /// it had started writing. Uses `download_item_with_cap` with a 4 KiB
+    /// cap (R178's suggested seam) rather than a real document/raw-file
+    /// cap, so the over-cap body here is a few KiB, not hundreds of MiB.
+    #[tokio::test]
+    async fn download_item_with_cap_a_chunked_response_with_no_content_length_that_exceeds_a_small_cap_mid_stream_is_refused_and_the_part_is_removed() {
+        // Arrange
+        let local_root = temp_data_root();
+        let track_id = "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d";
+        let cap: u64 = 4096;
+        let chunk = vec![b'a'; 1000];
+        let mut raw_response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        for _ in 0..6 {
+            raw_response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            raw_response.extend_from_slice(&chunk);
+            raw_response.extend_from_slice(b"\r\n");
+        }
+        raw_response.extend_from_slice(b"0\r\n\r\n");
+        let addr = spawn_raw_response_server(raw_response).await;
+        let base_url = format!("http://{addr}/idl1/v1");
+        let item = SyncItem { class: SyncClass::Track, key: track_id.to_string(), session_id: None, size_bytes: 0 };
+        let client = reqwest::Client::new();
+
+        // Act
+        let err = download_item_with_cap(&client, &base_url, "tok-1", &local_root, &item, cap).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, TransportErrorKind::Sync);
+        assert!(err.message.contains("cap"), "{}", err.message);
+        assert!(!tmp_part_path(&local_root, &item).exists());
+
+        let _ = std::fs::remove_dir_all(&local_root);
+    }
+
+    /// R178, raw-file-tier mirror of the mid-stream test above — same
+    /// small-cap seam, `Blob` class instead of `Track`, confirming the
+    /// mid-stream check is exercised regardless of which cap tier the item
+    /// nominally belongs to (the cap value itself is what's under test).
+    #[tokio::test]
+    async fn download_item_with_cap_a_blob_class_chunked_response_that_exceeds_a_small_cap_mid_stream_is_refused_and_the_part_is_removed() {
+        // Arrange
+        let local_root = temp_data_root();
+        let placeholder_digest = "b".repeat(64);
+        let cap: u64 = 4096;
+        let chunk = vec![b'a'; 1000];
+        let mut raw_response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        for _ in 0..6 {
+            raw_response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            raw_response.extend_from_slice(&chunk);
+            raw_response.extend_from_slice(b"\r\n");
+        }
+        raw_response.extend_from_slice(b"0\r\n\r\n");
+        let addr = spawn_raw_response_server(raw_response).await;
+        let base_url = format!("http://{addr}/idl1/v1");
+        let item = SyncItem { class: SyncClass::Blob, key: placeholder_digest, session_id: None, size_bytes: 0 };
+        let client = reqwest::Client::new();
+
+        // Act
+        let err = download_item_with_cap(&client, &base_url, "tok-1", &local_root, &item, cap).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, TransportErrorKind::Sync);
+        assert!(err.message.contains("cap"), "{}", err.message);
+        assert!(!tmp_part_path(&local_root, &item).exists());
+
+        let _ = std::fs::remove_dir_all(&local_root);
     }
 
     /// R102 Minor: a peer-supplied `session_id` containing a colon could
