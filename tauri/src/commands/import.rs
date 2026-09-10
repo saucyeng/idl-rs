@@ -114,10 +114,10 @@ fn resolve_extension(path: &str, importer_id: Option<&str>) -> Result<String, Ip
 /// rebuilds the catalog (C4 §5's rebuild is cheap and idempotent —
 /// incremental catalog indexing does not exist yet), and reads the
 /// freshly-imported row back from `catalog_read::list_sessions` by
-/// `session_id`. `on_progress` is called with `"reading"` before
-/// [`std::fs::read`], `"decoding"` once the bytes are in hand and before the
-/// importer call, and `"materializing"` after a successful import and
-/// before the catalog rebuild — never called again once a call has failed.
+/// `session_id`. `on_progress` is called with `"reading"` before the file
+/// is sized and mapped, `"decoding"` before the importer call, and
+/// `"materializing"` after a successful import and before the catalog
+/// rebuild — never called again once a call has failed.
 fn import_file_via(
     data_dir: &Path,
     path: &str,
@@ -127,19 +127,28 @@ fn import_file_via(
     let ext = resolve_extension(path, importer_id)?;
 
     on_progress("reading");
-    let bytes = std::fs::read(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            IpcError::new(IpcErrorKind::NotFound, format!("'{path}' does not exist"))
-        } else {
-            IpcError::new(IpcErrorKind::Io, format!("reading {path}: {e}"))
-        }
-    })?;
+    // Sized before anything is read (ruling R203.4). An import's heap peak
+    // is the parsed `Session` plus one channel's Arrow column plus the
+    // encoded output — the raw log itself is a memory map, not heap, since
+    // R203.3 — so twice the file size is a conservative ceiling for it.
+    let file_len = std::fs::metadata(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                IpcError::new(IpcErrorKind::NotFound, format!("'{path}' does not exist"))
+            } else {
+                IpcError::new(IpcErrorKind::Io, format!("reading {path}: {e}"))
+            }
+        })?
+        .len();
+    crate::memory::ensure_fits(file_len.saturating_mul(2), &format!("import '{path}'"))?;
 
     on_progress("decoding");
+    // The path forms map the file rather than copying it onto the heap
+    // (ruling R203.3).
     let report = if ext == "idl0" {
-        core_import::import_idl0(data_dir, &bytes)
+        core_import::import_idl0_path(data_dir, Path::new(path))
     } else {
-        core_import::import_file(data_dir, &ext, &bytes)
+        core_import::import_file_path(data_dir, &ext, Path::new(path))
     }
     .map_err(IpcError::from)?;
 
@@ -168,10 +177,17 @@ pub fn import_file(
     importer_id: Option<String>,
     progress: tauri::ipc::Channel<Progress>,
     data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, crate::session_cache::SessionCache>,
 ) -> Result<ImportOutcome, IpcError> {
-    import_file_via(&data_dir.0, &path, importer_id.as_deref(), |phase| {
+    let outcome = import_file_via(&data_dir.0, &path, importer_id.as_deref(), |phase| {
         let _ = progress.send(Progress { done: 0, total: None, phase: phase.to_string() });
-    })
+    })?;
+    // A re-import under an existing `session_id` rewrites that session's
+    // `data.parquet`, so any channel decoded from the old one is stale
+    // (ruling R203.2). Harmless on a first import — nothing is resident
+    // under a session id that did not exist a moment ago.
+    cache.invalidate_session(&outcome.session.session_id);
+    Ok(outcome)
 }
 
 #[cfg(test)]

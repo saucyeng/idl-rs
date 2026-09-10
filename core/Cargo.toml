@@ -23,6 +23,7 @@ pulldown-cmark = "0.13.4"
 serde_yaml_ng = "0.10.0"
 quick-xml = "0.41.0"
 fitparser = "0.9"
+memmap2 = "0.9"
 
 [dev-dependencies]
 approx = "0.5"

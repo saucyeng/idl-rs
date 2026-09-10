@@ -1065,17 +1065,11 @@ fn cmd_fit(
 // "success payload" shape the envelope's `Structured`/bulk-artifact split fits.
 // ---------------------------------------------------------------------------
 
-/// Reads `file`, imports it into `data_dir` via [`import::import_idl0`], and
+/// Imports `file` into `data_dir` via [`import::import_idl0_path`] — which
+/// maps the log rather than copying it onto the heap (ruling R203.3) — and
 /// rebuilds the catalog so the import is immediately queryable.
 fn cmd_import(file: &Path, data_dir: &Path) -> ExitCode {
-    let bytes = match std::fs::read(file) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("error: cannot read {}: {e}", file.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let report = match import::import_idl0(data_dir, &bytes) {
+    let report = match import::import_idl0_path(data_dir, file) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: import: {e}");

@@ -9,11 +9,13 @@
 pub mod column;
 pub mod filename;
 pub mod handle;
+pub mod samples;
 pub mod seam_correction;
 pub mod synthesis;
 pub mod time_map;
 
 pub use column::RawColumn;
+pub use samples::ChannelSamples;
 pub use seam_correction::{ImportWarning, ImportWarningKind};
 
 use std::fmt;

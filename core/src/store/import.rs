@@ -273,6 +273,61 @@ pub fn import_idl0(data_root: &Path, bytes: &[u8]) -> Result<ImportReport, Impor
     Ok(report)
 }
 
+/// Maps `path` into memory read-only and hands the mapped bytes to `f`
+/// (ruling R203.3).
+///
+/// An import used to begin with `std::fs::read`, i.e. a heap `Vec<u8>` the
+/// size of the whole `.idl0` file, resident alongside the parsed `Session`
+/// for the rest of the import. A mapping is the OS's page cache instead:
+/// the bytes are still addressable, but they are file-backed pages the
+/// kernel can drop under pressure rather than committed heap the allocator
+/// must find. On a 395 MB log that is the difference between two
+/// session-sized heap allocations and one.
+///
+/// A zero-length file cannot be mapped on every platform, so it is passed
+/// through as an empty slice — the parsers reject it on their own terms
+/// (`InvalidMagicBytes`), which is the error the caller should see.
+///
+/// # Safety of the mapping
+///
+/// `Mmap::map` is `unsafe` because another process truncating or writing
+/// the file while it is mapped is undefined behaviour. The files this is
+/// called on are user-selected logs being read once, and the import
+/// pipeline's own writes go to the CAS and `data.parquet`, never back to
+/// the source path. A truncation racing an import is a bad-input case we
+/// accept here exactly as `std::fs::read` accepted a short read.
+fn with_mapped_file<T>(path: &Path, f: impl FnOnce(&[u8]) -> Result<T, ImportError>) -> Result<T, ImportError> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| ImportError::new(ImportErrorKind::Io, format!("opening {}: {e}", path.display())))?;
+    let len = file
+        .metadata()
+        .map_err(|e| ImportError::new(ImportErrorKind::Io, format!("stat {}: {e}", path.display())))?
+        .len();
+    if len == 0 {
+        return f(&[]);
+    }
+    let map = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| ImportError::new(ImportErrorKind::Io, format!("mapping {}: {e}", path.display())))?;
+    f(&map)
+}
+
+/// [`import_idl0`] over a file path, reading the log through a memory map
+/// rather than a heap copy (ruling R203.3). The entry point every caller
+/// that starts from a path should use; the `&[u8]` form stays for callers
+/// that already hold a buffer (tests, in-memory fixtures).
+pub fn import_idl0_path(data_root: &Path, path: &Path) -> Result<ImportReport, ImportError> {
+    with_mapped_file(path, |bytes| import_idl0(data_root, bytes))
+}
+
+/// [`import_file`] over a file path, reading the source through a memory
+/// map rather than a heap copy (ruling R203.3). `extension` is a lowercase
+/// extension without the dot, exactly as [`import_file`] takes it — it is
+/// not re-derived from `path`, since the caller may have resolved an
+/// explicit importer id instead.
+pub fn import_file_path(data_root: &Path, extension: &str, path: &Path) -> Result<ImportReport, ImportError> {
+    with_mapped_file(path, |bytes| import_file(data_root, extension, bytes))
+}
+
 /// Imports one non-`.idl0` source buffer (FIT/GPX/CSV, ledger R23 L2-R13)
 /// into `data_root`, generalising [`import_idl0`]'s blob/parquet/
 /// `session.json` pipeline to any format [`crate::import::importer_for_extension`]

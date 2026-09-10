@@ -22,19 +22,32 @@ pub fn session_dir(data_dir: &Path, session_id: &str) -> PathBuf {
     data_dir.join("sessions").join(session_id)
 }
 
-// TODO(idl0): every call re-reads the whole `data.parquet` from disk — a
-// session cache is design §4's recorded deferral, not this task's.
 /// Reads `session_id`'s `data.parquet` back into a [`Session`], running
 /// [`synthesize_base_channels`] before returning (`read_session_parquet`
 /// does not reconstruct `Time`/`Distance` itself — its own doc comment says
 /// so). A missing session directory or `data.parquet` is
 /// [`IpcErrorKind::NotFound`] (the id is named in the message); a parquet
-/// read failure is [`IpcErrorKind::Io`].
+/// read failure is [`IpcErrorKind::Io`]; a session too large to decode
+/// inside the app's memory budget is [`IpcErrorKind::ResourceExhausted`],
+/// refused before any allocation (ruling R203.4).
+///
+/// This is the **whole-file** read: every channel, decoded fresh. It stays
+/// for the callers that genuinely need a whole `Session` — export, verify,
+/// rebuild, and the workbook evaluator's `SessionHandle` — while every
+/// caller that wants one channel goes through
+/// `crate::session_cache::SessionCache` instead (ruling R203.1). It is
+/// deliberately *not* served from that cache: assembling a `Session` out of
+/// cached channels would copy each one back out of its `Arc`, leaving the
+/// session resident twice.
 pub fn load_session(data_dir: &Path, session_id: &str) -> Result<Session, IpcError> {
-    let parquet_path = session_dir(data_dir, session_id).join("data.parquet");
+    let dir = session_dir(data_dir, session_id);
+    let parquet_path = dir.join("data.parquet");
     if !parquet_path.exists() {
         return Err(IpcError::new(IpcErrorKind::NotFound, format!("session '{session_id}' not found")));
     }
+    let needed = idl_rs::store::parquet::estimate_session_bytes(&dir)
+        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("sizing {}: {}", parquet_path.display(), e.message)))?;
+    crate::memory::ensure_fits(needed, &format!("decode every channel of session '{session_id}'"))?;
     let mut session = read_session_parquet(&parquet_path)
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {}", parquet_path.display(), e.message)))?;
     synthesize_base_channels(&mut session);
