@@ -133,6 +133,22 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    /// Writes `bytes` to `target` via the production save path (temp-file +
+    /// rename, `idl_rs::store::atomic::write_atomic` — C4 §4 step 3), and
+    /// registers the resulting hash in `hashes` **before** calling it, so the
+    /// watcher classifies the write as the app's own. `root` is `target`'s
+    /// `<data>` root (the write stages under `root/tmp`, a sibling of the
+    /// watched directory, not inside it — mirrors the real `workbooks_dir`
+    /// layout so the staging write itself produces no watched-directory
+    /// event). `based_on` is the previous write's hash, or `None` for a
+    /// fresh path.
+    fn write_self(root: &Path, target: &Path, bytes: &[u8], hashes: &ExpectedHashSet, based_on: Option<&str>) -> String {
+        let hash = idl_rs::store::atomic::sha256_hex(bytes);
+        hashes.expect(target.to_path_buf(), hash.clone());
+        idl_rs::store::atomic::write_atomic(root, target, bytes, based_on).unwrap();
+        hash
+    }
+
     #[test]
     fn external_write_to_workbooks_dir_fires_callback_with_the_path() {
         // Arrange
@@ -152,43 +168,61 @@ mod tests {
     }
 
     #[test]
-    fn self_write_with_pre_registered_hash_never_fires_callback() {
+    fn self_write_with_pre_registered_hash_is_suppressed_so_the_first_callback_is_for_a_later_external_edit() {
         // Arrange
-        let dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let workbooks_dir = root.path().join("workbooks");
+        std::fs::create_dir_all(&workbooks_dir).unwrap();
         let (tx, rx) = mpsc::channel::<PathBuf>();
         let hashes = Arc::new(ExpectedHashSet::new());
-        let target = dir.path().join("dummy.idl1wb");
-        let content = b"---\nid: test\n---\n# Dummy\n";
-        hashes.expect(target.clone(), sha256_hex(content)); // registered before the write, per C4 §4 step 3
-        let _watcher = WorkbookWatcher::new(dir.path(), Arc::clone(&hashes), move |p| { let _ = tx.send(p.to_path_buf()); }).unwrap();
+        let target = workbooks_dir.join("dummy.idl1wb");
+        let self_content = b"---\nid: test\n---\n# Dummy\n";
+        let external_content = b"---\nid: test\n---\n# Edited elsewhere\n";
+        let _watcher =
+            WorkbookWatcher::new(&workbooks_dir, Arc::clone(&hashes), move |p| { let _ = tx.send(p.to_path_buf()); }).unwrap();
 
-        // Act
-        std::fs::write(&target, content).unwrap();
+        // Act — our own write first, via the production temp-file + rename
+        // pattern with the hash pre-registered before the rename. A negative
+        // "no callback within N ms" assertion can never be deterministic
+        // (CLAUDE.md §4 spirit, brief R rulings), so instead: if suppression
+        // failed, the self-write's callback would be the FIRST one received
+        // below, ahead of the external edit's.
+        write_self(root.path(), &target, self_content, &hashes, None);
+        std::fs::write(&target, external_content).unwrap();
 
-        // Assert
-        assert!(rx.recv_timeout(Duration::from_millis(500)).is_err(), "callback must not fire for a self-write");
+        // Assert — the first (and only, within the timeout) callback
+        // received is for the external write, proven by content hash rather
+        // than by timing.
+        let seen = rx.recv_timeout(Duration::from_secs(2)).expect("callback fired for the external edit");
+        assert_eq!(seen, target);
+        let seen_hash = sha256_hex(&std::fs::read(&seen).unwrap());
+        assert_eq!(seen_hash, sha256_hex(external_content));
     }
 
     #[test]
     fn self_write_followed_by_a_different_external_edit_within_the_ttl_window_still_fires_callback() {
         // Arrange
-        let dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let workbooks_dir = root.path().join("workbooks");
+        std::fs::create_dir_all(&workbooks_dir).unwrap();
         let (tx, rx) = mpsc::channel::<PathBuf>();
         let hashes = Arc::new(ExpectedHashSet::new());
-        let target = dir.path().join("dummy.idl1wb");
+        let target = workbooks_dir.join("dummy.idl1wb");
         let self_content = b"---\nid: test\n---\n# Dummy\n";
         let external_content = b"---\nid: test\n---\n# Edited elsewhere\n";
-        hashes.expect(target.clone(), sha256_hex(self_content)); // registered before our write, per C4 §4 step 3
-        let _watcher = WorkbookWatcher::new(dir.path(), Arc::clone(&hashes), move |p| { let _ = tx.send(p.to_path_buf()); }).unwrap();
+        let _watcher =
+            WorkbookWatcher::new(&workbooks_dir, Arc::clone(&hashes), move |p| { let _ = tx.send(p.to_path_buf()); }).unwrap();
 
-        // Act — our own write first (suppressed), then a genuinely different
-        // write to the same path shortly after, while the expected-hash entry
-        // is still live (well within EXPECTED_HASH_TTL). The matched entry
-        // lingering until TTL must not suppress this: check_and_consume gates
-        // on exact hash equality, and external_content's hash differs from
-        // the registered one, so this is a real edit, not a duplicate delivery
-        // of our own write.
-        std::fs::write(&target, self_content).unwrap();
+        // Act — our own write first (suppressed), via the production
+        // temp-file + rename pattern, then a genuinely different write to the
+        // same path shortly after, while the expected-hash entry is still
+        // live (well within EXPECTED_HASH_TTL). The matched entry lingering
+        // until TTL must not suppress this: check_and_consume gates on exact
+        // hash equality, and external_content's hash differs from the
+        // registered one, so this is a real edit, not a duplicate delivery of
+        // our own write. The external write is a plain `std::fs::write`,
+        // matching what an editor does (brief item 4).
+        write_self(root.path(), &target, self_content, &hashes, None);
         std::fs::write(&target, external_content).unwrap();
 
         // Assert
