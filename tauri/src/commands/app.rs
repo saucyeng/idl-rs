@@ -595,7 +595,7 @@ fn map_path_error(e: tauri::Error) -> IpcError {
 /// Generic over `R: tauri::Runtime` — `handler()` is itself generic, and a
 /// non-generic `tauri::AppHandle` (fixed to the default runtime) does not
 /// implement `CommandArg` for an arbitrary `R`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_settings<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<AppSettingsDto, IpcError> {
     let app_config_dir = app.path().app_config_dir().map_err(map_path_error)?;
     Ok(get_settings_via(&settings_path(&app_config_dir)))
@@ -604,7 +604,7 @@ pub fn get_settings<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<AppSe
 /// C3 §3.10 `set_settings(settings)`. Ignores `settings.data_dir` (ruling
 /// R59 Q5 — `set_data_dir` is the sole writer of that key) and persists
 /// `rider_name`/`unit_system`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_settings<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     settings: AppSettingsArg,
@@ -615,7 +615,7 @@ pub fn set_settings<R: tauri::Runtime>(
 
 /// C3 §3.10 `get_data_dir()`. `resolved_path` is the managed `DataDir`
 /// fixed at startup, not a freshly recomputed value.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_data_dir<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     data_dir: tauri::State<'_, DataDir>,
@@ -628,7 +628,7 @@ pub fn get_data_dir<R: tauri::Runtime>(
 /// C3 §3.10 `set_data_dir(path)`. Writes only the `data_dir` key,
 /// read-modify-write, preserving `rider_name`/`unit_system`; does not move
 /// existing files.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_data_dir<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     data_dir: tauri::State<'_, DataDir>,
@@ -646,7 +646,7 @@ pub fn set_data_dir<R: tauri::Runtime>(
 /// only — the override itself is desktop only (C4 §1, ruling R183), so a
 /// move has nowhere to go on mobile.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn move_data_dir<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     data_dir: tauri::State<'_, DataDir>,
@@ -674,7 +674,7 @@ pub fn move_data_dir<R: tauri::Runtime>(
 /// C3 §3.10 `move_data_dir` on mobile — see the desktop version's doc
 /// comment.
 #[cfg(any(target_os = "android", target_os = "ios"))]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn move_data_dir(new_root: String) -> Result<DataDirInfo, IpcError> {
     let _ = new_root;
     Err(IpcError::with_detail(
@@ -797,14 +797,14 @@ fn delete_profile_via(data_root: &Path, profile_id: &str) -> Result<(), IpcError
 
 /// C3 §3.10 `list_profiles()`. Thin over `store::profile::load_all` against
 /// `<data>/profiles/*.idl0p` (C4 §2).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_profiles(data_dir: tauri::State<'_, DataDir>) -> Result<ProfileLoadReport, IpcError> {
     Ok(list_profiles_via(&data_dir.0))
 }
 
 /// C3 §3.10 `save_profile(profile)`. Thin over `store::profile::save`;
 /// rejects a non-object `config` as `invalid_argument`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_profile(
     data_dir: tauri::State<'_, DataDir>,
     profile: BikeProfileDto,
@@ -815,7 +815,7 @@ pub fn save_profile(
 /// C3 §3.10 `delete_profile(profile_id)`. Raises `not_found` when the
 /// file is absent (ruling R59 F2) before delegating to core's idempotent
 /// `store::profile::delete`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_profile(data_dir: tauri::State<'_, DataDir>, profile_id: String) -> Result<(), IpcError> {
     delete_profile_via(&data_dir.0, &profile_id)
 }

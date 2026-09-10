@@ -1030,7 +1030,7 @@ fn watch_workbook_via(
 }
 
 /// C3 §3.4 `open_workbook(id_or_path)`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_workbook(id_or_path: String, data_dir: tauri::State<'_, DataDir>) -> Result<WorkbookHandle, IpcError> {
     open_workbook_via(&data_dir.0, &id_or_path)
 }
@@ -1038,7 +1038,7 @@ pub fn open_workbook(id_or_path: String, data_dir: tauri::State<'_, DataDir>) ->
 /// C3 §3.4 `read_workbook(id_or_path)` — returns the file's raw text and its
 /// hash, without parsing. See [`read_workbook_via`] for why this must not
 /// call `parse_workbook`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_workbook(id_or_path: String, data_dir: tauri::State<'_, DataDir>) -> Result<WorkbookSource, IpcError> {
     read_workbook_via(&data_dir.0, &id_or_path)
 }
@@ -1047,7 +1047,7 @@ pub fn read_workbook(id_or_path: String, data_dir: tauri::State<'_, DataDir>) ->
 /// post-sign (2026-09-05, ledger R59, R64.1) as an additive trailing
 /// argument — absent (`null` on the wire) reproduces today's behaviour
 /// exactly (C3 §5, no `_v2`).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn eval_workbook(
     id: String,
     session_id: Option<String>,
@@ -1063,7 +1063,7 @@ pub fn eval_workbook(
 /// revision (R117.3). Returns one [`WindowEval`] per window — a window that
 /// fails to resolve fails only its own entry (R121); see
 /// [`eval_workbook_v2_via`] for the full resolution.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn eval_workbook_v2(
     id: String,
     windows: Vec<WindowDto>,
@@ -1078,7 +1078,7 @@ pub fn eval_workbook_v2(
 /// not JSON — the binary counterpart to `eval_workbook`'s `HostChannelRef`
 /// marker. See [`fetch_host_channel_via`] for the full resolution and error
 /// mapping.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fetch_host_channel(
     data_dir: tauri::State<'_, DataDir>,
     workbook_id: String,
@@ -1097,7 +1097,7 @@ pub fn fetch_host_channel(
 /// whenever a lap was selected (R117 item 7). `fetch_host_channel` stays
 /// registered, deprecated for one revision (R117.3). See
 /// [`fetch_host_channel_v2_via`] for the full resolution and error mapping.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fetch_host_channel_v2(
     data_dir: tauri::State<'_, DataDir>,
     workbook_id: String,
@@ -1158,7 +1158,7 @@ pub fn list_math_builtins() -> Vec<MathBuiltinDto> {
 }
 
 /// C3 §3.4 `save_workbook(id, markdown, based_on_hash)`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_workbook(
     id: String,
     markdown: String,
@@ -1171,7 +1171,7 @@ pub fn save_workbook(
 
 /// C3 §3.4 `create_workbook(name)`. Mints a new workbook file and returns
 /// its [`WorkbookHandle`]; see [`create_workbook_via`].
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_workbook(name: String, data_dir: tauri::State<'_, DataDir>) -> Result<WorkbookHandle, IpcError> {
     create_workbook_via(&data_dir.0, &name)
 }
@@ -1180,7 +1180,7 @@ pub fn create_workbook(name: String, data_dir: tauri::State<'_, DataDir>) -> Res
 /// [`Watchers`] keyed by `id` until [`unwatch_workbook`] removes it (or the
 /// app exits) — re-subscribing to the same id replaces (and so stops) the
 /// previous one, the backstop for a frontend that never calls unwatch.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn watch_workbook(
     id: String,
     channel: tauri::ipc::Channel<WorkbookEvent>,

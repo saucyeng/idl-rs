@@ -162,7 +162,7 @@ fn import_file_via(
 }
 
 /// C3 §3.3 `import_file(path, importer_id, progress)`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn import_file(
     path: String,
     importer_id: Option<String>,

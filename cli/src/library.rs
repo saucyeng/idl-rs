@@ -3,8 +3,11 @@
 //! `rebuild`.
 //!
 //! Every action is a wrapper over the same `idl-rs` core functions the app's
-//! C3 commands call (`store::scan::scan_folder`, `store::import::{import_idl0,
-//! import_file, reimport_session}`, `store::catalog_read::list_stale_sessions`),
+//! C3 commands call (`store::scan::scan_folder_with_blob_check` — the
+//! hashing scan, which a CLI with no UI to freeze can afford where C3's
+//! `scan_folder` no longer can, ruling R201 item 2;
+//! `store::import::{import_idl0, import_file, reimport_session}`,
+//! `store::catalog_read::list_stale_sessions`),
 //! so the CLI and the app can never drift. No import, hashing or staleness
 //! logic lives here: this module walks directories, formats tables, and
 //! counts outcomes.
@@ -25,7 +28,7 @@ use idl_rs::store::blob::blob_exists;
 use idl_rs::store::catalog::{self, CatalogError};
 use idl_rs::store::catalog_read::{list_stale_sessions, StaleSession};
 use idl_rs::store::import::{self, ImportError, ImportOutcome};
-use idl_rs::store::scan::{scan_folder, ScanEntry, ScanError};
+use idl_rs::store::scan::{scan_folder_with_blob_check, ScanEntry, ScanError};
 
 /// The `library` sub-actions.
 #[derive(Subcommand)]
@@ -99,7 +102,7 @@ pub enum LibraryAction {
 /// the wrapped core errors plus this module's own filesystem walk.
 #[derive(Debug)]
 pub enum LibraryError {
-    /// [`scan_folder`] failed for the folder named.
+    /// [`scan_folder_with_blob_check`] failed for the folder named.
     Scan(ScanError),
     /// A catalog open or query failed.
     Catalog(CatalogError),
@@ -318,9 +321,9 @@ fn print_json(value: &Value) -> ExitCode {
 
 // ── scan ─────────────────────────────────────────────────────────────────────
 
-/// [`scan_folder`] over one folder, or over the folder and every
+/// [`scan_folder_with_blob_check`] over one folder, or over the folder and every
 /// sub-directory beneath it when `recursive`. The recursion is this module's
-/// only addition to core's scan: it walks the tree and calls `scan_folder`
+/// only addition to core's scan: it walks the tree and calls the scan
 /// per directory, so extension→importer mapping, the blob-digest
 /// already-imported test and the header peek all still happen in core.
 /// Ordered by path for a deterministic preview.
@@ -332,7 +335,7 @@ pub fn collect_entries(data_root: &Path, folder: &Path, recursive: bool) -> Resu
 
     let mut entries = Vec::new();
     for dir in &folders {
-        entries.extend(scan_folder(data_root, dir)?);
+        entries.extend(scan_folder_with_blob_check(data_root, dir)?);
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
@@ -374,7 +377,7 @@ fn print_scan_table(entries: &[ScanEntry]) {
             e.file_name,
             e.importer_id.as_deref().unwrap_or("-"),
             e.size_bytes,
-            if e.already_imported { "yes" } else { "no" },
+            if e.already_imported == Some(true) { "yes" } else { "no" },
             start
         );
     }
@@ -759,7 +762,7 @@ mod tests {
         let summary = fold_in(&data_root, &second, false, |_| {});
 
         // Assert
-        assert!(second[0].already_imported);
+        assert_eq!(second[0].already_imported, Some(true));
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.imported, 0);
 

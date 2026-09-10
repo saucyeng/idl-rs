@@ -121,7 +121,7 @@ fn verify_data_dir_via(
 }
 
 /// C3 §3.2 `list_quarantine()`. Thin over `store::quarantine::list_quarantine`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_quarantine(data_dir: tauri::State<'_, DataDir>) -> Result<Vec<QuarantineEntry>, IpcError> {
     list_quarantine_via(&data_dir.0)
 }
@@ -129,7 +129,7 @@ pub fn list_quarantine(data_dir: tauri::State<'_, DataDir>) -> Result<Vec<Quaran
 /// C3 §3.2 `resolve_quarantine(entry_id, action)`. `action` is
 /// `"restore" | "discard"` — anything else, including the retired
 /// `"retry"`, is `invalid_argument`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resolve_quarantine(
     entry_id: String,
     action: String,
@@ -142,7 +142,7 @@ pub fn resolve_quarantine(
 /// unchanged (read-only); `repair: true` additionally runs the C4 §7
 /// repair pass, minting a fresh uuid v4 per repair and stamping every
 /// repair with the current wall-clock time.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn verify_data_dir(repair: bool, data_dir: tauri::State<'_, DataDir>) -> Result<VerifyReport, IpcError> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
