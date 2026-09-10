@@ -209,6 +209,13 @@ pub fn load_image_from_file(path: &str) -> Result<LoadedImage, IpcError> {
 /// Finds `version` in `releases`. A version the catalog does not carry is
 /// `not_found` rather than a silent "latest" substitution — the user asked
 /// for a specific build.
+///
+/// First match wins. Two releases normalising to the same `version` (the
+/// same semver published under two tags, e.g. `v1.5.0` and `1.5.0+build`)
+/// would be indistinguishable here; the catalog list is newest-first, so
+/// the winner is whichever GitHub listed first among the tied pair. Not
+/// worth an error: a repository publishing one firmware version twice is a
+/// release-process mistake, and picking either is equally right.
 pub fn release_by_version<'a>(
     releases: &'a [FirmwareRelease],
     version: &str,
@@ -233,11 +240,17 @@ fn check_preconditions(status: &idl_transport::ble_status::DeviceStatus) -> Resu
     Ok(())
 }
 
-/// Whether auto-confirm may fire for this push (R198): catalog source, and
-/// its sha256 verified. Additionally, when both versions are known, the
-/// device must have come back running the version that was pushed — a
-/// device reporting anything else has already rolled back, and confirming
-/// would commit the *old* image (SPEC §27.7's "Auto-confirm", kept).
+/// Whether auto-confirm may fire for this push (R198): catalog source, its
+/// sha256 verified, **and** the device came back running the version that
+/// was pushed — a device reporting anything else has already rolled back,
+/// and confirming would commit the *old* image (SPEC §27.7's
+/// "Auto-confirm", kept).
+///
+/// An unknown version on either side is `false`, not `true`: committing an
+/// image on the user's behalf is only defensible when the app can prove the
+/// device is running the image it sent, and a device that reports no
+/// `Firmware:` line proves nothing. The manual pending-verify card is the
+/// fallback, which is exactly the state the user is left in.
 pub fn auto_confirm_armed(
     image: &LoadedImage,
     source_is_catalog: bool,
@@ -248,7 +261,7 @@ pub fn auto_confirm_armed(
     }
     match (image.version.as_deref(), device_version) {
         (Some(pushed), Some(running)) => pushed == running,
-        _ => true,
+        _ => false,
     }
 }
 
@@ -682,9 +695,39 @@ mod tests {
         // Act / Assert
         assert!(auto_confirm_armed(&verified, true, Some("1.6.0")));
         assert!(!auto_confirm_armed(&verified, true, Some("1.5.0")), "a rolled-back device must not be confirmed");
+        assert!(!auto_confirm_armed(&verified, true, None), "a device reporting no version proves nothing");
         assert!(!auto_confirm_armed(&verified, false, Some("1.6.0")), "a file source never arms");
         assert!(!auto_confirm_armed(&unverified, true, Some("1.6.0")), "an unverified download never arms");
         assert!(!auto_confirm_armed(&manual, false, Some("1.6.0")));
+    }
+
+    #[tokio::test]
+    async fn push_firmware_via_device_back_without_a_version_line_waits_for_the_user_not_auto_confirm() {
+        // Arrange
+        let connections = connected_map(ready_ble(None, true));
+        let wifi = StubWifi { push_ota_result: Ok(()), ..StubWifi::default() };
+        let image = verified_image("1.6.0");
+        let mut on_state = |_: OtaState| {};
+        let mut on_progress = |_: u64, _: u64, _: &str| {};
+
+        // Act
+        let outcome = push_firmware_via(
+            &connections,
+            "dev-1",
+            &image,
+            true,
+            &wifi,
+            || async { Ok(ready_ble(None, true)) },
+            &fast_timings(),
+            &mut on_state,
+            &mut on_progress,
+        )
+        .await
+        .unwrap();
+
+        // Assert
+        assert_eq!(outcome.state, OtaState::PendingVerify { auto_confirm_armed: false });
+        assert!(!outcome.auto_confirmed);
     }
 
     #[test]
