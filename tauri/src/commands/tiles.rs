@@ -82,7 +82,7 @@ pub fn fetch_tile(
 mod tests {
     use super::*;
 
-    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat};
+    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
     use idl_rs::store::parquet::write_session_parquet;
     use uuid::Uuid;
 
@@ -101,6 +101,7 @@ mod tests {
             session_id: "s1".to_string(),
             device_id: None,
             timestamp_utc_ms: 0,
+            timestamp_source: TimestampSource::SourceFile,
             config_checksum: None,
             source_format: SourceFormat::Fit,
             blob_sha256: "a".repeat(64),

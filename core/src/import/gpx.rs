@@ -5,7 +5,7 @@
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
-use crate::session::{Channel, Session, SourceFormat};
+use crate::session::{Channel, Session, SourceFormat, TimestampSource};
 
 use super::{ImportedSession, Importer, ImporterError, ImporterWarning};
 
@@ -145,6 +145,7 @@ impl Importer for GpxImporter {
             session_id: super::session_id_from_blob_hash(blob_sha256),
             device_id: None,
             timestamp_utc_ms,
+            timestamp_source: TimestampSource::SourceFile,
             config_checksum: None,
             source_format: SourceFormat::Gpx,
             blob_sha256: blob_sha256.to_string(),

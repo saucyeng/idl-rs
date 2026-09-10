@@ -1907,6 +1907,7 @@ mod tests {
             session_id: session_id.to_string(),
             device_id: None,
             timestamp_utc_ms: 0,
+            timestamp_source: idl_rs::session::TimestampSource::SourceFile,
             config_checksum: None,
             source_format: SourceFormat::Gpx,
             blob_sha256: String::new(),

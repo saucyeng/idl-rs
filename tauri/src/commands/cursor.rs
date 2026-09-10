@@ -95,7 +95,7 @@ pub fn cursor_readout(
 mod tests {
     use super::*;
 
-    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat};
+    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
     use idl_rs::store::parquet::write_session_parquet;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -114,6 +114,7 @@ mod tests {
             session_id: session_id.to_string(),
             device_id: None,
             timestamp_utc_ms: 0,
+            timestamp_source: TimestampSource::Header,
             config_checksum: None,
             source_format: SourceFormat::Idl0,
             blob_sha256: String::new(),

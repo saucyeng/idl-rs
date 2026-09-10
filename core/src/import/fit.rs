@@ -10,7 +10,7 @@
 //! timestamp collides is equivalent to dropping the same sample from every
 //! channel independently — this module does it once, at the record level.
 
-use crate::session::{Channel, Session, SourceFormat};
+use crate::session::{Channel, Session, SourceFormat, TimestampSource};
 
 use super::{ImportedSession, Importer, ImporterError, ImporterWarning};
 
@@ -182,6 +182,7 @@ impl Importer for FitImporter {
             session_id: super::session_id_from_blob_hash(blob_sha256),
             device_id: None,
             timestamp_utc_ms: first_utc_s * 1000,
+            timestamp_source: TimestampSource::SourceFile,
             config_checksum: None,
             source_format: SourceFormat::Fit,
             blob_sha256: blob_sha256.to_string(),

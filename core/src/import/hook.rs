@@ -31,7 +31,7 @@ impl PostImportHook for NoopPostImportHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::SourceFormat;
+    use crate::session::{SourceFormat, TimestampSource};
 
     #[test]
     fn noop_post_import_hook_runs_without_panicking() {
@@ -40,6 +40,7 @@ mod tests {
             session_id: String::new(),
             device_id: None,
             timestamp_utc_ms: 0,
+            timestamp_source: TimestampSource::SourceFile,
             config_checksum: None,
             source_format: SourceFormat::Csv,
             blob_sha256: String::new(),

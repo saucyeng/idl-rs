@@ -18,6 +18,8 @@ pub use seam_correction::{ImportWarning, ImportWarningKind};
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Errors raised while parsing an `.idl0` binary log.
 ///
 /// Mirrors the Dart exception hierarchy in `app/lib/data/exceptions.dart`.
@@ -121,6 +123,38 @@ impl SourceFormat {
             SourceFormat::Fit => "fit",
             SourceFormat::Gpx => "gpx",
             SourceFormat::Csv => "csv",
+        }
+    }
+}
+
+/// Provenance of a [`Session`]'s `timestamp_utc_ms` (contract C1 §2). Only
+/// `User` makes a reader prefer `session.json`'s `timestamp_utc_ms` over
+/// `data.parquet`'s (see [`crate::store::session_json::effective_start_ms`]);
+/// every other variant means the parquet value is the truth. Never written
+/// into `data.parquet` file metadata — it lives only in `session.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampSource {
+    /// Recovered from the `.idl0` file header's `session_start_ms` field.
+    Header,
+    /// Header value was `0`/missing and the start was recovered from the
+    /// first GPS fix instead (SPEC §5.6 back-fill).
+    GpsBackfill,
+    /// Taken from a non-`.idl0` source file's own timestamp (FIT/GPX/CSV).
+    SourceFile,
+    /// Set explicitly by the user via `set_session_start`.
+    User,
+}
+
+impl TimestampSource {
+    /// The lowercase wire token this variant serializes to in `session.json`
+    /// (contract C1 §6). `const fn` for parity with [`SourceFormat::as_str`].
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            TimestampSource::Header => "header",
+            TimestampSource::GpsBackfill => "gps_backfill",
+            TimestampSource::SourceFile => "source_file",
+            TimestampSource::User => "user",
         }
     }
 }
@@ -353,6 +387,14 @@ pub struct Session {
     /// Session start, UTC milliseconds since the Unix epoch. `0` means
     /// "unknown" (SPEC §5.1 sentinel convention, unchanged).
     pub timestamp_utc_ms: i64,
+    /// Where `timestamp_utc_ms` came from (contract C1 §2, ruling R194):
+    /// `Header` (`.idl0` header `Session start UTC`), `GpsBackfill` (§3.1's
+    /// first-fix formula), `SourceFile` (FIT/GPX/CSV earliest converted
+    /// instant), or `User` (`set_session_start`, C3 §3.3). Set by each
+    /// importer and carried in `session.json` — deliberately never written
+    /// into `data.parquet` file metadata, so no parquet is invalidated by
+    /// its introduction.
+    pub timestamp_source: TimestampSource,
     /// CRC32 of `idl0_config.json` at recording time, 8-char lowercase hex.
     /// `None` for FIT/GPX/CSV — there is no device config.
     pub config_checksum: Option<String>,
@@ -443,6 +485,7 @@ mod tests {
             session_id: String::new(),
             device_id: None,
             timestamp_utc_ms: 0,
+            timestamp_source: TimestampSource::Header,
             config_checksum: None,
             source_format: SourceFormat::Idl0,
             blob_sha256: String::new(),

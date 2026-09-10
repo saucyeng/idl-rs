@@ -230,7 +230,7 @@ pub fn host_constants(doc: &WorkbookDoc) -> HashMap<String, f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::SourceFormat;
+    use crate::session::{SourceFormat, TimestampSource};
 
     struct MapLookup(HashMap<&'static str, (Vec<f64>, f64, Vec<i64>)>);
     impl ChannelLookup for MapLookup {
@@ -440,6 +440,7 @@ mod tests {
             session_id: "abc123".to_string(),
             device_id: None,
             timestamp_utc_ms: 1_700_000_000_000,
+            timestamp_source: TimestampSource::Header,
             config_checksum: None,
             source_format: SourceFormat::Idl0,
             blob_sha256: "0".repeat(64),

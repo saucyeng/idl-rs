@@ -455,7 +455,7 @@ pub fn load_lap_context(
 mod tests {
     use super::*;
 
-    use idl_rs::session::{Channel, RawColumn, SourceFormat};
+    use idl_rs::session::{Channel, RawColumn, SourceFormat, TimestampSource};
     use idl_rs::store::parquet::write_session_parquet;
     use idl_rs::store::session_json::{empty_session_json, write_session_json, LapJson};
     use uuid::Uuid;
@@ -471,6 +471,7 @@ mod tests {
             session_id: session_id.to_string(),
             device_id: None,
             timestamp_utc_ms: 0,
+            timestamp_source: TimestampSource::SourceFile,
             config_checksum: None,
             source_format: SourceFormat::Fit,
             blob_sha256: "a".repeat(64),

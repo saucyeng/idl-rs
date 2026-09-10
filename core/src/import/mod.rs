@@ -200,6 +200,7 @@ mod tests {
                     session_id: session_id_from_blob_hash(blob_sha256),
                     device_id: None,
                     timestamp_utc_ms: 0,
+                    timestamp_source: crate::session::TimestampSource::SourceFile,
                     config_checksum: None,
                     source_format: SourceFormat::Fit,
                     blob_sha256: blob_sha256.to_string(),

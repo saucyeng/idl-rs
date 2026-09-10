@@ -245,6 +245,10 @@ impl SessionHandle {
             session_id: meta.session_id,
             device_id: meta.device_id,
             timestamp_utc_ms: meta.timestamp_utc_ms,
+            // GPX is this constructor's only caller today (see
+            // `SessionMetaInput`'s doc comment) — fixed to `SourceFile`
+            // exactly as `source_format` below is fixed to `Gpx`, per R194.
+            timestamp_source: crate::session::TimestampSource::SourceFile,
             config_checksum: meta.config_checksum,
             // GPX is this constructor's only caller today (see
             // `SessionMetaInput`'s doc comment).

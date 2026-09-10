@@ -314,7 +314,7 @@ fn walk_unexpected(data_root: &Path, dir: &Path, out: &mut Vec<Finding>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Channel, RawColumn, Session, SourceFormat};
+    use crate::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
     use crate::store::blob::write_blob;
     use crate::store::derived::{write_derived_parquet, DerivedOutput};
     use crate::store::parquet::write_session_parquet;
@@ -338,6 +338,7 @@ mod tests {
             session_id: session_id.to_string(),
             device_id: None,
             timestamp_utc_ms: 0,
+            timestamp_source: TimestampSource::Header,
             config_checksum: None,
             source_format: SourceFormat::Idl0,
             blob_sha256,

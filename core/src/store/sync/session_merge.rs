@@ -99,6 +99,12 @@ pub fn merge_session_json(
         starred_lap_number: merge_field(local.starred_lap_number, peer.starred_lap_number, local_newer),
         track_visits: local.track_visits.clone(),
         track_visits_library_hash: local.track_visits_library_hash.clone(),
+        // User-owned via `set_session_start` (C3 §3.3), not part of the
+        // never-merged L2b lap cache above — merges like every other C1 §6
+        // user field (R194 doesn't rule on sync merge explicitly; this
+        // follows the existing `merge_field` precedent for user-set data).
+        timestamp_utc_ms: merge_field(local.timestamp_utc_ms, peer.timestamp_utc_ms, local_newer),
+        timestamp_source: merge_field(local.timestamp_source, peer.timestamp_source, local_newer),
         lap_detector_version: local.lap_detector_version.clone(),
     }
 }

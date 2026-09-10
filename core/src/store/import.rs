@@ -366,7 +366,11 @@ fn finish_import(
 
     let sj_path = data_root.join("sessions").join(&session_id).join("session.json");
     let session_json_created = if !sj_path.is_file() {
-        let doc = empty_session_json(&session_id);
+        let mut doc = empty_session_json(&session_id);
+        // Stamps the importer's provenance (R194) on a fresh `session.json`
+        // only — an existing file is never overwritten (see this fn's doc
+        // comment), so a user's start always survives re-import.
+        doc.timestamp_source = Some(session.timestamp_source);
         write_session_json(data_root, &session_id, &doc, None)?;
         true
     } else {
@@ -768,6 +772,23 @@ mod tests {
         let mut session = read_session_parquet(&report.data_parquet).unwrap();
         crate::session::synthesis::synthesize_base_channels(&mut session);
         assert!(session.channels.iter().any(|c| c.channel_id == "Time"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_file_gpx_fresh_session_writes_timestamp_source_matching_importer() {
+        // Arrange
+        let root = temp_root();
+        let bytes = minimal_gpx_with_warning();
+
+        // Act
+        let report = import_file(&root, "gpx", &bytes).unwrap();
+
+        // Assert — the GPX importer always assigns `SourceFile` (Task item 3).
+        let sj_path = root.join("sessions").join(&report.session_id).join("session.json");
+        let doc = read_session_json(&sj_path).unwrap();
+        assert_eq!(doc.timestamp_source, Some(crate::session::TimestampSource::SourceFile));
 
         let _ = std::fs::remove_dir_all(&root);
     }

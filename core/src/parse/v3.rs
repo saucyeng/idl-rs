@@ -246,12 +246,17 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     // wall clock at recording start:
     //   `gps_epoch - (gps_device_ts - first_sample_ts) / 1000`.
     let mut effective_start_ms = session_start_ms;
+    let mut timestamp_source = crate::session::TimestampSource::Header;
     if effective_start_ms == 0 {
         if let (Some(epoch), Some(dev)) = (gps_anchor.gps_epoch_ms, gps_anchor.device_ts_us) {
             let first_sample_us = origin.min_us.unwrap_or(0);
             effective_start_ms =
                 epoch - ((dev - first_sample_us) as f64 / 1000.0).round() as i64;
+            timestamp_source = crate::session::TimestampSource::GpsBackfill;
         }
+        // else: still `0` — the header is where the `0` came from, so
+        // `Header` remains truthful about provenance (only `"user"` changes
+        // any read, per R194).
     }
 
     Ok(ParseResult {
@@ -259,6 +264,7 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
             session_id,
             device_id: Some(device_id),
             timestamp_utc_ms: effective_start_ms,
+            timestamp_source,
             config_checksum: Some(format!("{config_crc:08x}")),
             source_format: crate::session::SourceFormat::Idl0,
             // Filled by the caller, not here — `parse_v3` only sees the

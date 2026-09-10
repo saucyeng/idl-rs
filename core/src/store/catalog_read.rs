@@ -318,7 +318,7 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
     Ok(SessionDetail {
         session_id: session_id.to_string(),
         device_id: metadata.device_id,
-        timestamp_utc_ms: metadata.timestamp_utc_ms,
+        timestamp_utc_ms: crate::store::session_json::effective_start_ms(&doc, metadata.timestamp_utc_ms),
         config_checksum: metadata.config_checksum,
         source_format: session.source_format.as_str().to_string(),
         blob_sha256: metadata.blob_sha256,
@@ -480,7 +480,7 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
-    use crate::session::{Channel, RawColumn, Session, SourceFormat};
+    use crate::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
     use crate::store::blob::write_blob;
     use crate::store::derived::{write_derived_parquet, DerivedOutput};
     use crate::store::parquet::write_session_parquet;
@@ -503,6 +503,7 @@ mod tests {
             session_id: session_id.to_string(),
             device_id: Some("d1".to_string()),
             timestamp_utc_ms,
+            timestamp_source: TimestampSource::Header,
             config_checksum: Some("cafef00d".to_string()),
             source_format: SourceFormat::Idl0,
             blob_sha256,
@@ -591,6 +592,40 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, CatalogErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_session_a_session_whose_parquet_start_is_zero_after_set_session_start_reports_the_user_value() {
+        // Arrange
+        let root = temp_root();
+        let doc = empty_session_json("s1");
+        write_full_session(&root, "s1", 0, &doc);
+
+        // Act
+        crate::store::session_json::set_session_start(&root, "s1", 1_700_000_000_000).unwrap();
+        let detail = get_session(&root, "s1").unwrap();
+
+        // Assert
+        assert_eq!(detail.timestamp_utc_ms, 1_700_000_000_000);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_session_a_session_with_no_user_value_and_zero_parquet_start_reads_as_zero() {
+        // Arrange — parquet start unknown (`0`) and `session.json` carries
+        // no user-supplied start: unknown stays unknown.
+        let root = temp_root();
+        let doc = empty_session_json("s1");
+        write_full_session(&root, "s1", 0, &doc);
+
+        // Act
+        let detail = get_session(&root, "s1").unwrap();
+
+        // Assert
+        assert_eq!(detail.timestamp_utc_ms, 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }
