@@ -9,6 +9,10 @@
 //! ```
 
 pub mod commands;
+/// Build-time guard over the engine's delete sites (ruling R196). Test-only
+/// — it contains no runtime code, only the scan and the audited allowlist.
+#[cfg(test)]
+mod delete_guard;
 pub mod error;
 /// `<data>/inbox` watching (C4 §2, ruling R191). Desktop only — the inbox
 /// does not exist on mobile, where `inbox_status` returns
