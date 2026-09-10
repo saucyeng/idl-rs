@@ -165,10 +165,20 @@ fn runtime_err(msg: impl Into<String>) -> MathEvalError {
     MathEvalError::new(MathEvalErrorKind::Runtime, msg)
 }
 
+/// The `(main_lap_start_sec, main_lap_end_sec)` pair that switches
+/// [`crate::variance`]'s per-sample gate off. That layer's convention is
+/// its own — "any `start >= end` disables gating" — so `None` (no window
+/// selected) is spelled here with bounds no resolved window can hold,
+/// never with a zero pair that would read back as a real window starting
+/// at 0 s. That conflation was the sentinel ruling R128 item 3 removed.
+const NO_WINDOW_GATE: (f64, f64) = (f64::INFINITY, f64::NEG_INFINITY);
+
 /// Assembles `variance_time` inputs and delegates to
 /// [`crate::variance::variance_time`]. Mirrors `_callVarianceTimeRust`.
 /// `main_t_us` is the main channel's own per-sample time (G5.7) — the
 /// result aligns to `main_samples`, so it carries that same axis forward.
+/// `main_window` is `None` when no window is selected (gating off) and
+/// `Some((start_sec, end_sec))` for a resolved window, which may be empty.
 pub fn eval_variance_time(
     main_samples: &[f64],
     main_rate: f64,
@@ -176,7 +186,7 @@ pub fn eval_variance_time(
     channel_id: &str,
     main: &dyn ChannelLookup,
     overlay: &MathOverlay,
-    main_window: (f64, f64),
+    main_window: Option<(f64, f64)>,
 ) -> Result<Value, MathEvalError> {
     let overlay_ch = overlay.lookup.lookup(channel_id).ok_or_else(|| {
         runtime_err(format!(
@@ -199,7 +209,8 @@ pub fn eval_variance_time(
             runtime_err("lap_delta_time(): main session is missing GPS_Latitude / GPS_Longitude.")
         })?;
 
-    let result = variance_time_against(&r, &overlay_ch, &main_pos, main_samples, main_rate, main_window);
+    let window = main_window.unwrap_or(NO_WINDOW_GATE);
+    let result = variance_time_against(&r, &overlay_ch, &main_pos, main_samples, main_rate, window);
     Ok(Value::Channel(ChannelValue {
         samples: std::sync::Arc::from(result),
         sample_rate_hz: main_rate,
@@ -245,6 +256,8 @@ pub fn variance_time_against(
 /// [`crate::variance::variance_dist`]. Mirrors `_callVarianceDistRust`.
 /// `main_t_us` is the main channel's own per-sample time (G5.7) — the
 /// result aligns to `main_samples`, so it carries that same axis forward.
+/// `main_window` is `None` when no window is selected (gating off) and
+/// `Some((start_sec, end_sec))` for a resolved window, which may be empty.
 pub fn eval_variance_dist(
     main_samples: &[f64],
     main_rate: f64,
@@ -252,7 +265,7 @@ pub fn eval_variance_dist(
     channel_id: &str,
     main: &dyn ChannelLookup,
     overlay: &MathOverlay,
-    main_window: (f64, f64),
+    main_window: Option<(f64, f64)>,
 ) -> Result<Value, MathEvalError> {
     let overlay_ch = overlay.lookup.lookup(channel_id).ok_or_else(|| {
         runtime_err(format!(
@@ -273,8 +286,9 @@ pub fn eval_variance_dist(
 
     let overlay_arc = cumulative_arc(&r.e, &r.n);
     let overlay_samples = subsample_to_arc(&overlay_ch.samples, &overlay_arc);
+    let window = main_window.unwrap_or(NO_WINDOW_GATE);
     let result =
-        variance_dist_against(&overlay_arc, &overlay_samples, &main_pos, main_samples, main_rate, main_window);
+        variance_dist_against(&overlay_arc, &overlay_samples, &main_pos, main_samples, main_rate, window);
     Ok(Value::Channel(ChannelValue {
         samples: std::sync::Arc::from(result),
         sample_rate_hz: main_rate,

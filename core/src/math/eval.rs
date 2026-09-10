@@ -699,8 +699,16 @@ fn require_ref_channel(v: &Value, ctx: &str) -> Result<(Arc<[f64]>, f64, Arc<[i6
 }
 
 // The designated main lap's `(start_sec, end_sec)` from the already-uniform
-// `main_lap_bounds`, or the `(0.0, 0.0)` gating-off sentinel. Mirrors the
-// uniform-time `_mainLapWindow`.
+// `main_lap_bounds`, or `None` when no window is selected at all (gate off).
+// Mirrors the uniform-time `_mainLapWindow`.
+//
+// `None` and `Some((s, e))` are the two states, and they cannot be spelled
+// the same way (ruling R128 item 3, closing the follow-up R128 filed): a
+// resolved window is always `Some`, *including* an empty one (`s >= e`),
+// and "no window selected" is never a pair of numbers. Before this, both
+// states shared the exact value `(0.0, 0.0)`, so a window resolving to zero
+// seconds was indistinguishable from an absent one — the conflation that
+// produced R119, R128 and R130 through three different doors.
 //
 // `main_lap_bounds` has two possible shapes, and they read differently: the
 // whole-session `load_lap_context(selection = None)` path fills it with
@@ -709,17 +717,16 @@ fn require_ref_channel(v: &Value, ctx: &str) -> Result<(Arc<[f64]>, f64, Arc<[i6
 // lap/session/range span (S1, R117, `load_window_context`) — is always a
 // one-entry vec, and `main_lap_number` there is a fixed `Some(1)` marker
 // ("a main lap is designated"), not a position; treating a 1-entry vec as
-// number-indexed silently fell back to the `(0.0, 0.0)` sentinel for any
-// lap number other than 1 and switched gating off entirely (`variance_time`/
-// `variance_dist`'s gate is `start < end`, and `0.0 < 0.0` is false) — the
-// live defect this function now closes. A one-entry vec is therefore always
-// read directly, regardless of what `main_lap_number` says; only a longer
-// vec is still indexed by lap number.
-fn main_lap_window(lap_ctx: &MathLapContext) -> (f64, f64) {
+// number-indexed silently fell back to `None` for any lap number other than
+// 1 and switched gating off entirely (`variance_time`/`variance_dist`'s gate
+// is `start < end`) — the live defect this function now closes. A one-entry
+// vec is therefore always read directly, regardless of what
+// `main_lap_number` says; only a longer vec is still indexed by lap number.
+fn main_lap_window(lap_ctx: &MathLapContext) -> Option<(f64, f64)> {
     match (lap_ctx.main_lap_number, lap_ctx.main_lap_bounds.as_slice()) {
-        (Some(_), [only]) => *only,
-        (Some(n), bounds) => bounds.get((n as usize).saturating_sub(1)).copied().unwrap_or((0.0, 0.0)),
-        (None, _) => (0.0, 0.0),
+        (Some(_), [only]) => Some(*only),
+        (Some(n), bounds) => bounds.get((n as usize).saturating_sub(1)).copied(),
+        (None, _) => None,
     }
 }
 
@@ -739,28 +746,32 @@ fn main_lap_window(lap_ctx: &MathLapContext) -> (f64, f64) {
 // timestamp as `end_sec` silently drops it, since it lands exactly on the
 // excluded boundary.
 //
-// Whole range (no narrowing) when: the gate is off (`main_lap_window`'s
-// exact `(0.0, 0.0)` sentinel — "no window selected", not any other
-// `start >= end`), or `sample_rate_hz <= 0.0` — a `{col[]}` whole-column
-// table reference has no time axis and is never windowed (R124.3). Any
-// *other* non-narrowing bound (`start_sec >= end_sec` but not the sentinel)
-// is an empty, resolved window and yields `(0, 0)`, never `(0, len)`
+// Whole range (no narrowing) when: the gate is off (`main_lap_window`
+// returns `None` — "no window selected", which is a *different value* from
+// any resolved window, never merely a different pair of numbers), or
+// `sample_rate_hz <= 0.0` — a `{col[]}` whole-column table reference has no
+// time axis and is never windowed (R124.3). A resolved but non-narrowing
+// window (`Some((s, e))` with `s >= e`) yields `(0, 0)`, never `(0, len)`
 // (ruling R128, amending R126): conflating "no window" with "an empty
 // window" here is what let a Range clamped past the session's end silently
-// read back as the whole channel instead of nothing selected.
+// read back as the whole channel instead of nothing selected. Since R128
+// item 3 the two states are distinct in the type, so this can no longer be
+// got wrong by writing the wrong comparison.
 fn window_index_range(lap_ctx: &MathLapContext, sample_rate_hz: f64, len: usize) -> (usize, usize) {
     if sample_rate_hz <= 0.0 {
         return (0, len);
     }
-    let (start_sec, end_sec) = main_lap_window(lap_ctx);
+    let (start_sec, end_sec) = match main_lap_window(lap_ctx) {
+        // No window selected: the gate is off and the whole channel is read.
+        None => return (0, len),
+        Some(w) => w,
+    };
     if !(start_sec < end_sec) {
-        // R128 (amending R126): only `main_lap_window`'s exact `(0.0, 0.0)`
-        // sentinel means "no window selected, gate off" — the whole
-        // channel. Any *other* `start_sec >= end_sec` (e.g. a Range window
+        // A resolved window that narrows to nothing (e.g. a Range window
         // that clamped to a degenerate `(X, X)` past the session's end) is
-        // an empty, resolved window, not an absent one, and must read back
-        // as nothing selected, never silently as everything.
-        return if start_sec == 0.0 && end_sec == 0.0 { (0, len) } else { (0, 0) };
+        // an empty window, not an absent one, and must read back as nothing
+        // selected, never silently as everything (ruling R128).
+        return (0, 0);
     }
     let start = (start_sec * sample_rate_hz).ceil().max(0.0) as usize;
     let end = (end_sec * sample_rate_hz).ceil().max(0.0) as usize;
@@ -2472,10 +2483,10 @@ mod tests {
     }
 
     #[test]
-    fn window_index_range_no_lap_context_sentinel_is_the_whole_channel() {
+    fn window_index_range_no_window_selected_none_is_the_whole_channel() {
         // Arrange — `no_laps()` has no bounds at all, so `main_lap_window`
-        // returns its `(0.0, 0.0)` "no window selected" sentinel — the one
-        // and only shape that means "gate off" (ruling R128).
+        // returns `None` — the one and only value that means "no window
+        // selected, gate off" (ruling R128).
 
         // Act
         let (start, end) = window_index_range(&no_laps(), 10.0, 7);
@@ -2485,13 +2496,13 @@ mod tests {
     }
 
     #[test]
-    fn window_index_range_degenerate_non_sentinel_bound_is_empty_not_the_whole_channel() {
+    fn window_index_range_degenerate_resolved_bound_is_empty_not_the_whole_channel() {
         // Arrange — a *resolved* window whose bounds happen to collapse to
         // equal (e.g. a Range clamped past the session's end, R128) is not
-        // the same value as "no window selected": only the exact
-        // `(0.0, 0.0)` sentinel means that. `(0.5, 0.5)` is degenerate for
-        // an entirely different reason and must read back as nothing
-        // selected, never silently as everything.
+        // the same value as "no window selected": only `None` means that.
+        // `(0.5, 0.5)` is `Some`, degenerate for an entirely different
+        // reason, and must read back as nothing selected, never silently as
+        // everything.
         let degenerate = window_ctx(0.5, 0.5);
 
         // Act
@@ -3112,12 +3123,11 @@ mod tests {
         // entry in `main_lap_bounds` (0..5 s) but `main_lap_number = Some(3)`,
         // since a window's lap number is no longer an index into that vec.
         // Before the fix, `main_lap_window` read `main_lap_bounds.get(3 - 1)`
-        // on a 1-element vec, missed, and fell back to the `(0.0, 0.0)`
-        // sentinel. `variance_time`'s gate is `start < end` (`variance.rs`'s
-        // `variance_time`), so `(0.0, 0.0)` does not merely gate everything
-        // out — `0.0 < 0.0` is false, so it silently disables gating
-        // entirely and every sample (including t = 9 s, well outside the
-        // real 0..5 s window) passes through ungated. The regression this
+        // on a 1-element vec, missed, and fell back to "no window selected".
+        // `variance_time`'s gate is `start < end` (`variance.rs`'s
+        // `variance_time`), and no window selected disables that gate
+        // entirely, so every sample (including t = 9 s, well outside the
+        // real 0..5 s window) passed through ungated. The regression this
         // guards is samples at/after t = 5 s must be `NaN`.
         let lon: Vec<f64> = (0..10).map(|i| i as f64 * 0.001).collect();
         let lat = vec![0.0; 10];
