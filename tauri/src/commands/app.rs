@@ -174,6 +174,242 @@ fn set_data_dir_via(
     })
 }
 
+/// The five trees `move_data_dir` copies (C4 §1 "Moving the root").
+/// `tmp/` (scratch), `inbox/` (a desktop drop folder, not library content)
+/// and `catalog.sqlite*` are deliberately absent: the catalog is an index,
+/// rebuilt at the destination rather than copied, and copying a live sqlite
+/// file plus its `-wal`/`-shm` sidecars byte-for-byte is the one way to move
+/// a *corrupt* index to the new root.
+const MOVED_TREES: [&str; 5] = ["blobs", "sessions", "workbooks", "tracks", "profiles"];
+
+/// Chunk size for the streaming copy/hash below. Blobs are whole ride logs;
+/// reading one into memory to hash it is not an option.
+const COPY_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Absolute, symlink-resolved form of `path`, which need not exist: the
+/// deepest existing ancestor is canonicalised and the remaining components
+/// are re-appended. Used only to compare two roots for containment, where
+/// Windows' `\\?\` verbatim prefix is harmless because both sides get it.
+fn normalized(path: &Path) -> PathBuf {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = path.to_path_buf();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&probe) {
+            let mut out = real;
+            for part in suffix.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (probe.file_name().map(|n| n.to_os_string()), probe.parent().map(|p| p.to_path_buf())) {
+            (Some(name), Some(parent)) if !parent.as_os_str().is_empty() => {
+                suffix.push(name);
+                probe = parent;
+            }
+            // No existing ancestor at all (a bogus drive letter): compare the
+            // path as given rather than inventing one.
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// `true` when `a` and `b` are the same directory or one contains the other
+/// — either direction is fatal for a move, since the destination would end
+/// up inside the source being walked (or swallow it).
+fn overlaps(a: &Path, b: &Path) -> bool {
+    let (a, b) = (normalized(a), normalized(b));
+    a.starts_with(&b) || b.starts_with(&a)
+}
+
+/// Every regular file under `dir`, as paths relative to `base`. A missing
+/// `dir` yields nothing — a library with no `tracks/` yet is normal, not an
+/// error.
+fn collect_files(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), IpcError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", dir.display()))),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", dir.display())))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("stat {}: {e}", path.display())))?;
+        if file_type.is_dir() {
+            collect_files(base, &path, out)?;
+        } else {
+            let rel = path
+                .strip_prefix(base)
+                .map_err(|e| IpcError::new(IpcErrorKind::Internal, format!("{} not under {}: {e}", path.display(), base.display())))?;
+            out.push(rel.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+/// Copies `src` to `dst` (creating `dst`'s parent), streaming, and returns
+/// the sha256 hex digest of the bytes it *read* — the source's own digest,
+/// which the verify phase then re-derives from the file it wrote.
+fn copy_and_hash(src: &Path, dst: &Path) -> Result<String, IpcError> {
+    use sha2::Digest;
+    use std::io::{Read, Write};
+
+    let io = |what: &str, e: std::io::Error| IpcError::new(IpcErrorKind::Io, format!("{what}: {e}"));
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io(&format!("creating {}", parent.display()), e))?;
+    }
+    let mut reader = std::fs::File::open(src).map_err(|e| io(&format!("opening {}", src.display()), e))?;
+    let mut writer = std::fs::File::create(dst).map_err(|e| io(&format!("creating {}", dst.display()), e))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; COPY_CHUNK_BYTES];
+    loop {
+        let read = reader.read(&mut buf).map_err(|e| io(&format!("reading {}", src.display()), e))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+        writer.write_all(&buf[..read]).map_err(|e| io(&format!("writing {}", dst.display()), e))?;
+    }
+    writer.flush().map_err(|e| io(&format!("writing {}", dst.display()), e))?;
+    Ok(hex(&hasher.finalize()))
+}
+
+/// sha256 hex digest of a file on disk, read in chunks.
+fn sha256_file(path: &Path) -> Result<String, IpcError> {
+    use sha2::Digest;
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("opening {}: {e}", path.display())))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; COPY_CHUNK_BYTES];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// Lowercase hex, no separators.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The digest a path under `blobs/sha256/<2 hex>/<62 hex>` claims for its own
+/// content (C4 §2), or `None` when `rel` is not a blob path — only a blob's
+/// name is a checkable assertion about its bytes.
+fn blob_digest_from_relative_path(rel: &Path) -> Option<String> {
+    let parts: Vec<&str> = rel.components().map(|c| c.as_os_str().to_str().unwrap_or("")).collect();
+    if parts.len() != 4 || parts[0] != "blobs" || parts[1] != "sha256" {
+        return None;
+    }
+    let (prefix, rest) = (parts[2], parts[3]);
+    if prefix.len() != 2 || rest.len() != 62 {
+        return None;
+    }
+    let digest = format!("{prefix}{rest}");
+    if digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(digest.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// `move_data_dir`'s transport-agnostic core (C3 §3.10, C4 §1 "Moving the
+/// root", ruling R196).
+///
+/// Copies the five [`MOVED_TREES`] from the *running* `<data>` root to
+/// `<new_root>/data`, re-hashing every copied file and checking each blob
+/// against the digest its own path names, rebuilds the catalog at the
+/// destination, and only then writes the `data_dir` override. Any failure
+/// before that last step leaves `settings.json` untouched and the old root
+/// exactly as it was — the copy is additive, nothing is ever deleted, and a
+/// partial copy is left at the destination for the user to inspect rather
+/// than silently removed.
+///
+/// `progress(phase, done, total)` is called per file for `"copy"` and
+/// `"verify"` and once at each end of `"catalog"`.
+fn move_data_dir_via(
+    settings_path: &Path,
+    app_data_dir: &Path,
+    app_config_dir: &Path,
+    resolved_data_dir: &Path,
+    new_root: &str,
+    progress: impl Fn(&str, u64, u64),
+) -> Result<DataDirInfo, IpcError> {
+    let invalid = |message: String| IpcError::new(IpcErrorKind::InvalidArgument, message);
+
+    let new_root_path = Path::new(new_root);
+    if !new_root_path.is_absolute() {
+        return Err(invalid(format!("'{new_root}' is not an absolute path")));
+    }
+    let new_data = new_root_path.join("data");
+    if overlaps(&new_data, resolved_data_dir) {
+        return Err(invalid(format!("'{new_root}' overlaps the library it would receive")));
+    }
+    if new_root_path.exists() {
+        if !new_root_path.is_dir() {
+            return Err(invalid(format!("'{new_root}' is not a directory")));
+        }
+        let mut entries = std::fs::read_dir(new_root_path)
+            .map_err(|e| invalid(format!("cannot read '{new_root}': {e}")))?;
+        if entries.next().is_some() {
+            return Err(invalid(format!("'{new_root}' is not empty")));
+        }
+    }
+    std::fs::create_dir_all(&new_data).map_err(|e| invalid(format!("cannot write to '{new_root}': {e}")))?;
+
+    // Enumerate first, so `total` is honest from the first progress event.
+    let mut files: Vec<PathBuf> = Vec::new();
+    for tree in MOVED_TREES {
+        collect_files(resolved_data_dir, &resolved_data_dir.join(tree), &mut files)?;
+    }
+    let total = files.len() as u64;
+
+    let mut source_digests: Vec<String> = Vec::with_capacity(files.len());
+    progress("copy", 0, total);
+    for (index, rel) in files.iter().enumerate() {
+        source_digests.push(copy_and_hash(&resolved_data_dir.join(rel), &new_data.join(rel))?);
+        progress("copy", index as u64 + 1, total);
+    }
+
+    progress("verify", 0, total);
+    for (index, rel) in files.iter().enumerate() {
+        let written = sha256_file(&new_data.join(rel))?;
+        if written != source_digests[index] {
+            return Err(IpcError::with_detail(
+                IpcErrorKind::Io,
+                format!("{} did not survive the copy intact; nothing was switched", rel.display()),
+                serde_json::json!({ "path": rel.display().to_string(), "reason": "copy_mismatch" }),
+            ));
+        }
+        if let Some(claimed) = blob_digest_from_relative_path(rel) {
+            if written != claimed {
+                return Err(IpcError::with_detail(
+                    IpcErrorKind::Io,
+                    format!("blob {} does not hash to its own name; nothing was switched", rel.display()),
+                    serde_json::json!({ "path": rel.display().to_string(), "reason": "blob_hash_mismatch" }),
+                ));
+            }
+        }
+        progress("verify", index as u64 + 1, total);
+    }
+
+    progress("catalog", 0, total);
+    idl_rs::store::catalog_read::rebuild_catalog_report(&new_data)?;
+    progress("catalog", total, total);
+
+    // Last, and only now: the override. Everything above is additive, so a
+    // failure anywhere leaves a library that still opens at the old root.
+    set_data_dir_via(settings_path, app_data_dir, app_config_dir, resolved_data_dir, Some(new_root.to_string()))
+}
+
 /// Maps a `tauri::Error` from `app.path()...` itself (launch-time
 /// path-resolution failing at command time) to `Internal` — no C3 §3.10
 /// error row names it because it should never actually happen once
@@ -229,6 +465,51 @@ pub fn set_data_dir<R: tauri::Runtime>(
     let app_data_dir = app.path().app_data_dir().map_err(map_path_error)?;
     let app_config_dir = app.path().app_config_dir().map_err(map_path_error)?;
     set_data_dir_via(&settings_path(&app_config_dir), &app_data_dir, &app_config_dir, &data_dir.0, path)
+}
+
+/// C3 §3.10 `move_data_dir(new_root, progress)`. Copies the library to
+/// `new_root` with every blob's sha256 verified on arrival, rebuilds the
+/// catalog there, then sets the override (C4 §1 "Moving the root", ruling
+/// R196). The old root is left in place for the user to delete. Desktop
+/// only — the override itself is desktop only (C4 §1, ruling R183), so a
+/// move has nowhere to go on mobile.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tauri::command]
+pub fn move_data_dir<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    data_dir: tauri::State<'_, DataDir>,
+    new_root: String,
+    progress: tauri::ipc::Channel<crate::commands::device::Progress>,
+) -> Result<DataDirInfo, IpcError> {
+    let app_data_dir = app.path().app_data_dir().map_err(map_path_error)?;
+    let app_config_dir = app.path().app_config_dir().map_err(map_path_error)?;
+    move_data_dir_via(
+        &settings_path(&app_config_dir),
+        &app_data_dir,
+        &app_config_dir,
+        &data_dir.0,
+        &new_root,
+        |phase, done, total| {
+            let _ = progress.send(crate::commands::device::Progress {
+                done,
+                total: Some(total),
+                phase: phase.to_string(),
+            });
+        },
+    )
+}
+
+/// C3 §3.10 `move_data_dir` on mobile — see the desktop version's doc
+/// comment.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[tauri::command]
+pub fn move_data_dir(new_root: String) -> Result<DataDirInfo, IpcError> {
+    let _ = new_root;
+    Err(IpcError::with_detail(
+        IpcErrorKind::UnsupportedPlatform,
+        "moving the data directory is desktop only",
+        serde_json::json!({ "platform": std::env::consts::OS }),
+    ))
 }
 
 /// C3 §3.10 `BikeProfile` — mirrors `idl_rs::store::profile::BikeProfile`
@@ -672,6 +953,189 @@ mod tests {
         assert!(new_root.join("data/tmp/quarantine").is_dir());
         assert_eq!(info.override_path, Some(new_root_str));
         assert!(info.restart_required);
+    }
+
+    /// Builds a small but structurally real library under `<root>/data`:
+    /// one blob correctly named for its own content, one session file, one
+    /// workbook, and `tmp/`+`catalog.sqlite` content that must *not* travel.
+    /// Returns the blob's relative path under `<data>`.
+    fn seed_library(data: &Path) -> PathBuf {
+        use sha2::Digest;
+        let bytes = b"raw ride log bytes".to_vec();
+        let digest = hex(&sha2::Sha256::digest(&bytes));
+        let rel = PathBuf::from("blobs").join("sha256").join(&digest[0..2]).join(&digest[2..]);
+        std::fs::create_dir_all(data.join(&rel).parent().unwrap()).unwrap();
+        std::fs::write(data.join(&rel), &bytes).unwrap();
+        std::fs::create_dir_all(data.join("sessions").join("s1")).unwrap();
+        std::fs::write(data.join("sessions").join("s1").join("session.json"), br#"{"session_id":"s1"}"#).unwrap();
+        std::fs::create_dir_all(data.join("workbooks")).unwrap();
+        std::fs::write(data.join("workbooks").join("w1.idl1wb"), b"{}").unwrap();
+        std::fs::create_dir_all(data.join("tmp")).unwrap();
+        std::fs::write(data.join("tmp").join("scratch"), b"do not move me").unwrap();
+        std::fs::write(data.join("catalog.sqlite"), b"stale index").unwrap();
+        rel
+    }
+
+    /// A `progress` sink recording `(phase, done, total)` for assertions.
+    fn recording_progress(log: &std::sync::Mutex<Vec<(String, u64, u64)>>) -> impl Fn(&str, u64, u64) + '_ {
+        move |phase, done, total| log.lock().unwrap().push((phase.to_string(), done, total))
+    }
+
+    #[test]
+    fn move_data_dir_via_copies_the_five_trees_verifies_them_and_switches_the_override() {
+        // Arrange
+        let app_data = temp_root();
+        let app_config = temp_root();
+        let settings = settings_path(&app_config);
+        let old_data = crate::paths::resolve_data_dir(&app_data, &app_config).unwrap();
+        let blob_rel = seed_library(&old_data);
+        let new_root = temp_root().join("moved");
+        let log = std::sync::Mutex::new(Vec::new());
+
+        // Act
+        let info = move_data_dir_via(
+            &settings,
+            &app_data,
+            &app_config,
+            &old_data,
+            &new_root.display().to_string(),
+            recording_progress(&log),
+        )
+        .unwrap();
+
+        // Assert — content arrived, skipped things did not, override switched.
+        let new_data = new_root.join("data");
+        assert_eq!(std::fs::read(new_data.join(&blob_rel)).unwrap(), b"raw ride log bytes");
+        assert!(new_data.join("sessions").join("s1").join("session.json").is_file());
+        assert!(new_data.join("workbooks").join("w1.idl1wb").is_file());
+        assert!(!new_data.join("tmp").join("scratch").exists());
+        // The catalog at the destination is rebuilt, never the copied file:
+        // whatever is there, it is not the source's stale bytes.
+        if new_data.join("catalog.sqlite").is_file() {
+            assert_ne!(std::fs::read(new_data.join("catalog.sqlite")).unwrap(), b"stale index".to_vec());
+        }
+        assert_eq!(info.override_path, Some(new_root.display().to_string()));
+        assert_eq!(idl_rs::store::settings::load(&settings).data_dir, Some(new_root.display().to_string()));
+        // The old root is left exactly as it was — a move never deletes.
+        assert!(old_data.join(&blob_rel).is_file());
+        assert!(old_data.join("tmp").join("scratch").is_file());
+        // Phases in contract order (C3 §3.10), each with an honest total.
+        let phases: Vec<String> = log.lock().unwrap().iter().map(|(p, _, _)| p.clone()).collect();
+        assert_eq!(phases.first().map(String::as_str), Some("copy"));
+        assert!(phases.iter().any(|p| p == "verify"));
+        assert_eq!(phases.last().map(String::as_str), Some("catalog"));
+        let (_, done, total) = log.lock().unwrap().iter().filter(|(p, _, _)| p == "copy").last().unwrap().clone();
+        assert_eq!(done, total);
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn move_data_dir_via_a_blob_whose_bytes_do_not_match_its_name_aborts_before_the_override_switches() {
+        // Arrange
+        let app_data = temp_root();
+        let app_config = temp_root();
+        let settings = settings_path(&app_config);
+        let old_data = crate::paths::resolve_data_dir(&app_data, &app_config).unwrap();
+        let blob_rel = seed_library(&old_data);
+        // Corruption already present in the source: the file no longer hashes
+        // to the name it is filed under. The copy is byte-perfect; it is the
+        // *content-address* check that must catch this.
+        std::fs::write(old_data.join(&blob_rel), b"tampered bytes").unwrap();
+        let new_root = temp_root().join("moved");
+        let log = std::sync::Mutex::new(Vec::new());
+
+        // Act
+        let result = move_data_dir_via(
+            &settings,
+            &app_data,
+            &app_config,
+            &old_data,
+            &new_root.display().to_string(),
+            recording_progress(&log),
+        );
+
+        // Assert
+        let err = result.expect_err("a blob that does not hash to its own name must abort the move");
+        assert_eq!(err.kind, IpcErrorKind::Io);
+        assert_eq!(err.detail.unwrap()["reason"], serde_json::json!("blob_hash_mismatch"));
+        assert_eq!(idl_rs::store::settings::load(&settings).data_dir, None);
+        assert!(old_data.join(&blob_rel).is_file());
+    }
+
+    #[test]
+    fn move_data_dir_via_a_non_empty_target_is_rejected_and_nothing_is_copied_or_switched() {
+        // Arrange
+        let app_data = temp_root();
+        let app_config = temp_root();
+        let settings = settings_path(&app_config);
+        let old_data = crate::paths::resolve_data_dir(&app_data, &app_config).unwrap();
+        seed_library(&old_data);
+        let new_root = temp_root();
+        std::fs::write(new_root.join("someone-elses-file.txt"), b"occupied").unwrap();
+
+        // Act
+        let result =
+            move_data_dir_via(&settings, &app_data, &app_config, &old_data, &new_root.display().to_string(), |_, _, _| {});
+
+        // Assert
+        assert!(matches!(result, Err(e) if e.kind == IpcErrorKind::InvalidArgument));
+        assert!(!new_root.join("data").exists());
+        assert_eq!(idl_rs::store::settings::load(&settings).data_dir, None);
+    }
+
+    #[test]
+    fn move_data_dir_via_a_target_inside_the_current_root_is_rejected() {
+        // Arrange
+        let app_data = temp_root();
+        let app_config = temp_root();
+        let settings = settings_path(&app_config);
+        let old_data = crate::paths::resolve_data_dir(&app_data, &app_config).unwrap();
+        seed_library(&old_data);
+        let nested = old_data.join("sessions").join("inside");
+
+        // Act
+        let result =
+            move_data_dir_via(&settings, &app_data, &app_config, &old_data, &nested.display().to_string(), |_, _, _| {});
+
+        // Assert
+        assert!(matches!(result, Err(e) if e.kind == IpcErrorKind::InvalidArgument));
+        assert_eq!(idl_rs::store::settings::load(&settings).data_dir, None);
+    }
+
+    #[test]
+    fn move_data_dir_via_a_relative_target_is_rejected() {
+        // Arrange
+        let app_data = temp_root();
+        let app_config = temp_root();
+        let settings = settings_path(&app_config);
+        let old_data = crate::paths::resolve_data_dir(&app_data, &app_config).unwrap();
+
+        // Act
+        let result = move_data_dir_via(&settings, &app_data, &app_config, &old_data, "moved-library", |_, _, _| {});
+
+        // Assert
+        assert!(matches!(result, Err(e) if e.kind == IpcErrorKind::InvalidArgument));
+        assert!(!settings.exists());
+    }
+
+    #[test]
+    fn blob_digest_from_relative_path_recognises_a_blob_and_rejects_everything_else() {
+        // Arrange
+        let blob = PathBuf::from("blobs").join("sha256").join("ab").join("c".repeat(62));
+        let session = PathBuf::from("sessions").join("s1").join("session.json");
+        let short = PathBuf::from("blobs").join("sha256").join("ab").join("c".repeat(10));
+
+        // Act
+        let (from_blob, from_session, from_short) = (
+            blob_digest_from_relative_path(&blob),
+            blob_digest_from_relative_path(&session),
+            blob_digest_from_relative_path(&short),
+        );
+
+        // Assert
+        assert_eq!(from_blob, Some(format!("ab{}", "c".repeat(62))));
+        assert_eq!(from_session, None);
+        assert_eq!(from_short, None);
     }
 
     #[test]
