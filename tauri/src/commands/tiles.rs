@@ -13,7 +13,8 @@ use idl_rs::chart_decimation::MAX_TIER;
 use idl_rs::tile::build_tile_bytes;
 
 use crate::error::{IpcError, IpcErrorKind};
-use crate::session_source::load_session;
+use crate::session_cache::SessionCache;
+use crate::session_source::session_dir;
 use crate::state::DataDir;
 
 /// Largest `column_count` a caller may request (C3 §3.5, ruling R43).
@@ -30,6 +31,7 @@ const MAX_COLUMN_COUNT: u32 = 4096;
 /// [`idl_rs::tile::build_tile_bytes`], which owns decimation, column
 /// stats and the header — this function re-implements none of it.
 pub fn fetch_tile_via(
+    cache: &SessionCache,
     data_dir: &Path,
     session_id: &str,
     channel: &str,
@@ -52,12 +54,10 @@ pub fn fetch_tile_via(
         ));
     }
 
-    let session = load_session(data_dir, session_id)?;
-    let ch = session
-        .channels
-        .iter()
-        .find(|c| c.channel_id == channel)
-        .ok_or_else(|| IpcError::new(IpcErrorKind::NotFound, format!("channel '{channel}' not found")))?;
+    // One channel's column, not the whole `data.parquet` (ruling R203.1),
+    // and decoded at most once while the cache holds it (R203.2) — this is
+    // the pan/zoom path, called dozens of times a minute.
+    let ch = cache.channel(&session_dir(data_dir, session_id), session_id, channel)?;
 
     let samples = ch.materialize();
     Ok(build_tile_bytes(&samples, &ch.t_us, tier, tile_index, column_count))
@@ -73,8 +73,9 @@ pub fn fetch_tile(
     tile_index: u32,
     column_count: u32,
     data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, SessionCache>,
 ) -> Result<tauri::ipc::Response, IpcError> {
-    let bytes = fetch_tile_via(&data_dir.0, &session_id, &channel, tier, tile_index, column_count)?;
+    let bytes = fetch_tile_via(&cache, &data_dir.0, &session_id, &channel, tier, tile_index, column_count)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -126,7 +127,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let bytes = fetch_tile_via(&root, "s1", "Speed", 0, 0, 256).unwrap();
+        let bytes = fetch_tile_via(&SessionCache::new(), &root, "s1", "Speed", 0, 0, 256).unwrap();
 
         // Assert — C3 §3.5 v2: 32 + sample_count*8 + column_count*12 + column_count*8.
         assert_eq!(&bytes[0..4], b"IDLT");
@@ -152,7 +153,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let bytes = fetch_tile_via(&root, "s1", "Speed", 0, 0, 256).unwrap();
+        let bytes = fetch_tile_via(&SessionCache::new(), &root, "s1", "Speed", 0, 0, 256).unwrap();
 
         // Assert
         let sample_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
@@ -172,7 +173,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let err = fetch_tile_via(&root, "s1", "Speed", MAX_TIER + 1, 0, 256).unwrap_err();
+        let err = fetch_tile_via(&SessionCache::new(), &root, "s1", "Speed", MAX_TIER + 1, 0, 256).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -190,7 +191,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let err = fetch_tile_via(&root, "s1", "NopeChannel", 0, 0, 256).unwrap_err();
+        let err = fetch_tile_via(&SessionCache::new(), &root, "s1", "NopeChannel", 0, 0, 256).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -204,7 +205,7 @@ mod tests {
         let root = temp_root();
 
         // Act
-        let err = fetch_tile_via(&root, "nope", "Speed", 0, 0, 256).unwrap_err();
+        let err = fetch_tile_via(&SessionCache::new(), &root, "nope", "Speed", 0, 0, 256).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -219,7 +220,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let err = fetch_tile_via(&root, "s1", "Speed", 0, 0, 0).unwrap_err();
+        let err = fetch_tile_via(&SessionCache::new(), &root, "s1", "Speed", 0, 0, 0).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);

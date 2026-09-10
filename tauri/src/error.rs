@@ -139,6 +139,16 @@ pub enum IpcErrorKind {
     /// here: `inbox_status` on mobile (C3 §3.3, ruling R191 — the inbox is
     /// desktop only). `detail` carries `{ platform }`.
     UnsupportedPlatform,
+    /// C3 §1 (added 2026-09-10, lead ruling R203): the command was refused
+    /// **before** allocating, because the work would not fit the app's
+    /// memory budget — a session too large to decode, a raster too large to
+    /// render, an import too large to hold. Not `Internal` (nothing failed;
+    /// the app declined to try) and not `InvalidArgument` (the caller asked
+    /// for something legitimate that this machine cannot serve right now).
+    /// The UI shows it as a toast naming both numbers and the notebook
+    /// keeps running; the app never aborts on allocation failure (CLAUDE.md
+    /// §5). `detail` carries `{ needed_bytes, budget_bytes, hint }`.
+    ResourceExhausted,
 }
 
 /// One JSON error crossing every fallible command (C3 §2). `detail`'s shape

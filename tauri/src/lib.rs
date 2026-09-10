@@ -19,7 +19,9 @@ pub mod error;
 /// `unsupported_platform`.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod inbox;
+pub mod memory;
 pub mod paths;
+pub mod session_cache;
 pub mod session_source;
 pub mod state;
 pub mod watcher;

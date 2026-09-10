@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{IpcError, IpcErrorKind};
-use crate::session_source::load_session;
+use crate::session_cache::SessionCache;
+use crate::session_source::session_dir;
 
 /// `cursor_readout`'s return (C3 §3.7).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -36,12 +37,20 @@ pub struct CursorReadout {
 /// outside-span rule (ledger R31) — this function does not re-derive or
 /// second-guess it, only folds the `(id, value)` pairs into C3's map.
 pub fn cursor_readout_via(
+    cache: &SessionCache,
     data_dir: &Path,
     session_id: &str,
     channels: &[String],
     t_us: i64,
 ) -> Result<CursorReadout, IpcError> {
-    let session = load_session(data_dir, session_id)?;
+    let dir = session_dir(data_dir, session_id);
+    // An unknown session is `not_found` and an unknown channel on a known
+    // session is `invalid_argument` (C3 §3.7) — the cache raises the same
+    // `not_found` for both, so the session is checked here, once, before
+    // any channel is asked for.
+    if !dir.join("data.parquet").exists() {
+        return Err(IpcError::new(IpcErrorKind::NotFound, format!("session '{session_id}' not found")));
+    }
 
     // Resolved once per requested id — the existence check and the lookup
     // used to materialize below are the same lookup, so there is no second
@@ -49,14 +58,26 @@ pub fn cursor_readout_via(
     // (previously two separate lookups, the second pair asserted via
     // `.unwrap()` on the "it was already checked above" invariant; a typed
     // error here needs no such invariant to hold).
+    //
+    // Each id is read as its own column and cached (rulings R203.1/R203.2)
+    // rather than every id sharing one whole-file decode: a cursor readout
+    // names a handful of channels, and this is the settle path of the same
+    // pan `fetch_tile` serves, so the columns are usually already resident.
     let mut resolved = Vec::with_capacity(channels.len());
     for id in channels {
-        let channel = session.channels.iter().find(|c| &c.channel_id == id).ok_or_else(|| {
-            IpcError::with_detail(
-                IpcErrorKind::InvalidArgument,
-                format!("channel '{id}' not found on session '{session_id}'"),
-                serde_json::json!({ "channel": id }),
-            )
+        let channel = cache.channel(&dir, session_id, id).map_err(|e| {
+            // C3 §3.7: an unknown channel on a known session is the
+            // caller's mistake, `invalid_argument` with `detail.channel`,
+            // not the `not_found` the cache raises for either case.
+            if e.kind == IpcErrorKind::NotFound {
+                IpcError::with_detail(
+                    IpcErrorKind::InvalidArgument,
+                    format!("channel '{id}' not found on session '{session_id}'"),
+                    serde_json::json!({ "channel": id }),
+                )
+            } else {
+                e
+            }
         })?;
         resolved.push(channel);
     }
@@ -68,7 +89,7 @@ pub fn cursor_readout_via(
         .iter()
         .zip(resolved.iter())
         .zip(materialized.iter())
-        .map(|((id, channel), samples)| (id.as_str(), channel.t_us.as_slice(), samples.as_slice()))
+        .map(|((id, channel), samples)| (id.as_str(), channel.t_us.as_ref(), samples.as_slice()))
         .collect();
 
     let values = idl_rs::cursor::cursor_readout(&triples, t_us).into_iter().collect();
@@ -77,18 +98,15 @@ pub fn cursor_readout_via(
 
 /// C3 §3.7 `cursor_readout(session_id, channels, t_us)`. Settle-bound only,
 /// never a hot path (C3 §4) — nothing in wave 1 calls it from a hover path.
-// TODO(idl0): every call re-reads the session's whole `data.parquet` from
-// disk via `load_session` — a session/tier cache is design §4's recorded
-// deferral, not this task's (same deferral as `session_source::load_session`
-// and Task 11's workbook commands).
 #[tauri::command(async)]
 pub fn cursor_readout(
     session_id: String,
     channels: Vec<String>,
     t_us: i64,
     data_dir: tauri::State<'_, crate::state::DataDir>,
+    cache: tauri::State<'_, SessionCache>,
 ) -> Result<CursorReadout, IpcError> {
-    cursor_readout_via(&data_dir.0, &session_id, &channels, t_us)
+    cursor_readout_via(&cache, &data_dir.0, &session_id, &channels, t_us)
 }
 
 #[cfg(test)]
@@ -161,7 +179,7 @@ mod tests {
         seed_two_channel_session(&root, "s1");
 
         // Act
-        let out = cursor_readout_via(&root, "s1", &["long".to_string(), "short".to_string()], 1_000_000).unwrap();
+        let out = cursor_readout_via(&SessionCache::new(), &root, "s1", &["long".to_string(), "short".to_string()], 1_000_000).unwrap();
 
         // Assert
         assert_eq!(out.t_us, 1_000_000);
@@ -178,7 +196,7 @@ mod tests {
         seed_two_channel_session(&root, "s1");
 
         // Act
-        let out = cursor_readout_via(&root, "s1", &["long".to_string()], 1_500_000).unwrap();
+        let out = cursor_readout_via(&SessionCache::new(), &root, "s1", &["long".to_string()], 1_500_000).unwrap();
 
         // Assert
         assert_eq!(out.values.get("long"), Some(&Some(2.0)));
@@ -194,7 +212,7 @@ mod tests {
         seed_two_channel_session(&root, "s1");
 
         // Act
-        let out = cursor_readout_via(&root, "s1", &["long".to_string(), "short".to_string()], 2_000_000).unwrap();
+        let out = cursor_readout_via(&SessionCache::new(), &root, "s1", &["long".to_string(), "short".to_string()], 2_000_000).unwrap();
 
         // Assert
         assert_eq!(out.values.get("short"), Some(&None));
@@ -210,7 +228,7 @@ mod tests {
         seed_two_channel_session(&root, "s1");
 
         // Act
-        let out = cursor_readout_via(&root, "s1", &["late".to_string()], 0).unwrap();
+        let out = cursor_readout_via(&SessionCache::new(), &root, "s1", &["late".to_string()], 0).unwrap();
 
         // Assert
         assert_eq!(out.values.get("late"), Some(&None));
@@ -225,7 +243,7 @@ mod tests {
         seed_two_channel_session(&root, "s1");
 
         // Act
-        let err = cursor_readout_via(&root, "s1", &["long".to_string(), "nope".to_string()], 0).unwrap_err();
+        let err = cursor_readout_via(&SessionCache::new(), &root, "s1", &["long".to_string(), "nope".to_string()], 0).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -240,7 +258,7 @@ mod tests {
         let root = temp_root();
 
         // Act
-        let err = cursor_readout_via(&root, "nope", &["long".to_string()], 0).unwrap_err();
+        let err = cursor_readout_via(&SessionCache::new(), &root, "nope", &["long".to_string()], 0).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::NotFound);

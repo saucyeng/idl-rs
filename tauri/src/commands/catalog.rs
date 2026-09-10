@@ -1054,8 +1054,15 @@ pub fn delete_session(
     session_id: String,
     delete_blob: bool,
     data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, crate::session_cache::SessionCache>,
 ) -> Result<(), IpcError> {
-    delete_session_via(&data_dir.0, &session_id, delete_blob)
+    delete_session_via(&data_dir.0, &session_id, delete_blob)?;
+    // The decoded channels came from a `data.parquet` that no longer
+    // exists (ruling R203.2's invalidation rule). Invalidated after the
+    // delete succeeds: a refused delete leaves the file, and its decodes,
+    // valid.
+    cache.invalidate_session(&session_id);
+    Ok(())
 }
 
 #[cfg(test)]

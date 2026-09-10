@@ -15,10 +15,11 @@ use idl_rs::raster::{
     build_histogram2d_raster_bytes, build_spectrogram_raster_bytes, histogram2d_raster_meta,
     spectrogram_raster_meta, RasterMeta as CoreRasterMeta,
 };
-use idl_rs::session::{Channel, Session};
+use idl_rs::session::ChannelSamples;
 
 use crate::error::{IpcError, IpcErrorKind};
-use crate::session_source::{load_session, load_session_handle, resolve_lap_window, resolve_window, WindowDto};
+use crate::session_cache::SessionCache;
+use crate::session_source::{resolve_lap_window, resolve_window, session_dir, WindowDto};
 use crate::state::DataDir;
 
 /// `SpectrogramParams.window` (C3 §3.6) — `idl_rs::fft::FftWindow`'s three
@@ -209,21 +210,21 @@ fn parse_histogram2d_params(params: &serde_json::Value) -> Result<Histogram2dPar
     })
 }
 
-/// Finds `channel_id` in `session.channels`, or `not_found` naming it.
-fn find_channel<'a>(session: &'a Session, channel_id: &str) -> Result<&'a Channel, IpcError> {
-    find_channel_in(&session.channels, channel_id)
-}
-
-/// [`find_channel`]'s body, over a plain channel slice — `fetch_fft_via`
-/// looks a channel up in a [`idl_rs::session::handle::SessionHandle`]'s
-/// [`idl_rs::session::handle::SessionHandle::channel_data`] rather than a
-/// [`Session`], so this is the one place both paths share the lookup and
-/// its `not_found` message.
-fn find_channel_in<'a>(channels: &'a [Channel], channel_id: &str) -> Result<&'a Channel, IpcError> {
-    channels
-        .iter()
-        .find(|c| c.channel_id == channel_id)
-        .ok_or_else(|| IpcError::new(IpcErrorKind::NotFound, format!("channel '{channel_id}' not found")))
+/// One channel's samples, through the session cache (rulings R203.1/R203.2)
+/// — the single lookup every raster and FFT path in this module uses.
+///
+/// A raster or a spectrum is one channel's question (histogram2d's two are
+/// still two named channels, not a session), so nothing here decodes a
+/// whole `data.parquet`. `not_found` names an unknown session or channel;
+/// `resource_exhausted` refuses a decode too large for the budget before
+/// it is attempted.
+fn raster_channel(
+    cache: &SessionCache,
+    data_dir: &Path,
+    session_id: &str,
+    channel: &str,
+) -> Result<std::sync::Arc<ChannelSamples>, IpcError> {
+    cache.channel(&session_dir(data_dir, session_id), session_id, channel)
 }
 
 /// Rejects `x_bins`/`y_bins` that disagree with the command's own
@@ -342,6 +343,7 @@ impl RasterMetaOut {
 /// — an upsampled display of a coarse histogram — is the intended future
 /// extension.
 pub fn fetch_raster_via(
+    cache: &SessionCache,
     data_dir: &Path,
     session_id: &str,
     channel: &str,
@@ -353,11 +355,10 @@ pub fn fetch_raster_via(
     if width == 0 || height == 0 {
         return Err(IpcError::new(IpcErrorKind::InvalidArgument, format!("width/height must be nonzero, got {width}x{height}")));
     }
-    let session = load_session(data_dir, session_id)?;
 
     match kind {
         "spectrogram" => {
-            let ch = find_channel(&session, channel)?;
+            let ch = raster_channel(cache, data_dir, session_id, channel)?;
             if ch.nominal_rate_hz == 0.0 {
                 return Err(IpcError::new(
                     IpcErrorKind::InvalidArgument,
@@ -372,8 +373,8 @@ pub fn fetch_raster_via(
         "histogram2d" => {
             let p = parse_histogram2d_params(params)?;
             check_bins_match_pixels(&p, width, height)?;
-            let x_ch = find_channel(&session, channel)?;
-            let y_ch = find_channel(&session, &p.y_channel)?;
+            let x_ch = raster_channel(cache, data_dir, session_id, channel)?;
+            let y_ch = raster_channel(cache, data_dir, session_id, &p.y_channel)?;
             let xs = x_ch.materialize();
             let ys = y_ch.materialize();
             if xs.len() != ys.len() {
@@ -407,6 +408,7 @@ pub fn fetch_raster_via(
 /// `height` are never passed into the meta functions (they take none,
 /// deliberately — `core/src/raster.rs:192-206`/`:217-…`).
 pub fn fetch_raster_meta_via(
+    cache: &SessionCache,
     data_dir: &Path,
     session_id: &str,
     channel: &str,
@@ -418,11 +420,10 @@ pub fn fetch_raster_meta_via(
     if width == 0 || height == 0 {
         return Err(IpcError::new(IpcErrorKind::InvalidArgument, format!("width/height must be nonzero, got {width}x{height}")));
     }
-    let session = load_session(data_dir, session_id)?;
 
     match kind {
         "spectrogram" => {
-            let ch = find_channel(&session, channel)?;
+            let ch = raster_channel(cache, data_dir, session_id, channel)?;
             if ch.nominal_rate_hz == 0.0 {
                 return Err(IpcError::new(
                     IpcErrorKind::InvalidArgument,
@@ -444,8 +445,8 @@ pub fn fetch_raster_meta_via(
         "histogram2d" => {
             let p = parse_histogram2d_params(params)?;
             check_bins_match_pixels(&p, width, height)?;
-            let x_ch = find_channel(&session, channel)?;
-            let y_ch = find_channel(&session, &p.y_channel)?;
+            let x_ch = raster_channel(cache, data_dir, session_id, channel)?;
+            let y_ch = raster_channel(cache, data_dir, session_id, &p.y_channel)?;
             let xs = x_ch.materialize();
             let ys = y_ch.materialize();
             if xs.len() != ys.len() {
@@ -484,8 +485,9 @@ pub fn fetch_raster(
     height: u16,
     params: serde_json::Value,
     data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, SessionCache>,
 ) -> Result<tauri::ipc::Response, IpcError> {
-    let bytes = fetch_raster_via(&data_dir.0, &session_id, &channel, &kind, width, height, &params)?;
+    let bytes = fetch_raster_via(&cache, &data_dir.0, &session_id, &channel, &kind, width, height, &params)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -501,8 +503,9 @@ pub fn fetch_raster_meta(
     height: u16,
     params: serde_json::Value,
     data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, SessionCache>,
 ) -> Result<RasterMetaOut, IpcError> {
-    fetch_raster_meta_via(&data_dir.0, &session_id, &channel, &kind, width, height, &params)
+    fetch_raster_meta_via(&cache, &data_dir.0, &session_id, &channel, &kind, width, height, &params)
 }
 
 /// Maps [`idl_rs::fft::FftError`] to the IPC `invalid_argument` shape
@@ -523,7 +526,8 @@ fn map_fft_error(e: idl_rs::fft::FftError) -> IpcError {
 }
 
 /// Transport-agnostic core of `fetch_fft` (C3 §3.6, ruling R63 (3), R76,
-/// R83). Loads the channel via [`load_session_handle`]/[`find_channel_in`].
+/// R83). Loads the channel via [`raster_channel`], i.e. that one column
+/// and the session cache, never the whole `data.parquet` (ruling R203.1).
 /// `lap: None` takes the whole channel (`Channel::materialize`); `lap:
 /// Some(n)` resolves `n`'s recording-time window via
 /// [`crate::session_source::resolve_lap_window`] and takes only
@@ -547,6 +551,7 @@ fn map_fft_error(e: idl_rs::fft::FftError) -> IpcError {
 /// "segments": n }`), or a window with too few samples/duplicate timestamps
 /// to derive a sample rate.
 pub fn fetch_fft_via(
+    cache: &SessionCache,
     data_dir: &Path,
     session_id: &str,
     channel: &str,
@@ -554,21 +559,20 @@ pub fn fetch_fft_via(
     params: &SpectrogramParams,
     averaging: Averaging,
 ) -> Result<Vec<u8>, IpcError> {
-    let handle = load_session_handle(data_dir, session_id)?;
-    let ch = find_channel_in(handle.channel_data(), channel)?;
+    let ch = raster_channel(cache, data_dir, session_id, channel)?;
     let (window, detrend, scaling, window_size, noverlap) = resolve_spectrogram_params(params)?;
     let (samples, window_t_us) = match lap {
         None => (ch.materialize(), None),
         Some(n) => {
             let (t0_secs, t1_secs) = resolve_lap_window(data_dir, session_id, n)?;
-            let sliced = handle.slice_by_time(channel, t0_secs, t1_secs);
-            let t_us = slice_t_us_by_time(&ch.t_us, t0_secs, t1_secs);
+            let sliced = ch.slice_by_time(t0_secs, t1_secs);
+            let t_us = ch.slice_t_us_by_time(t0_secs, t1_secs);
             (sliced, Some(t_us))
         }
     };
     idl_rs::fft::check_none_averaging_segments(&averaging, window_size, noverlap, samples.len())
         .map_err(map_fft_error)?;
-    let rate_t_us = window_t_us.as_deref().unwrap_or(&ch.t_us);
+    let rate_t_us = window_t_us.as_deref().unwrap_or(ch.t_us.as_ref());
     let sample_rate_hz = idl_rs::fft::effective_rate_hz_from_t_us(rate_t_us).map_err(map_fft_error)?;
     let result = idl_rs::fft::welch(samples, sample_rate_hz, window, window_size, noverlap, detrend, averaging, scaling);
     Ok(idl_rs::fft_wire::encode_fft_idlf(&result.values, sample_rate_hz))
@@ -579,10 +583,6 @@ pub fn fetch_fft_via(
 /// boundary math `SessionHandle::slice_by_time` used to slice `samples`
 /// from) so `check_none_averaging_segments`/`effective_rate_hz_from_t_us`
 /// see the identical window.
-fn slice_t_us_by_time(t_us: &[i64], t0_secs: f64, t1_secs: f64) -> Vec<i64> {
-    let (lo, hi) = idl_rs::session::handle::time_window_index_range(t_us, t0_secs, t1_secs);
-    t_us[lo..hi].to_vec()
-}
 
 /// Fetches one channel's FFT spectrum as `IDLF` v1 bytes (C3 §3.6, ruling
 /// R63 (3), R76, R83). `lap: null` is the whole channel; `lap: n` is that
@@ -596,8 +596,9 @@ pub fn fetch_fft(
     params: SpectrogramParams,
     averaging: AveragingToken,
     data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, SessionCache>,
 ) -> Result<tauri::ipc::Response, IpcError> {
-    let bytes = fetch_fft_via(&data_dir.0, &session_id, &channel, lap, &params, averaging.into())?;
+    let bytes = fetch_fft_via(&cache, &data_dir.0, &session_id, &channel, lap, &params, averaging.into())?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -616,7 +617,7 @@ pub fn fetch_fft(
 /// resolves the span first (surfacing R119/R120's `no_overlap`/
 /// `invalid_range_order` for a degenerate `range`, or [`unknown_lap`] for a
 /// `lap` — `unknown_lap`'s check predates R119/R120 and needs no bounds),
-/// then `handle.slice_by_time`/[`slice_t_us_by_time`] slice the channel and
+/// then `ChannelSamples::slice_by_time`/`slice_t_us_by_time` slice the channel and
 /// its `t_us` to that window, then `check_none_averaging_segments` and
 /// `effective_rate_hz_from_t_us` run against the *sliced* window, never the
 /// whole channel — the same ordering [`fetch_fft_via`]'s doc comment
@@ -626,25 +627,25 @@ pub fn fetch_fft(
 /// still reaches this slice-then-guard path exactly as before, and still
 /// fails there rather than at `resolve_window`.
 ///
-/// `not_found`: unknown `session_id` (via [`load_session_handle`], `session`
+/// `not_found`: unknown `session_id` (via [`raster_channel`], `session`
 /// and `range` spans) or `channel`. `invalid_argument`: an unknown `lap`
 /// number, a `range` failing R119/R120, `params` that fail
 /// [`resolve_spectrogram_params`]'s validation, `averaging: none` with more
 /// than one segment, or a window with too few samples/duplicate timestamps
 /// to derive a sample rate.
 pub fn fetch_fft_v2_via(
+    cache: &SessionCache,
     data_dir: &Path,
     window: &WindowDto,
     channel: &str,
     params: &SpectrogramParams,
     averaging: Averaging,
 ) -> Result<Vec<u8>, IpcError> {
-    let handle = load_session_handle(data_dir, &window.session_id)?;
-    let ch = find_channel_in(handle.channel_data(), channel)?;
+    let ch = raster_channel(cache, data_dir, &window.session_id, channel)?;
     let (fft_window, detrend, scaling, window_size, noverlap) = resolve_spectrogram_params(params)?;
     let (t0_secs, t1_secs) = resolve_window(data_dir, window)?;
-    let samples = handle.slice_by_time(channel, t0_secs, t1_secs);
-    let window_t_us = slice_t_us_by_time(&ch.t_us, t0_secs, t1_secs);
+    let samples = ch.slice_by_time(t0_secs, t1_secs);
+    let window_t_us = ch.slice_t_us_by_time(t0_secs, t1_secs);
     idl_rs::fft::check_none_averaging_segments(&averaging, window_size, noverlap, samples.len())
         .map_err(map_fft_error)?;
     let sample_rate_hz = idl_rs::fft::effective_rate_hz_from_t_us(&window_t_us).map_err(map_fft_error)?;
@@ -664,8 +665,9 @@ pub fn fetch_fft_v2(
     params: SpectrogramParams,
     averaging: AveragingToken,
     data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, SessionCache>,
 ) -> Result<tauri::ipc::Response, IpcError> {
-    let bytes = fetch_fft_v2_via(&data_dir.0, &window, &channel, &params, averaging.into())?;
+    let bytes = fetch_fft_v2_via(&cache, &data_dir.0, &window, &channel, &params, averaging.into())?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -673,12 +675,12 @@ pub fn fetch_fft_v2(
 mod tests {
     use super::*;
 
-    use idl_rs::session::{RawColumn, SourceFormat, TimestampSource};
+    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
     use idl_rs::store::parquet::write_session_parquet;
     use idl_rs::store::session_json::{empty_session_json, write_session_json, LapJson};
     use uuid::Uuid;
 
-    use crate::session_source::SpanDto;
+    use crate::session_source::{load_session, load_session_handle, SpanDto};
 
     fn temp_root() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("idl-rs-tauri-rasters-test-{}", Uuid::new_v4()));
@@ -840,7 +842,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let bytes = fetch_raster_via(&root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+        let bytes = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
 
         // Assert — C3 §3.6: 16 + width*height*4 = 16 + 64*32*4 = 8208.
         assert_eq!(bytes.len(), 8208);
@@ -860,7 +862,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let bytes = fetch_raster_via(&root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let bytes = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
 
         // Assert
         assert_eq!(bytes.len(), 16 + 16 * 8 * 4);
@@ -875,7 +877,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let err = fetch_raster_via(&root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(4, 8)).unwrap_err();
+        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(4, 8)).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -895,7 +897,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let err = fetch_raster_via(&root, "s1", "Speed", "spectrogram", 0, 32, &spectrogram_params_json()).unwrap_err();
+        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 0, 32, &spectrogram_params_json()).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -910,7 +912,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let err = fetch_raster_via(&root, "s1", "NopeChannel", "spectrogram", 8, 8, &spectrogram_params_json()).unwrap_err();
+        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", "NopeChannel", "spectrogram", 8, 8, &spectrogram_params_json()).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -925,7 +927,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let err = fetch_raster_via(&root, "s1", "Lap", "spectrogram", 8, 8, &spectrogram_params_json()).unwrap_err();
+        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", "Lap", "spectrogram", 8, 8, &spectrogram_params_json()).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -941,7 +943,7 @@ mod tests {
         let bad_params = serde_json::json!({ "window_size": 16, "hop_size": 32, "window": "hann", "detrend": "mean", "scaling": "density" });
 
         // Act
-        let err = fetch_raster_via(&root, "s1", "Speed", "spectrogram", 8, 8, &bad_params).unwrap_err();
+        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 8, 8, &bad_params).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -955,12 +957,12 @@ mod tests {
         let root = temp_root();
         seed_session(&root);
         let session = load_session(&root, "s1").unwrap();
-        let ch = find_channel(&session, "Speed").unwrap();
+        let ch = session.channels.iter().find(|c| c.channel_id == "Speed").unwrap();
         let samples = ch.materialize();
         let direct = spectrogram_raster_meta(&samples, ch.nominal_rate_hz, FftWindow::Hann, 32, 16, Detrend::Mean, Scaling::Density);
 
         // Act
-        let meta = fetch_raster_meta_via(&root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
 
         // Assert — R38's guarantee, tested rather than trusted: same bounds
         // as calling the core meta function directly, regardless of width/height.
@@ -983,7 +985,7 @@ mod tests {
         let want = idl_rs::math::units::spectral_output_unit("m/s", "density");
 
         // Act
-        let meta = fetch_raster_meta_via(&root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
 
         // Assert
         assert_eq!(meta.magnitude_unit, Some(crate::commands::workbook::UnitLabel::from(&want)));
@@ -999,7 +1001,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let meta = fetch_raster_meta_via(&root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
 
         // Assert
         assert_eq!(meta.magnitude_unit, None);
@@ -1014,7 +1016,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let meta = fetch_raster_meta_via(&root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
 
         // Assert
         assert_eq!(meta.x_label, "Speed (m/s)");
@@ -1045,7 +1047,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let meta = fetch_raster_meta_via(&root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
 
         // Assert — C3 §3.6: n >= 16, endpoints included, every stop opaque,
         // and the stops are core's ramp, never a second table here.
@@ -1066,8 +1068,8 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let hist = fetch_raster_meta_via(&root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
-        let spec = fetch_raster_meta_via(&root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+        let hist = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let spec = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
 
         // Assert
         assert_eq!(hist.ramp_stops, spec.ramp_stops);
@@ -1081,10 +1083,10 @@ mod tests {
         // survives into the payload and must carry the ramp's t = 1.0 colour.
         let root = temp_root();
         seed_session(&root);
-        let meta = fetch_raster_meta_via(&root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
 
         // Act
-        let bytes = fetch_raster_via(&root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let bytes = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
         let pixels = opaque_pixels(&bytes);
 
         // Assert — the legend's top end is a colour the picture really uses.
@@ -1103,7 +1105,7 @@ mod tests {
         let ramp: Vec<[u8; 4]> = (0..=4096).map(|i| idl_rs::colormap::turbo_rgba8(i as f64 / 4096.0)).collect();
 
         // Act
-        let bytes = fetch_raster_via(&root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+        let bytes = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
         let pixels = opaque_pixels(&bytes);
 
         // Assert — Turbo, not some other ramp, encoded these pixels.
@@ -1154,8 +1156,8 @@ mod tests {
         seed_laps_for_s1(&root);
 
         // Act
-        let whole = fetch_fft_via(&root, "s1", "Speed", None, &fft_params(), Averaging::Mean).unwrap();
-        let lap2 = fetch_fft_via(&root, "s1", "Speed", Some(2), &fft_params(), Averaging::Mean).unwrap();
+        let whole = fetch_fft_via(&SessionCache::new(), &root, "s1", "Speed", None, &fft_params(), Averaging::Mean).unwrap();
+        let lap2 = fetch_fft_via(&SessionCache::new(), &root, "s1", "Speed", Some(2), &fft_params(), Averaging::Mean).unwrap();
 
         // Assert
         let bin_count = |bytes: &[u8]| u32::from_le_bytes(bytes[8..12].try_into().unwrap());
@@ -1174,7 +1176,7 @@ mod tests {
         seed_laps_for_s1(&root);
 
         // Act
-        let err = fetch_fft_via(&root, "s1", "Speed", Some(99), &fft_params(), Averaging::Mean).unwrap_err();
+        let err = fetch_fft_via(&SessionCache::new(), &root, "s1", "Speed", Some(99), &fft_params(), Averaging::Mean).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -1192,9 +1194,9 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let before = fetch_fft_via(&root, "s1", "Speed", None, &fft_params(), Averaging::Mean).unwrap();
+        let before = fetch_fft_via(&SessionCache::new(), &root, "s1", "Speed", None, &fft_params(), Averaging::Mean).unwrap();
         seed_laps_for_s1(&root);
-        let after = fetch_fft_via(&root, "s1", "Speed", None, &fft_params(), Averaging::Mean).unwrap();
+        let after = fetch_fft_via(&SessionCache::new(), &root, "s1", "Speed", None, &fft_params(), Averaging::Mean).unwrap();
 
         // Assert
         assert_eq!(before, after);
@@ -1216,7 +1218,7 @@ mod tests {
         seed_laps_for_s1(&root);
 
         // Act
-        let err = fetch_fft_via(&root, "s1", "Speed", Some(3), &fft_params(), Averaging::None).unwrap_err();
+        let err = fetch_fft_via(&SessionCache::new(), &root, "s1", "Speed", Some(3), &fft_params(), Averaging::None).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -1281,7 +1283,7 @@ mod tests {
         let params = SpectrogramParams { window_size: 0, hop_size: 0, window: WindowToken::Hann, detrend: DetrendToken::Mean, scaling: ScalingToken::Density };
 
         // Act
-        let err = fetch_fft_via(&root, "s1", "Dup", Some(1), &params, Averaging::Mean).unwrap_err();
+        let err = fetch_fft_via(&SessionCache::new(), &root, "s1", "Dup", Some(1), &params, Averaging::Mean).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -1301,7 +1303,7 @@ mod tests {
         let params = SpectrogramParams { window_size: 0, hop_size: 0, window: WindowToken::Hann, detrend: DetrendToken::Mean, scaling: ScalingToken::Density };
 
         // Act
-        let err = fetch_fft_via(&root, "s1", "Dup", Some(2), &params, Averaging::Mean).unwrap_err();
+        let err = fetch_fft_via(&SessionCache::new(), &root, "s1", "Dup", Some(2), &params, Averaging::Mean).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -1323,7 +1325,7 @@ mod tests {
         seed_laps_for_s1(&root);
 
         // Act
-        let got = fetch_fft_via(&root, "s1", "Speed", Some(2), &fft_params(), Averaging::Mean).unwrap();
+        let got = fetch_fft_via(&SessionCache::new(), &root, "s1", "Speed", Some(2), &fft_params(), Averaging::Mean).unwrap();
 
         let handle = load_session_handle(&root, "s1").unwrap();
         let (t0, t1) = resolve_lap_window(&root, "s1", 2).unwrap();
@@ -1346,7 +1348,7 @@ mod tests {
         let root = temp_root();
 
         // Act
-        let err = fetch_fft_via(&root, "nope", "Speed", None, &fft_params(), Averaging::Mean).unwrap_err();
+        let err = fetch_fft_via(&SessionCache::new(), &root, "nope", "Speed", None, &fft_params(), Averaging::Mean).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -1361,7 +1363,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let err = fetch_fft_via(&root, "s1", "NopeChannel", None, &fft_params(), Averaging::Mean).unwrap_err();
+        let err = fetch_fft_via(&SessionCache::new(), &root, "s1", "NopeChannel", None, &fft_params(), Averaging::Mean).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -1379,8 +1381,8 @@ mod tests {
         let none_params = SpectrogramParams { window_size: 128, hop_size: 128, window: WindowToken::Hann, detrend: DetrendToken::Mean, scaling: ScalingToken::Density };
 
         // Act
-        let none_bytes = fetch_fft_via(&root, "s1", "Speed", None, &none_params, Averaging::None).unwrap();
-        let max_bytes = fetch_fft_via(&root, "s1", "Speed", None, &fft_params(), Averaging::Max).unwrap();
+        let none_bytes = fetch_fft_via(&SessionCache::new(), &root, "s1", "Speed", None, &none_params, Averaging::None).unwrap();
+        let max_bytes = fetch_fft_via(&SessionCache::new(), &root, "s1", "Speed", None, &fft_params(), Averaging::Max).unwrap();
 
         // Assert — well-formed IDLF header on both; the whole point of R63 (3)
         // is that these no longer reject.
@@ -1404,7 +1406,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let err = fetch_fft_via(&root, "s1", "Speed", None, &fft_params(), Averaging::None).unwrap_err();
+        let err = fetch_fft_via(&SessionCache::new(), &root, "s1", "Speed", None, &fft_params(), Averaging::None).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -1439,7 +1441,7 @@ mod tests {
         write_session_parquet(&root, &session, "0.1.0").unwrap();
 
         // Act
-        let err = fetch_fft_via(&root, "s2", "Speed", None, &fft_params(), Averaging::Mean).unwrap_err();
+        let err = fetch_fft_via(&SessionCache::new(), &root, "s2", "Speed", None, &fft_params(), Averaging::Mean).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -1474,7 +1476,7 @@ mod tests {
         write_session_parquet(&root, &session, "0.1.0").unwrap();
 
         // Act
-        let err = fetch_fft_via(&root, "s3", "Speed", None, &fft_params(), Averaging::Mean).unwrap_err();
+        let err = fetch_fft_via(&SessionCache::new(), &root, "s3", "Speed", None, &fft_params(), Averaging::Mean).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -1490,7 +1492,7 @@ mod tests {
         let bad_params = SpectrogramParams { window_size: 0, hop_size: 0, window: WindowToken::Hann, detrend: DetrendToken::Mean, scaling: ScalingToken::Density };
 
         // Act
-        let err = fetch_fft_via(&root, "s1", "Speed", None, &bad_params, Averaging::Mean).unwrap_err();
+        let err = fetch_fft_via(&SessionCache::new(), &root, "s1", "Speed", None, &bad_params, Averaging::Mean).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -1514,8 +1516,8 @@ mod tests {
         let range_window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Range { t0_us: 1_000_000, t1_us: 1_140_625 }, colour: "--chart-1".to_string() };
 
         // Act
-        let lap_bytes = fetch_fft_v2_via(&root, &lap_window, "Speed", &fft_params(), Averaging::Mean).unwrap();
-        let range_bytes = fetch_fft_v2_via(&root, &range_window, "Speed", &fft_params(), Averaging::Mean).unwrap();
+        let lap_bytes = fetch_fft_v2_via(&SessionCache::new(), &root, &lap_window, "Speed", &fft_params(), Averaging::Mean).unwrap();
+        let range_bytes = fetch_fft_v2_via(&SessionCache::new(), &root, &range_window, "Speed", &fft_params(), Averaging::Mean).unwrap();
 
         // Assert
         assert_eq!(lap_bytes, range_bytes);
@@ -1533,8 +1535,8 @@ mod tests {
         let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Session, colour: "--chart-1".to_string() };
 
         // Act
-        let v1_bytes = fetch_fft_via(&root, "s1", "Speed", None, &fft_params(), Averaging::Mean).unwrap();
-        let v2_bytes = fetch_fft_v2_via(&root, &window, "Speed", &fft_params(), Averaging::Mean).unwrap();
+        let v1_bytes = fetch_fft_via(&SessionCache::new(), &root, "s1", "Speed", None, &fft_params(), Averaging::Mean).unwrap();
+        let v2_bytes = fetch_fft_v2_via(&SessionCache::new(), &root, &window, "Speed", &fft_params(), Averaging::Mean).unwrap();
 
         // Assert
         assert_eq!(v1_bytes, v2_bytes);
@@ -1551,7 +1553,7 @@ mod tests {
         let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Range { t0_us: 10_000_000, t1_us: 11_000_000 }, colour: "--chart-1".to_string() };
 
         // Act
-        let err = fetch_fft_v2_via(&root, &window, "Speed", &fft_params(), Averaging::Mean).unwrap_err();
+        let err = fetch_fft_v2_via(&SessionCache::new(), &root, &window, "Speed", &fft_params(), Averaging::Mean).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -1568,7 +1570,7 @@ mod tests {
         let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 99 }, colour: "--chart-1".to_string() };
 
         // Act
-        let err = fetch_fft_v2_via(&root, &window, "Speed", &fft_params(), Averaging::Mean).unwrap_err();
+        let err = fetch_fft_v2_via(&SessionCache::new(), &root, &window, "Speed", &fft_params(), Averaging::Mean).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);

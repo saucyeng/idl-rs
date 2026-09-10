@@ -219,7 +219,15 @@ pub fn reimport_sessions(
     session_ids: Vec<String>,
     progress: tauri::ipc::Channel<Progress>,
     data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, crate::session_cache::SessionCache>,
 ) -> Result<ReimportReport, IpcError> {
+    // Every named session's `data.parquet` is rewritten, so every decode
+    // of one is stale — invalidated up front rather than per success, since
+    // a failed rebuild can still have replaced the file before failing
+    // (ruling R203.2).
+    for session_id in &session_ids {
+        cache.invalidate_session(session_id);
+    }
     Ok(reimport_sessions_via(&data_dir.0, &session_ids, |done, total| {
         let _ = progress.send(Progress { done, total: Some(total), phase: "sessions".to_string() });
     }))
