@@ -168,6 +168,12 @@ pub fn open_catalog(path: &Path) -> Result<Connection, CatalogError> {
 /// Creates the schema and sets `user_version` on a freshly-opened,
 /// empty database.
 fn create_schema(conn: &Connection) -> Result<(), CatalogError> {
+    // Idempotent: `open_catalog` may already have bootstrapped an empty file
+    // (R200), and callers that open-then-create must not fail on it.
+    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if user_version == CATALOG_SCHEMA_VERSION {
+        return Ok(());
+    }
     conn.execute_batch(DDL)?;
     conn.pragma_update(None, "user_version", CATALOG_SCHEMA_VERSION)?;
     Ok(())
