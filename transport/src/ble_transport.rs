@@ -7,7 +7,7 @@ use btleplug::api::{
     BDAddr, Central, CentralEvent, Characteristic, Manager as _, Peripheral as _, ScanFilter,
     WriteType,
 };
-use btleplug::platform::{Adapter, Manager, Peripheral, PeripheralId};
+use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
@@ -213,7 +213,11 @@ impl BleTransport for BtleplugBle {
                 let Ok(peripheral) = adapter.peripheral(&id).await else { continue };
                 let Ok(Some(props)) = peripheral.properties().await else { continue };
                 let device = DiscoveredDevice {
-                    device_id: id.to_string(),
+                    // The Bluetooth address, not `PeripheralId`'s `Display`:
+                    // the latter is a MAC on Windows, a bluez object path on
+                    // Linux and a UUID on macOS, and `connect` needs one
+                    // spelling it can look up on every platform (R193).
+                    device_id: props.address.to_string(),
                     name: props.local_name.unwrap_or_default(),
                     // `props.rssi` is `None` on some backends until the
                     // first advertisement report lands; -127 dBm (the
@@ -237,18 +241,32 @@ impl BleTransport for BtleplugBle {
 
     /// SPEC §7.4 steps 2–4: connect, discover services, subscribe to Status
     /// notifications, read the initial status for `ConnectionInfo::
-    /// firmware_version`. `device_id` is whatever `scan` handed back
-    /// (`PeripheralId`'s `Display`, a colon-delimited MAC on this platform)
-    /// — parsed back via `BDAddr`'s `FromStr` rather than re-scanning, so
-    /// the device must already be known to this adapter (from a prior
-    /// `scan` call) or this errors.
+    /// firmware_version`. `device_id` is whatever `scan` handed back: the
+    /// device's Bluetooth address, colon-delimited — parsed back via
+    /// `BDAddr`'s `FromStr` and looked up among the adapter's known
+    /// peripherals by address (R193: `PeripheralId: From<BDAddr>` exists
+    /// only on Windows), so the device must already be known to this
+    /// adapter (from a prior `scan` call) or this errors.
     async fn connect(&mut self, device_id: &str) -> Result<ConnectionInfo, TransportError> {
         let addr: BDAddr = device_id
             .parse()
             .map_err(|e| ble_error(format!("device id {device_id:?} is not a BLE address: {e}")))?;
-        let id: PeripheralId = addr.into();
-        let peripheral = self.adapter.peripheral(&id).await.map_err(|e| {
-            ble_error(format!("device {device_id} not known to this adapter — scan for it first: {e}"))
+        let known = self
+            .adapter
+            .peripherals()
+            .await
+            .map_err(|e| ble_error(format!("listing known peripherals failed: {e}")))?;
+        let mut found = None;
+        for candidate in known {
+            if let Ok(Some(props)) = candidate.properties().await {
+                if props.address == addr {
+                    found = Some(candidate);
+                    break;
+                }
+            }
+        }
+        let peripheral = found.ok_or_else(|| {
+            ble_error(format!("device {device_id} not known to this adapter — scan for it first"))
         })?;
         peripheral
             .connect()
