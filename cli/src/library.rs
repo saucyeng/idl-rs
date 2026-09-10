@@ -470,7 +470,9 @@ pub fn fold_in(
             FoldOutcome::Imported => summary.imported += 1,
             FoldOutcome::Skipped => summary.skipped += 1,
             FoldOutcome::Failed => summary.failed += 1,
-            FoldOutcome::NoImporter => summary.no_importer += 1,
+            // Unreachable: the only path that produces `NoImporter` counted
+            // itself and `continue`d before this match.
+            FoldOutcome::NoImporter => {}
         }
         if result.source_removed {
             summary.moved += 1;
