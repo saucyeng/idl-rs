@@ -84,13 +84,13 @@ mod tests {
         ("core/src/track_artifact/write.rs", "delete_track"),
         // (h) `move_data_dir` (C3 §3.10 as amended by R197: move, not copy).
         // `copy_verify_delete` removes a source file only after its copy has
-        // verified at the destination; `move_data_dir_via` removes a source
+        // verified at the destination; `move_data_dir_with` removes a source
         // whose destination copy already verifies, resuming an interrupted
         // run; `prune_emptied_dirs` uses `remove_dir`, which fails on a
         // non-empty directory by construction, so it can only remove what the
         // move itself emptied.
         ("tauri/src/commands/app.rs", "copy_verify_delete"),
-        ("tauri/src/commands/app.rs", "move_data_dir_via"),
+        ("tauri/src/commands/app.rs", "move_data_dir_with"),
         ("tauri/src/commands/app.rs", "prune_emptied_dirs"),
         // (e) the one and only blob-deleting path: `delete_session` with
         // `delete_blob: true`, after confirming no other session references
