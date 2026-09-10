@@ -1356,6 +1356,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn update_session_timestamp_an_existing_row_takes_the_user_supplied_start() {
+        // Arrange — a catalogued session whose importer left the start at 0
+        // (C1 §3.1: unknown), the case `set_session_start` exists for.
+        let root = temp_root();
+        let doc = empty_session_json("s1");
+        write_full_session(&root, "s1", 0, &doc);
+        rebuild_catalog(&root).unwrap();
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+
+        // Act
+        let updated = update_session_timestamp(&conn, "s1", 1_700_000_000_000).unwrap();
+
+        // Assert
+        assert!(updated);
+        let stored: i64 = conn
+            .query_row("SELECT timestamp_utc_ms FROM sessions WHERE session_id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 1_700_000_000_000);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn update_session_timestamp_an_unknown_session_id_returns_false_and_changes_nothing() {
+        // Arrange
+        let root = temp_root();
+        let doc = empty_session_json("s1");
+        write_full_session(&root, "s1", 10_000, &doc);
+        rebuild_catalog(&root).unwrap();
+        let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+
+        // Act
+        let updated = update_session_timestamp(&conn, "nope", 1_700_000_000_000).unwrap();
+
+        // Assert
+        assert!(!updated);
+        let stored: i64 = conn
+            .query_row("SELECT timestamp_utc_ms FROM sessions WHERE session_id = 's1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 10_000);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Minimal domain `Track` for [`upsert_track`] tests — `store::catalog`
     /// has no reason to exercise gate/timing fields, only the five scalar
     /// columns `upsert_track` writes.

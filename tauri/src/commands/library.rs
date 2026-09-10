@@ -90,13 +90,16 @@ pub struct ReimportReport {
 
 /// Transport-agnostic core of `set_session_start` (C3 §3.3). Writes the
 /// user-supplied start into `session.json` with `timestamp_source: "user"`
-/// (C1 §3.1/§6, ruling R194) via core, then re-indexes this session's
-/// catalog row so listing and sorting agree with the file (R194 item 3 —
-/// the catalog's populate path already prefers `session.json` when the
-/// source is `"user"`), and returns the re-read `SessionDetail`, the shape
-/// `save_session_metadata` returns for the same reason.
+/// (C1 §3.1/§6, ruling R194) via core, then updates this session's catalog
+/// `timestamp_utc_ms` so listing and sorting agree with the file (R194 item
+/// 3 — the catalog's own populate path already prefers `session.json` when
+/// the source is `"user"`, so a later `rebuild_catalog` reaches the same
+/// value), and returns the re-read `SessionDetail`, the shape
+/// `save_session_metadata` returns for the same reason. A targeted
+/// `UPDATE`, not a full `index_session` re-index: nothing but the start
+/// changed, and re-indexing re-reads `data.parquet` for every column.
 ///
-/// The catalog re-index is best-effort in exactly one way: a `<data>` with
+/// The catalog update is skipped in exactly one case: a `<data>` with
 /// no `catalog.sqlite` yet is left alone rather than having one created
 /// here (the catalog is "deletable, rebuildable, never synced" — creating
 /// it is `rebuild_catalog`'s job). A catalog that exists but rejects the
@@ -113,7 +116,7 @@ fn set_session_start_via(data_dir: &Path, session_id: &str, timestamp_utc_ms: i6
     let catalog_path = data_dir.join("catalog.sqlite");
     if catalog_path.is_file() {
         let conn = idl_rs::store::catalog::open_catalog(&catalog_path)?;
-        idl_rs::store::catalog::index_session(&conn, data_dir, session_id)?;
+        idl_rs::store::catalog::update_session_timestamp(&conn, session_id, timestamp_utc_ms)?;
     }
 
     Ok(idl_rs::store::catalog_read::get_session(data_dir, session_id)?.into())
