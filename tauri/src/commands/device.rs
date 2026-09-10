@@ -1051,8 +1051,12 @@ mod tests {
             Err(TransportError::new(TransportErrorKind::Wifi, "StubWifi::push_config not exercised"))
         }
 
-        async fn push_ota(&self, _firmware_image: &[u8]) -> Result<(), TransportError> {
-            Err(TransportError::new(TransportErrorKind::Wifi, "StubWifi::push_ota not exercised"))
+        async fn push_ota(
+            &self,
+            _firmware_image: &[u8],
+            _on_progress: &mut (dyn FnMut(u64, u64) + Send),
+        ) -> Result<(), idl_transport::wifi_transport::OtaPushError> {
+            Err(idl_transport::wifi_transport::OtaPushError::transport("StubWifi::push_ota not exercised"))
         }
     }
 

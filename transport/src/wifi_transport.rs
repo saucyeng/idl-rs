@@ -6,11 +6,21 @@
 //! the app talks to 192.168.4.1 directly and the user joins the AP in
 //! system settings") — desktop always talks to the fixed AP IP directly.
 
+use std::fmt;
+
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
 use crate::device::DeviceFile;
 use crate::{TransportError, TransportErrorKind};
+
+/// How many bytes of the firmware image are handed to the HTTP body stream
+/// at a time (`push_ota`). 16 KiB: large enough that a 1.6 MB image (SPEC
+/// §4.6's `ota_0` partition size) is ~100 chunks rather than thousands, small
+/// enough that the progress callback fires often enough for a smooth bar.
+/// A judgment call — SPEC §6.1 fixes no chunk size, only that the body is
+/// the raw image.
+const OTA_CHUNK_BYTES: usize = 16 * 1024;
 
 /// Builds a `TransportErrorKind::Wifi` error with `message`.
 fn wifi_error(message: impl Into<String>) -> TransportError {
@@ -88,6 +98,86 @@ pub fn verify_device_identity(
     Ok(())
 }
 
+/// Which way a `POST /ota` failed (SPEC §6.1's three documented response
+/// classes). Kept as its own enum rather than folded into
+/// [`TransportErrorKind`]: `Wifi` there means "the HTTP call itself did not
+/// complete", while these three are *the device answering* — the app draws a
+/// different card for each (R198 "distinct typed errors").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OtaPushErrorKind {
+    /// HTTP 400 — the device refused the image before flashing anything:
+    /// `image validation failed` (embedded SHA-256 mismatch, i.e. a corrupt
+    /// upload) or `short upload` (fewer bytes than `Content-Length`
+    /// announced). The device keeps running the previous image, and a retry
+    /// is the right next step.
+    Rejected,
+    /// HTTP 500 — the device failed while receiving or writing the image
+    /// (flash-write or receive failure). The device keeps running the
+    /// previous image; a retry may or may not help.
+    DeviceError,
+    /// Any other non-2xx status, or a transport-level failure before the
+    /// device answered at all (AP gone, connection reset mid-body).
+    Transport,
+}
+
+/// A `POST /ota` failure (SPEC §6.1). Carries the device's own response body
+/// verbatim in [`OtaPushError::detail`] so the UI can show what the firmware
+/// said rather than a guess (R198).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OtaPushError {
+    /// Which of SPEC §6.1's response classes this was.
+    pub kind: OtaPushErrorKind,
+    /// The HTTP status the device returned, or `None` when the request never
+    /// got a response at all.
+    pub status_code: Option<u16>,
+    /// The device's response body, verbatim and untrimmed of meaning (e.g.
+    /// `"image validation failed"`). Empty when there was no body, or when
+    /// the failure happened before a response arrived.
+    pub detail: String,
+    /// What went wrong, for the user. No stack traces.
+    pub message: String,
+}
+
+impl OtaPushError {
+    /// Builds an error of `kind` for a device response with `status_code`
+    /// and body `detail`.
+    pub fn new(
+        kind: OtaPushErrorKind,
+        status_code: Option<u16>,
+        detail: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self { kind, status_code, detail: detail.into(), message: message.into() }
+    }
+
+    /// Builds a [`OtaPushErrorKind::Transport`] error for a failure that
+    /// happened before the device answered — no status, no body.
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self::new(OtaPushErrorKind::Transport, None, "", message)
+    }
+}
+
+impl fmt::Display for OtaPushError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}: {}", self.kind, self.message)
+    }
+}
+
+impl std::error::Error for OtaPushError {}
+
+/// Folds an OTA push failure back into the crate's general transport error,
+/// for callers that route on [`TransportErrorKind`] alone and do not need
+/// the three-way split. The device's body text is kept in the message so
+/// nothing is lost by folding.
+impl From<OtaPushError> for TransportError {
+    fn from(e: OtaPushError) -> Self {
+        let message =
+            if e.detail.is_empty() { e.message } else { format!("{} (device said: {})", e.message, e.detail) };
+        TransportError::new(TransportErrorKind::Wifi, message)
+    }
+}
+
 /// Abstraction over the WiFi/HTTP link to one IDL0 device in WiFi mode
 /// (SPEC §6). `ReqwestWifi` implements it for desktop; L9's mobile plugin
 /// implements it wrapping the platform's network-binding proxy (SPEC §6.2)
@@ -131,7 +221,26 @@ pub trait WifiTransport {
 
     /// `POST /ota` (SPEC §6.1) — raw firmware image body,
     /// `Content-Type: application/octet-stream`, `Content-Length` set.
-    async fn push_ota(&self, firmware_image: &[u8]) -> Result<(), TransportError>;
+    ///
+    /// The body is streamed in [`OTA_CHUNK_BYTES`] chunks and
+    /// `on_progress(sent_bytes, total_bytes)` is called as each chunk is
+    /// pulled out of the body stream by the HTTP client — i.e. as bytes go
+    /// *to the socket*, not merely as they are queued into a sink (R198;
+    /// the Flutter app reported the latter, `wifi_transfer.dart:329-332`).
+    /// `total_bytes` is `firmware_image.len()` and never changes across a
+    /// call. Progress is monotonic and its final value equals `total_bytes`
+    /// on a successful push.
+    ///
+    /// Returns [`OtaPushError`], not [`TransportError`]: SPEC §6.1's three
+    /// response classes are distinct conditions the UI presents differently.
+    /// A `200` means the image validated and the device will reboot ~500 ms
+    /// later — a connection failure on the *next* request is expected, and
+    /// is the caller's business, not this method's.
+    async fn push_ota(
+        &self,
+        firmware_image: &[u8],
+        on_progress: &mut (dyn FnMut(u64, u64) + Send),
+    ) -> Result<(), OtaPushError>;
 }
 
 /// `reqwest`-backed desktop `WifiTransport`, always against
@@ -294,17 +403,89 @@ impl WifiTransport for ReqwestWifi {
         Ok(())
     }
 
-    async fn push_ota(&self, firmware_image: &[u8]) -> Result<(), TransportError> {
-        self.client
+    /// Streams the image as a chunked body, reporting progress as chunks are
+    /// pulled by the client, and splits SPEC §6.1's response classes into
+    /// three typed errors carrying the device's own body text.
+    ///
+    /// The chunks are owned copies rather than borrows of `firmware_image`:
+    /// `reqwest::Body::wrap_stream` requires a `'static` stream, and a
+    /// firmware image is ~1.6 MB (SPEC §4.6), so one copy costs nothing
+    /// measurable against the seconds the upload itself takes. Chunk sizes
+    /// travel to this function over an unbounded channel because the stream
+    /// is polled *inside* the `send()` future and so cannot call
+    /// `on_progress` (a `&mut` borrow held by this frame) directly.
+    async fn push_ota(
+        &self,
+        firmware_image: &[u8],
+        on_progress: &mut (dyn FnMut(u64, u64) + Send),
+    ) -> Result<(), OtaPushError> {
+        let total_bytes = firmware_image.len() as u64;
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let chunks: Vec<Vec<u8>> =
+            firmware_image.chunks(OTA_CHUNK_BYTES).map(|chunk| chunk.to_vec()).collect();
+        let body_stream = futures::stream::iter(chunks.into_iter().map(move |chunk| {
+            // A closed receiver only means this frame stopped listening for
+            // progress; the upload itself carries on.
+            let _ = chunk_tx.send(chunk.len() as u64);
+            Ok::<Vec<u8>, std::io::Error>(chunk)
+        }));
+
+        let send = self
+            .client
             .post(format!("{}/ota", self.base_url))
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(firmware_image.to_vec())
-            .send()
-            .await
-            .map_err(|e| wifi_error(format!("POST /ota failed: {e}")))?
-            .error_for_status()
-            .map_err(|e| wifi_error(format!("POST /ota returned an error status: {e}")))?;
-        Ok(())
+            .header(reqwest::header::CONTENT_LENGTH, total_bytes)
+            .body(reqwest::Body::wrap_stream(body_stream))
+            .send();
+        tokio::pin!(send);
+
+        let mut sent_bytes: u64 = 0;
+        let response = loop {
+            tokio::select! {
+                // `biased` so queued progress is drained before the
+                // completed response is taken — without it a fast local
+                // upload can finish while chunk messages are still pending
+                // and the bar would never reach its total.
+                biased;
+                Some(chunk_bytes) = chunk_rx.recv() => {
+                    sent_bytes += chunk_bytes;
+                    on_progress(sent_bytes, total_bytes);
+                }
+                result = &mut send => break result,
+            }
+        };
+        while let Ok(chunk_bytes) = chunk_rx.try_recv() {
+            sent_bytes += chunk_bytes;
+            on_progress(sent_bytes, total_bytes);
+        }
+
+        let response = response.map_err(|e| OtaPushError::transport(format!("POST /ota failed: {e}")))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let status_code = status.as_u16();
+        let detail = response.text().await.unwrap_or_default();
+        Err(match status_code {
+            400 => OtaPushError::new(
+                OtaPushErrorKind::Rejected,
+                Some(status_code),
+                detail,
+                "the device rejected the firmware image and kept running the previous one",
+            ),
+            500 => OtaPushError::new(
+                OtaPushErrorKind::DeviceError,
+                Some(status_code),
+                detail,
+                "the device failed while writing the firmware image and kept running the previous one",
+            ),
+            _ => OtaPushError::new(
+                OtaPushErrorKind::Transport,
+                Some(status_code),
+                detail,
+                format!("POST /ota returned an unexpected status {status_code}"),
+            ),
+        })
     }
 }
 
@@ -394,6 +575,35 @@ mod tests {
         let err = mismatched.unwrap_err();
         assert_eq!(err.kind, TransportErrorKind::Wifi);
     }
+
+    #[test]
+    fn ota_push_error_kind_serialises_as_snake_case() {
+        // Arrange
+        let kind = OtaPushErrorKind::DeviceError;
+
+        // Act
+        let json = serde_json::to_string(&kind).unwrap();
+
+        // Assert
+        assert_eq!(json, r#""device_error""#);
+    }
+
+    #[test]
+    fn ota_push_error_folded_into_transport_error_keeps_the_device_body_text() {
+        // Arrange
+        let with_body =
+            OtaPushError::new(OtaPushErrorKind::Rejected, Some(400), "short upload", "the device rejected it");
+        let without_body = OtaPushError::transport("POST /ota failed: connection reset");
+
+        // Act
+        let folded_with_body: TransportError = with_body.into();
+        let folded_without_body: TransportError = without_body.into();
+
+        // Assert
+        assert_eq!(folded_with_body.kind, TransportErrorKind::Wifi);
+        assert_eq!(folded_with_body.message, "the device rejected it (device said: short upload)");
+        assert_eq!(folded_without_body.message, "POST /ota failed: connection reset");
+    }
 }
 
 /// Integration-shaped tests: `ReqwestWifi` against a hand-rolled HTTP/1.1
@@ -420,15 +630,21 @@ pub(crate) mod integration {
     pub(crate) type MockResponse = (u16, &'static str, Vec<(String, String)>, Vec<u8>);
 
     /// Spins up a `TcpListener` on an OS-assigned free port and answers
-    /// every request with whatever `route(path, headers)` returns. No HTTP
-    /// framework: SPEC §6 needs only a handful of fixed GET/POST endpoints
-    /// with no persistent connections, and a hand-rolled response is a
-    /// handful of lines (Task 7 Step 2's own guidance) — this keeps the
+    /// every request with whatever `route(path, headers, body)` returns. No
+    /// HTTP framework: SPEC §6 needs only a handful of fixed GET/POST
+    /// endpoints with no persistent connections, and a hand-rolled response
+    /// is a handful of lines (Task 7 Step 2's own guidance) — this keeps the
     /// crate's dependency list to what SPEC actually requires. One request
     /// per accepted connection; `route` runs once per request.
+    ///
+    /// `body` is the request body, read to completion before `route` runs
+    /// whenever the request carries a `Content-Length` (the OTA lane: a
+    /// `POST /ota` whose body the server never read would have the client
+    /// see a reset socket rather than the response). Empty for the
+    /// body-less GETs the earlier tasks' tests send.
     pub(crate) async fn spawn_mock_server<F>(route: F) -> (SocketAddr, JoinHandle<()>)
     where
-        F: Fn(&str, &[(String, String)]) -> MockResponse + Send + Sync + 'static,
+        F: Fn(&str, &[(String, String)], &[u8]) -> MockResponse + Send + Sync + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
         let addr = listener.local_addr().expect("mock server local addr");
@@ -439,29 +655,46 @@ pub(crate) mod integration {
                 let Ok((mut socket, _)) = listener.accept().await else { break };
                 let route = Arc::clone(&route);
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 8192];
-                    let mut total = 0;
-                    loop {
-                        let n = socket.read(&mut buf[total..]).await.unwrap_or(0);
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut scratch = vec![0u8; 8192];
+                    let header_end = loop {
+                        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4; // end of headers
+                        }
+                        let n = socket.read(&mut scratch).await.unwrap_or(0);
                         if n == 0 {
                             return; // connection closed before a full request arrived
                         }
-                        total += n;
-                        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-                            break; // end of headers — every request here has no body
-                        }
-                    }
-                    let text = String::from_utf8_lossy(&buf[..total]);
+                        buf.extend_from_slice(&scratch[..n]);
+                    };
+                    let text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
                     let mut lines = text.lines();
                     let request_line = lines.next().unwrap_or("");
-                    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+                    let path = request_line.split_whitespace().nth(1).unwrap_or("/").to_string();
                     let headers: Vec<(String, String)> = lines
                         .take_while(|line| !line.is_empty())
                         .filter_map(|line| line.split_once(':'))
                         .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
                         .collect();
 
-                    let (status, reason, extra_headers, body) = route(path, &headers);
+                    // Read the body to completion when one was announced, so
+                    // the client is never left writing into a socket nobody
+                    // is draining.
+                    let content_length: usize = headers
+                        .iter()
+                        .find(|(key, _)| key == "content-length")
+                        .and_then(|(_, value)| value.parse().ok())
+                        .unwrap_or(0);
+                    let mut request_body = buf[header_end..].to_vec();
+                    while request_body.len() < content_length {
+                        let n = socket.read(&mut scratch).await.unwrap_or(0);
+                        if n == 0 {
+                            break; // client hung up mid-body
+                        }
+                        request_body.extend_from_slice(&scratch[..n]);
+                    }
+
+                    let (status, reason, extra_headers, body) = route(&path, &headers, &request_body);
                     let mut response = format!(
                         "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
                         body.len()
@@ -482,7 +715,7 @@ pub(crate) mod integration {
     #[tokio::test]
     async fn ping_then_verify_device_identity_matching_ok_mismatched_wifi_error() {
         // Arrange
-        let (addr, _server) = spawn_mock_server(|path, _headers| {
+        let (addr, _server) = spawn_mock_server(|path, _headers, _body| {
             assert_eq!(path, "/ping");
             let body = br#"{"device":"IDL0-A3F2","fw":"1.4.0","proto":1,"battery":87,"sd":"OK","mode":"wifi","ble":"on"}"#.to_vec();
             (
@@ -509,7 +742,7 @@ pub(crate) mod integration {
     #[tokio::test]
     async fn list_files_two_entries_one_missing_session_id_deserialises_both() {
         // Arrange
-        let (addr, _server) = spawn_mock_server(|path, _headers| {
+        let (addr, _server) = spawn_mock_server(|path, _headers, _body| {
             assert_eq!(path, "/files");
             let body = br#"[
                 {"name":"session_001.idl0","size":12345,"session_id":"0123456789abcdef0123456789abcdef"},
@@ -546,7 +779,7 @@ pub(crate) mod integration {
         // Arrange
         const CONTENT: &[u8] = b"0123456789ABCDEFGHIJ"; // 20 bytes
 
-        let (addr, _server) = spawn_mock_server(|path, headers| {
+        let (addr, _server) = spawn_mock_server(|path, headers, _body| {
             assert!(path.starts_with("/download?file="));
             let range_value = headers
                 .iter()
@@ -605,5 +838,118 @@ pub(crate) mod integration {
         let mut concatenated = full_sink[..10].to_vec();
         concatenated.extend_from_slice(&resumed_sink);
         assert_eq!(concatenated, CONTENT);
+    }
+
+    /// A firmware image big enough to cross several `OTA_CHUNK_BYTES`
+    /// boundaries (so progress is genuinely incremental) without being the
+    /// ~1.6 MB of a real one. Byte pattern rather than zeros so a truncated
+    /// or reordered body fails the comparison.
+    fn firmware_fixture(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Spawns a mock `/ota` endpoint answering with `status`/`reason`/`body`
+    /// and recording every request body it received.
+    async fn spawn_ota_server(
+        status: u16,
+        reason: &'static str,
+        body: &'static str,
+    ) -> (SocketAddr, Arc<std::sync::Mutex<Vec<u8>>>, JoinHandle<()>) {
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        let (addr, handle) = spawn_mock_server(move |path, _headers, request_body| {
+            assert_eq!(path, "/ota");
+            sink.lock().unwrap().extend_from_slice(request_body);
+            (status, reason, Vec::new(), body.as_bytes().to_vec())
+        })
+        .await;
+        (addr, received, handle)
+    }
+
+    #[tokio::test]
+    async fn push_ota_multi_chunk_image_arrives_whole_with_monotonic_progress_ending_at_total() {
+        // Arrange
+        let image = firmware_fixture(OTA_CHUNK_BYTES * 3 + 17);
+        let (addr, received, _server) = spawn_ota_server(200, "OK", "ok\n").await;
+        let wifi = ReqwestWifi::new(format!("http://{addr}"));
+        let mut progress: Vec<(u64, u64)> = Vec::new();
+        let mut on_progress = |sent_bytes: u64, total_bytes: u64| progress.push((sent_bytes, total_bytes));
+
+        // Act
+        let pushed = wifi.push_ota(&image, &mut on_progress).await;
+
+        // Assert
+        assert!(pushed.is_ok(), "expected a 200 to succeed, got {pushed:?}");
+        assert_eq!(*received.lock().unwrap(), image);
+        assert!(progress.len() > 1, "a multi-chunk image should report more than one progress step");
+        assert!(progress.windows(2).all(|w| w[0].0 <= w[1].0), "progress must be monotonic");
+        assert!(progress.iter().all(|(_, total)| *total == image.len() as u64));
+        assert_eq!(progress.last().unwrap().0, image.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn push_ota_http_400_is_rejected_with_the_devices_body_text_in_detail() {
+        // Arrange
+        let image = firmware_fixture(1024);
+        let (addr, _received, _server) = spawn_ota_server(400, "Bad Request", "image validation failed").await;
+        let wifi = ReqwestWifi::new(format!("http://{addr}"));
+        let mut on_progress = |_: u64, _: u64| {};
+
+        // Act
+        let err = wifi.push_ota(&image, &mut on_progress).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, OtaPushErrorKind::Rejected);
+        assert_eq!(err.status_code, Some(400));
+        assert_eq!(err.detail, "image validation failed");
+    }
+
+    #[tokio::test]
+    async fn push_ota_http_500_is_device_error_not_rejected() {
+        // Arrange
+        let image = firmware_fixture(1024);
+        let (addr, _received, _server) = spawn_ota_server(500, "Internal Server Error", "flash write failed").await;
+        let wifi = ReqwestWifi::new(format!("http://{addr}"));
+        let mut on_progress = |_: u64, _: u64| {};
+
+        // Act
+        let err = wifi.push_ota(&image, &mut on_progress).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, OtaPushErrorKind::DeviceError);
+        assert_eq!(err.status_code, Some(500));
+        assert_eq!(err.detail, "flash write failed");
+    }
+
+    #[tokio::test]
+    async fn push_ota_undocumented_status_is_transport_carrying_the_status_code() {
+        // Arrange
+        let image = firmware_fixture(1024);
+        let (addr, _received, _server) = spawn_ota_server(418, "I'm a teapot", "no").await;
+        let wifi = ReqwestWifi::new(format!("http://{addr}"));
+        let mut on_progress = |_: u64, _: u64| {};
+
+        // Act
+        let err = wifi.push_ota(&image, &mut on_progress).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, OtaPushErrorKind::Transport);
+        assert_eq!(err.status_code, Some(418));
+    }
+
+    #[tokio::test]
+    async fn push_ota_unreachable_device_is_transport_with_no_status_or_detail() {
+        // Arrange — a port nothing is listening on
+        let wifi = ReqwestWifi::new("http://127.0.0.1:1");
+        let image = firmware_fixture(64);
+        let mut on_progress = |_: u64, _: u64| {};
+
+        // Act
+        let err = wifi.push_ota(&image, &mut on_progress).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, OtaPushErrorKind::Transport);
+        assert_eq!(err.status_code, None);
+        assert!(err.detail.is_empty());
     }
 }
