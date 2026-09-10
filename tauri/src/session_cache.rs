@@ -19,6 +19,15 @@
 //! event drops every channel of that session, because `data.parquet` is a
 //! function of (blob, importer version) and a changed file makes every
 //! decode of it stale at once.
+//!
+//! The lock is held to look a channel up and to insert it, but **not**
+//! across the decode in between, so two commands racing for the same
+//! not-yet-resident channel (a `fetch_tile` and the `cursor_readout` that
+//! settles behind it) can both decode it once. Both results are correct
+//! and byte accounting stays consistent — the loser's copy is simply
+//! dropped — so this costs one redundant decode on a cold channel, never
+//! correctness. Holding the lock across the decode instead would serialise
+//! every sample-serving command in the app behind the slowest read.
 
 use std::collections::HashMap;
 use std::path::Path;

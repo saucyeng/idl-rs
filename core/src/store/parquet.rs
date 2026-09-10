@@ -1005,6 +1005,14 @@ fn non_null_len(batch: &RecordBatch, name: &str) -> usize {
 /// `0.0`). Returns `(source channel id, rate, length)`, or `None` when the
 /// file has no channel with samples — the case where synthesis appends no
 /// `Time` at all.
+///
+/// "Longest" is measured the way the reader measures it: a channel's own
+/// sample count is its **non-null rows** (C1 §4.5's read rule), which is
+/// what `Channel::len()` reports on a `Session` that came back out of
+/// `read_session_parquet`. A channel whose recorded timestamps repeat
+/// therefore counts once per distinct timestamp on both sides of the
+/// comparison — see the duplicate-timestamp election test below, which
+/// pins this against `read_session_parquet` + synthesis.
 fn time_source(
     session_dir: &Path,
     index: &[ChannelColumnInfo],
@@ -1870,6 +1878,50 @@ mod channel_read_tests {
 
         // Assert
         assert_eq!(err.kind, ParquetStoreErrorKind::NotFound);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_channel_a_duplicate_timestamp_candidate_elects_the_same_time_source_as_the_whole_file_read() {
+        // Arrange — two rate-0 channels, the election's fallback branch
+        // (longest wins). `noisy` has more raw samples than `clean`, but
+        // its timestamps repeat, so it has fewer distinct rows. Whichever
+        // channel wins, both readers must pick the same one: the risk is
+        // that a single-column read counts raw samples while the
+        // whole-file read counts the rows a duplicate collapsed to.
+        let mut session = sample_session();
+        session.channels = vec![
+            Channel {
+                channel_id: "noisy".to_string(),
+                t_us: vec![0, 1000, 1000, 2000, 2000, 3000],
+                t_recorded_us: None,
+                nominal_rate_hz: 0.0,
+                column: RawColumn::F64(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                source_kind: "hr".to_string(),
+                unit: "ms".to_string(),
+                gaps: Vec::new(),
+            },
+            Channel {
+                channel_id: "clean".to_string(),
+                t_us: vec![0, 1000, 2000, 3000, 4000],
+                t_recorded_us: None,
+                nominal_rate_hz: 0.0,
+                column: RawColumn::F64(vec![10.0, 20.0, 30.0, 40.0, 50.0]),
+                source_kind: "gps".to_string(),
+                unit: "m".to_string(),
+                gaps: Vec::new(),
+            },
+        ];
+        let (root, dir) = seed(&session);
+        let expected = whole_file(&dir);
+
+        // Act
+        let got = read_channel(&dir, "Time").unwrap();
+
+        // Assert
+        let want = expected.channels.iter().find(|c| c.channel_id == "Time").unwrap();
+        assert_eq!(&got.to_channel(), want);
 
         let _ = std::fs::remove_dir_all(&root);
     }
