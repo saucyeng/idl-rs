@@ -544,43 +544,43 @@ fn get_track_via(data_dir: &Path, track_id: &str) -> Result<TrackDetail, IpcErro
 }
 
 /// C3 §3.2 `list_sessions()`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_sessions(data_dir: tauri::State<'_, DataDir>) -> Result<Vec<SessionSummary>, IpcError> {
     list_sessions_via(&data_dir.0)
 }
 
 /// C3 §3.2 `get_session(session_id)`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_session(session_id: String, data_dir: tauri::State<'_, DataDir>) -> Result<SessionDetail, IpcError> {
     get_session_via(&data_dir.0, &session_id)
 }
 
 /// C3 §3.2 `list_laps(session_id)`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_laps(session_id: String, data_dir: tauri::State<'_, DataDir>) -> Result<Vec<LapSummary>, IpcError> {
     list_laps_via(&data_dir.0, &session_id)
 }
 
 /// C3 §3.2 `rebuild_catalog()`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn rebuild_catalog(data_dir: tauri::State<'_, DataDir>) -> Result<RebuildReport, IpcError> {
     rebuild_catalog_via(&data_dir.0)
 }
 
 /// C3 §3.2 `list_workbooks()`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_workbooks(data_dir: tauri::State<'_, DataDir>) -> Result<Vec<WorkbookSummary>, IpcError> {
     list_workbooks_via(&data_dir.0)
 }
 
 /// C3 §3.2 `list_tracks()`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_tracks(data_dir: tauri::State<'_, DataDir>) -> Result<Vec<TrackSummary>, IpcError> {
     list_tracks_via(&data_dir.0)
 }
 
 /// C3 §3.2 `get_track(track_id)`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_track(track_id: String, data_dir: tauri::State<'_, DataDir>) -> Result<TrackDetail, IpcError> {
     get_track_via(&data_dir.0, &track_id)
 }
@@ -734,7 +734,7 @@ fn save_track_via(data_dir: &Path, draft: TrackDraft, now_ms: i64, new_id: &str)
 /// C3 §3.2 `save_track(track)`. Mints the UUID v4 and `now_ms` here (the
 /// only impure inputs `save_track_via` needs), keeping every core/command
 /// function underneath deterministic and testable without a clock.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_track(track: TrackDraft, data_dir: tauri::State<'_, DataDir>) -> Result<SaveTrackResult, IpcError> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -798,7 +798,7 @@ fn delete_track_via(data_dir: &Path, track_id: &str) -> Result<DeleteTrackReport
 }
 
 /// C3 §3.2 `delete_track(track_id)`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_track(track_id: String, data_dir: tauri::State<'_, DataDir>) -> Result<DeleteTrackReport, IpcError> {
     delete_track_via(&data_dir.0, &track_id)
 }
@@ -866,7 +866,7 @@ fn rescan_tracks_via(data_dir: &Path, session_id: &str) -> Result<RescanReport, 
 /// Re-runs visit and lap detection for one session against the current
 /// track library, rewrites its `session.json`, and re-indexes its catalog
 /// rows when a catalog exists.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn rescan_tracks(session_id: String, data_dir: tauri::State<'_, DataDir>) -> Result<RescanReport, IpcError> {
     rescan_tracks_via(&data_dir.0, &session_id)
 }
@@ -1039,7 +1039,7 @@ fn delete_session_via(data_dir: &Path, session_id: &str, delete_blob: bool) -> R
 }
 
 /// C3 §3.2 `save_session_metadata(session_id, metadata)`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_session_metadata(
     session_id: String,
     metadata: SessionMetadataPatch,
@@ -1049,7 +1049,7 @@ pub fn save_session_metadata(
 }
 
 /// C3 §3.2 `delete_session(session_id, delete_blob)`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_session(
     session_id: String,
     delete_blob: bool,

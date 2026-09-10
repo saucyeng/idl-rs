@@ -81,7 +81,7 @@ pub fn cursor_readout_via(
 // disk via `load_session` — a session/tier cache is design §4's recorded
 // deferral, not this task's (same deferral as `session_source::load_session`
 // and Task 11's workbook commands).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cursor_readout(
     session_id: String,
     channels: Vec<String>,
