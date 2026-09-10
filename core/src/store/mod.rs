@@ -15,6 +15,7 @@ pub mod lap_index;
 pub mod parquet;
 pub mod profile;
 pub mod quarantine;
+pub mod scan;
 pub mod session_json;
 pub mod settings;
 pub mod sync;
