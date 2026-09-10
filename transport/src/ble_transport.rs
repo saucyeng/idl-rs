@@ -514,7 +514,7 @@ mod sequencing {
         // Arrange
         let ble = StubBle::new();
         const CONTENT: &[u8] = b"session bytes";
-        let (addr, _server) = spawn_mock_server(|path, _headers| {
+        let (addr, _server) = spawn_mock_server(|path, _headers, _body| {
             if path == "/ping" {
                 let body = br#"{"device":"IDL0-A3F2","fw":"1.4.0","proto":1,"battery":80,"sd":"OK","mode":"wifi","ble":"on"}"#.to_vec();
                 (
