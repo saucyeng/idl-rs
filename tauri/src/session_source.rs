@@ -892,9 +892,11 @@ mod tests {
     fn resolve_window_lap_span_degenerate_zero_zero_bounds_invalid_argument_with_detail() {
         // Arrange — a `laps[]` entry with `start_time_secs == end_time_secs
         // == 0.0` (a corrupted or hand-edited `session.json`; the shipped
-        // detectors cannot produce this). Unvalidated, `(0.0, 0.0)` is
-        // exactly `main_lap_window`'s "no window selected" sentinel and
-        // would silently resolve to the whole channel (ruling R130).
+        // detectors cannot produce this). A lap of zero duration selects
+        // nothing, so it is rejected at the trust boundary rather than
+        // resolved into an empty window downstream (ruling R130; the
+        // sentinel that made it read as the whole channel is gone since
+        // R128 item 3, but the bounds are still invalid data).
         let root = temp_root();
         seed_session(&root, "s1");
         let mut doc = empty_session_json("s1");
