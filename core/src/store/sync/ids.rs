@@ -288,6 +288,11 @@ mod tests {
         assert_eq!(result, Some(root.join("tracks").join(format!("{id}.idl0t"))));
     }
 
+    // Windows only: `C:evil` is a drive-relative path there and nowhere
+    // else. On Unix the same string is an ordinary file name that escapes
+    // nothing, so `safe_join` is right to accept it; the colon is still
+    // refused by the shape check on every platform. Found by CI's Linux run.
+    #[cfg(windows)]
     #[test]
     fn safe_join_catches_a_drive_relative_escape_the_shape_check_would_also_catch() {
         // Arrange: this segment would already fail `is_valid_id` — safe_join
