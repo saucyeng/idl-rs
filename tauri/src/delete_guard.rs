@@ -27,7 +27,15 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
-    /// The audited delete sites (`runs/2026-09-10/DELETE-AUDIT.md`), as
+    /// The audited delete sites, as
+    ///
+    /// **Where the audit lives:** `runs/2026-09-10/DELETE-AUDIT.md` is in the
+    /// *superproject* (`idl1-app`), not in this repository — `idl-rs` is a
+    /// submodule of it. A reader with only `idl-rs` checked out cannot open
+    /// the cited source, and nothing mechanically ties the two, so an entry
+    /// added here must be added there in the same change by hand.
+    ///
+    /// The entries are
     /// `(path relative to the idl-rs workspace root, enclosing function)`.
     /// One comment per entry says what it deletes and why that is safe.
     const ALLOWLIST: &[(&str, &str)] = &[
@@ -163,39 +171,56 @@ mod tests {
         out
     }
 
-    /// Index of the first line of the file's trailing `#[cfg(test)] mod … {`
-    /// block, if it has one. Everything from there on is test code.
+    /// `true` when line `index` opens an inline `#[cfg(test)] mod … {` block
+    /// — an attribute line followed by a `mod … {` line.
     ///
-    /// Matching the *inline module* form specifically (an attribute line
-    /// followed by a `mod … {` line) is what makes this exact without a
-    /// brace-counting parser: `#[cfg(test)] mod name;` declarations end in
-    /// `;` and are handled by [`test_only_module_files`] instead, and this
-    /// repo places its inline test module last in every file.
-    fn test_module_start(text: &str) -> Option<usize> {
-        let lines: Vec<&str> = text.lines().collect();
-        lines.iter().enumerate().find_map(|(index, line)| {
-            if line.trim() != "#[cfg(test)]" {
-                return None;
+    /// Matching that shape specifically is what makes the skip exact without
+    /// a brace-counting parser: `#[cfg(test)] mod name;` *declarations* end
+    /// in `;` and are handled by [`test_only_module_files`] instead.
+    fn opens_inline_test_module(lines: &[&str], index: usize) -> bool {
+        if lines[index].trim() != "#[cfg(test)]" {
+            return false;
+        }
+        match lines.get(index + 1) {
+            Some(next) => {
+                let next = next.trim();
+                next.starts_with("mod ") && next.ends_with('{')
             }
-            let next = lines.get(index + 1)?.trim();
-            if next.starts_with("mod ") && next.ends_with('{') {
-                Some(index)
-            } else {
-                None
-            }
-        })
+            None => false,
+        }
     }
 
     /// Scans one file, returning `(relative path, function)` for every delete
     /// call in non-test code.
+    ///
+    /// Each inline test module is skipped individually, from its
+    /// `#[cfg(test)]` line to the next line that is exactly `}` in column 0
+    /// — this repo's test modules are top-level items, so their closing brace
+    /// is the only unindented `}` that can end them. Skipping each block
+    /// rather than everything from the first one to end of file matters:
+    /// several files here carry two test modules back to back, and one file
+    /// could carry production code between them.
+    ///
+    /// Erring is one-directional by design. A `#[cfg(test)]` *function* is
+    /// still scanned, so a delete inside one would be reported as
+    /// unaudited — noisy, but visible. Nothing production is ever skipped.
     fn scan(root: &Path, path: &Path, text: &str) -> Vec<(String, String)> {
         let relative = path.strip_prefix(root).unwrap_or(path).display().to_string().replace('\\', "/");
-        let end = test_module_start(text).unwrap_or(usize::MAX);
+        let lines: Vec<&str> = text.lines().collect();
         let mut hits = Vec::new();
         let mut current_fn = String::from("(module)");
-        for (index, line) in text.lines().enumerate() {
-            if index >= end {
-                break;
+        let mut in_test_module = false;
+        for index in 0..lines.len() {
+            let line = lines[index];
+            if in_test_module {
+                if line == "}" {
+                    in_test_module = false;
+                }
+                continue;
+            }
+            if opens_inline_test_module(&lines, index) {
+                in_test_module = true;
+                continue;
             }
             if line.trim_start().starts_with("//") {
                 continue;
@@ -208,6 +233,43 @@ mod tests {
             }
         }
         hits
+    }
+
+    #[test]
+    fn scan_production_code_between_two_inline_test_modules_is_still_scanned() {
+        // Arrange — the shape that would break a "first test module to end of
+        // file" skip: two test modules with a production function between
+        // them, each containing a delete call.
+        let source = "fn early() {\n    std::fs::remove_file(&p);\n}\n\
+                      #[cfg(test)]\nmod tests {\n    fn helper() {\n        std::fs::remove_dir_all(&r);\n    }\n}\n\
+                      fn between() {\n    std::fs::remove_dir(&d);\n}\n\
+                      #[cfg(test)]\nmod more_tests {\n    fn other() {\n        std::fs::remove_file(&q);\n    }\n}\n";
+
+        // Act
+        let hits = scan(Path::new("/repo"), Path::new("/repo/core/src/thing.rs"), source);
+
+        // Assert — both production sites, neither test site.
+        assert_eq!(
+            hits,
+            vec![
+                ("core/src/thing.rs".to_string(), "early".to_string()),
+                ("core/src/thing.rs".to_string(), "between".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_a_cfg_test_mod_declaration_is_not_mistaken_for_an_inline_test_module() {
+        // Arrange — `#[cfg(test)] mod name;` ends in `;`, pulls in a separate
+        // file, and must not start a skip that swallows the rest of this one.
+        let source = "#[cfg(test)]\nmod loopback_tests;\n\
+                      fn after() {\n    std::fs::remove_file(&p);\n}\n";
+
+        // Act
+        let hits = scan(Path::new("/repo"), Path::new("/repo/transport/src/sync/mod.rs"), source);
+
+        // Assert
+        assert_eq!(hits, vec![("transport/src/sync/mod.rs".to_string(), "after".to_string())]);
     }
 
     #[test]
