@@ -45,7 +45,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 # `/ping` and `/files` (SPEC §6.1) are both JSON bodies this trait
 # deserialises directly (`PingResponse`, `Vec<DeviceFile>>`); not in Task 6's
 # original feature list because Task 6 only wrote the trait, not its body.
-reqwest = { version = "0.13.4", default-features = false, features = ["stream", "json"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["stream", "json", "rustls"] }
 # Task 8: the sync manifest/apply this crate's server calls through are
 # `idl-rs` (PLAN §8 Q1 — sync lives in `idl-transport`, gaining this one
 # dependency; `idl-rs` never depends back on this crate). No merge logic
