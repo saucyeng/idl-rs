@@ -32,9 +32,11 @@ pub struct AppSettings {
     pub unit_system: UnitSystem,
     /// The command "Ask an agent" spawns in the user's terminal (ruling
     /// R222 item 3). A bare program name is resolved on `PATH`; the
-    /// default is `claude`. Never a shell line — it is passed as the
-    /// program, with arguments built by the command layer, so nothing the
-    /// user types here is interpreted by a shell.
+    /// default is `claude`. Never a shell line: the command layer rejects
+    /// one, spawns it as the program directly where the platform allows
+    /// (Windows Terminal), and shell-quotes it where a shell is
+    /// unavoidable, so nothing the user types here is ever interpreted as
+    /// more than one program name.
     #[serde(default = "default_agent_command")]
     pub agent_command: String,
 }

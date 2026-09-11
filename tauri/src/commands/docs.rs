@@ -169,6 +169,29 @@ fn check_agent_command(command: &str) -> Result<(), IpcError> {
     Ok(())
 }
 
+/// `s` as a POSIX shell single-quoted word: wrapped in `'`, with every
+/// embedded `'` closed, escaped and reopened (`'\''`).
+///
+/// Applied to *every* value spliced into a shell line, including the data
+/// root — a library folder named `O'Brien` is ordinary, and an unquoted
+/// path there would end the quoted string mid-command.
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// `s` as a PowerShell single-quoted string: wrapped in `'`, with every
+/// embedded `'` doubled, which is PowerShell's own escape.
+fn ps_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// `s` as the body of an AppleScript double-quoted string: `\` and `"`
+/// escaped. The macOS path nests a shell line inside one of these, so the
+/// shell quoting has to survive AppleScript's own parse first.
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// One terminal invocation: the program to run and its arguments, with the
 /// working directory applied by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,7 +210,8 @@ pub struct TerminalInvocation {
 /// interpreted. Otherwise `cmd /c start "" powershell -NoExit -Command
 /// …`, which is the only way to get a *visible* console out of a GUI
 /// process without Windows Terminal; that path does go through a shell,
-/// which is why the values reaching it are checked above.
+/// which is why every value reaching it — the data root included — is
+/// shell-quoted rather than spliced raw.
 ///
 /// **macOS and Linux are untested** (ruling R222 item 3 says to document
 /// them as such). The macOS path drives Terminal.app through `osascript`;
@@ -220,7 +244,14 @@ pub fn terminal_invocation(
                 "powershell".to_string(),
                 "-NoExit".to_string(),
                 "-Command".to_string(),
-                format!("Set-Location '{cwd}'; & {agent_command} '{prompt}'"),
+                format!(
+                    "Set-Location {}; & {} {}",
+                    ps_single_quote(&cwd),
+                    // `&` needs its program quoted too, or a path with a
+                    // space is split into a program and its arguments.
+                    ps_single_quote(agent_command),
+                    ps_single_quote(prompt)
+                ),
             ],
         }),
         "macos" => Ok(TerminalInvocation {
@@ -228,7 +259,13 @@ pub fn terminal_invocation(
             args: vec![
                 "-e".to_string(),
                 format!(
-                    "tell application \"Terminal\" to do script \"cd '{cwd}' && {agent_command} '{prompt}'\""
+                    "tell application \"Terminal\" to do script \"{}\"",
+                    applescript_escape(&format!(
+                        "cd {} && {} {}",
+                        sh_single_quote(&cwd),
+                        sh_single_quote(agent_command),
+                        sh_single_quote(prompt)
+                    ))
                 ),
             ],
         }),
@@ -238,7 +275,12 @@ pub fn terminal_invocation(
                 "-e".to_string(),
                 "sh".to_string(),
                 "-c".to_string(),
-                format!("cd '{cwd}' && {agent_command} '{prompt}'"),
+                format!(
+                    "cd {} && {} {}",
+                    sh_single_quote(&cwd),
+                    sh_single_quote(agent_command),
+                    sh_single_quote(prompt)
+                ),
             ],
         }),
         other => Err(IpcError::new(
@@ -503,5 +545,69 @@ mod tests {
                 "{os}: the prompt never reaches the agent"
             );
         }
+    }
+
+    #[test]
+    fn terminal_invocation_a_data_root_containing_an_apostrophe_is_quoted_not_spliced() {
+        // Arrange — `C:\Users\O'Brien\idl1` is an ordinary Windows library
+        // path, and an unquoted one would close the shell string mid-command.
+        let cwd = Path::new("C:/Users/O'Brien/idl1");
+
+        // Act / Assert — PowerShell doubles the apostrophe; the two POSIX
+        // shells close/escape/reopen it; and on macOS that escape's own
+        // backslash is then doubled again for AppleScript, which strips one
+        // before the shell ever sees the line.
+        for (os, escaped) in [("windows", "O''Brien"), ("macos", "O'\\\\''Brien"), ("linux", "O'\\''Brien")] {
+            let invocation = terminal_invocation(os, false, cwd, "claude", "hello").unwrap();
+            let line = invocation.args.last().unwrap().clone();
+            assert!(
+                line.contains(escaped),
+                "{os}: the apostrophe in the data root reached the shell unescaped: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_invocation_an_agent_path_containing_a_space_stays_one_program() {
+        // Arrange
+        let cwd = Path::new("/data");
+
+        // Act / Assert — an absolute path is a documented, supported value,
+        // so it must not be split into a program and an argument.
+        for os in ["windows", "macos", "linux"] {
+            let invocation = terminal_invocation(os, false, cwd, "/Applications/My App/claude", "hello").unwrap();
+            let line = invocation.args.last().unwrap().clone();
+            assert!(
+                line.contains("'/Applications/My App/claude'"),
+                "{os}: the agent path was not quoted as one word: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn sh_single_quote_a_value_with_an_apostrophe_closes_escapes_and_reopens() {
+        // Arrange / Act
+        let quoted = sh_single_quote("O'Brien");
+
+        // Assert
+        assert_eq!(quoted, "'O'\\''Brien'");
+    }
+
+    #[test]
+    fn ps_single_quote_a_value_with_an_apostrophe_doubles_it() {
+        // Arrange / Act
+        let quoted = ps_single_quote("O'Brien");
+
+        // Assert
+        assert_eq!(quoted, "'O''Brien'");
+    }
+
+    #[test]
+    fn applescript_escape_a_value_with_a_quote_and_a_backslash_escapes_both() {
+        // Arrange / Act
+        let escaped = applescript_escape(r#"a\b"c"#);
+
+        // Assert
+        assert_eq!(escaped, r#"a\\b\"c"#);
     }
 }
