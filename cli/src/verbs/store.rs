@@ -144,10 +144,13 @@ fn cli(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
     let markdown = render_command_reference();
     let table = command_table_json();
 
+    // The table is embedded in the envelope only when it is not being
+    // written to a file: with `--out` the file *is* the payload, and
+    // repeating all of it on stdout would double the output for no reader.
     let data = json!({
         "out": out.as_ref().map(|p| p.display().to_string()),
         "written": out.is_some() && !ctx.dry_run,
-        "table": table,
+        "table": out.is_none().then(|| table.clone()),
     });
 
     match (&out, ctx.dry_run) {

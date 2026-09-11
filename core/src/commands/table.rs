@@ -505,7 +505,9 @@ pub const COMMANDS: &[CommandRow] = &[
         core_fn: "commands::workbook_ops::new_workbook",
         json_shape: Some("WorkbookNewReport"),
         help: "Create a new workbook from a built-in skeleton",
-        tier: Tier::Core,
+        // R225 ratified this tier on the app side; the two tables share the
+        // id `workbook.new`, so the tier is that ruling's, not this row's.
+        tier: Tier::Occasional,
         status: Status::Current,
         data_dir: false,
         writer: true,
@@ -747,7 +749,8 @@ pub const COMMANDS: &[CommandRow] = &[
         core_fn: "store::import::reimport_session",
         json_shape: Some("RebuildSessionsReport"),
         help: "Re-import listed sessions from their own blobs",
-        tier: Tier::Rare,
+        // Shared id `library.rebuild`: R225 set this tier on the app side.
+        tier: Tier::Occasional,
         status: Status::Current,
         data_dir: true,
         writer: true,
