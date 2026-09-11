@@ -41,11 +41,19 @@ pub struct AppSettingsDto {
     pub rider_name: String,
     /// Unit system used across the app. Engine default is `Imperial`.
     pub unit_system: UnitSystem,
+    /// The command "Ask an agent" spawns (ruling R222 item 3). Engine
+    /// default is `claude`.
+    pub agent_command: String,
 }
 
 impl From<AppSettings> for AppSettingsDto {
     fn from(s: AppSettings) -> Self {
-        Self { data_dir: s.data_dir, rider_name: s.rider_name, unit_system: s.unit_system }
+        Self {
+            data_dir: s.data_dir,
+            rider_name: s.rider_name,
+            unit_system: s.unit_system,
+            agent_command: s.agent_command,
+        }
     }
 }
 
@@ -62,6 +70,17 @@ pub struct AppSettingsArg {
     pub rider_name: String,
     /// Unit system to persist.
     pub unit_system: UnitSystem,
+    /// The agent command to persist (ruling R222 item 3). Trimmed and
+    /// validated at spawn time by `commands::docs`, not here: a setting
+    /// the user is halfway through typing must still be storable.
+    #[serde(default = "default_agent_command_arg")]
+    pub agent_command: String,
+}
+
+/// `AppSettingsArg::agent_command`'s serde default, so a frontend built
+/// before this field existed still deserialises (C3 §5's additive rule).
+fn default_agent_command_arg() -> String {
+    "claude".to_string()
 }
 
 /// C3 §3.10 `DataDirInfo`.
@@ -110,6 +129,7 @@ fn set_settings_via(settings_path: &Path, arg: AppSettingsArg) -> Result<AppSett
     let mut current = idl_rs::store::settings::load(settings_path);
     current.rider_name = arg.rider_name;
     current.unit_system = arg.unit_system;
+    current.agent_command = arg.agent_command;
     idl_rs::store::settings::save(settings_path, &current).map_err(map_settings_error)?;
     Ok(idl_rs::store::settings::load(settings_path).into())
 }
@@ -962,6 +982,7 @@ mod tests {
             data_dir: Some("D:\\race-data".to_string()),
             rider_name: "Isaac".to_string(),
             unit_system: UnitSystem::Metric,
+            agent_command: "claude".to_string(),
         };
         idl_rs::store::settings::save(&path, &written).unwrap();
 
@@ -977,8 +998,8 @@ mod tests {
     #[test]
     fn app_settings_dto_unit_system_serialises_to_the_literal_imperial_and_metric_strings() {
         // Arrange
-        let imperial = AppSettingsDto { data_dir: None, rider_name: String::new(), unit_system: UnitSystem::Imperial };
-        let metric = AppSettingsDto { data_dir: None, rider_name: String::new(), unit_system: UnitSystem::Metric };
+        let imperial = AppSettingsDto { data_dir: None, rider_name: String::new(), unit_system: UnitSystem::Imperial, agent_command: "claude".to_string() };
+        let metric = AppSettingsDto { data_dir: None, rider_name: String::new(), unit_system: UnitSystem::Metric, agent_command: "claude".to_string() };
 
         // Act
         let imperial_json = serde_json::to_value(&imperial).unwrap();
@@ -1001,12 +1022,14 @@ mod tests {
             data_dir: Some("D:\\existing-override".to_string()),
             rider_name: String::new(),
             unit_system: UnitSystem::Imperial,
+            agent_command: "claude".to_string(),
         };
         idl_rs::store::settings::save(&path, &existing).unwrap();
         let arg = AppSettingsArg {
             data_dir: Some("D:\\attempted-override".to_string()),
             rider_name: "Isaac".to_string(),
             unit_system: UnitSystem::Metric,
+            agent_command: "claude".to_string(),
         };
 
         // Act
@@ -1022,7 +1045,7 @@ mod tests {
         let app_config = temp_root();
         let path = settings_path(&app_config);
         let arg =
-            AppSettingsArg { data_dir: None, rider_name: "Isaac".to_string(), unit_system: UnitSystem::Metric };
+            AppSettingsArg { data_dir: None, rider_name: "Isaac".to_string(), unit_system: UnitSystem::Metric, agent_command: "claude".to_string() };
 
         // Act
         let dto = set_settings_via(&path, arg).unwrap();
@@ -1069,6 +1092,7 @@ mod tests {
                 data_dir: Some(override_root.display().to_string()),
                 rider_name: String::new(),
                 unit_system: UnitSystem::Imperial,
+                agent_command: "claude".to_string(),
             },
         )
         .unwrap();
@@ -1467,6 +1491,7 @@ mod tests {
                 data_dir: Some(override_root.display().to_string()),
                 rider_name: String::new(),
                 unit_system: UnitSystem::Imperial,
+                agent_command: "claude".to_string(),
             },
         )
         .unwrap();

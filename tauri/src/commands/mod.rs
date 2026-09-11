@@ -4,6 +4,9 @@ pub mod app;
 pub mod catalog;
 pub mod cursor;
 pub mod device;
+/// The bundled workbook reference and "Ask an agent" (C3 §3.10,
+/// ruling R222 items 1-3).
+pub mod docs;
 pub mod firmware;
 pub mod histogram;
 pub mod import;

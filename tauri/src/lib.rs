@@ -97,6 +97,8 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::library::inbox_status,
         commands::app::get_settings,
         commands::app::set_settings,
+        commands::docs::read_workbook_reference,
+        commands::docs::open_agent_terminal,
         commands::app::get_data_dir,
         commands::app::set_data_dir,
         commands::app::move_data_dir,

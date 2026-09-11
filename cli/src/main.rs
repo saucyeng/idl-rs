@@ -12,6 +12,7 @@
 //! `scan`) write their raw artifact on success and an error envelope to stderr
 //! on failure. See `docs/IDL0_SPEC.md` (CLI section) for the contract.
 
+mod docs_cmd;
 mod envelope;
 mod library;
 mod recover;
@@ -266,6 +267,13 @@ enum Command {
     Library {
         #[command(subcommand)]
         action: library::LibraryAction,
+    },
+    /// Regenerate documentation from the engine's own catalogs (the
+    /// `docs` group, ruling R222 item 1). CI runs `docs workbook` and
+    /// fails if the committed file differs.
+    Docs {
+        #[command(subcommand)]
+        action: docs_cmd::DocsAction,
     },
     /// Evaluate, list, or validate a workbook's tables (the `table` group).
     Table {
@@ -570,6 +578,7 @@ fn main() -> ExitCode {
             recover::scan_all(&device, out_dir.as_deref(), scan_limit.unwrap_or(u64::MAX)),
         ),
         Command::Library { action } => library::run(action),
+        Command::Docs { action } => docs_cmd::run(action),
         Command::Table { action } => table_cmd::run(action),
         Command::Import { file, data_dir } => cmd_import(&file, &data_dir),
         Command::Sessions { data_dir, format } => cmd_sessions(&data_dir, format),
