@@ -34,6 +34,76 @@ impl HistogramResult {
     }
 }
 
+/// The binning range `histogram` would choose for `samples` with no explicit
+/// `range`: the finite data min/max, widened to `[-m, m]` with
+/// `m = max(|min|, |max|)` when `symmetric` so zero sits on a bin boundary.
+///
+/// `None` when no sample is finite — the caller has nothing to bin, the same
+/// case that yields [`HistogramResult::empty`]. A zero-width range (a constant
+/// channel) is still returned as `Some((v, v))`: it is a real answer about the
+/// data, and it is [`histogram`] that decides such a range is unbinnable, not
+/// this function.
+///
+/// Extracted so [`bins_for_width`] and [`histogram`] agree on the range by
+/// construction rather than by two copies of the same min/max fold.
+pub fn data_range(samples: &[f64], symmetric: bool) -> Option<(f64, f64)> {
+    let (mut mn, mut mx) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &v in samples {
+        if v.is_finite() {
+            if v < mn {
+                mn = v;
+            }
+            if v > mx {
+                mx = v;
+            }
+        }
+    }
+    if mn > mx {
+        return None; // no finite sample
+    }
+    if symmetric {
+        let m = mn.abs().max(mx.abs());
+        Some((-m, m))
+    } else {
+        Some((mn, mx))
+    }
+}
+
+/// The bin **count** that covers `samples`' auto range (see [`data_range`]) in
+/// buckets no wider than `bin_width`, in the samples' own unit — the
+/// count-side translation of a "bin width" choice, so [`histogram`] keeps one
+/// binning mode (equal-width buckets over a resolved range) and the caller's
+/// two ways of expressing it both land there.
+///
+/// `ceil(range / bin_width)`, floored at 1 so a width at least as wide as the
+/// whole range still yields one bin rather than zero. `0` — meaning "nothing
+/// to bin", which [`histogram`] renders as [`HistogramResult::empty`] — when
+/// no sample is finite, when `bin_width` is not finite and positive, or when
+/// the range has zero width (a constant channel).
+///
+/// Capped at `max_bins` so a pathologically small width cannot ask for an
+/// allocation proportional to `range / bin_width`; the cap is the caller's,
+/// since only the caller knows what its transport can carry.
+pub fn bins_for_width(samples: &[f64], bin_width: f64, symmetric: bool, max_bins: usize) -> usize {
+    if !(bin_width > 0.0) || !bin_width.is_finite() {
+        return 0;
+    }
+    let (lo, hi) = match data_range(samples, symmetric) {
+        Some(r) => r,
+        None => return 0,
+    };
+    let span = hi - lo;
+    if !(span > 0.0) {
+        return 0;
+    }
+    let exact = span / bin_width;
+    if !exact.is_finite() {
+        return 0;
+    }
+    let count = exact.ceil() as usize;
+    count.max(1).min(max_bins)
+}
+
 /// Bins finite `samples` into `bins` equal-width buckets.
 ///
 /// Range is `[lo, hi]` when `range` is `Some` (the future manual-range path);
@@ -60,28 +130,10 @@ pub fn histogram(
     // pass; it runs only when the caller did not supply an explicit range.
     let (lo, hi) = match range {
         Some(r) => r,
-        None => {
-            let (mut mn, mut mx) = (f64::INFINITY, f64::NEG_INFINITY);
-            for &v in samples {
-                if v.is_finite() {
-                    if v < mn {
-                        mn = v;
-                    }
-                    if v > mx {
-                        mx = v;
-                    }
-                }
-            }
-            if mn > mx {
-                return HistogramResult::empty(); // no finite sample
-            }
-            if symmetric {
-                let m = mn.abs().max(mx.abs());
-                (-m, m)
-            } else {
-                (mn, mx)
-            }
-        }
+        None => match data_range(samples, symmetric) {
+            Some(r) => r,
+            None => return HistogramResult::empty(), // no finite sample
+        },
     };
 
     let width = hi - lo;
@@ -172,6 +224,104 @@ mod tests {
         assert_eq!(h.counts.first(), Some(&1));
         assert_eq!(h.counts.last(), Some(&1));
         assert_eq!(h.total, 2);
+    }
+
+    #[test]
+    fn data_range_symmetric_widens_to_the_larger_magnitude_about_zero() {
+        // Arrange
+        let data = vec![-1.0, 0.0, 3.0];
+
+        // Act
+        let asymmetric = data_range(&data, false).unwrap();
+        let symmetric = data_range(&data, true).unwrap();
+
+        // Assert
+        assert_relative_eq!(asymmetric.0, -1.0, epsilon = 1e-12);
+        assert_relative_eq!(asymmetric.1, 3.0, epsilon = 1e-12);
+        assert_relative_eq!(symmetric.0, -3.0, epsilon = 1e-12);
+        assert_relative_eq!(symmetric.1, 3.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn data_range_no_finite_sample_is_none() {
+        // Arrange / Act / Assert
+        assert!(data_range(&[f64::NAN, f64::INFINITY], false).is_none());
+        assert!(data_range(&[], false).is_none());
+    }
+
+    #[test]
+    fn bins_for_width_exact_division_covers_the_range_with_no_extra_bin() {
+        // Arrange — range 0..10, width 2 → exactly 5 bins.
+        let data = vec![0.0, 10.0];
+
+        // Act
+        let bins = bins_for_width(&data, 2.0, false, 4096);
+
+        // Assert
+        assert_eq!(bins, 5);
+    }
+
+    #[test]
+    fn bins_for_width_inexact_division_rounds_up_so_the_range_is_covered() {
+        // Arrange — range 0..10, width 3 → 3.33… bins, must cover the top.
+        let data = vec![0.0, 10.0];
+
+        // Act
+        let bins = bins_for_width(&data, 3.0, false, 4096);
+
+        // Assert
+        assert_eq!(bins, 4);
+    }
+
+    #[test]
+    fn bins_for_width_width_wider_than_the_range_is_one_bin_not_zero() {
+        // Arrange
+        let data = vec![0.0, 1.0];
+
+        // Act
+        let bins = bins_for_width(&data, 100.0, false, 4096);
+
+        // Assert
+        assert_eq!(bins, 1);
+    }
+
+    #[test]
+    fn bins_for_width_tiny_width_is_capped_at_max_bins() {
+        // Arrange — 1e-9 over a range of 10 would be 10 billion bins.
+        let data = vec![0.0, 10.0];
+
+        // Act
+        let bins = bins_for_width(&data, 1e-9, false, 4096);
+
+        // Assert
+        assert_eq!(bins, 4096);
+    }
+
+    #[test]
+    fn bins_for_width_degenerate_inputs_are_zero() {
+        // Zero/negative/non-finite width, a constant channel, and an
+        // all-non-finite channel each have nothing to bin.
+        assert_eq!(bins_for_width(&[0.0, 10.0], 0.0, false, 4096), 0);
+        assert_eq!(bins_for_width(&[0.0, 10.0], -1.0, false, 4096), 0);
+        assert_eq!(bins_for_width(&[0.0, 10.0], f64::NAN, false, 4096), 0);
+        assert_eq!(bins_for_width(&[5.0, 5.0], 1.0, false, 4096), 0);
+        assert_eq!(bins_for_width(&[f64::NAN], 1.0, false, 4096), 0);
+    }
+
+    #[test]
+    fn bins_for_width_and_histogram_agree_on_the_symmetric_range() {
+        // Arrange — the width must be measured against the *widened* range.
+        let data = vec![-1.0, 0.0, 3.0];
+
+        // Act — symmetric range is [-3, 3], span 6, width 2 → 3 bins.
+        let bins = bins_for_width(&data, 2.0, true, 4096);
+        let h = histogram(&data, bins, true, None);
+
+        // Assert
+        assert_eq!(bins, 3);
+        assert_eq!(h.counts.len(), 3);
+        assert_relative_eq!(h.bin_edges[0], -3.0, epsilon = 1e-12);
+        assert_relative_eq!(*h.bin_edges.last().unwrap(), 3.0, epsilon = 1e-12);
     }
 
     #[test]

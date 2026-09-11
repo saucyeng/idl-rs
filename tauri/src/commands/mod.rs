@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod cursor;
 pub mod device;
 pub mod firmware;
+pub mod histogram;
 pub mod import;
 pub mod library;
 pub mod maintenance;

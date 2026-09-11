@@ -76,6 +76,7 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::rasters::fetch_raster_meta,
         commands::rasters::fetch_fft,
         commands::rasters::fetch_fft_v2,
+        commands::histogram::fetch_histogram,
         commands::tiles::fetch_tile,
         commands::import::list_importers,
         commands::import::import_file,
