@@ -22,7 +22,7 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::store::catalog::{open_catalog, rebuild_catalog, CatalogError, CatalogErrorKind, RebuildReport};
-use crate::store::parquet::{read_channel_index, read_channel_sample_counts, read_session_metadata};
+use crate::store::parquet::{parse_source_format, read_channel_index, read_channel_sample_counts, read_session_metadata};
 use crate::store::session_json::{
     read_session_json, LapJson, NeutralZoneVisitJson, OverlayLapKeyJson, SectorJson, TrackVisitJson,
 };
@@ -362,28 +362,47 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
     let doc = read_session_json(&sj_path).map_err(io_like)?;
     let index = read_channel_index(&session_dir).map_err(io_like)?;
     let counts = read_channel_sample_counts(&session_dir).map_err(io_like)?;
+    let source_format = parse_source_format(&metadata.source_format).map_err(io_like)?;
 
-    let channels = index
-        .iter()
-        .map(|c| ChannelSummary {
+    // Both readers walk the file's schema fields in order and skip the same
+    // axis columns, so the two lists are the same channels in the same
+    // order. Zipping rather than looking each name up keeps that invariant
+    // visible — and checked, since a future divergence would otherwise
+    // report every `sample_count` as a silent zero.
+    if counts.len() != index.len() {
+        return Err(io_like(format!(
+            "{} channel columns but {} sample counts for session {session_id} — the two footer readers disagree",
+            index.len(),
+            counts.len()
+        )));
+    }
+    let mut channels = Vec::with_capacity(index.len());
+    for (c, (name, count)) in index.iter().zip(counts.iter()) {
+        if name != &c.channel_id {
+            return Err(io_like(format!(
+                "channel column {} paired with sample count for {name} on session {session_id}",
+                c.channel_id
+            )));
+        }
+        channels.push(ChannelSummary {
             channel_id: c.channel_id.clone(),
             nominal_rate_hz: c.nominal_rate_hz,
             unit: c.unit.clone(),
             source_kind: c.source_kind.clone(),
             channel_kind: if c.nominal_rate_hz == 0.0 { "event".to_string() } else { "fixed-rate".to_string() },
-            sample_count: counts.iter().find(|(n, _)| *n == c.channel_id).map_or(0, |(_, n)| *n as u64),
-        })
-        .collect();
+            sample_count: *count as u64,
+        });
+    }
 
     Ok(SessionDetail {
         session_id: session_id.to_string(),
         device_id: metadata.device_id,
         timestamp_utc_ms: crate::store::session_json::effective_start_ms(&doc, metadata.timestamp_utc_ms),
         config_checksum: metadata.config_checksum,
-        // The stored C1 §4.3 token verbatim (`"idl0"`/`"fit"`/`"gpx"`/
-        // `"csv"`) — the same string a parsed `SourceFormat::as_str()`
-        // round-trips to, without parsing it first.
-        source_format: metadata.source_format.clone(),
+        // Parsed and re-rendered, not passed through: a token that is not
+        // one of C1 §4.3's four is a corrupt file and must fail here, as it
+        // did when this function decoded the whole session to find out.
+        source_format: source_format.as_str().to_string(),
         blob_sha256: metadata.blob_sha256,
         channels,
         rider: doc.rider,

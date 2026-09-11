@@ -586,6 +586,25 @@ fn metadata_from_builder(
     })
 }
 
+/// One of C1 §4.3's four `source_format` tokens, parsed, or a
+/// [`ParquetStoreErrorKind::Schema`] error naming the token that is not one
+/// of them.
+///
+/// Public because the footer-only readers need the same validation the
+/// whole-file read has always done: a caller that reports `source_format`
+/// out of [`SessionParquetMetadata`] must reject a corrupt or foreign token
+/// rather than pass it through (C1 treats stored metadata as data to
+/// validate, not trust).
+pub fn parse_source_format(token: &str) -> Result<SourceFormat, ParquetStoreError> {
+    match token {
+        "idl0" => Ok(SourceFormat::Idl0),
+        "fit" => Ok(SourceFormat::Fit),
+        "gpx" => Ok(SourceFormat::Gpx),
+        "csv" => Ok(SourceFormat::Csv),
+        other => Err(ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("unknown source_format {other}"))),
+    }
+}
+
 /// Reads `data.parquet`'s file-level key-value metadata (C1 §4.3) only — no
 /// row-group or column materialization, just the Parquet footer.
 pub fn read_session_metadata(path: &Path) -> Result<SessionParquetMetadata, ParquetStoreError> {
@@ -688,15 +707,7 @@ pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
 /// cannot drift on how a stored `source_format` token becomes a
 /// [`SourceFormat`].
 fn session_shell(meta: SessionParquetMetadata) -> Result<Session, ParquetStoreError> {
-    let source_format = match meta.source_format.as_str() {
-        "idl0" => SourceFormat::Idl0,
-        "fit" => SourceFormat::Fit,
-        "gpx" => SourceFormat::Gpx,
-        "csv" => SourceFormat::Csv,
-        other => {
-            return Err(ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("unknown source_format {other}")))
-        }
-    };
+    let source_format = parse_source_format(&meta.source_format)?;
     // `timestamp_source` is deliberately not among `data.parquet`'s C1 §4.3
     // metadata keys (it lives only in `session.json`, R194) — this read-back
     // path has no recorded provenance to recover, so it approximates from
