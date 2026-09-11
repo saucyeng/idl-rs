@@ -26,7 +26,7 @@ pub use error::{WorkbookError, WorkbookErrorKind};
 pub use eval::{eval_cells, CellDefResult, CellError, CellEvalResult};
 pub use front_matter::{ConstantRaw, FrontMatter, UnitsPref};
 pub use host::{channel, host_constants, host_laps, host_session, to_host_channel, HostChannel, HostLap, HostSession};
-pub use host_channel_wire::encode_host_channel_idlh;
+pub use host_channel_wire::{encode_host_channel_idlh, AxisKind};
 pub use js_cell::{find_inline_exprs, InlineExpr};
 pub use math_cell::{parse_math_cell_body, rewrite_math_cell_body, MathCellLine};
 pub use prose::{render_prose_html, ProseSpanRef, RenderedProse};

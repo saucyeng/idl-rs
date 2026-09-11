@@ -254,12 +254,15 @@ fn cmd_eval(
                         ),
                     });
                 }
-                if (ctx.lap_index as usize) >= laps.len() {
+                // Matched by lap *number*, the way `lap_windows` resolves it
+                // (C2 §4, ruling R217 item 2.4) — a count comparison would
+                // still pass for a number no lap carries after a renumber.
+                if !laps.iter().any(|l| l.lap_number == ctx.lap_number) {
                     warnings.push(Warning {
                         kind: "lap_out_of_range".into(),
                         message: format!(
-                            "table '{}' row {r} lap {} is past the {} detected laps",
-                            wt.block_id, ctx.lap_index, laps.len()
+                            "table '{}' row {r} lap {} matches none of the {} detected laps",
+                            wt.block_id, ctx.lap_number, laps.len()
                         ),
                     });
                 }
@@ -468,6 +471,8 @@ mod tests {
                 columns: cols,
                 rows: (0..rows).map(|i| Row { id: format!("r{i}"), context: None }).collect(),
                 cells: (0..rows).map(|_| vec![]).collect(),
+                            row_source: idl_rs::table::RowSource::Authored,
+                main_row_id: None,
             },
         }
     }
