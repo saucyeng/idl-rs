@@ -21,6 +21,7 @@ use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 
+use crate::session::handle::{ChannelSource, LazyChannelInfo, SessionHandle};
 use crate::session::{Channel, ChannelSamples, GapSpan, RawColumn, Session, SourceFormat};
 use crate::store::atomic::write_atomic;
 
@@ -41,6 +42,12 @@ pub enum ParquetStoreErrorKind {
     /// Raised only by the single-channel read path ([`read_channel`]) —
     /// the whole-file readers never ask for a name.
     NotFound,
+    /// The allocator refused a buffer this read needs (ruling R211.4). The
+    /// file is fine and the request is legitimate — this machine cannot
+    /// hold the result right now. Never a panic and never an abort: the
+    /// caller maps it to C3 §1's `resource_exhausted` and the app shows a
+    /// toast.
+    ResourceExhausted,
 }
 
 /// Error from the Parquet store. Never `Err(String)` (CLAUDE.md §5).
@@ -616,30 +623,7 @@ pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
     let batch = arrow::compute::concat_batches(&schema, &batches)
         .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Io, format!("concat_batches: {e}")))?;
 
-    let session_id = meta.session_id;
-    let timestamp_utc_ms = meta.timestamp_utc_ms;
-    let blob_sha256 = meta.blob_sha256;
-    let source_format = match meta.source_format.as_str() {
-        "idl0" => SourceFormat::Idl0,
-        "fit" => SourceFormat::Fit,
-        "gpx" => SourceFormat::Gpx,
-        "csv" => SourceFormat::Csv,
-        other => {
-            return Err(ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("unknown source_format {other}")))
-        }
-    };
-    // `timestamp_source` is deliberately not among `data.parquet`'s C1 §4.3
-    // metadata keys (it lives only in `session.json`, R194) — this read-back
-    // path has no recorded provenance to recover, so it approximates from
-    // `source_format` the same way importer-absent test fixtures do
-    // (`Idl0` -> `Header`, everything else -> `SourceFile`). Nothing today
-    // reads this field off a parquet-round-tripped `Session`.
-    let timestamp_source = match source_format {
-        SourceFormat::Idl0 => crate::session::TimestampSource::Header,
-        _ => crate::session::TimestampSource::SourceFile,
-    };
-    let device_id = meta.device_id;
-    let config_checksum = meta.config_checksum;
+    let mut session = session_shell(meta)?;
 
     let t_col = batch
         .column_by_name("t")
@@ -648,7 +632,6 @@ pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| ParquetStoreError::new(ParquetStoreErrorKind::Schema, "t column is not Int64".to_string()))?;
 
-    let mut channels = Vec::new();
     for field in schema.fields() {
         let name = field.name();
         if name == "t" || name.ends_with("_t_recorded_us") {
@@ -681,7 +664,7 @@ pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
 
         let (t_us, t_recorded_us, column) = read_column(col, t_col, recorded_col, meta)?;
 
-        channels.push(Channel {
+        session.channels.push(Channel {
             channel_id: name.clone(),
             t_us,
             t_recorded_us,
@@ -693,7 +676,47 @@ pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
         });
     }
 
-    Ok(Session { session_id, device_id, timestamp_utc_ms, timestamp_source, config_checksum, source_format, blob_sha256, channels })
+    Ok(session)
+}
+
+/// The [`Session`] `data.parquet`'s file-level C1 §4.3 metadata describes,
+/// with **no** channels: identity, provenance and format, nothing decoded.
+///
+/// Shared by [`read_session_parquet`], which then fills `channels` in, and
+/// by [`open_session_lazy`], which leaves them empty and reaches each one
+/// through [`read_channel`] on demand (ruling R211.1) — so the two paths
+/// cannot drift on how a stored `source_format` token becomes a
+/// [`SourceFormat`].
+fn session_shell(meta: SessionParquetMetadata) -> Result<Session, ParquetStoreError> {
+    let source_format = match meta.source_format.as_str() {
+        "idl0" => SourceFormat::Idl0,
+        "fit" => SourceFormat::Fit,
+        "gpx" => SourceFormat::Gpx,
+        "csv" => SourceFormat::Csv,
+        other => {
+            return Err(ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("unknown source_format {other}")))
+        }
+    };
+    // `timestamp_source` is deliberately not among `data.parquet`'s C1 §4.3
+    // metadata keys (it lives only in `session.json`, R194) — this read-back
+    // path has no recorded provenance to recover, so it approximates from
+    // `source_format` the same way importer-absent test fixtures do
+    // (`Idl0` -> `Header`, everything else -> `SourceFile`). Nothing today
+    // reads this field off a parquet-round-tripped `Session`.
+    let timestamp_source = match source_format {
+        SourceFormat::Idl0 => crate::session::TimestampSource::Header,
+        _ => crate::session::TimestampSource::SourceFile,
+    };
+    Ok(Session {
+        session_id: meta.session_id,
+        device_id: meta.device_id,
+        timestamp_utc_ms: meta.timestamp_utc_ms,
+        timestamp_source,
+        config_checksum: meta.config_checksum,
+        source_format,
+        blob_sha256: meta.blob_sha256,
+        channels: Vec::new(),
+    })
 }
 
 /// Filters `col`'s non-null rows, pairing each with `t`'s value at that row
@@ -708,6 +731,16 @@ pub fn read_session_parquet(path: &Path) -> Result<Session, ParquetStoreError> {
 /// `scale`/`offset` metadata for `Int16`/`Int32`/`Float32`; `Float64` is
 /// read verbatim (bit-exact, including `-0.0`/`NaN` — no `× 1.0 + 0.0`,
 /// C1 §2's `F64` round-trip guarantee).
+/// The [`ParquetStoreErrorKind::ResourceExhausted`] error for a buffer the
+/// allocator refused (ruling R211.4), naming which buffer and how many
+/// samples it was for.
+fn out_of_memory(what: &str, rows: usize) -> ParquetStoreError {
+    ParquetStoreError::new(
+        ParquetStoreErrorKind::ResourceExhausted,
+        format!("could not allocate {what} for {rows} samples"),
+    )
+}
+
 fn read_column(
     col: &ArrayRef,
     t_col: &Int64Array,
@@ -726,9 +759,19 @@ fn read_column(
             let arr = col.as_any().downcast_ref::<$arr_ty>().ok_or_else(|| {
                 ParquetStoreError::new(ParquetStoreErrorKind::Schema, "column type mismatch".to_string())
             })?;
+            // Reserved up front and fallibly (ruling R211.4): these three
+            // buffers are the session-scaled allocations of a channel read,
+            // and growing them by doubling would both copy more and abort
+            // on refusal instead of reporting one.
+            let rows = arr.len() - arr.null_count();
             let mut t_us = Vec::new();
             let mut t_recorded_us = Vec::new();
             let mut values = Vec::new();
+            t_us.try_reserve_exact(rows).map_err(|_| out_of_memory("t_us", rows))?;
+            values.try_reserve_exact(rows).map_err(|_| out_of_memory("values", rows))?;
+            if recorded_col.is_some() {
+                t_recorded_us.try_reserve_exact(rows).map_err(|_| out_of_memory("t_recorded_us", rows))?;
+            }
             for i in 0..arr.len() {
                 if arr.is_valid(i) {
                     t_us.push(t_col.value(i));
@@ -784,11 +827,13 @@ fn read_column(
 // and rebuild — the paths that genuinely want every channel.
 // ---------------------------------------------------------------------------
 
-/// The synthesized time channel's id (C1 §2). Never a stored column.
-const TIME_CHANNEL_ID: &str = "Time";
+/// The synthesized time channel's id (C1 §2). Never a stored column. One
+/// definition, in `session::handle`, so the lazy channel index and this
+/// reader cannot disagree about the name.
+use crate::session::handle::TIME_CHANNEL_ID;
 /// The synthesized cumulative-distance channel's id (C1 §2). Never a stored
 /// column.
-const DISTANCE_CHANNEL_ID: &str = "Distance";
+pub(crate) const DISTANCE_CHANNEL_ID: &str = "Distance";
 /// The channel `Distance` integrates. Absent → no `Distance` exists.
 const GPS_SPEED_CHANNEL_ID: &str = "GPS_SpeedKmh";
 
@@ -1179,6 +1224,246 @@ pub fn estimate_session_bytes(session_dir: &Path) -> Result<u64, ParquetStoreErr
     let rows = index.first().map_or(0, |c| c.file_rows) as u64;
     let per_row: u64 = index.iter().map(|c| c.sample_bytes as u64 * 2 + 16).sum::<u64>() + 8;
     Ok(rows.saturating_mul(per_row))
+}
+
+/// The session's recorded time span, microseconds, as
+/// `Some((first_us, last_us))` — the smallest and largest value of the
+/// shared `t` axis — or `None` when the file has no rows (ruling R211.1).
+///
+/// `t` is the **union** axis: every channel's timestamps appear in it, so
+/// its minimum is the earliest first sample of any channel and its maximum
+/// the latest last sample of any channel. That is exactly what a
+/// whole-session span is, which is why it can be read without decoding a
+/// single channel — this replaces the whole-session decode the app used to
+/// do on every window resolution.
+///
+/// Read from `t`'s column-chunk statistics, which `write_session_parquet`
+/// enables explicitly for that column; a file whose chunks carry none falls
+/// back to reading the `t` column alone (8 B/row, no channel data).
+pub fn read_time_axis_bounds(session_dir: &Path) -> Result<Option<(i64, i64)>, ParquetStoreError> {
+    let builder = open_data_parquet(session_dir)?;
+    let metadata = builder.metadata().clone();
+    drop(builder);
+
+    let mut bounds: Option<(i64, i64)> = None;
+    let mut have_stats = true;
+    for group in metadata.row_groups() {
+        if group.num_rows() == 0 {
+            continue;
+        }
+        let Some(chunk) = group.columns().iter().find(|c| c.column_path().string() == "t") else {
+            have_stats = false;
+            break;
+        };
+        let stats = match chunk.statistics() {
+            Some(parquet::file::statistics::Statistics::Int64(s)) => s.clone(),
+            _ => {
+                have_stats = false;
+                break;
+            }
+        };
+        let (Some(&min), Some(&max)) = (stats.min_opt(), stats.max_opt()) else {
+            have_stats = false;
+            break;
+        };
+        bounds = Some(match bounds {
+            Some((lo, hi)) => (lo.min(min), hi.max(max)),
+            None => (min, max),
+        });
+    }
+    if have_stats {
+        return Ok(bounds);
+    }
+
+    let batch = read_projected_batch(session_dir, &[])?;
+    let t = t_column_of(&batch)?;
+    let mut out: Option<(i64, i64)> = None;
+    for i in 0..t.len() {
+        if t.is_null(i) {
+            continue;
+        }
+        let v = t.value(i);
+        out = Some(match out {
+            Some((lo, hi)) => (lo.min(v), hi.max(v)),
+            None => (v, v),
+        });
+    }
+    Ok(out)
+}
+
+/// Every stored channel's **exact** sample count — its non-null rows, C1
+/// §4.5's read rule — without decoding any samples (ruling R211.1).
+///
+/// Read from the row groups' column-chunk statistics in the footer, which
+/// `write_session_parquet` leaves at the writer's default (per-page
+/// statistics, which include the chunk null count). A column whose chunks
+/// carry no null count falls back to decoding that column and counting —
+/// correct on any file, whatever wrote it, at the cost of one column read;
+/// the fallback is per column, so one statistics-less column never widens
+/// into a whole-session decode.
+///
+/// Returned in schema order, matching [`read_channel_index`]. Synthesized
+/// `Time`/`Distance` are not included — they are never columns (C1 §2).
+pub fn read_channel_sample_counts(session_dir: &Path) -> Result<Vec<(String, usize)>, ParquetStoreError> {
+    let builder = open_data_parquet(session_dir)?;
+    let metadata = builder.metadata().clone();
+    let schema = builder.schema().clone();
+    drop(builder);
+
+    let mut out = Vec::new();
+    let mut needs_decode: Vec<String> = Vec::new();
+    for field in schema.fields() {
+        if is_axis_column(field.name()) {
+            continue;
+        }
+        let mut rows = 0usize;
+        let mut nulls = 0usize;
+        let mut have_stats = true;
+        for group in metadata.row_groups() {
+            let Some(chunk) = group.columns().iter().find(|c| c.column_path().string() == *field.name()) else {
+                have_stats = false;
+                break;
+            };
+            let Some(null_count) = chunk.statistics().and_then(|s| s.null_count_opt()) else {
+                have_stats = false;
+                break;
+            };
+            rows += group.num_rows().max(0) as usize;
+            nulls += null_count as usize;
+        }
+        if have_stats {
+            out.push((field.name().clone(), rows.saturating_sub(nulls)));
+        } else {
+            needs_decode.push(field.name().clone());
+            out.push((field.name().clone(), 0));
+        }
+    }
+
+    for name in needs_decode {
+        let batch = read_projected_batch(session_dir, &[name.as_str()])?;
+        let exact = non_null_len(&batch, &name);
+        if let Some(slot) = out.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = exact;
+        }
+    }
+    Ok(out)
+}
+
+/// A [`ChannelSource`] over one session directory: every lookup is a
+/// [`read_channel`] of that one column (ruling R211.1).
+///
+/// Nothing is cached here — a lazy [`SessionHandle`] remembers what it has
+/// already asked for, and the app's `SessionCache` (`idl-rs-tauri`) is the
+/// cross-request, byte-budgeted cache. This type is the plain, unbudgeted
+/// source the CLI and the import pipeline use.
+#[derive(Debug, Clone)]
+pub struct ParquetChannelSource {
+    session_dir: PathBuf,
+}
+
+impl ParquetChannelSource {
+    /// A source over `<data>/sessions/<session_id>` (C4 §2).
+    pub fn new(session_dir: impl Into<PathBuf>) -> Self {
+        ParquetChannelSource { session_dir: session_dir.into() }
+    }
+}
+
+impl ChannelSource for ParquetChannelSource {
+    /// One channel, or `None` when the file has no such channel **or** the
+    /// read failed. [`ChannelSource`] has no error channel by design (see
+    /// its docs): a failed decode degrades that one channel to absent
+    /// rather than failing a whole import or evaluation.
+    fn channel(&self, channel_id: &str) -> Option<Channel> {
+        read_channel(&self.session_dir, channel_id).ok().map(ChannelSamples::into_channel)
+    }
+}
+
+/// Every channel a lazy [`SessionHandle`] over `session_dir` can serve,
+/// from the file footer alone — the stored columns plus the synthesized
+/// `Time`/`Distance` (ruling R211.1).
+///
+/// The two synthesized entries are listed on the same conditions
+/// `session::synthesis::synthesize_base_channels` appends them, as far as
+/// the footer can tell: `Time` whenever the file has a channel column and
+/// at least one row, `Distance` additionally when `GPS_SpeedKmh` is stored
+/// at a positive rate. The footer cannot see that every row of a column is
+/// null, so a listed entry can still resolve to `None` at decode time —
+/// [`SessionHandle::with_channel`] treats that exactly as an absent
+/// channel, which is what synthesis would have produced anyway.
+///
+/// [`LazyChannelInfo::max_length`] is the file's row count for every entry:
+/// a per-channel sample count is its non-null rows, which the footer does
+/// not carry (C1 §4.5).
+pub fn read_lazy_channel_index(session_dir: &Path) -> Result<Vec<LazyChannelInfo>, ParquetStoreError> {
+    let index = read_channel_index(session_dir)?;
+    let rows = index.first().map_or(0, |c| c.file_rows);
+    let max_rate = index.iter().map(|c| c.nominal_rate_hz).filter(|r| *r > 0.0).fold(0.0_f64, f64::max);
+
+    let mut out: Vec<LazyChannelInfo> = index
+        .iter()
+        .map(|c| LazyChannelInfo {
+            channel_id: c.channel_id.clone(),
+            nominal_rate_hz: c.nominal_rate_hz,
+            unit: c.unit.clone(),
+            max_length: rows,
+            synthesized: false,
+        })
+        .collect();
+
+    if !index.is_empty() && rows > 0 {
+        // `Time`/`Distance` carry the elected source channel's rate, exactly
+        // as synthesis gives them (`0.0` when no channel declares a positive
+        // rate — ledger R23 Q2 — never a fabricated one).
+        out.push(LazyChannelInfo {
+            channel_id: TIME_CHANNEL_ID.to_string(),
+            nominal_rate_hz: max_rate,
+            unit: "s".to_string(),
+            max_length: rows,
+            synthesized: true,
+        });
+        if index.iter().any(|c| c.channel_id == GPS_SPEED_CHANNEL_ID && c.nominal_rate_hz > 0.0) {
+            out.push(LazyChannelInfo {
+                channel_id: DISTANCE_CHANNEL_ID.to_string(),
+                nominal_rate_hz: max_rate,
+                unit: "m".to_string(),
+                max_length: rows,
+                synthesized: true,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// A [`SessionHandle`] over `<session_dir>/data.parquet` that decodes
+/// **nothing** until a channel is asked for, then decodes that channel
+/// alone (ruling R211.1).
+///
+/// The replacement for `read_session_parquet` + `SessionHandle::
+/// from_session` everywhere a caller wants a handle rather than a whole
+/// `Session`: lap indexing after an import, a rescan, and the app's
+/// workbook evaluator (which supplies its own byte-budgeted
+/// [`ChannelSource`] instead of [`ParquetChannelSource`]). Costs two footer
+/// reads and no row-group decode.
+pub fn open_session_lazy(session_dir: &Path) -> Result<SessionHandle, ParquetStoreError> {
+    open_session_lazy_with(session_dir, Arc::new(ParquetChannelSource::new(session_dir)))
+}
+
+/// [`open_session_lazy`] with a caller-supplied [`ChannelSource`] in place
+/// of the plain [`ParquetChannelSource`].
+///
+/// The app passes its byte-budgeted `SessionCache` here (ruling R211.2), so
+/// the evaluator's decodes queue behind the same budget as every other
+/// command's rather than each passing a check none of them can honour
+/// together. `source` is trusted to serve the same channels the index
+/// lists, out of the same file.
+pub fn open_session_lazy_with(
+    session_dir: &Path,
+    source: Arc<dyn ChannelSource>,
+) -> Result<SessionHandle, ParquetStoreError> {
+    let meta = read_session_metadata(&session_dir.join("data.parquet"))?;
+    let index = read_lazy_channel_index(session_dir)?;
+    let session = session_shell(meta)?;
+    Ok(SessionHandle::lazy(session, index, source))
 }
 
 #[cfg(test)]
@@ -1738,6 +2023,7 @@ mod streaming_write_parity_tests {
 mod channel_read_tests {
     use super::tests::sample_session;
     use super::*;
+    use crate::math::eval::ChannelLookup;
     use crate::session::synthesis::synthesize_base_channels;
     use uuid::Uuid;
 
@@ -1942,6 +2228,130 @@ mod channel_read_tests {
         assert_eq!(index[0].nominal_rate_hz, 800.0);
         assert_eq!(index[0].source_kind, "imu0");
         assert_eq!(index[1].sample_bytes, 8);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_lazy_channel_index_lists_every_stored_column_plus_the_two_synthesized_ones() {
+        // Arrange
+        let session = session_with_gps_speed();
+        let (root, dir) = seed(&session);
+        let expected = whole_file(&dir);
+
+        // Act
+        let index = read_lazy_channel_index(&dir).unwrap();
+
+        // Assert — the same set of names a whole-session read plus synthesis
+        // produces, which is what makes the lazy handle interchangeable.
+        let mut got: Vec<&str> = index.iter().map(|i| i.channel_id.as_str()).collect();
+        let mut want: Vec<&str> = expected.channels.iter().map(|c| c.channel_id.as_str()).collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+        assert!(index.iter().find(|i| i.channel_id == "Time").unwrap().synthesized);
+        assert!(index.iter().find(|i| i.channel_id == "Distance").unwrap().synthesized);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_session_lazy_serves_the_same_samples_units_and_rates_as_the_whole_file_read() {
+        // Arrange
+        let session = session_with_gps_speed();
+        let (root, dir) = seed(&session);
+        let expected = whole_file(&dir);
+
+        // Act
+        let handle = open_session_lazy(&dir).unwrap();
+
+        // Assert — every channel, including both synthesized ones, resolves
+        // through the lazy path to what synthesis would have built.
+        for want in &expected.channels {
+            // Bitwise: these fixtures carry `-0.0` and `NaN` deliberately,
+            // and `NaN != NaN` would pass a wrong answer as a failure and a
+            // sign flip as a match.
+            let bits = |v: Vec<f64>| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+            assert_eq!(
+                bits(handle.channel_samples(&want.channel_id)),
+                bits(want.materialize()),
+                "channel {} differs", want.channel_id
+            );
+            assert_eq!(handle.channel_dims(&want.channel_id), Some((want.len(), want.nominal_rate_hz)));
+        }
+        assert_eq!(handle.metadata().session_id, expected.session_id);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_session_lazy_decodes_nothing_until_a_channel_is_asked_for() {
+        // Arrange
+        let session = session_with_gps_speed();
+        let (root, dir) = seed(&session);
+
+        // Act
+        let handle = open_session_lazy(&dir).unwrap();
+        let before = handle.resident_bytes();
+        let _ = handle.channel_samples("IMU0_AccelX");
+
+        // Assert
+        assert_eq!(before, 0);
+        assert!(handle.resident_bytes() > 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_session_lazy_a_name_the_session_does_not_have_reads_as_absent_rather_than_failing() {
+        // Arrange
+        let session = session_with_gps_speed();
+        let (root, dir) = seed(&session);
+
+        // Act
+        let handle = open_session_lazy(&dir).unwrap();
+
+        // Assert
+        assert!(handle.channel_samples("NopeChannel").is_empty());
+        assert_eq!(handle.channel_dims("NopeChannel"), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_channel_sample_counts_match_the_whole_file_reads_per_channel_lengths() {
+        // Arrange — channels of different lengths, so a per-file row count
+        // could not stand in for any of them.
+        let session = session_with_gps_speed();
+        let (root, dir) = seed(&session);
+        let expected = read_session_parquet(&dir.join("data.parquet")).unwrap();
+
+        // Act
+        let counts = read_channel_sample_counts(&dir).unwrap();
+
+        // Assert
+        for c in &expected.channels {
+            let got = counts.iter().find(|(n, _)| *n == c.channel_id).map(|(_, n)| *n);
+            assert_eq!(got, Some(c.len()), "channel {} count differs", c.channel_id);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_time_axis_bounds_match_the_earliest_and_latest_sample_of_the_whole_file_read() {
+        // Arrange
+        let session = session_with_gps_speed();
+        let (root, dir) = seed(&session);
+        let expected = read_session_parquet(&dir.join("data.parquet")).unwrap();
+        let first = expected.channels.iter().filter_map(|c| c.t_us.first().copied()).min().unwrap();
+        let last = expected.channels.iter().filter_map(|c| c.t_us.last().copied()).max().unwrap();
+
+        // Act
+        let got = read_time_axis_bounds(&dir).unwrap();
+
+        // Assert
+        assert_eq!(got, Some((first, last)));
 
         let _ = std::fs::remove_dir_all(&root);
     }

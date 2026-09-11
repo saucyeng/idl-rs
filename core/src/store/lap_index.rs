@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::laps::{detect_laps, renumber_session_laps};
 use crate::session::handle::SessionHandle;
 use crate::store::atomic::sha256_hex;
-use crate::store::parquet::read_session_parquet;
+use crate::store::parquet::open_session_lazy;
 use crate::store::session_json::{
     empty_session_json, parse_session_json, write_session_json, LapJson, NeutralZoneVisitJson, SectorJson,
     TrackVisitJson,
@@ -331,11 +331,10 @@ pub fn index_laps(
 /// A missing `data.parquet` is [`LapIndexErrorKind::Io`] with the path in
 /// the message, never a panic.
 pub fn reindex_laps(data_root: &Path, session_id: &str) -> Result<LapIndexReport, LapIndexError> {
-    let data_parquet_path = data_root.join("sessions").join(session_id).join("data.parquet");
-    let session = read_session_parquet(&data_parquet_path).map_err(|e| {
-        LapIndexError::new(LapIndexErrorKind::Io, format!("reading {}: {e}", data_parquet_path.display()))
+    let session_dir = data_root.join("sessions").join(session_id);
+    let handle = open_session_lazy(&session_dir).map_err(|e| {
+        LapIndexError::new(LapIndexErrorKind::Io, format!("reading {}: {e}", session_dir.join("data.parquet").display()))
     })?;
-    let handle = SessionHandle::from_session(session);
     index_laps(data_root, session_id, &handle, true)
 }
 

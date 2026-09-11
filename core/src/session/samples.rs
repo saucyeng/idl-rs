@@ -74,6 +74,27 @@ impl ChannelSamples {
         }
     }
 
+    /// Consumes this into an owned [`Channel`], **moving** the sample column
+    /// instead of cloning it ([`Self::to_channel`] clones everything).
+    ///
+    /// The column is the large allocation — 8 B/sample on a 22 M-sample
+    /// channel is 181 MB — so the path that hands a freshly-decoded channel
+    /// to a [`crate::session::handle::SessionHandle`] must move it, not
+    /// duplicate it (ruling R211.3). Only the two time axes are copied, and
+    /// only because `Arc<[i64]>` cannot be reclaimed as a `Vec<i64>`.
+    pub fn into_channel(self) -> Channel {
+        Channel {
+            channel_id: self.channel_id,
+            t_us: self.t_us.to_vec(),
+            t_recorded_us: self.t_recorded_us.as_ref().map(|r| r.to_vec()),
+            nominal_rate_hz: self.nominal_rate_hz,
+            column: self.column,
+            source_kind: self.source_kind,
+            unit: self.unit,
+            gaps: self.gaps,
+        }
+    }
+
     /// Number of samples.
     pub fn len(&self) -> usize {
         self.column.len()

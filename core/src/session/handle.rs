@@ -90,6 +90,69 @@ pub struct ChannelInput {
     pub source_kind: String,
 }
 
+/// The engine-synthesized time channel's id (C1 §2) — never a stored
+/// column, re-derived from the elected source channel's own `t_us`.
+pub const TIME_CHANNEL_ID: &str = "Time";
+
+/// Supplies one session channel's samples on demand, so a [`SessionHandle`]
+/// can be built over a session's channel *index* without decoding any of it
+/// (ruling R211.1).
+///
+/// A whole-session decode is what killed the app: nine notebook cells each
+/// asked for one channel and each got every channel, f64, concurrently. An
+/// implementation of this trait decodes exactly the column it is asked for —
+/// [`crate::store::parquet::ParquetChannelSource`] here, and the app's
+/// byte-budgeted `SessionCache` in `idl-rs-tauri`.
+///
+/// `None` means "no samples for that id". Both "this source has no such
+/// channel" and "the decode failed or was refused" read back as `None`,
+/// because a [`SessionHandle`] has no error channel of its own: the
+/// implementation owns the typed failure (it is the layer that has one) and
+/// the evaluator degrades that channel to `math_unknown_channel` rather than
+/// aborting the process — CLAUDE.md §5, never a crash on bad data.
+pub trait ChannelSource: std::fmt::Debug + Send + Sync {
+    /// `channel_id`'s samples, decoded now, or `None` (see the trait docs).
+    fn channel(&self, channel_id: &str) -> Option<Channel>;
+}
+
+/// One channel's identity as a session's index knows it — everything a lazy
+/// [`SessionHandle`] can answer without decoding a single sample (R211.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LazyChannelInfo {
+    /// Registry name, e.g. `IMU0_AccelZ`. Matches [`Channel::channel_id`].
+    pub channel_id: String,
+    /// Declared sample rate, Hz. `0.0` for event-driven channels.
+    pub nominal_rate_hz: f64,
+    /// Unit label, e.g. `m/s`. Empty means "no unit recorded" (C1 §4.1).
+    pub unit: String,
+    /// **Upper bound** on this channel's sample count — the file's row count,
+    /// which every column shares. The exact count is its non-null rows (C1
+    /// §4.5) and costs a decode, so nothing that must be exact
+    /// ([`SessionHandle::channel_dims`]'s time base) may read this field;
+    /// [`SessionHandle::channels`] reports it, documented as a ceiling.
+    pub max_length: usize,
+    /// `true` for the engine-synthesized `Time`/`Distance` ids (C1 §2),
+    /// which are never stored columns.
+    pub synthesized: bool,
+}
+
+/// A lazy handle's channel index plus the source that fills it in.
+///
+/// `decoded` is the store of what has actually been asked for. Its values
+/// are `Option<Channel>` so a source miss is remembered: a document naming a
+/// channel this session does not have must cost one lookup, not one per
+/// expression that mentions it. It is behind an `Arc` so that cloning a
+/// handle (one `MathOverlay` per overlay lap, `load_lap_context`) shares the
+/// decodes rather than copying them — a decoded channel is the largest
+/// allocation in the process and must exist once per session, not once per
+/// overlay.
+#[derive(Debug)]
+struct Lazy {
+    index: Vec<LazyChannelInfo>,
+    source: Arc<dyn ChannelSource>,
+    decoded: Arc<RwLock<HashMap<String, Option<Channel>>>>,
+}
+
 /// Owned parsed session. Synthesis runs in every constructor. The `derived`
 /// store is interior-mutable so the math evaluator's resolver can write
 /// resolved dependency outputs back without re-marshalling samples across FFI
@@ -97,6 +160,14 @@ pub struct ChannelInput {
 /// overwrite a math output or shadow a base channel. Parsed+synthesized
 /// `session.channels` stay immutable so the exporter's `channel_data()` borrow
 /// is unaffected.
+///
+/// A handle built by [`SessionHandle::lazy`] holds `session.channels` empty
+/// and reaches its samples through `lazy` instead, one channel at a time
+/// (ruling R211.1). Every accessor that goes through
+/// [`SessionHandle::with_channel`] behaves identically either way; the ones
+/// that read `session.channels` directly —
+/// [`SessionHandle::channel_data`] above all — are documented as
+/// eager-only.
 #[derive(Debug)]
 pub struct SessionHandle {
     session: Session,
@@ -104,6 +175,7 @@ pub struct SessionHandle {
     truncation_warning: Option<String>,
     import_warnings: Vec<String>,
     derived: RwLock<HashMap<DerivedKey, Channel>>,
+    lazy: Option<Lazy>,
 }
 
 impl Clone for SessionHandle {
@@ -114,6 +186,16 @@ impl Clone for SessionHandle {
             truncation_warning: self.truncation_warning.clone(),
             import_warnings: self.import_warnings.clone(),
             derived: RwLock::new(self.derived.read().unwrap().clone()),
+            // The source and the decoded-channel store are shared, not
+            // copied — a clone of a lazy handle is for an overlay lap
+            // reading the same file (`load_lap_context`'s `MathOverlay`),
+            // and re-decoding (or duplicating) every channel per overlay is
+            // exactly the waste this is here to stop.
+            lazy: self.lazy.as_ref().map(|l| Lazy {
+                index: l.index.clone(),
+                source: Arc::clone(&l.source),
+                decoded: Arc::clone(&l.decoded),
+            }),
         }
     }
 }
@@ -230,6 +312,7 @@ impl SessionHandle {
             // reader is `SessionMeta::import_warnings`, text-only).
             import_warnings: import_warnings.into_iter().map(|w| w.message).collect(),
             derived: RwLock::new(HashMap::new()),
+            lazy: None,
         })
     }
 
@@ -280,6 +363,7 @@ impl SessionHandle {
             // always empty on this path.
             import_warnings: Vec::new(),
             derived: RwLock::new(HashMap::new()),
+            lazy: None,
         }
     }
 
@@ -298,11 +382,69 @@ impl SessionHandle {
             truncation_warning: None,
             import_warnings: Vec::new(),
             derived: RwLock::new(HashMap::new()),
+            lazy: None,
         }
     }
 
+    /// Builds a handle that holds **no samples at all** until something asks
+    /// for one, then decodes that one channel through `source` (ruling
+    /// R211.1).
+    ///
+    /// `session` carries the session's identity (`session_id`, `device_id`,
+    /// `timestamp_utc_ms`, `config_checksum`, `source_format`,
+    /// `blob_sha256`) with `channels` **empty**; `index` is every channel the
+    /// session has, including the engine-synthesized `Time`/`Distance` —
+    /// [`Self::with_channel`] only asks `source` for names that appear in it,
+    /// so a math-store or lap-slice name never costs a source lookup.
+    ///
+    /// [`synthesize_base_channels`] is deliberately *not* run here: it needs
+    /// every channel's samples, which is the decode this constructor exists
+    /// to avoid. The source is responsible for producing `Time`/`Distance`
+    /// on demand, byte-identically — `store::parquet::read_channel`'s doc
+    /// comment states that guarantee and its tests pin it.
+    ///
+    /// Everything reached through [`Self::with_channel`] — `lookup`,
+    /// `channel_samples`, `decimate_tile`, the lap slicers, the estimator —
+    /// behaves exactly as on an eager handle. [`Self::channel_data`] does
+    /// not: it borrows `session.channels`, which is empty here.
+    pub fn lazy(session: Session, index: Vec<LazyChannelInfo>, source: Arc<dyn ChannelSource>) -> Self {
+        let synthesized_ids = index.iter().filter(|i| i.synthesized).map(|i| i.channel_id.clone()).collect();
+        Self {
+            session,
+            synthesized_ids,
+            truncation_warning: None,
+            import_warnings: Vec::new(),
+            derived: RwLock::new(HashMap::new()),
+            lazy: Some(Lazy { index, source, decoded: Arc::new(RwLock::new(HashMap::new())) }),
+        }
+    }
+
+    /// `true` when this handle decodes channels on demand ([`Self::lazy`])
+    /// rather than holding them all. The accessors documented as eager-only
+    /// ([`Self::channel_data`]) are the reason a caller would ask.
+    pub fn is_lazy(&self) -> bool {
+        self.lazy.is_some()
+    }
+
     /// Compact summary for the catalog / library list.
+    ///
+    /// On a lazy handle ([`Self::lazy`]) `channel_count` comes from the
+    /// channel index and `duration_ms` folds only the channels decoded so
+    /// far — the longest span across *every* channel cannot be known without
+    /// decoding every channel, which is the whole point of that constructor.
+    /// Callers that need the true duration of an arbitrary session read it
+    /// from `session.json`/the catalog, not from a lazy handle.
     pub fn metadata(&self) -> SessionMeta {
+        let (channel_count, duration_ms) = match &self.lazy {
+            Some(lazy) => (
+                lazy.index.len() as u32,
+                lazy.decoded.read().unwrap().values().flatten().map(|c| c.duration_ms()).max().unwrap_or(0),
+            ),
+            None => (
+                self.session.channels.len() as u32,
+                self.session.channels.iter().map(|c| c.duration_ms()).max().unwrap_or(0),
+            ),
+        };
         SessionMeta {
             session_id: self.session.session_id.clone(),
             // `SessionMeta`'s FFI-facing shape predates C1's `Option<String>`
@@ -312,21 +454,36 @@ impl SessionHandle {
             device_id: self.session.device_id.clone().unwrap_or_default(),
             timestamp_utc_ms: self.session.timestamp_utc_ms,
             config_checksum: self.session.config_checksum.clone().unwrap_or_default(),
-            channel_count: self.session.channels.len() as u32,
-            duration_ms: self
-                .session
-                .channels
-                .iter()
-                .map(|c| c.duration_ms())
-                .max()
-                .unwrap_or(0),
+            channel_count,
+            duration_ms,
             truncation_warning: self.truncation_warning.clone(),
             import_warnings: self.import_warnings.clone(),
         }
     }
 
     /// Metadata for every channel (no samples).
+    ///
+    /// On a lazy handle ([`Self::lazy`]) this is the channel index, and
+    /// `length` is [`LazyChannelInfo::max_length`] — the file's row count,
+    /// an **upper bound** on each channel's own sample count rather than the
+    /// exact figure an eager handle reports. Exactness there would cost the
+    /// whole-session decode the lazy handle exists to avoid;
+    /// [`Self::channel_meta`] on one named channel is exact either way,
+    /// because it decodes that channel.
     pub fn channels(&self) -> Vec<ChannelMeta> {
+        if let Some(lazy) = &self.lazy {
+            return lazy
+                .index
+                .iter()
+                .map(|i| ChannelMeta {
+                    channel_id: i.channel_id.clone(),
+                    sample_rate_hz: i.nominal_rate_hz,
+                    length: i.max_length as u32,
+                    is_event_driven: i.nominal_rate_hz == 0.0,
+                    synthesized: i.synthesized,
+                })
+                .collect();
+        }
         self.session
             .channels
             .iter()
@@ -586,11 +743,25 @@ impl SessionHandle {
         }
         let cols: u64 = self.session.channels.iter().map(channel_bytes).sum();
         let math: u64 = self.derived.read().unwrap().values().map(channel_bytes).sum();
-        cols + math
+        // A lazy handle's samples live in its decoded store, not in
+        // `session.channels` — counting only the latter would report 0 for
+        // exactly the handles whose residency the budget cares about.
+        let lazily_decoded: u64 = self
+            .lazy
+            .as_ref()
+            .map(|l| l.decoded.read().unwrap().values().flatten().map(channel_bytes).sum())
+            .unwrap_or(0);
+        cols + math + lazily_decoded
     }
 
     /// Borrow the parsed + synthesized channels. In-core only (not bridged);
     /// the exporter uses this to stream samples without cloning.
+    ///
+    /// **Eager handles only.** A handle from [`Self::lazy`] holds no channels
+    /// here and returns an empty slice — it has no whole-session view to
+    /// borrow, by construction. Code that must work on both kinds resolves
+    /// channels by name ([`Self::channel_samples`], [`Self::channels`])
+    /// instead of iterating this.
     pub fn channel_data(&self) -> &[Channel] {
         &self.session.channels
     }
@@ -647,6 +818,33 @@ impl SessionHandle {
     fn with_channel<R>(&self, channel_id: &str, f: impl FnOnce(&Channel) -> R) -> Option<R> {
         if let Some(c) = self.session.channels.iter().find(|c| c.channel_id == channel_id) {
             return Some(f(c));
+        }
+        if let Some(lazy) = &self.lazy {
+            // Only names the index knows are ever put to the source: a
+            // math-store output or a lap-slice token is not a column of the
+            // file, and asking for one would cost a footer read per
+            // expression that mentions it.
+            if lazy.index.iter().any(|i| i.channel_id == channel_id) {
+                let known = lazy.decoded.read().unwrap().contains_key(channel_id);
+                if !known {
+                    // The decode runs with **no** lock held — it is the
+                    // slowest thing in the process, and holding the store
+                    // across it would serialise every other channel's
+                    // lookup behind it. Two threads racing for the same
+                    // cold channel both decode and the loser's copy is
+                    // dropped by `or_insert`, exactly as `SessionCache`
+                    // documents for the same race: one redundant decode,
+                    // never a wrong answer.
+                    let decoded = lazy.source.channel(channel_id);
+                    lazy.decoded.write().unwrap().entry(channel_id.to_string()).or_insert(decoded);
+                }
+                let store = lazy.decoded.read().unwrap();
+                if let Some(Some(c)) = store.get(channel_id) {
+                    return Some(f(c));
+                }
+                // A `None` slot means the source has no samples for this id;
+                // fall through to the derived store, which may.
+            }
         }
         let store = self.derived.read().unwrap();
         store.get(&DerivedKey::from_token(channel_id)).map(|c| f(c))
@@ -1011,11 +1209,20 @@ impl crate::math::eval::ChannelLookup for SessionHandle {
         // checks session.channels first). The evaluator needs the whole array.
         // t_us is the channel's own real recorded time (C1 §8 item 5) —
         // never re-derived from the rate.
-        self.with_channel(name, |c| crate::math::eval::LookupChannel {
-            samples: Arc::from(c.materialize()),
-            sample_rate_hz: c.nominal_rate_hz,
-            t_us: Arc::from(c.t_us.as_slice()),
+        //
+        // `try_materialize` rather than `materialize` (ruling R211.4): an
+        // allocation the machine refuses must read as *absent* here, not as
+        // a present channel with no samples. An empty array would evaluate
+        // to a wrong answer silently; `None` surfaces as
+        // `math_unknown_channel` on that one definition.
+        self.with_channel(name, |c| {
+            Some(crate::math::eval::LookupChannel {
+                samples: Arc::from(c.try_materialize()?),
+                sample_rate_hz: c.nominal_rate_hz,
+                t_us: Arc::from(c.t_us.as_slice()),
+            })
         })
+        .flatten()
     }
 
     fn channel_dims(&self, name: &str) -> Option<(usize, f64)> {
@@ -1041,6 +1248,16 @@ impl crate::math::eval::ChannelLookup for SessionHandle {
         };
         for c in &self.session.channels {
             consider(c.len(), c.nominal_rate_hz);
+        }
+        // A lazy handle cannot scan every channel's length without decoding
+        // every channel. It does not need to: `Time` is synthesized *as* the
+        // winner of exactly this election (highest positive rate, longest at
+        // that rate — `session::synthesis::synthesize_base_channels`), so its
+        // own dims are the answer, at the cost of one channel's decode.
+        if self.lazy.is_some() {
+            if let Some((len, rate)) = self.channel_dims(TIME_CHANNEL_ID) {
+                consider(len, rate);
+            }
         }
         for c in self.derived.read().unwrap().values() {
             consider(c.len(), c.nominal_rate_hz);
