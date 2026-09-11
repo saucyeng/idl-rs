@@ -22,7 +22,8 @@ use idl_rs::workbook::v3::front_matter::{parse_front_matter, render_front_matter
 use idl_rs::workbook::v3::{parse_workbook, render_prose_html, CellDoc, CellError, CellKindToken, WorkbookError};
 
 use crate::error::{IpcError, IpcErrorKind};
-use crate::session_source::{load_lap_context, load_session_handle, load_window_context, WindowDto};
+use crate::session_cache::SessionCache;
+use crate::session_source::{load_lap_context, load_lazy_session_handle, load_window_context, WindowDto};
 use crate::state::{DataDir, Hashes, Watchers};
 use crate::watcher::{ExpectedHashSet, WorkbookWatcher};
 
@@ -448,6 +449,7 @@ fn empty_session_handle() -> SessionHandle {
 /// resolution, including the same-session `overlay` construction (R64.1)
 /// and its multi-overlay fold (R73).
 fn eval_workbook_via(
+    cache: &SessionCache,
     data_dir: &Path,
     id: &str,
     session_id: Option<&str>,
@@ -458,16 +460,24 @@ fn eval_workbook_via(
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
     let (doc, structural) = parse_workbook(&markdown).map_err(fatal_parse_error)?;
 
-    let (handle, lap_ctx) = match session_id {
+    let (handle, source, lap_ctx) = match session_id {
         Some(sid) => {
-            let handle = load_session_handle(data_dir, sid)?;
+            let (handle, source) = load_lazy_session_handle(data_dir, sid, cache)?;
             let lap_ctx = load_lap_context(data_dir, sid, &handle, lap_context)?;
-            (handle, lap_ctx)
+            (handle, Some(source), lap_ctx)
         }
-        None => (empty_session_handle(), MathLapContext::empty()),
+        None => (empty_session_handle(), None, MathLapContext::empty()),
     };
 
-    Ok(build_cell_outputs(&doc, &structural, &handle, &lap_ctx, session_id.is_some()))
+    let outputs = build_cell_outputs(&doc, &structural, &handle, &lap_ctx, session_id.is_some());
+    // A channel the app could not decode (out of budget, unreadable file)
+    // must not read back as a per-cell "unknown channel" — the document is
+    // fine, the machine is busy. R211.2's typed refusal is raised here, once
+    // the evaluation that provoked it has finished.
+    if let Some(err) = source.and_then(|s| s.take_first_error()) {
+        return Err(err);
+    }
+    Ok(outputs)
 }
 
 /// Evaluates `doc`/`structural` against `handle`/`lap_ctx` and builds this
@@ -597,7 +607,12 @@ fn with_window_index(mut err: IpcError, i: usize) -> IpcError {
 /// window has a meaningful answer without a document to evaluate. Per-cell
 /// evaluation errors keep their existing home in `CellOutput.errors`,
 /// unaffected by either path.
-fn eval_workbook_v2_via(data_dir: &Path, id: &str, windows: &[WindowDto]) -> Result<Vec<WindowEval>, IpcError> {
+fn eval_workbook_v2_via(
+    cache: &SessionCache,
+    data_dir: &Path,
+    id: &str,
+    windows: &[WindowDto],
+) -> Result<Vec<WindowEval>, IpcError> {
     let path = resolve_workbook_path(data_dir, id)?;
     let markdown = std::fs::read_to_string(&path)
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
@@ -613,7 +628,7 @@ fn eval_workbook_v2_via(data_dir: &Path, id: &str, windows: &[WindowDto]) -> Res
         .iter()
         .enumerate()
         .map(|(i, window)| {
-            let handle = match load_session_handle(data_dir, &window.session_id) {
+            let (handle, source) = match load_lazy_session_handle(data_dir, &window.session_id, cache) {
                 Ok(h) => h,
                 Err(e) => return WindowEval::Error { error: with_window_index(e, i) },
             };
@@ -621,7 +636,13 @@ fn eval_workbook_v2_via(data_dir: &Path, id: &str, windows: &[WindowDto]) -> Res
                 Ok(c) => c,
                 Err(e) => return WindowEval::Error { error: with_window_index(e, i) },
             };
-            WindowEval::Ok { ok: build_cell_outputs(&doc, &structural, &handle, &lap_ctx, true) }
+            let ok = build_cell_outputs(&doc, &structural, &handle, &lap_ctx, true);
+            // Per-window attribution (R121): a decode this window could not
+            // be given is this window's failure, not the whole call's.
+            match source.take_first_error() {
+                Some(e) => WindowEval::Error { error: with_window_index(e, i) },
+                None => WindowEval::Ok { ok },
+            }
         })
         .collect())
 }
@@ -657,6 +678,7 @@ fn eval_workbook_v2_via(data_dir: &Path, id: &str, windows: &[WindowDto]) -> Res
 /// [`IpcErrorKind::Internal`] for the (unreachable in practice) case of a
 /// def with neither a value nor an error.
 fn fetch_host_channel_via(
+    cache: &SessionCache,
     data_dir: &Path,
     id: &str,
     session_id: Option<&str>,
@@ -672,16 +694,24 @@ fn fetch_host_channel_via(
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
     let (doc, structural) = parse_workbook(&markdown).map_err(fatal_parse_error)?;
 
-    let (handle, lap_ctx) = match session_id {
+    let (handle, source, lap_ctx) = match session_id {
         Some(sid) => {
-            let handle = load_session_handle(data_dir, sid)?;
+            let (handle, source) = load_lazy_session_handle(data_dir, sid, cache)?;
             let lap_ctx = load_lap_context(data_dir, sid, &handle, None)?;
-            (handle, lap_ctx)
+            (handle, Some(source), lap_ctx)
         }
-        None => (empty_session_handle(), MathLapContext::empty()),
+        None => (empty_session_handle(), None, MathLapContext::empty()),
     };
 
     let cell_results = idl_rs::workbook::v3::eval_cells(&doc, &structural, &handle, &lap_ctx);
+
+    // Checked before the definition is picked out: a channel the app could
+    // not decode makes every definition that reads it wrong, and "no such
+    // channel" is the wrong thing to tell the caller about a busy machine
+    // (R211.2).
+    if let Some(err) = source.and_then(|s| s.take_first_error()) {
+        return Err(err);
+    }
 
     let def = cell_results.iter().flat_map(|c| c.defs.iter()).find(|d| d.name == def_name).ok_or_else(|| {
         IpcError::new(IpcErrorKind::NotFound, format!("no definition named '{def_name}' in workbook '{id}'"))
@@ -728,6 +758,7 @@ fn fetch_host_channel_via(
 /// or `invalid_argument` with `detail: { session_id, t0_us, t1_us,
 /// session_span_us }` for a non-overlapping or misordered `Range` window).
 fn fetch_host_channel_v2_via(
+    cache: &SessionCache,
     data_dir: &Path,
     id: &str,
     window: Option<&crate::session_source::WindowDto>,
@@ -743,16 +774,22 @@ fn fetch_host_channel_v2_via(
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
     let (doc, structural) = parse_workbook(&markdown).map_err(fatal_parse_error)?;
 
-    let (handle, lap_ctx) = match window {
+    let (handle, source, lap_ctx) = match window {
         Some(w) => {
-            let handle = load_session_handle(data_dir, &w.session_id)?;
+            let (handle, source) = load_lazy_session_handle(data_dir, &w.session_id, cache)?;
             let lap_ctx = load_window_context(data_dir, w, &handle)?;
-            (handle, lap_ctx)
+            (handle, Some(source), lap_ctx)
         }
-        None => (empty_session_handle(), MathLapContext::empty()),
+        None => (empty_session_handle(), None, MathLapContext::empty()),
     };
 
     let cell_results = idl_rs::workbook::v3::eval_cells(&doc, &structural, &handle, &lap_ctx);
+
+    // See `fetch_host_channel_via`: a refused decode is the caller's answer,
+    // not a missing definition (R211.2).
+    if let Some(err) = source.and_then(|s| s.take_first_error()) {
+        return Err(err);
+    }
 
     let def = cell_results.iter().flat_map(|c| c.defs.iter()).find(|d| d.name == def_name).ok_or_else(|| {
         IpcError::new(IpcErrorKind::NotFound, format!("no definition named '{def_name}' in workbook '{id}'"))
@@ -1053,8 +1090,9 @@ pub fn eval_workbook(
     session_id: Option<String>,
     lap_context: Option<LapContext>,
     data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, SessionCache>,
 ) -> Result<Vec<CellOutput>, IpcError> {
-    eval_workbook_via(&data_dir.0, &id, session_id.as_deref(), lap_context.as_ref())
+    eval_workbook_via(&cache, &data_dir.0, &id, session_id.as_deref(), lap_context.as_ref())
 }
 
 /// C3 §3.4 `eval_workbook_v2(id, windows)` (R117.3/.4, R121). Replaces
@@ -1068,8 +1106,9 @@ pub fn eval_workbook_v2(
     id: String,
     windows: Vec<WindowDto>,
     data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, SessionCache>,
 ) -> Result<Vec<WindowEval>, IpcError> {
-    eval_workbook_v2_via(&data_dir.0, &id, &windows)
+    eval_workbook_v2_via(&cache, &data_dir.0, &id, &windows)
 }
 
 /// C3 §3.4 `fetch_host_channel(workbook_id, session_id, def_name, budget)` —
@@ -1081,12 +1120,13 @@ pub fn eval_workbook_v2(
 #[tauri::command(async)]
 pub fn fetch_host_channel(
     data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, SessionCache>,
     workbook_id: String,
     session_id: Option<String>,
     def_name: String,
     budget: u32,
 ) -> Result<tauri::ipc::Response, IpcError> {
-    let bytes = fetch_host_channel_via(&data_dir.0, &workbook_id, session_id.as_deref(), &def_name, budget)?;
+    let bytes = fetch_host_channel_via(&cache, &data_dir.0, &workbook_id, session_id.as_deref(), &def_name, budget)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -1100,12 +1140,13 @@ pub fn fetch_host_channel(
 #[tauri::command(async)]
 pub fn fetch_host_channel_v2(
     data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, SessionCache>,
     workbook_id: String,
     window: Option<WindowDto>,
     def_name: String,
     budget: u32,
 ) -> Result<tauri::ipc::Response, IpcError> {
-    let bytes = fetch_host_channel_v2_via(&data_dir.0, &workbook_id, window.as_ref(), &def_name, budget)?;
+    let bytes = fetch_host_channel_v2_via(&cache, &data_dir.0, &workbook_id, window.as_ref(), &def_name, budget)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -1862,7 +1903,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let out = eval_workbook_via(&root, WB_ID, Some("s1"), None).unwrap();
+        let out = eval_workbook_via(&SessionCache::new(), &root, WB_ID, Some("s1"), None).unwrap();
 
         // Assert
         assert_eq!(out.len(), 1);
@@ -1878,7 +1919,7 @@ mod tests {
     fn eval_workbook_via_lap_context_none_output_byte_identical_to_the_pre_task9_fixture() {
         // Arrange — literal JSON captured from this exact seeded
         // session+workbook by running this test's body against the
-        // pre-Task-9 `eval_workbook_via(&root, WB_ID, Some("s1"))` (two
+        // pre-Task-9 `eval_workbook_via(&SessionCache::new(), &root, WB_ID, Some("s1"))` (two
         // trailing args, no `lap_context`), before the `lap_context`
         // parameter was added. `None` here must reproduce it exactly,
         // updated for `unit`/`unit_notes` (ruling R154/R162): `ChanA` has
@@ -1892,7 +1933,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let out = eval_workbook_via(&root, WB_ID, Some("s1"), None).unwrap();
+        let out = eval_workbook_via(&SessionCache::new(), &root, WB_ID, Some("s1"), None).unwrap();
 
         // Assert
         let json = serde_json::to_string(&out).unwrap();
@@ -1918,8 +1959,8 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let via = eval_workbook_via(&root, WB_ID, None, None).unwrap();
-        let v2 = eval_workbook_v2_via(&root, WB_ID, &[]).unwrap();
+        let via = eval_workbook_via(&SessionCache::new(), &root, WB_ID, None, None).unwrap();
+        let v2 = eval_workbook_v2_via(&SessionCache::new(), &root, WB_ID, &[]).unwrap();
 
         // Assert — byte-identical via JSON, `CellOutput` has no `PartialEq`.
         assert_eq!(
@@ -1968,14 +2009,14 @@ mod tests {
 
         // Act — the wire path, asserted for shape (both windows resolve,
         // `out[1]` inspected, not skipped).
-        let out = eval_workbook_v2_via(&root, WB_ID, &windows).unwrap();
+        let out = eval_workbook_v2_via(&SessionCache::new(), &root, WB_ID, &windows).unwrap();
 
         // Act — the same resolution `eval_workbook_v2_via` uses internally,
         // called directly per window so the actual scalar is visible.
         let markdown_text = std::fs::read_to_string(root.join("workbooks").join("test.idl1wb")).unwrap();
         let (doc, structural) = parse_workbook(&markdown_text).unwrap();
         let scalar_for = |w: &WindowDto| -> f64 {
-            let handle = load_session_handle(&root, &w.session_id).unwrap();
+            let handle = load_lazy_session_handle(&root, &w.session_id, &SessionCache::new()).unwrap().0;
             let lap_ctx = load_window_context(&root, w, &handle).unwrap();
             let cells = idl_rs::workbook::v3::eval_cells(&doc, &structural, &handle, &lap_ctx);
             cells[0].defs[0].value.as_ref().unwrap().v[0]
@@ -2029,7 +2070,7 @@ mod tests {
         ];
 
         // Act
-        let out = eval_workbook_v2_via(&root, WB_ID, &windows).unwrap();
+        let out = eval_workbook_v2_via(&SessionCache::new(), &root, WB_ID, &windows).unwrap();
 
         // Assert
         assert_eq!(out.len(), 3);
@@ -2064,7 +2105,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let out = eval_workbook_via(&root, WB_ID, Some("s1"), None).unwrap();
+        let out = eval_workbook_via(&SessionCache::new(), &root, WB_ID, Some("s1"), None).unwrap();
 
         // Assert
         let x = &out[0].defs[0];
@@ -2089,7 +2130,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let out = eval_workbook_via(&root, WB_ID, None, None).unwrap();
+        let out = eval_workbook_via(&SessionCache::new(), &root, WB_ID, None, None).unwrap();
 
         // Assert
         assert_eq!(out.len(), 2);
@@ -2112,7 +2153,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let out = eval_workbook_via(&root, WB_ID, None, None).unwrap();
+        let out = eval_workbook_via(&SessionCache::new(), &root, WB_ID, None, None).unwrap();
 
         // Assert
         let x = &out[0].defs[0];
@@ -2129,7 +2170,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let err = eval_workbook_via(&root, WB_ID, None, None).unwrap_err();
+        let err = eval_workbook_via(&SessionCache::new(), &root, WB_ID, None, None).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::WorkbookUnsupportedVersion);
@@ -2147,7 +2188,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let out = eval_workbook_via(&root, WB_ID, Some("s1"), None).unwrap();
+        let out = eval_workbook_via(&SessionCache::new(), &root, WB_ID, Some("s1"), None).unwrap();
 
         // Assert
         let value = out[0].value.as_ref().unwrap();
@@ -2170,7 +2211,7 @@ mod tests {
         let lap_context = LapContext { main_lap: Some(1), overlay_laps: Vec::new() };
 
         // Act
-        let err = eval_workbook_via(&root, WB_ID, Some("s1"), Some(&lap_context)).unwrap_err();
+        let err = eval_workbook_via(&SessionCache::new(), &root, WB_ID, Some("s1"), Some(&lap_context)).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -2191,7 +2232,7 @@ mod tests {
         let lap_context = LapContext { main_lap: None, overlay_laps: vec![2, 3] };
 
         // Act
-        let err = eval_workbook_via(&root, WB_ID, Some("s1"), Some(&lap_context)).unwrap_err();
+        let err = eval_workbook_via(&SessionCache::new(), &root, WB_ID, Some("s1"), Some(&lap_context)).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -2216,8 +2257,8 @@ mod tests {
         let empty_selection = LapContext { main_lap: None, overlay_laps: Vec::new() };
 
         // Act
-        let none_out = eval_workbook_via(&root, WB_ID, Some("s1"), None).unwrap();
-        let empty_out = eval_workbook_via(&root, WB_ID, Some("s1"), Some(&empty_selection)).unwrap();
+        let none_out = eval_workbook_via(&SessionCache::new(), &root, WB_ID, Some("s1"), None).unwrap();
+        let empty_out = eval_workbook_via(&SessionCache::new(), &root, WB_ID, Some("s1"), Some(&empty_selection)).unwrap();
 
         // Assert
         assert_eq!(serde_json::to_string(&none_out).unwrap(), serde_json::to_string(&empty_out).unwrap());
@@ -2238,7 +2279,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let out = eval_workbook_via(&root, WB_ID, None, None).unwrap();
+        let out = eval_workbook_via(&SessionCache::new(), &root, WB_ID, None, None).unwrap();
 
         // Assert -- expected HTML is built by calling render_prose_html
         // directly, not hand-written a second time.
@@ -2455,7 +2496,7 @@ mod tests {
         let root = temp_root();
 
         // Act
-        let err = fetch_host_channel_via(&root, WB_ID, None, "x", 0).unwrap_err();
+        let err = fetch_host_channel_via(&SessionCache::new(), &root, WB_ID, None, "x", 0).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -2469,7 +2510,7 @@ mod tests {
         let root = temp_root();
 
         // Act
-        let err = fetch_host_channel_via(&root, WB_ID, None, "x", 65537).unwrap_err();
+        let err = fetch_host_channel_via(&SessionCache::new(), &root, WB_ID, None, "x", 65537).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -2483,7 +2524,7 @@ mod tests {
         let root = temp_root();
 
         // Act
-        let err = fetch_host_channel_via(&root, "nope", None, "x", 100).unwrap_err();
+        let err = fetch_host_channel_via(&SessionCache::new(), &root, "nope", None, "x", 100).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -2501,7 +2542,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let err = fetch_host_channel_via(&root, WB_ID, Some("s1"), "nope", 100).unwrap_err();
+        let err = fetch_host_channel_via(&SessionCache::new(), &root, WB_ID, Some("s1"), "nope", 100).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -2521,7 +2562,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let err = fetch_host_channel_via(&root, WB_ID, Some("s1"), "x", 100).unwrap_err();
+        let err = fetch_host_channel_via(&SessionCache::new(), &root, WB_ID, Some("s1"), "x", 100).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::MathUnknownChannel);
@@ -2539,7 +2580,7 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let bytes = fetch_host_channel_via(&root, WB_ID, Some("s1"), "x", 65536).unwrap();
+        let bytes = fetch_host_channel_via(&SessionCache::new(), &root, WB_ID, Some("s1"), "x", 65536).unwrap();
 
         // Assert — decode the header manually at the documented offsets.
         assert_eq!(&bytes[0..4], b"IDLH");
@@ -2583,8 +2624,8 @@ mod tests {
         };
 
         // Act
-        let v2 = eval_workbook_v2_via(&root, WB_ID, std::slice::from_ref(&window)).unwrap();
-        let bytes = fetch_host_channel_v2_via(&root, WB_ID, Some(&window), "x", 65536).unwrap();
+        let v2 = eval_workbook_v2_via(&SessionCache::new(), &root, WB_ID, std::slice::from_ref(&window)).unwrap();
+        let bytes = fetch_host_channel_v2_via(&SessionCache::new(), &root, WB_ID, Some(&window), "x", 65536).unwrap();
 
         // Assert — same window, same definition, same value: `eval_workbook_v2`'s
         // marker (length/has_t) matches the decoded `IDLH` bytes, and both
@@ -2615,8 +2656,8 @@ mod tests {
         write_workbook(&root, "test.idl1wb", &markdown);
 
         // Act
-        let via = fetch_host_channel_via(&root, WB_ID, None, "x", 100).unwrap();
-        let v2 = fetch_host_channel_v2_via(&root, WB_ID, None, "x", 100).unwrap();
+        let via = fetch_host_channel_via(&SessionCache::new(), &root, WB_ID, None, "x", 100).unwrap();
+        let v2 = fetch_host_channel_v2_via(&SessionCache::new(), &root, WB_ID, None, "x", 100).unwrap();
 
         // Assert
         assert_eq!(via, v2);
@@ -2630,7 +2671,7 @@ mod tests {
         let root = temp_root();
 
         // Act
-        let err = fetch_host_channel_v2_via(&root, WB_ID, None, "x", 0).unwrap_err();
+        let err = fetch_host_channel_v2_via(&SessionCache::new(), &root, WB_ID, None, "x", 0).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -2654,7 +2695,7 @@ mod tests {
         };
 
         // Act
-        let err = fetch_host_channel_v2_via(&root, WB_ID, Some(&window), "x", 100).unwrap_err();
+        let err = fetch_host_channel_v2_via(&SessionCache::new(), &root, WB_ID, Some(&window), "x", 100).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
