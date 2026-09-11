@@ -30,6 +30,13 @@ pub struct AppSettings {
     pub rider_name: String,
     #[serde(default = "default_unit_system")]
     pub unit_system: UnitSystem,
+    /// The command "Ask an agent" spawns in the user's terminal (ruling
+    /// R222 item 3). A bare program name is resolved on `PATH`; the
+    /// default is `claude`. Never a shell line — it is passed as the
+    /// program, with arguments built by the command layer, so nothing the
+    /// user types here is interpreted by a shell.
+    #[serde(default = "default_agent_command")]
+    pub agent_command: String,
 }
 
 fn default_rider_name() -> String {
@@ -38,10 +45,18 @@ fn default_rider_name() -> String {
 fn default_unit_system() -> UnitSystem {
     UnitSystem::Imperial
 }
+fn default_agent_command() -> String {
+    "claude".to_string()
+}
 
 impl Default for AppSettings {
     fn default() -> Self {
-        AppSettings { data_dir: None, rider_name: default_rider_name(), unit_system: default_unit_system() }
+        AppSettings {
+            data_dir: None,
+            rider_name: default_rider_name(),
+            unit_system: default_unit_system(),
+            agent_command: default_agent_command(),
+        }
     }
 }
 

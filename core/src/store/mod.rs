@@ -5,6 +5,9 @@
 //! module implements. Pure: `std::fs`/`std::path` only — no Tauri, no async,
 //! no network (CLAUDE.md §2).
 
+/// `<data>/AGENTS.md`, the orientation file an agent reads before it
+/// touches the library (ruling R222 item 4).
+pub mod agents_md;
 pub mod atomic;
 pub mod blob;
 pub mod catalog;
