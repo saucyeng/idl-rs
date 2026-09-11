@@ -105,7 +105,10 @@ pub fn new_workbook_source(template: WorkbookTemplate, spec: &NewWorkbook) -> St
             }
             out.push('\n');
             out.push_str("```math id=00000001\n");
-            out.push_str("# Replace [speed] with a channel this session actually has —\n");
+            // Plain ASCII in a generated file: a workbook is edited by hand
+            // in whatever editor the user has, and the template should not
+            // be the thing that introduces a non-ASCII byte.
+            out.push_str("# Replace [speed] with a channel this session has.\n");
             out.push_str("# `idl-rs session show <id>` lists them.\n");
             out.push_str("speed_kmh = [speed] * 3.6\n");
             out.push_str("top_speed_kmh = max([speed_kmh])\n");
@@ -232,6 +235,18 @@ mod tests {
         // Assert
         let (doc, _) = parse_workbook(&source).unwrap();
         assert_eq!(doc.id, spec.id);
+    }
+
+    #[test]
+    fn a_rendered_template_is_ascii_apart_from_what_the_caller_supplied() {
+        // Arrange
+        let spec = NewWorkbook { name: "Plain".to_string(), ..spec() };
+
+        // Act
+        let source = new_workbook_source(WorkbookTemplate::Session, &spec);
+
+        // Assert — the skeleton itself introduces no non-ASCII byte.
+        assert!(source.is_ascii(), "template is not ASCII: {source}");
     }
 
     #[test]

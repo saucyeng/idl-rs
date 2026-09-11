@@ -77,6 +77,10 @@ pub struct Arg {
     pub kind: ValueKind,
     /// `false` makes this and every later argument optional.
     pub required: bool,
+    /// The argument may be given more than once, accumulating. Only ever
+    /// true on the last argument — clap cannot place a positional after a
+    /// variadic one, and [`tests`] asserts it.
+    pub repeatable: bool,
     /// The closed value set when `kind` is [`ValueKind::Choice`]; empty otherwise.
     pub choices: &'static [&'static str],
     /// One line, sentence case, no trailing full stop.
@@ -324,6 +328,7 @@ const SESSION_ID_ARG: Arg = Arg {
     name: "id",
     kind: ValueKind::Text,
     required: true,
+    repeatable: false,
     choices: &[],
     help: "Session id, as `session list` prints it",
 };
@@ -332,6 +337,7 @@ const WORKBOOK_FILE_ARG: Arg = Arg {
     name: "file",
     kind: ValueKind::Path,
     required: true,
+    repeatable: false,
     choices: &[],
     help: "Path to an `.idl0wb` workbook",
 };
@@ -418,6 +424,7 @@ pub const COMMANDS: &[CommandRow] = &[
                 name: "utc-ms",
                 kind: ValueKind::Integer,
                 required: true,
+                repeatable: false,
                 choices: &[],
                 help: "Recording start, Unix epoch milliseconds; must be greater than zero",
             },
@@ -459,6 +466,7 @@ pub const COMMANDS: &[CommandRow] = &[
             name: "file",
             kind: ValueKind::Path,
             required: true,
+            repeatable: false,
             choices: &[],
             help: "Log file to import (`.idl0`, `.fit`, `.gpx`, `.csv`)",
         }],
@@ -479,6 +487,7 @@ pub const COMMANDS: &[CommandRow] = &[
             name: "file",
             kind: ValueKind::Path,
             required: true,
+            repeatable: false,
             choices: &[],
             help: "Workbook file to create; refuses to overwrite an existing one",
         }],
@@ -549,6 +558,7 @@ pub const COMMANDS: &[CommandRow] = &[
                 name: "cell",
                 kind: ValueKind::Text,
                 required: true,
+                repeatable: false,
                 choices: &[],
                 help: "Cell id, as `workbook cells` prints it",
             },
@@ -649,6 +659,7 @@ pub const COMMANDS: &[CommandRow] = &[
             name: "folder",
             kind: ValueKind::Path,
             required: true,
+            repeatable: false,
             choices: &[],
             help: "Folder to fold into the library",
         }],
@@ -671,6 +682,7 @@ pub const COMMANDS: &[CommandRow] = &[
             name: "folder",
             kind: ValueKind::Path,
             required: true,
+            repeatable: false,
             choices: &[],
             help: "Folder to scan",
         }],
@@ -703,6 +715,7 @@ pub const COMMANDS: &[CommandRow] = &[
             name: "sessions",
             kind: ValueKind::Text,
             required: false,
+            repeatable: true,
             choices: &[],
             help: "Session ids to index; with none, every session whose index is stale",
         }],
@@ -726,6 +739,7 @@ pub const COMMANDS: &[CommandRow] = &[
             name: "sessions",
             kind: ValueKind::Text,
             required: false,
+            repeatable: true,
             choices: &[],
             help: "Session ids to rebuild; mutually exclusive with --all",
         }],
@@ -923,6 +937,19 @@ mod tests {
                     row.args[at..].iter().all(|a| !a.required),
                     "{row} has a required argument after an optional one"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_last_argument_is_ever_repeatable() {
+        // Arrange
+        let rows = COMMANDS;
+
+        // Act / Assert — clap cannot place a positional after a variadic one.
+        for row in rows {
+            if let Some(at) = row.args.iter().position(|a| a.repeatable) {
+                assert_eq!(at, row.args.len() - 1, "{row}'s repeatable argument is not last");
             }
         }
     }

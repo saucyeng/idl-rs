@@ -149,6 +149,7 @@ fn row_json(row: &CommandRow) -> Value {
             "name": arg.name,
             "kind": arg.kind.as_str(),
             "required": arg.required,
+            "repeatable": arg.repeatable,
             "choices": arg.choices,
             "help": arg.help,
         })).collect::<Vec<_>>(),

@@ -17,13 +17,14 @@ mod envelope;
 mod library;
 mod recover;
 mod table_cmd;
+mod verbs;
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
 use idl_rs::export::{self, ExportFormat, ExportOptions, FitLap, FitOptions, FitSport};
@@ -260,21 +261,6 @@ enum Command {
         #[arg(long)]
         scan_limit: Option<u64>,
     },
-    /// Bulk library management for a data directory (ruling R197): fold a
-    /// folder in, preview a scan, list stale sessions, rebuild them. Every
-    /// action is a wrapper over the core functions the app's own commands
-    /// call, so the CLI and the app can never drift.
-    Library {
-        #[command(subcommand)]
-        action: library::LibraryAction,
-    },
-    /// Regenerate documentation from the engine's own catalogs (the
-    /// `docs` group, ruling R222 item 1). CI runs `docs workbook` and
-    /// fails if the committed file differs.
-    Docs {
-        #[command(subcommand)]
-        action: docs_cmd::DocsAction,
-    },
     /// Evaluate, list, or validate a workbook's tables (the `table` group).
     Table {
         #[command(subcommand)]
@@ -465,8 +451,60 @@ impl ScalingArg {
 /// pre-dispatch usage errors itself (exit 2, native stderr message);
 /// everything past parse goes through the JSON envelope.
 
+/// The pre-R230 spelling of a command, and the noun-rooted one that
+/// replaces it.
+///
+/// R230 allows breaking changes only at a major version, so every one of
+/// these still runs; it prints a one-line notice to stderr first, which
+/// keeps a script's stdout byte-identical while telling whoever reads the
+/// terminal what to type instead. The list is exactly the legacy commands a
+/// table row supersedes — `info`, `channels`, `fft` and the rest have no
+/// noun-rooted replacement yet and so are not deprecated.
+const DEPRECATED: &[(&str, &str)] = &[
+    ("import", "session import"),
+    ("sessions", "session list"),
+    ("verify", "catalog verify"),
+    ("rescan", "track detect"),
+    ("table eval", "workbook eval"),
+    ("table list", "workbook cells"),
+    ("table check", "workbook check"),
+];
+
+/// Prints the deprecation notice for `command`, if it has one.
+fn warn_if_deprecated(command: &str) {
+    if let Some((_, replacement)) = DEPRECATED.iter().find(|(old, _)| *old == command) {
+        eprintln!("note: `idl-rs {command}` is deprecated; use `idl-rs {replacement}`");
+    }
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // The noun-rooted surface is generated from the one command table
+    // (ruling R230); the legacy noun-less verbs are still the derive's.
+    let matches = verbs::augment(Cli::command()).get_matches();
+    if let Some((noun, noun_matches)) = matches.subcommand() {
+        if let Some(code) = verbs::dispatch(noun, noun_matches) {
+            return code;
+        }
+    }
+
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+
+    match &cli.command {
+        Command::Import { .. } => warn_if_deprecated("import"),
+        Command::Sessions { .. } => warn_if_deprecated("sessions"),
+        Command::Verify { .. } => warn_if_deprecated("verify"),
+        Command::Rescan { .. } => warn_if_deprecated("rescan"),
+        Command::Table { action } => warn_if_deprecated(match action {
+            table_cmd::TableAction::Eval { .. } => "table eval",
+            table_cmd::TableAction::List { .. } => "table list",
+            table_cmd::TableAction::Check { .. } => "table check",
+        }),
+        _ => {}
+    }
+
     match cli.command {
         Command::Info { file, format } => emit_structured("info", cmd_info(&file, format)),
         Command::Channels { file, format } => {
@@ -577,8 +615,6 @@ fn main() -> ExitCode {
             "scan",
             recover::scan_all(&device, out_dir.as_deref(), scan_limit.unwrap_or(u64::MAX)),
         ),
-        Command::Library { action } => library::run(action),
-        Command::Docs { action } => docs_cmd::run(action),
         Command::Table { action } => table_cmd::run(action),
         Command::Import { file, data_dir } => cmd_import(&file, &data_dir),
         Command::Sessions { data_dir, format } => cmd_sessions(&data_dir, format),
