@@ -24,6 +24,11 @@ serde_yaml_ng = "0.10.0"
 quick-xml = "0.41.0"
 fitparser = "0.9"
 memmap2 = "0.9"
+# Per-session work fans out over a private pool of `physical cores - 1`
+# workers (ruling R208 item 1) — `store::index_job`.
+rayon = "1"
+# Physical (not logical) core count, which `std` does not expose.
+num_cpus = "1"
 
 [dev-dependencies]
 approx = "0.5"
