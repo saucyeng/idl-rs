@@ -20,7 +20,7 @@ use crate::session::handle::SessionHandle;
 /// unbalanced or nested bracket simply yields no match for that fragment rather
 /// than erroring, preserving the Dart "swallow and let the outer eval report
 /// it" behavior. Empty `[]` is skipped.
-pub(crate) fn channel_refs(expr: &str) -> Vec<String> {
+pub fn channel_refs(expr: &str) -> Vec<String> {
     let mut refs = Vec::new();
     let mut rest = expr;
     while let Some(open) = rest.find('[') {

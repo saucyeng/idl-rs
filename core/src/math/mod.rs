@@ -27,7 +27,7 @@ pub use eval::{
     evaluate, evaluate_scalar, ChannelLookup, EvalOutput, LookupChannel, MathLapContext,
     MathOverlay,
 };
-pub use resolve::resolve_dependencies;
+pub use resolve::{channel_refs, resolve_dependencies};
 pub use value::{ChannelValue, Value, Vec3Value};
 
 #[cfg(test)]
