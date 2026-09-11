@@ -471,7 +471,7 @@ mod tests {
                 columns: cols,
                 rows: (0..rows).map(|i| Row { id: format!("r{i}"), context: None }).collect(),
                 cells: (0..rows).map(|_| vec![]).collect(),
-                            row_source: idl_rs::table::RowSource::Authored,
+                row_source: idl_rs::table::RowSource::Authored,
                 main_row_id: None,
             },
         }
