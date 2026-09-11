@@ -965,7 +965,27 @@ pub fn read_channel_index(session_dir: &Path) -> Result<Vec<ChannelColumnInfo>, 
 /// decodes only the requested column chunks, so peak bytes scale with the
 /// requested channels, not with the session.
 fn read_projected_batch(session_dir: &Path, wanted: &[&str]) -> Result<RecordBatch, ParquetStoreError> {
+    read_projected_batch_with_progress(session_dir, wanted, &mut |_, _| {})
+}
+
+/// [`read_projected_batch`], reporting `(rows decoded so far, rows in the
+/// file)` to `on_progress` after every [`RecordBatch`] the reader yields
+/// (ruling R221 item 1).
+///
+/// The callback is the only difference: the read itself, its projection and
+/// its errors are identical, so the progress-reporting and the silent path
+/// cannot decode differently. Reporting happens **during** the streaming
+/// read only — the `concat_batches` that follows, and the gather
+/// [`channel_samples_from_batch`] does after it, are single steps with no
+/// intermediate observation, so a caller sees the count reach the file's row
+/// count slightly before the decode returns.
+fn read_projected_batch_with_progress(
+    session_dir: &Path,
+    wanted: &[&str],
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> Result<RecordBatch, ParquetStoreError> {
     let builder = open_data_parquet(session_dir)?;
+    let total_rows = builder.metadata().file_metadata().num_rows().max(0) as usize;
     let schema = builder.schema().clone();
     let roots: Vec<usize> = schema
         .fields()
@@ -980,9 +1000,14 @@ fn read_projected_batch(session_dir: &Path, wanted: &[&str]) -> Result<RecordBat
         .build()
         .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Io, format!("build reader: {e}")))?;
     let projected_schema = reader.schema();
-    let batches: Vec<RecordBatch> = reader
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Io, format!("read batches: {e}")))?;
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    let mut done_rows = 0usize;
+    for batch in reader {
+        let batch = batch.map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Io, format!("read batches: {e}")))?;
+        done_rows += batch.num_rows();
+        batches.push(batch);
+        on_progress(done_rows.min(total_rows), total_rows);
+    }
     arrow::compute::concat_batches(&projected_schema, &batches)
         .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Io, format!("concat_batches: {e}")))
 }
@@ -1118,11 +1143,38 @@ fn time_source(
 /// against a session synthesis would not have given one to (no samples, or
 /// no usable `GPS_SpeedKmh`).
 pub fn read_channel(session_dir: &Path, channel: &str) -> Result<ChannelSamples, ParquetStoreError> {
+    read_channel_with_progress(session_dir, channel, &mut |_, _| {})
+}
+
+/// [`read_channel`], reporting `(rows decoded so far, rows this decode has
+/// to get through)` to `on_progress` as it streams (ruling R221 item 1).
+///
+/// `read_channel` is this function with a callback that does nothing, so the
+/// two can never decode differently.
+///
+/// **The count is monotonic over the whole decode, not per column read.** A
+/// stored channel is one pass over the file, so the total is the file's row
+/// count. `Time` is also one pass (its source channel's). `Distance` is
+/// two — its `Time` source and `GPS_SpeedKmh` — so its total is twice the
+/// file's row count and its second pass continues where the first stopped,
+/// rather than sending a ring back to zero halfway through.
+///
+/// Nothing is reported for the integration and interpolation `Distance` does
+/// after its reads, nor for the per-sample gather every channel ends with:
+/// they are single steps with no intermediate observation. A caller that
+/// draws the fraction therefore sees it reach 1 shortly before the decode
+/// returns, never after.
+pub fn read_channel_with_progress(
+    session_dir: &Path,
+    channel: &str,
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> Result<ChannelSamples, ParquetStoreError> {
     let index = read_channel_index(session_dir)?;
+    let file_rows = index.first().map_or(0, |c| c.file_rows);
 
     if let Some(info) = index.iter().find(|c| c.channel_id == channel) {
         let recorded = format!("{}_t_recorded_us", info.source_kind);
-        let batch = read_projected_batch(session_dir, &[channel, recorded.as_str()])?;
+        let batch = read_projected_batch_with_progress(session_dir, &[channel, recorded.as_str()], on_progress)?;
         return channel_samples_from_batch(&batch, channel);
     }
 
@@ -1141,10 +1193,17 @@ pub fn read_channel(session_dir: &Path, channel: &str) -> Result<ChannelSamples,
     };
     let (source_id, max_rate, max_rate_len) = time_source(session_dir, &index)?.ok_or_else(no_time)?;
 
+    // How many passes over the file this decode makes, so the reported
+    // fraction is monotonic across them (see this function's doc comment).
+    let passes = if channel == TIME_CHANNEL_ID { 1 } else { 2 };
+
     // The source channel's own recorded time axis — `Time`'s values are it,
     // in seconds, and `Distance` is presented on it (they share one axis by
     // construction, exactly as synthesis builds them).
-    let source = read_channel(session_dir, &source_id)?;
+    let source = {
+        let mut first = |done: usize, total: usize| on_progress(done, total * passes);
+        read_channel_with_progress(session_dir, &source_id, &mut first)?
+    };
     let time_t_us = source.t_us.clone();
     drop(source);
 
@@ -1176,7 +1235,10 @@ pub fn read_channel(session_dir: &Path, channel: &str) -> Result<ChannelSamples,
         .find(|c| c.channel_id == GPS_SPEED_CHANNEL_ID && c.nominal_rate_hz > 0.0)
         .ok_or_else(speed_absent)?
         .nominal_rate_hz;
-    let speed = read_channel(session_dir, GPS_SPEED_CHANNEL_ID)?;
+    let speed = {
+        let mut second = |done: usize, total: usize| on_progress(file_rows + done, total * passes);
+        read_channel_with_progress(session_dir, GPS_SPEED_CHANNEL_ID, &mut second)?
+    };
     if speed.is_empty() {
         return Err(speed_absent());
     }
@@ -2074,6 +2136,54 @@ mod channel_read_tests {
             gaps: Vec::new(),
         });
         session
+    }
+
+    /// Every `(done, total)` `read_channel_with_progress` reported, in order.
+    fn progress_of(session_dir: &Path, channel: &str) -> (ChannelSamples, Vec<(usize, usize)>) {
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        let samples = {
+            let mut record = |done: usize, total: usize| seen.push((done, total));
+            read_channel_with_progress(session_dir, channel, &mut record).unwrap()
+        };
+        (samples, seen)
+    }
+
+    #[test]
+    fn read_channel_with_progress_a_stored_channel_reports_up_to_the_files_row_count_and_decodes_the_same_samples() {
+        // Arrange
+        let session = sample_session();
+        let (root, dir) = seed(&session);
+        let file_rows = read_channel_index(&dir).unwrap().first().unwrap().file_rows;
+
+        // Act
+        let (got, seen) = progress_of(&dir, "IMU0_AccelX");
+
+        // Assert — one pass over the file, ending exactly at its row count,
+        // and the samples are `read_channel`'s own.
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|&(_, total)| total == file_rows));
+        assert_eq!(seen.last().unwrap().0, file_rows);
+        assert_eq!(got.to_channel(), read_channel(&dir, "IMU0_AccelX").unwrap().to_channel());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_channel_with_progress_the_synthesized_distance_channel_counts_its_two_passes_monotonically() {
+        // Arrange — `Distance` reads its `Time` source and `GPS_SpeedKmh`.
+        let session = session_with_gps_speed();
+        let (root, dir) = seed(&session);
+        let file_rows = read_channel_index(&dir).unwrap().first().unwrap().file_rows;
+
+        // Act
+        let (_, seen) = progress_of(&dir, "Distance");
+
+        // Assert — one total covering both passes, never sent back to zero.
+        assert!(seen.iter().all(|&(_, total)| total == file_rows * 2));
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert_eq!(seen.last().unwrap().0, file_rows * 2);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
