@@ -184,6 +184,15 @@ fn create_schema(conn: &Connection) -> Result<(), CatalogError> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RebuildReport {
     pub blobs_indexed: usize,
+    /// Blobs whose `(sha256, size_bytes, mtime_ms)` matched a row in the
+    /// previous `catalog.sqlite` and were copied across **without**
+    /// re-hashing (C4 §5 step 1 as amended by ruling R219). Always `0` on a
+    /// rebuild with no usable previous catalog.
+    pub blobs_carried: usize,
+    /// Blobs actually read and hashed this run — new paths, and paths whose
+    /// size or mtime no longer matches the carried row. `blobs_carried +
+    /// blobs_hashed == blobs_indexed`.
+    pub blobs_hashed: usize,
     pub tracks_indexed: usize,
     pub sessions_indexed: usize,
     pub laps_indexed: usize,
@@ -193,6 +202,50 @@ pub struct RebuildReport {
     pub lap_summary_indexed: usize,
     pub workbooks_indexed: usize,
     pub skipped: Vec<String>, // human-readable "<path>: <reason>" entries
+}
+
+/// Which step of C4 §5's scan a [`RebuildProgress`] observation belongs to.
+/// The five spellings are the C3 §3.2 `rebuild_progress` contract — they are
+/// what the status chip renders (ruling R219 item 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebuildPhase {
+    /// Step 1: walking `blobs/sha256/*/*`.
+    Blobs,
+    /// Step 2: walking `tracks/*.idl0t`.
+    Tracks,
+    /// Steps 3–5: walking `sessions/*/`.
+    Sessions,
+    /// The terminal lap count, once every session has been scanned — laps
+    /// are inserted inside step 3's per-session body, so they have no walk
+    /// of their own to count through.
+    Laps,
+    /// Step 6: walking `workbooks/*.idl1wb`.
+    Workbooks,
+}
+
+impl RebuildPhase {
+    /// The C3 §3.2 wire spelling, byte for byte.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RebuildPhase::Blobs => "blobs",
+            RebuildPhase::Tracks => "tracks",
+            RebuildPhase::Sessions => "sessions",
+            RebuildPhase::Laps => "laps",
+            RebuildPhase::Workbooks => "workbooks",
+        }
+    }
+}
+
+/// One observation from [`rebuild_catalog_with_progress`], reported as each
+/// entity in a phase is finished. `done` counts entities **finished** in
+/// this phase, so `done + 1` is the one being worked on; `total` is how many
+/// that phase has to get through (a directory-entry count, taken before the
+/// phase starts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebuildProgress {
+    pub phase: RebuildPhase,
+    pub done: usize,
+    pub total: usize,
 }
 
 /// Rebuilds `<data_root>/catalog.sqlite` from a full tree scan (C4 §5).
@@ -210,6 +263,27 @@ pub struct RebuildReport {
 /// replace-under-a-reader — the caller is responsible for not holding a
 /// [`open_catalog`] connection across a call to this function.
 pub fn rebuild_catalog(data_root: &Path) -> Result<RebuildReport, CatalogError> {
+    rebuild_catalog_with_progress(data_root, &|_| {})
+}
+
+/// [`rebuild_catalog`] with a progress hook (ruling R219 item 2): `progress`
+/// is called from this thread as each entity in each C4 §5 phase is
+/// finished, so a caller running the rebuild on a background thread can
+/// report it without polling. `rebuild_catalog` is this function with a
+/// no-op hook; every word of its own documentation applies here unchanged.
+///
+/// **Step 1 is incremental** (C4 §5 step 1 as amended 2026-09-11, ruling
+/// R219): a previous `catalog.sqlite`, when one exists and carries this
+/// build's schema version, is opened read-only and every blob path whose
+/// `(sha256, size_bytes, mtime_ms)` still matches its row is carried across
+/// without re-reading the blob's bytes. Only new paths, and paths whose size
+/// or mtime moved, are hashed. The full hash of every blob is
+/// [`crate::store::verify::verify_data_dir`]'s job (C4 §7 #1), not the
+/// rebuild's — on a 159-session library the hash pass alone took minutes.
+pub fn rebuild_catalog_with_progress(
+    data_root: &Path,
+    progress: &dyn Fn(RebuildProgress),
+) -> Result<RebuildReport, CatalogError> {
     let tmp_dir = data_root.join("tmp");
     std::fs::create_dir_all(&tmp_dir).map_err(io_err)?;
     let staging_path = tmp_dir.join(format!("catalog-rebuild-{}.sqlite", Uuid::new_v4()));
@@ -218,45 +292,26 @@ pub fn rebuild_catalog(data_root: &Path) -> Result<RebuildReport, CatalogError> 
     create_schema(&conn)?;
     let mut report = RebuildReport::default();
 
-    // 1. blobs
-    let blobs_dir = data_root.join("blobs").join("sha256");
-    if blobs_dir.is_dir() {
-        for shard in std::fs::read_dir(&blobs_dir).map_err(io_err)?.flatten() {
-            if !shard.path().is_dir() {
-                continue;
-            }
-            let prefix = shard.file_name().to_string_lossy().into_owned();
-            for entry in std::fs::read_dir(shard.path()).map_err(io_err)?.flatten() {
-                let suffix = entry.file_name().to_string_lossy().into_owned();
-                let sha256 = format!("{prefix}{suffix}");
-                if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-                    report.skipped.push(format!("{}: path does not encode a 64-hex sha256", entry.path().display()));
-                    continue;
-                }
-                match verify_blob(data_root, &sha256) {
-                    Ok(()) => {
-                        let meta = entry.metadata().map_err(io_err)?;
-                        let mtime_ms = file_mtime_ms(&meta);
-                        conn.execute(
-                            "INSERT INTO blobs (sha256, size_bytes, mtime_ms) VALUES (?1, ?2, ?3)",
-                            rusqlite::params![sha256, meta.len() as i64, mtime_ms],
-                        )?;
-                        report.blobs_indexed += 1;
-                    }
-                    Err(e) => report.skipped.push(format!("{}: {e}", entry.path().display())),
-                }
-            }
-        }
+    // 1. blobs — incremental against the catalog already on disk.
+    let carried_rows = carryable_blob_rows(data_root);
+    let blob_entries = blob_entry_paths(data_root)?;
+    let blobs_total = blob_entries.len();
+    for (done, entry) in blob_entries.into_iter().enumerate() {
+        index_blob_entry(&conn, data_root, &entry, &carried_rows, &mut report)?;
+        progress(RebuildProgress { phase: RebuildPhase::Blobs, done: done + 1, total: blobs_total });
     }
 
     // 2. tracks
     let tracks_dir = data_root.join("tracks");
     if tracks_dir.is_dir() {
-        for entry in std::fs::read_dir(&tracks_dir).map_err(io_err)?.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("idl0t") {
-                continue;
-            }
+        let track_paths: Vec<std::path::PathBuf> = std::fs::read_dir(&tracks_dir)
+            .map_err(io_err)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("idl0t"))
+            .collect();
+        let tracks_total = track_paths.len();
+        for (done, path) in track_paths.into_iter().enumerate() {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
             match read_track(&path) {
                 Ok(track) if track.id == stem => {
@@ -270,25 +325,31 @@ pub fn rebuild_catalog(data_root: &Path) -> Result<RebuildReport, CatalogError> 
                 Ok(_) => report.skipped.push(format!("{}: filename does not match its own track_id", path.display())),
                 Err(e) => report.skipped.push(format!("{}: {e}", path.display())),
             }
+            progress(RebuildProgress { phase: RebuildPhase::Tracks, done: done + 1, total: tracks_total });
         }
     }
 
     // 3. sessions (+ 4. laps, inline per session; 5. lap_summary, inline per session)
     let sessions_dir = data_root.join("sessions");
     if sessions_dir.is_dir() {
-        for entry in std::fs::read_dir(&sessions_dir).map_err(io_err)?.flatten() {
-            let dir = entry.path();
-            if !dir.is_dir() {
-                continue;
-            }
-            let session_id = entry.file_name().to_string_lossy().into_owned();
+        let session_dirs: Vec<std::path::PathBuf> =
+            std::fs::read_dir(&sessions_dir).map_err(io_err)?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        let sessions_total = session_dirs.len();
+        for (done, dir) in session_dirs.into_iter().enumerate() {
+            let session_id = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             match index_session_body(&conn, &dir, &session_id, &mut report.laps_indexed, &mut report.lap_summary_indexed, &mut report.skipped)?
             {
                 SessionBodyOutcome::Indexed => report.sessions_indexed += 1,
                 SessionBodyOutcome::TransientNoData | SessionBodyOutcome::Skipped => {}
             }
+            progress(RebuildProgress { phase: RebuildPhase::Sessions, done: done + 1, total: sessions_total });
         }
     }
+
+    // 4. laps have no walk of their own — they are inserted inside step 3's
+    // per-session body. One terminal observation so the phase appears in the
+    // progress stream at all, with the count it actually produced.
+    progress(RebuildProgress { phase: RebuildPhase::Laps, done: report.laps_indexed, total: report.laps_indexed });
 
     // 6. workbooks — L3 shipped `.idl1wb` front-matter parsing (ruling R87):
     // walk `workbooks/*.idl1wb`, parse each file's front matter for
@@ -297,15 +358,19 @@ pub fn rebuild_catalog(data_root: &Path) -> Result<RebuildReport, CatalogError> 
     // as steps 2/3 above).
     let workbooks_dir = data_root.join("workbooks");
     if workbooks_dir.is_dir() {
-        for entry in std::fs::read_dir(&workbooks_dir).map_err(io_err)?.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("idl1wb") {
-                continue;
-            }
+        let workbook_paths: Vec<std::path::PathBuf> = std::fs::read_dir(&workbooks_dir)
+            .map_err(io_err)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("idl1wb"))
+            .collect();
+        let workbooks_total = workbook_paths.len();
+        for (done, path) in workbook_paths.into_iter().enumerate() {
             match index_workbook_file(&conn, &path) {
                 Ok(()) => report.workbooks_indexed += 1,
                 Err(e) => report.skipped.push(format!("{}: {e}", path.display())),
             }
+            progress(RebuildProgress { phase: RebuildPhase::Workbooks, done: done + 1, total: workbooks_total });
         }
     }
 
@@ -333,6 +398,122 @@ pub fn rebuild_catalog(data_root: &Path) -> Result<RebuildReport, CatalogError> 
     let _ = std::fs::remove_file(data_root.join("catalog.sqlite-shm"));
 
     Ok(report)
+}
+
+/// `blobs/sha256/<2>/<62>` file paths, in directory-walk order — collected
+/// up front so C4 §5 step 1 knows its own `total` before it starts (ruling
+/// R219 item 2's progress needs one) and so the walk is one pass, not two.
+/// Shard directories are the only thing under `blobs/sha256/`; a non-directory
+/// there is ignored, exactly as the inline walk this replaces did.
+fn blob_entry_paths(data_root: &Path) -> Result<Vec<std::path::PathBuf>, CatalogError> {
+    let blobs_dir = data_root.join("blobs").join("sha256");
+    if !blobs_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for shard in std::fs::read_dir(&blobs_dir).map_err(io_err)?.flatten() {
+        if !shard.path().is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(shard.path()).map_err(io_err)?.flatten() {
+            paths.push(entry.path());
+        }
+    }
+    Ok(paths)
+}
+
+/// The previous `catalog.sqlite`'s `blobs` rows as `sha256 -> (size_bytes,
+/// mtime_ms)` — the carry-over set for C4 §5 step 1 (ruling R219 item 1).
+///
+/// Opened **read-only**: this runs before the staging database is swapped
+/// in, while the live catalog is still the one the app is reading, and the
+/// rebuild has no business writing to it. Every failure — no catalog yet, a
+/// catalog this build's schema version does not match, an unreadable or
+/// corrupt file, a `blobs` table that will not query — degrades to an empty
+/// map, which simply means "hash everything", i.e. exactly the behaviour
+/// this function optimises away. A rebuild must never fail *because* the
+/// thing it is rebuilding is broken; that is the case it exists for.
+fn carryable_blob_rows(data_root: &Path) -> std::collections::HashMap<String, (i64, i64)> {
+    let path = data_root.join("catalog.sqlite");
+    if !path.is_file() {
+        return std::collections::HashMap::new();
+    }
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let Ok(conn) = Connection::open_with_flags(&path, flags) else {
+        return std::collections::HashMap::new();
+    };
+    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
+    if user_version != CATALOG_SCHEMA_VERSION {
+        return std::collections::HashMap::new();
+    }
+    let Ok(mut stmt) = conn.prepare("SELECT sha256, size_bytes, mtime_ms FROM blobs") else {
+        return std::collections::HashMap::new();
+    };
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+    });
+    match rows {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
+/// C4 §5 step 1 for one `blobs/sha256/<2>/<62>` path, as amended by ruling
+/// R219: the path must encode its own 64-hex digest, and then either
+///
+/// * its `(size_bytes, mtime_ms)` still match `carried`'s row for that
+///   digest, in which case the row is inserted without reading a byte of the
+///   blob (`blobs_carried`), or
+/// * it is new or has moved, in which case [`verify_blob`] re-hashes the
+///   whole file exactly as step 1 always did (`blobs_hashed`).
+///
+/// A path that does not encode a digest, or whose bytes fail the hash check,
+/// is reported into `skipped` and not inserted — unchanged. Size and mtime
+/// are a *change detector*, not an integrity check: C4 §7 #1's
+/// `verify_data_dir` still re-hashes every blob, and is where a silently
+/// corrupted-in-place blob is caught.
+fn index_blob_entry(
+    conn: &Connection,
+    data_root: &Path,
+    path: &Path,
+    carried: &std::collections::HashMap<String, (i64, i64)>,
+    report: &mut RebuildReport,
+) -> Result<(), CatalogError> {
+    let suffix = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let prefix =
+        path.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let sha256 = format!("{prefix}{suffix}");
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        report.skipped.push(format!("{}: path does not encode a 64-hex sha256", path.display()));
+        return Ok(());
+    }
+
+    let meta = std::fs::metadata(path).map_err(io_err)?;
+    let size_bytes = meta.len() as i64;
+    let mtime_ms = file_mtime_ms(&meta);
+
+    if carried.get(&sha256) == Some(&(size_bytes, mtime_ms)) {
+        conn.execute(
+            "INSERT INTO blobs (sha256, size_bytes, mtime_ms) VALUES (?1, ?2, ?3)",
+            rusqlite::params![sha256, size_bytes, mtime_ms],
+        )?;
+        report.blobs_indexed += 1;
+        report.blobs_carried += 1;
+        return Ok(());
+    }
+
+    match verify_blob(data_root, &sha256) {
+        Ok(()) => {
+            conn.execute(
+                "INSERT INTO blobs (sha256, size_bytes, mtime_ms) VALUES (?1, ?2, ?3)",
+                rusqlite::params![sha256, size_bytes, mtime_ms],
+            )?;
+            report.blobs_indexed += 1;
+            report.blobs_hashed += 1;
+        }
+        Err(e) => report.skipped.push(format!("{}: {e}", path.display())),
+    }
+    Ok(())
 }
 
 /// What [`index_session_body`] did with one session directory — the caller
@@ -1077,6 +1258,102 @@ mod tests {
         let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -- C4 §5 step 1, incremental (ruling R219 items 1-2) ---------------
+
+    #[test]
+    fn rebuild_catalog_first_run_no_previous_catalog_hashes_every_blob() {
+        // Arrange
+        let root = temp_root();
+        let doc = empty_session_json("s1");
+        write_full_session(&root, "s1", 0, &doc);
+
+        // Act
+        let report = rebuild_catalog(&root).unwrap();
+
+        // Assert
+        assert_eq!((report.blobs_indexed, report.blobs_carried, report.blobs_hashed), (1, 0, 1));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebuild_catalog_second_run_with_nothing_changed_carries_every_blob_and_hashes_none() {
+        // Arrange
+        let root = temp_root();
+        write_full_session(&root, "s1", 0, &empty_session_json("s1"));
+        write_full_session(&root, "s2", 0, &empty_session_json("s2"));
+        rebuild_catalog(&root).unwrap();
+
+        // Act
+        let report = rebuild_catalog(&root).unwrap();
+
+        // Assert
+        assert_eq!((report.blobs_indexed, report.blobs_carried, report.blobs_hashed), (2, 2, 0));
+        assert!(report.skipped.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebuild_catalog_second_run_with_one_new_blob_hashes_only_the_new_one() {
+        // Arrange
+        let root = temp_root();
+        write_full_session(&root, "s1", 0, &empty_session_json("s1"));
+        rebuild_catalog(&root).unwrap();
+        write_full_session(&root, "s2", 0, &empty_session_json("s2"));
+
+        // Act
+        let report = rebuild_catalog(&root).unwrap();
+
+        // Assert
+        assert_eq!((report.blobs_indexed, report.blobs_carried, report.blobs_hashed), (2, 1, 1));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebuild_catalog_a_blob_whose_mtime_no_longer_matches_its_row_is_re_hashed() {
+        // Arrange -- two blobs indexed, then one row's mtime_ms moved so it
+        // no longer matches the file on disk (what touching the blob does).
+        let root = temp_root();
+        write_full_session(&root, "s1", 0, &empty_session_json("s1"));
+        write_full_session(&root, "s2", 0, &empty_session_json("s2"));
+        rebuild_catalog(&root).unwrap();
+        {
+            let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
+            let sha: String = conn.query_row("SELECT sha256 FROM blobs ORDER BY sha256 LIMIT 1", [], |r| r.get(0)).unwrap();
+            conn.execute("UPDATE blobs SET mtime_ms = mtime_ms + 1 WHERE sha256 = ?1", rusqlite::params![sha]).unwrap();
+        }
+
+        // Act
+        let report = rebuild_catalog(&root).unwrap();
+
+        // Assert
+        assert_eq!((report.blobs_indexed, report.blobs_carried, report.blobs_hashed), (2, 1, 1));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebuild_catalog_with_progress_reports_every_phase_in_c4_scan_order() {
+        // Arrange
+        let root = temp_root();
+        write_full_session(&root, "s1", 0, &empty_session_json("s1"));
+        let seen = std::cell::RefCell::new(Vec::new());
+
+        // Act
+        rebuild_catalog_with_progress(&root, &|p| seen.borrow_mut().push((p.phase, p.done, p.total))).unwrap();
+
+        // Assert
+        let seen = seen.into_inner();
+        let phases: Vec<&'static str> = seen.iter().map(|(phase, _, _)| phase.as_str()).collect();
+        assert_eq!(phases, vec!["blobs", "sessions", "laps"]);
+        assert_eq!(seen[0], (RebuildPhase::Blobs, 1, 1));
+        assert_eq!(seen[1], (RebuildPhase::Sessions, 1, 1));
 
         let _ = std::fs::remove_dir_all(&root);
     }
