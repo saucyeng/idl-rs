@@ -605,7 +605,20 @@ fn index_session_inner(
 /// piece of C4 §5 step 1 [`index_session`] needs (ruling R84). Verifies the
 /// blob's own bytes first (same check step 1's scan makes), rather than
 /// trusting the caller's claim that this hash is the file's real digest.
+///
+/// A blob already present in `blobs` is left alone without re-verifying:
+/// [`verify_blob`] re-hashes the whole file, and re-indexing a session whose
+/// blob was verified when it was first inserted would otherwise re-hash
+/// hundreds of megabytes per session for a row that is already there
+/// (ruling R207's library-wide index job re-indexes every session). The
+/// verification still happens exactly once per blob, on the insert that
+/// creates its row.
 fn ensure_blob_row(conn: &Connection, data_root: &Path, sha256: &str) -> Result<(), CatalogError> {
+    let already_indexed =
+        conn.query_row("SELECT 1 FROM blobs WHERE sha256 = ?1", rusqlite::params![sha256], |_| Ok(())).is_ok();
+    if already_indexed {
+        return Ok(());
+    }
     verify_blob(data_root, sha256).map_err(|e| CatalogError { kind: CatalogErrorKind::Sql, message: e.to_string() })?;
     let path = blob_path(data_root, sha256);
     let meta = std::fs::metadata(&path).map_err(io_err)?;
@@ -2002,6 +2015,36 @@ mod tests {
         assert_eq!(sessions_rows, 1);
         let blobs_after: i64 = conn.query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0)).unwrap();
         assert_eq!(blobs_after, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_session_re_indexed_does_not_re_read_the_blob_it_already_recorded() {
+        // Arrange — one indexed session, then its blob file is emptied.
+        // Re-verifying would now fail the hash; the fast path must not look
+        // (rulings R207/R208.1: the library-wide job re-indexes every
+        // session, and re-hashing every source log each pass is the cost it
+        // exists to avoid).
+        let root = temp_root();
+        let conn = empty_catalog(&root);
+        let session_id = "sess-blob-fast-path";
+        let doc = empty_session_json(session_id);
+        write_full_session(&root, session_id, 0, &doc);
+        index_session(&conn, &root, session_id).unwrap();
+        let sha: String = conn
+            .query_row("SELECT blob_sha256 FROM sessions WHERE session_id = ?1", rusqlite::params![session_id], |r| r.get(0))
+            .unwrap();
+        std::fs::write(blob_path(&root, &sha), b"not the bytes this hash names").unwrap();
+
+        // Act
+        let report = index_session(&conn, &root, session_id).unwrap();
+
+        // Assert — the re-index succeeded without re-hashing, and the one
+        // `blobs` row is still the one the first index verified.
+        assert!(report.skipped.is_empty());
+        let blobs: i64 = conn.query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0)).unwrap();
+        assert_eq!(blobs, 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -6,6 +6,7 @@ pub mod cursor;
 pub mod device;
 pub mod firmware;
 pub mod import;
+pub mod index;
 pub mod library;
 pub mod maintenance;
 pub mod rasters;
