@@ -26,6 +26,7 @@ pub mod parse;
 pub mod raster;
 pub mod rotation;
 pub mod scatter;
+pub mod scatter_wire;
 pub mod session;
 pub mod spectrogram;
 pub mod statistics;
