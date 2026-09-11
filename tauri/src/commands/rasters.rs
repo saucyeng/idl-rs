@@ -396,6 +396,10 @@ pub fn fetch_raster_via(
         "histogram2d" => {
             let p = parse_histogram2d_params(params)?;
             check_bins_match_pixels(&p, width, height)?;
+            // Both axes at once, on the decode pool (ruling R232.2): a
+            // histogram2d cannot draw a pixel until it has both, so paying
+            // for them back to back buys nothing.
+            cache.prefetch(&session_dir(data_dir, session_id), session_id, &[channel, p.y_channel.as_str()]);
             let x_ch = raster_channel(cache, data_dir, session_id, channel)?;
             let y_ch = raster_channel(cache, data_dir, session_id, &p.y_channel)?;
             let xs = windowed_samples(&x_ch, span);
@@ -478,6 +482,10 @@ pub fn fetch_raster_meta_via(
         "histogram2d" => {
             let p = parse_histogram2d_params(params)?;
             check_bins_match_pixels(&p, width, height)?;
+            // Both axes at once, on the decode pool (ruling R232.2): a
+            // histogram2d cannot draw a pixel until it has both, so paying
+            // for them back to back buys nothing.
+            cache.prefetch(&session_dir(data_dir, session_id), session_id, &[channel, p.y_channel.as_str()]);
             let x_ch = raster_channel(cache, data_dir, session_id, channel)?;
             let y_ch = raster_channel(cache, data_dir, session_id, &p.y_channel)?;
             let xs = windowed_samples(&x_ch, span);

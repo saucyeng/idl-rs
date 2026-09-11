@@ -23,7 +23,7 @@ use idl_rs::workbook::v3::{parse_workbook, render_prose_html, CellDoc, CellError
 
 use crate::error::{IpcError, IpcErrorKind};
 use crate::session_cache::SessionCache;
-use crate::session_source::{load_lap_context, load_lazy_session_handle, load_window_context, WindowDto};
+use crate::session_source::{load_lap_context, load_lazy_session_handle, load_window_context, session_dir, WindowDto};
 use crate::state::{DataDir, Hashes, Watchers};
 use crate::watcher::{ExpectedHashSet, WorkbookWatcher};
 
@@ -463,6 +463,7 @@ fn eval_workbook_via(
     let (handle, source, lap_ctx) = match session_id {
         Some(sid) => {
             let (handle, source) = load_lazy_session_handle(data_dir, sid, cache)?;
+            prefetch_document_channels(cache, data_dir, sid, &doc, &handle);
             let lap_ctx = load_lap_context(data_dir, sid, &handle, lap_context)?;
             (handle, Some(source), lap_ctx)
         }
@@ -478,6 +479,45 @@ fn eval_workbook_via(
         return Err(err);
     }
     Ok(outputs)
+}
+
+/// Decodes every stored channel `doc` names, in parallel, before the
+/// evaluator starts asking for them one at a time (ruling R232.2).
+///
+/// This is the request the ruling is about: a notebook binding nine channels
+/// used to pay for nine decodes back to back, each a full pass over
+/// `data.parquet`, with nothing to show for the wait. The names come from
+/// the `[Name]` references in every definition in the document
+/// ([`idl_rs::math::channel_refs`]), filtered to the channels this session
+/// actually stores — a `[Name]` that resolves to a math definition, an alias
+/// or nothing at all is simply not prefetched, and the lazy lookup that
+/// needs it still runs exactly as before.
+///
+/// Best-effort by construction: nothing here reports a failure, because the
+/// evaluation that follows reaches the same channel through
+/// `CachedChannelSource` and reports it properly there.
+fn prefetch_document_channels(
+    cache: &SessionCache,
+    data_dir: &Path,
+    session_id: &str,
+    doc: &idl_rs::workbook::v3::WorkbookDoc,
+    handle: &SessionHandle,
+) {
+    let listed = handle.channels();
+    let stored: std::collections::HashSet<&str> = listed.iter().map(|c| c.channel_id.as_str()).collect();
+    let mut wanted: Vec<String> = Vec::new();
+    for def in &doc.defs {
+        for name in idl_rs::math::channel_refs(&def.expr_text) {
+            if stored.contains(name.as_str()) && !wanted.contains(&name) {
+                wanted.push(name);
+            }
+        }
+    }
+    if wanted.len() < 2 {
+        return;
+    }
+    let refs: Vec<&str> = wanted.iter().map(|s| s.as_str()).collect();
+    cache.prefetch(&session_dir(data_dir, session_id), session_id, &refs);
 }
 
 /// Evaluates `doc`/`structural` against `handle`/`lap_ctx` and builds this
@@ -632,6 +672,7 @@ fn eval_workbook_v2_via(
                 Ok(h) => h,
                 Err(e) => return WindowEval::Error { error: with_window_index(e, i) },
             };
+            prefetch_document_channels(cache, data_dir, &window.session_id, &doc, &handle);
             let lap_ctx = match load_window_context(data_dir, window, &handle) {
                 Ok(c) => c,
                 Err(e) => return WindowEval::Error { error: with_window_index(e, i) },
@@ -1927,6 +1968,82 @@ mod tests {
         // Assert
         assert!(result.migrations.is_empty());
         assert_eq!(result.hash, sha256_hex(markdown.as_bytes()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Seeds a session with several stored channels, all of one source, so
+    /// the prefetch tests have something to fan out over.
+    fn seed_multi_channel_session(root: &Path, session_id: &str, channel_ids: &[&str]) {
+        let session = Session {
+            session_id: session_id.to_string(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            timestamp_source: TimestampSource::Header,
+            config_checksum: None,
+            source_format: SourceFormat::Idl0,
+            blob_sha256: String::new(),
+            channels: channel_ids
+                .iter()
+                .map(|id| Channel {
+                    channel_id: (*id).to_string(),
+                    t_us: vec![0, 100_000, 200_000],
+                    t_recorded_us: None,
+                    nominal_rate_hz: 10.0,
+                    column: RawColumn::F64(vec![1.0, 2.0, 3.0]),
+                    source_kind: "test".to_string(),
+                    unit: String::new(),
+                    gaps: Vec::new(),
+                })
+                .collect(),
+        };
+        write_session_parquet(root, &session, "0.1.0").unwrap();
+    }
+
+    #[test]
+    fn eval_workbook_a_document_naming_four_stored_channels_decodes_all_four_before_evaluating() {
+        // Arrange — ruling R232.2: the channels a document names arrive
+        // together rather than one lazy lookup at a time.
+        let root = temp_root();
+        seed_multi_channel_session(&root, "s1", &["ChanA", "ChanB", "ChanC", "ChanD"]);
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nw = [ChanA]\nx = [ChanB]\ny = [ChanC]\nz = [ChanD]\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let cache = SessionCache::new();
+
+        // Act
+        let out = eval_workbook_via(&cache, &root, WB_ID, Some("s1"), None).unwrap();
+
+        // Assert — every named channel resident, the union axis decoded once
+        // for all four (R232.1), and the values unchanged.
+        assert_eq!(cache.len(), 4);
+        assert_eq!(cache.axis_decodes(), 2);
+        assert!(out[0].defs.iter().all(|d| d.error.is_none()));
+        assert!(out[0].defs.iter().all(|d| d.value.as_ref().unwrap().length == 3));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eval_workbook_a_reference_that_names_no_stored_channel_is_not_prefetched_and_still_reports_itself() {
+        // Arrange — `[Nope]` is neither a column nor a definition.
+        let root = temp_root();
+        seed_multi_channel_session(&root, "s1", &["ChanA", "ChanB"]);
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [ChanA]\ny = [ChanB]\nz = [Nope]\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let cache = SessionCache::new();
+
+        // Act
+        let out = eval_workbook_via(&cache, &root, WB_ID, Some("s1"), None).unwrap();
+
+        // Assert — only the two real channels became resident, and the
+        // unknown reference is still the evaluator's error to report.
+        assert_eq!(cache.len(), 2);
+        let z = out[0].defs.iter().find(|d| d.name == "z").unwrap();
+        assert!(z.error.is_some());
 
         let _ = std::fs::remove_dir_all(&root);
     }
