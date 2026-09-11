@@ -957,13 +957,18 @@ pub fn read_channel_index(session_dir: &Path) -> Result<Vec<ChannelColumnInfo>, 
 }
 
 /// Reads only the named columns of `<session_dir>/data.parquet` into one
-/// concatenated [`RecordBatch`], always including `t`.
+/// concatenated [`RecordBatch`].
 ///
 /// `wanted` is matched against top-level schema fields by name; a name the
 /// file does not carry is skipped silently (callers check existence first).
 /// The projection is what makes a single-channel read cheap — parquet
 /// decodes only the requested column chunks, so peak bytes scale with the
 /// requested channels, not with the session.
+///
+/// **`t` is not implied.** A caller that gathers samples needs it and names
+/// it; a caller decoding one axis column on its own (ruling R232.1's shared
+/// axis) must not pay for it, and an unconditional `t` would have made the
+/// whole shared-axis read pointless.
 fn read_projected_batch(session_dir: &Path, wanted: &[&str]) -> Result<RecordBatch, ParquetStoreError> {
     read_projected_batch_with_progress(session_dir, wanted, &mut |_, _| {})
 }
@@ -991,7 +996,7 @@ fn read_projected_batch_with_progress(
         .fields()
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.name() == "t" || wanted.contains(&f.name().as_str()))
+        .filter(|(_, f)| wanted.contains(&f.name().as_str()))
         .map(|(i, _)| i)
         .collect();
     let mask = ProjectionMask::roots(builder.parquet_schema(), roots);
@@ -1051,7 +1056,7 @@ fn channel_samples_from_batch(batch: &RecordBatch, name: &str) -> Result<Channel
 
     let t_col = t_column_of(batch)?;
     let recorded_col = batch
-        .column_by_name(&format!("{source_kind}_t_recorded_us"))
+        .column_by_name(&recorded_axis_column(&source_kind))
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
     let (t_us, t_recorded_us, column) = read_column(batch.column(idx), t_col, recorded_col, meta)?;
 
@@ -1107,6 +1112,9 @@ fn time_source(
     if candidates.is_empty() {
         return Ok(None);
     }
+    // Only the candidates' own columns: this read counts non-null rows and
+    // never gathers a sample, so it does not need `t` (which
+    // `read_projected_batch` no longer implies).
     let names: Vec<&str> = candidates.iter().map(|c| c.channel_id.as_str()).collect();
     let batch = read_projected_batch(session_dir, &names)?;
 
@@ -1120,6 +1128,227 @@ fn time_source(
     match best {
         None | Some((_, 0)) => Ok(None),
         Some((id, len)) => Ok(Some((id, max_rate, len))),
+    }
+}
+
+/// One decoded timestamp column of `data.parquet` — the union `t` axis, or
+/// a `<source>_t_recorded_us` companion — held apart from any one channel so
+/// every channel that reads through it decompresses it once (ruling R232.1).
+///
+/// Before this type each channel decode projected its own copy of `t` and of
+/// its source's recorded axis, so six `imu0` channels decompressed the same
+/// two i64 columns six times over a 516 MB file. The column is opaque on
+/// purpose: callers (the app's `SessionCache`) hold it, size it and hand it
+/// back to [`read_channel_sharing_axes`], but never read a timestamp out of it,
+/// so no Arrow type crosses out of this crate.
+///
+/// **Row-indexed, not sample-indexed**: the array has one entry per row of
+/// the file, nulls included, exactly as the reader yields it. That is what
+/// makes it shareable — a channel selects its own samples out of it with its
+/// own validity mask.
+#[derive(Debug, Clone)]
+pub struct AxisColumn {
+    /// The column as read, one entry per file row.
+    values: Int64Array,
+}
+
+impl AxisColumn {
+    /// Rows in the column — the file's row count, not any channel's sample
+    /// count.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// `true` when the file has no rows.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Heap bytes this column occupies, for a byte-budgeted cache's
+    /// accounting. Arrow's own figure for the backing buffers, so a shared
+    /// or sliced buffer is counted as the allocation it really is.
+    pub fn resident_bytes(&self) -> usize {
+        self.values.get_array_memory_size()
+    }
+}
+
+/// The already-decoded timestamp columns a channel decode may borrow
+/// instead of reading again (ruling R232.1).
+///
+/// `t` is the union axis, one per session; `recorded` is the channel's
+/// `<source>_t_recorded_us` companion, one per source kind. `None` means
+/// "not held -- read it", and whatever is read comes back in
+/// [`DecodedChannel`] for the caller to keep.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BorrowedAxes<'a> {
+    /// The shared union time axis (column `t`, C1 3.2), when already held.
+    pub t: Option<&'a AxisColumn>,
+    /// The channel's source's recorded-time companion, when already held.
+    pub recorded: Option<&'a AxisColumn>,
+}
+
+/// One channel's samples, plus whichever timestamp axes had to be read to
+/// produce them (ruling R232.1).
+///
+/// The axes are handed back rather than thrown away because they were
+/// decompressed in the same pass as the channel: a caching caller keeps
+/// them, and every later channel of that session and source borrows them
+/// instead of paying again.
+#[derive(Debug)]
+pub struct DecodedChannel {
+    /// The channel, field-for-field what [`read_channel`] returns.
+    pub samples: ChannelSamples,
+    /// The union `t` axis, when this read is the one that decoded it.
+    pub t: Option<AxisColumn>,
+    /// The source's recorded-time companion, when this read decoded it.
+    pub recorded: Option<AxisColumn>,
+}
+
+/// The `<source>_t_recorded_us` column name for `source_kind` (C1 3.2) --
+/// the one place that spelling is built, so a cache's axis keys and the
+/// reader's projection cannot drift apart.
+pub fn recorded_axis_column(source_kind: &str) -> String {
+    format!("{source_kind}_t_recorded_us")
+}
+
+/// [`read_channel_with_progress`], borrowing the timestamp axes the caller
+/// already holds and handing back the ones it had to read (ruling R232.1).
+///
+/// **One pass over the file, whatever is borrowed.** The projection is the
+/// channel's own column plus only the axes `have` does not supply, so this
+/// never costs more than [`read_channel_with_progress`] and costs
+/// substantially less once a session's axes are held: six `imu0` channels
+/// of a 516 MB file used to decompress the union `t` and the `imu0`
+/// recorded companion six times each, which is the cost ruling R232 exists
+/// to remove.
+///
+/// A borrowed axis must be the same file's, and is row-indexed over the
+/// whole file; one of a different length is
+/// [`ParquetStoreErrorKind::Schema`] rather than a silently wrong answer.
+///
+/// A synthesized `Time`/`Distance` has no stored column to project and
+/// borrows nothing: it falls through to [`read_channel_with_progress`],
+/// which owns the answer (and the error message) for both, as it does for a
+/// name this file does not carry at all.
+pub fn read_channel_sharing_axes(
+    session_dir: &Path,
+    channel: &str,
+    have: BorrowedAxes<'_>,
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> Result<DecodedChannel, ParquetStoreError> {
+    let index = read_channel_index(session_dir)?;
+    let Some(info) = index.iter().find(|c| c.channel_id == channel) else {
+        let samples = read_channel_with_progress(session_dir, channel, on_progress)?;
+        return Ok(DecodedChannel { samples, t: None, recorded: None });
+    };
+    let recorded_name = recorded_axis_column(&info.source_kind);
+
+    let mut wanted: Vec<&str> = vec![channel];
+    if have.t.is_none() {
+        wanted.push("t");
+    }
+    if have.recorded.is_none() {
+        wanted.push(recorded_name.as_str());
+    }
+    let batch = read_projected_batch_with_progress(session_dir, &wanted, on_progress)?;
+
+    let column = batch
+        .column_by_name(channel)
+        .ok_or_else(|| ParquetStoreError::new(ParquetStoreErrorKind::NotFound, format!("column {channel} not projected")))?
+        .clone();
+    let rows = column.len();
+
+    // Each axis is either the caller's -- checked against this file's row
+    // count, since a borrowed axis is only usable on the file it came from
+    // -- or this batch's, which is correct by construction.
+    let read_t = match have.t {
+        Some(_) => None,
+        None => Some(axis_from_batch(&batch, "t")?),
+    };
+    let read_recorded = match have.recorded {
+        Some(_) => None,
+        None => match batch.column_by_name(&recorded_name) {
+            Some(_) => Some(axis_from_batch(&batch, &recorded_name)?),
+            None => None,
+        },
+    };
+    let t = match (have.t, read_t.as_ref()) {
+        (Some(held), _) => check_axis_rows(held, "t", rows)?,
+        (None, Some(fresh)) => fresh,
+        (None, None) => {
+            return Err(ParquetStoreError::new(ParquetStoreErrorKind::Schema, "missing t column".to_string()))
+        }
+    };
+    let recorded = match (have.recorded, read_recorded.as_ref()) {
+        (Some(held), _) => Some(check_axis_rows(held, &recorded_name, rows)?),
+        (None, Some(fresh)) => Some(fresh),
+        (None, None) => None,
+    };
+
+    let schema = batch.schema();
+    let field = schema
+        .fields()
+        .iter()
+        .find(|f| f.name() == channel)
+        .ok_or_else(|| ParquetStoreError::new(ParquetStoreErrorKind::NotFound, format!("column {channel} not projected")))?
+        .clone();
+    let meta = field.metadata();
+    let get = |k: &str| -> Result<String, ParquetStoreError> {
+        meta.get(k).cloned().ok_or_else(|| {
+            ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("column {channel} missing metadata key {k}"))
+        })
+    };
+    let nominal_rate_hz: f64 = get("nominal_rate_hz")?
+        .parse()
+        .map_err(|_| ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("column {channel}: bad nominal_rate_hz")))?;
+    let unit = get("unit")?;
+    let source_kind = get("source_kind")?;
+    let gaps = match meta.get("gaps") {
+        Some(g) => gaps_from_json(g)?,
+        None => Vec::new(),
+    };
+
+    let (t_us, t_recorded_us, raw) = read_column(&column, &t.values, recorded.map(|a| &a.values), meta)?;
+
+    Ok(DecodedChannel {
+        samples: ChannelSamples::from_channel(Channel {
+            channel_id: channel.to_string(),
+            t_us,
+            t_recorded_us,
+            nominal_rate_hz,
+            column: raw,
+            source_kind,
+            unit,
+            gaps,
+        }),
+        t: read_t,
+        recorded: read_recorded,
+    })
+}
+
+/// One Int64 column of `batch` as an [`AxisColumn`].
+fn axis_from_batch(batch: &RecordBatch, name: &str) -> Result<AxisColumn, ParquetStoreError> {
+    let values = batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| {
+            ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("axis column {name} is missing or not Int64"))
+        })?
+        .clone();
+    Ok(AxisColumn { values })
+}
+
+/// Every axis is row-indexed over the whole file, so a borrowed one of a
+/// different length came from a different file -- a caller error, reported
+/// rather than gathered against.
+fn check_axis_rows<'a>(axis: &'a AxisColumn, name: &str, rows: usize) -> Result<&'a AxisColumn, ParquetStoreError> {
+    if axis.len() == rows {
+        Ok(axis)
+    } else {
+        Err(ParquetStoreError::new(
+            ParquetStoreErrorKind::Schema,
+            format!("borrowed {name} has {} rows, this file has {rows}", axis.len()),
+        ))
     }
 }
 
@@ -1173,8 +1402,8 @@ pub fn read_channel_with_progress(
     let file_rows = index.first().map_or(0, |c| c.file_rows);
 
     if let Some(info) = index.iter().find(|c| c.channel_id == channel) {
-        let recorded = format!("{}_t_recorded_us", info.source_kind);
-        let batch = read_projected_batch_with_progress(session_dir, &[channel, recorded.as_str()], on_progress)?;
+        let recorded = recorded_axis_column(&info.source_kind);
+        let batch = read_projected_batch_with_progress(session_dir, &["t", channel, recorded.as_str()], on_progress)?;
         return channel_samples_from_batch(&batch, channel);
     }
 
@@ -1348,7 +1577,7 @@ pub fn read_time_axis_bounds(session_dir: &Path) -> Result<Option<(i64, i64)>, P
         return Ok(bounds);
     }
 
-    let batch = read_projected_batch(session_dir, &[])?;
+    let batch = read_projected_batch(session_dir, &["t"])?;
     let t = t_column_of(&batch)?;
     let mut out: Option<(i64, i64)> = None;
     for i in 0..t.len() {
@@ -1585,6 +1814,186 @@ mod tests {
             blob_sha256: "0".repeat(64),
             channels: vec![imu, gps],
         }
+    }
+
+    /// The axes of `sample_session`'s `imu0` source, decoded the way a
+    /// caching caller decodes them once and then shares them: one ordinary
+    /// read that hands its axes back (ruling R232.1).
+    fn imu0_axes(dir: &Path) -> (AxisColumn, Option<AxisColumn>) {
+        let first = read_channel_sharing_axes(dir, "IMU0_AccelX", BorrowedAxes::default(), &mut |_, _| {}).unwrap();
+        (first.t.expect("the first read decodes the union axis"), first.recorded)
+    }
+
+    #[test]
+    fn read_channel_sharing_axes_the_first_read_hands_back_one_axis_entry_per_file_row() {
+        // Arrange
+        let root = temp_root();
+        let path = write_session_parquet(&root, &sample_session(), "0.1.0").unwrap();
+        let dir = path.parent().unwrap();
+
+        // Act
+        let first = read_channel_sharing_axes(dir, "IMU0_AccelX", BorrowedAxes::default(), &mut |_, _| {}).unwrap();
+
+        // Assert -- row-indexed over the union axis (0, 1250, 2500, 5000),
+        // not over either channel's own sample count.
+        let t = first.t.unwrap();
+        assert_eq!(t.len(), 4);
+        assert!(t.resident_bytes() > 0);
+        assert_eq!(first.recorded.unwrap().len(), 4);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_channel_sharing_axes_a_read_that_borrows_both_axes_reads_neither_again() {
+        // Arrange
+        let root = temp_root();
+        let path = write_session_parquet(&root, &sample_session(), "0.1.0").unwrap();
+        let dir = path.parent().unwrap();
+        let (t, recorded) = imu0_axes(dir);
+
+        // Act
+        let second =
+            read_channel_sharing_axes(dir, "IMU0_AccelX", BorrowedAxes { t: Some(&t), recorded: recorded.as_ref() }, &mut |_, _| {})
+                .unwrap();
+
+        // Assert -- nothing handed back means nothing was decoded twice,
+        // which is exactly what ruling R232.1 asks for.
+        assert!(second.t.is_none());
+        assert!(second.recorded.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_channel_sharing_axes_a_borrowed_axis_produces_the_same_channel_as_reading_it_alone() {
+        // Arrange
+        let root = temp_root();
+        let path = write_session_parquet(&root, &sample_session(), "0.1.0").unwrap();
+        let dir = path.parent().unwrap();
+        let (t, recorded) = imu0_axes(dir);
+
+        // Act
+        let shared = read_channel_sharing_axes(
+            dir,
+            "IMU0_AccelX",
+            BorrowedAxes { t: Some(&t), recorded: recorded.as_ref() },
+            &mut |_, _| {},
+        )
+        .unwrap()
+        .samples;
+        let alone = read_channel(dir, "IMU0_AccelX").unwrap();
+
+        // Assert -- borrowing the axis must not change one field of the answer.
+        assert_eq!(shared.t_us, alone.t_us);
+        assert_eq!(shared.t_recorded_us, alone.t_recorded_us);
+        assert_eq!(shared.materialize(), alone.materialize());
+        assert_eq!(shared.unit, alone.unit);
+        assert_eq!(shared.source_kind, alone.source_kind);
+        assert_eq!(shared.nominal_rate_hz, alone.nominal_rate_hz);
+        assert_eq!(shared.gaps, alone.gaps);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_channel_sharing_axes_six_channels_of_one_source_agree_with_six_independent_reads() {
+        // Arrange -- the shape ruling R232.1 exists for: several channels of
+        // one source, whose axes are decoded by the first and borrowed by
+        // the rest.
+        let root = temp_root();
+        let mut session = sample_session();
+        let base = session.channels[0].clone();
+        session.channels = (0..6).map(|i| Channel { channel_id: format!("IMU0_C{i}"), ..base.clone() }).collect();
+        let path = write_session_parquet(&root, &session, "0.1.0").unwrap();
+        let dir = path.parent().unwrap();
+        let first = read_channel_sharing_axes(dir, "IMU0_C0", BorrowedAxes::default(), &mut |_, _| {}).unwrap();
+        let t = first.t.unwrap();
+        let recorded = first.recorded;
+
+        // Act
+        let shared: Vec<ChannelSamples> = (0..6)
+            .map(|i| {
+                read_channel_sharing_axes(
+                    dir,
+                    &format!("IMU0_C{i}"),
+                    BorrowedAxes { t: Some(&t), recorded: recorded.as_ref() },
+                    &mut |_, _| {},
+                )
+                .unwrap()
+                .samples
+            })
+            .collect();
+
+        // Assert
+        for (i, got) in shared.iter().enumerate() {
+            let alone = read_channel(dir, &format!("IMU0_C{i}")).unwrap();
+            assert_eq!(got.t_us, alone.t_us);
+            assert_eq!(got.t_recorded_us, alone.t_recorded_us);
+            assert_eq!(got.materialize(), alone.materialize());
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_channel_sharing_axes_an_axis_from_a_different_file_is_a_schema_error_not_a_wrong_answer() {
+        // Arrange -- a second, shorter session's `t` handed to the first's
+        // channel: the mix-up a cache keyed wrongly would produce.
+        let root = temp_root();
+        let path = write_session_parquet(&root, &sample_session(), "0.1.0").unwrap();
+        let dir = path.parent().unwrap();
+        let other_root = temp_root();
+        let mut short = sample_session();
+        short.session_id = "1".repeat(32);
+        short.channels[0].t_us = vec![0];
+        short.channels[0].t_recorded_us = Some(vec![0]);
+        short.channels[0].column = RawColumn::I16 { data: vec![1], scale: 1.0, offset: 0.0 };
+        short.channels[0].gaps = Vec::new();
+        short.channels.truncate(1);
+        let other_path = write_session_parquet(&other_root, &short, "0.1.0").unwrap();
+        let other_t =
+            read_channel_sharing_axes(other_path.parent().unwrap(), "IMU0_AccelX", BorrowedAxes::default(), &mut |_, _| {})
+                .unwrap()
+                .t
+                .unwrap();
+
+        // Act
+        let err =
+            read_channel_sharing_axes(dir, "IMU0_AccelX", BorrowedAxes { t: Some(&other_t), recorded: None }, &mut |_, _| {})
+                .unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, ParquetStoreErrorKind::Schema);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&other_root);
+    }
+
+    #[test]
+    fn read_channel_sharing_axes_a_synthesized_channel_falls_through_to_the_ordinary_read() {
+        // Arrange
+        let root = temp_root();
+        let path = write_session_parquet(&root, &sample_session(), "0.1.0").unwrap();
+        let dir = path.parent().unwrap();
+        let (t, recorded) = imu0_axes(dir);
+
+        // Act -- `Time` has no stored column to project.
+        let shared = read_channel_sharing_axes(
+            dir,
+            "Time",
+            BorrowedAxes { t: Some(&t), recorded: recorded.as_ref() },
+            &mut |_, _| {},
+        )
+        .unwrap();
+        let alone = read_channel(dir, "Time").unwrap();
+
+        // Assert -- it borrows nothing and hands nothing back.
+        assert_eq!(shared.samples.t_us, alone.t_us);
+        assert_eq!(shared.samples.materialize(), alone.materialize());
+        assert!(shared.t.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -16,6 +16,10 @@ tauri-plugin-shell = "2.3.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.151"
 notify = "8.2.0"
+# The decode pool several channels of one request fan out over (ruling
+# R232.2) — the same library, and the same width rule, as the indexing
+# job's pool in `idl-rs`.
+rayon = "1"
 sha2 = "0.10"
 hex = "0.4"
 tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "fs", "io-util"] }
