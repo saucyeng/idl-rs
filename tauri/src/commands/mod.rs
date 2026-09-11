@@ -10,6 +10,7 @@ pub mod import;
 pub mod library;
 pub mod maintenance;
 pub mod rasters;
+pub mod scatter;
 pub mod sync;
 pub mod tiles;
 pub mod workbook;
