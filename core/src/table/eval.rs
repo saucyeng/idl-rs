@@ -281,15 +281,23 @@ pub fn evaluate_table_multi(
 }
 
 /// Map each row's lap binding to its recording-time `(t0, t1)` window. Returns
-/// `None` for a row with no `context` or whose `lap_index` is past the end of
+/// `None` for a row with no `context` or whose `lap_number` names no lap of
 /// `laps`. The result is the `row_windows` argument of [`evaluate_table`].
+///
+/// **Matched by lap *number*, not by position** (C2 §4, ruling R217 item 2.4).
+/// Until 2026-09-11 this indexed `laps` directly, which silently made the
+/// field 0-based while every other lap-numbered surface in the app — C3's
+/// `LapSummary.lap_number`, [`crate::laps::model::Lap::lap_number`], the
+/// `current_lap()` builtin — is 1-based. Matching by number also survives an
+/// ignored or renumbered lap, where a position would quietly slide to a
+/// neighbouring lap rather than resolving to nothing.
 pub fn lap_windows(table: &TableModel, laps: &[Lap]) -> Vec<Option<(f64, f64)>> {
     table
         .rows
         .iter()
         .map(|row| {
             row.context.as_ref().and_then(|ctx| {
-                laps.get(ctx.lap_index as usize).map(|l| (l.start_time_secs, l.end_time_secs))
+                laps.iter().find(|l| l.lap_number == ctx.lap_number).map(|l| (l.start_time_secs, l.end_time_secs))
             })
         })
         .collect()
@@ -389,24 +397,28 @@ mod tests {
     }
 
     #[test]
-    fn lap_windows_maps_index_and_none_for_unbound_or_oob() {
-        // Arrange — 2 laps; rows bound to lap 1, unbound, and out-of-range lap 9.
+    fn lap_windows_matches_the_1_based_lap_number_and_is_none_for_unbound_or_unknown() {
+        // Arrange — laps numbered 1 and 2; rows bound to lap 1, unbound, and
+        // to a lap number no lap carries.
         let laps = vec![lap(0, 10.0, 20.0), lap(1, 20.0, 35.0)];
         let t = TableModel {
             columns: vec![],
             rows: vec![
-                Row { id: "r0".into(), context: Some(RowContext { session_id: "s".into(), lap_index: 1 }) },
+                Row { id: "r0".into(), context: Some(RowContext { session_id: "s".into(), lap_number: 1 }) },
                 Row { id: "r1".into(), context: None },
-                Row { id: "r2".into(), context: Some(RowContext { session_id: "s".into(), lap_index: 9 }) },
+                Row { id: "r2".into(), context: Some(RowContext { session_id: "s".into(), lap_number: 9 }) },
             ],
             cells: vec![vec![], vec![], vec![]],
+            row_source: RowSource::Authored,
+            main_row_id: None,
         };
 
         // Act
         let w = lap_windows(&t, &laps);
 
-        // Assert
-        assert_eq!(w[0], Some((20.0, 35.0)));
+        // Assert — lap *number* 1 is the first lap (C2 §4, R217 item 2.4); it
+        // was the second one while this field was an index into `laps`.
+        assert_eq!(w[0], Some((10.0, 20.0)));
         assert_eq!(w[1], None);
         assert_eq!(w[2], None);
     }
@@ -418,6 +430,8 @@ mod tests {
             columns: vec![col("c", "v", None)],
             rows: vec![Row { id: "r0".into(), context: None }],
             cells: vec![],
+            row_source: RowSource::Authored,
+            main_row_id: None,
         };
 
         // Act + Assert
@@ -431,6 +445,8 @@ mod tests {
             columns: vec![col("c", "v", None)],
             rows: vec![Row { id: "r0".into(), context: None }],
             cells: vec![vec![Cell { formula: Some("max([Fork)".into()), ..Default::default() }]],
+            row_source: RowSource::Authored,
+            main_row_id: None,
         };
 
         // Act + Assert
@@ -444,6 +460,8 @@ mod tests {
             columns: vec![col("c", "v", None)],
             rows: vec![Row { id: "r0".into(), context: None }],
             cells: vec![vec![Cell { formula: Some("{nope}".into()), ..Default::default() }]],
+            row_source: RowSource::Authored,
+            main_row_id: None,
         };
 
         // Act + Assert
@@ -460,6 +478,8 @@ mod tests {
                 vec![Cell { formula: Some("{A2}".into()), ..Default::default() }],
                 vec![Cell { formula: Some("{A1}".into()), ..Default::default() }],
             ],
+            row_source: RowSource::Authored,
+            main_row_id: None,
         };
 
         // Act + Assert
@@ -473,6 +493,8 @@ mod tests {
             columns: vec![col("c", "v", None)],
             rows: vec![Row { id: "r0".into(), context: None }],
             cells: vec![vec![Cell { literal: Some(1.0), ..Default::default() }]],
+            row_source: RowSource::Authored,
+            main_row_id: None,
         };
 
         // Act + Assert
@@ -496,6 +518,8 @@ mod tests {
                 vec![Cell { literal: Some(10.0), ..Default::default() }],
                 vec![Cell { formula: Some("{A1} + 1".into()), ..Default::default() }],
             ],
+            row_source: RowSource::Authored,
+            main_row_id: None,
         };
         let order = topo_order(&t).unwrap();
         let p0 = order.iter().position(|&a| a == (0, 0)).unwrap();
@@ -516,6 +540,8 @@ mod tests {
                 vec![Cell { formula: Some("{A2}".into()), ..Default::default() }],
                 vec![Cell { formula: Some("{A1}".into()), ..Default::default() }],
             ],
+            row_source: RowSource::Authored,
+            main_row_id: None,
         };
         assert!(matches!(topo_order(&t), Err(ref c) if !c.is_empty()));
     }
@@ -551,6 +577,8 @@ mod tests {
             ],
             rows: vec![Row { id: "r0".into(), context: None }],
             cells: vec![vec![Cell::default(), Cell::default()]],
+            row_source: RowSource::Authored,
+            main_row_id: None,
         };
         let res = evaluate_table(&h, &t, &[Some((0.0, 1.0))]);
         assert_eq!(res[0][0].value, Some(9.0)); // max over [0..9]
@@ -569,6 +597,8 @@ mod tests {
                 vec![Cell { formula: Some("{A2}".into()), ..Default::default() }],
                 vec![Cell { formula: Some("{A1}".into()), ..Default::default() }],
             ],
+            row_source: RowSource::Authored,
+            main_row_id: None,
         };
         // No channels needed — cycle short-circuits before evaluation.
         let meta = SessionMetaInput {
@@ -625,6 +655,8 @@ mod tests {
                 vec![Cell::default(), Cell::default()],
                 vec![Cell::default(), Cell::default()],
             ],
+            row_source: RowSource::Authored,
+            main_row_id: None,
         };
 
         // Act — full-channel windows; Main row = 0 (session A, fmax 9).
@@ -664,6 +696,8 @@ mod tests {
             }],
             rows: vec![Row { id: "r0".into(), context: None }],
             cells: vec![vec![Cell::default()]],
+            row_source: RowSource::Authored,
+            main_row_id: None,
         };
 
         // Act

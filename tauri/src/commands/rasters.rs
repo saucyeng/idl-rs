@@ -227,6 +227,19 @@ fn raster_channel(
     cache.channel(&session_dir(data_dir, session_id), session_id, channel)
 }
 
+/// One channel's samples over `span`, or all of them when there is no window.
+///
+/// The nominal rate is deliberately *not* recomputed from the slice: a window
+/// narrows which samples a raster covers, not how fast they were recorded, and
+/// re-deriving a rate from a short slice would make the same channel's
+/// spectrogram shift frequency with the selection.
+fn windowed_samples(ch: &ChannelSamples, span: Option<(f64, f64)>) -> Vec<f64> {
+    match span {
+        Some((t0, t1)) => ch.slice_by_time(t0, t1),
+        None => ch.materialize(),
+    }
+}
+
 /// Rejects `x_bins`/`y_bins` that disagree with the command's own
 /// `width`/`height` (ruling R42) — see [`fetch_raster_via`]'s doc comment.
 fn check_bins_match_pixels(p: &Histogram2dParams, width: u16, height: u16) -> Result<(), IpcError> {
@@ -346,6 +359,7 @@ pub fn fetch_raster_via(
     cache: &SessionCache,
     data_dir: &Path,
     session_id: &str,
+    window: Option<&WindowDto>,
     channel: &str,
     kind: &str,
     width: u16,
@@ -355,6 +369,15 @@ pub fn fetch_raster_via(
     if width == 0 || height == 0 {
         return Err(IpcError::new(IpcErrorKind::InvalidArgument, format!("width/height must be nonzero, got {width}x{height}")));
     }
+
+    // The window resolves before any sample is read, so an unknown lap or a
+    // range failing R119/R120 is `invalid_argument` rather than an empty
+    // raster (rulings R85, R123). `None` is the deprecated session_id form's
+    // whole-session behaviour, unchanged.
+    let span = match window {
+        Some(w) => Some(resolve_window(data_dir, w)?),
+        None => None,
+    };
 
     match kind {
         "spectrogram" => {
@@ -367,7 +390,7 @@ pub fn fetch_raster_via(
             }
             let p = parse_spectrogram_params(params)?;
             let (window, detrend, scaling, window_size, noverlap) = resolve_spectrogram_params(&p)?;
-            let samples = ch.materialize();
+            let samples = windowed_samples(&ch, span);
             Ok(build_spectrogram_raster_bytes(&samples, ch.nominal_rate_hz, width, height, window, window_size, noverlap, detrend, scaling))
         }
         "histogram2d" => {
@@ -375,8 +398,8 @@ pub fn fetch_raster_via(
             check_bins_match_pixels(&p, width, height)?;
             let x_ch = raster_channel(cache, data_dir, session_id, channel)?;
             let y_ch = raster_channel(cache, data_dir, session_id, &p.y_channel)?;
-            let xs = x_ch.materialize();
-            let ys = y_ch.materialize();
+            let xs = windowed_samples(&x_ch, span);
+            let ys = windowed_samples(&y_ch, span);
             if xs.len() != ys.len() {
                 // TODO(idl0): resampling one channel onto the other's recorded
                 // time axis so mismatched-length pairs can still be histogrammed
@@ -411,6 +434,7 @@ pub fn fetch_raster_meta_via(
     cache: &SessionCache,
     data_dir: &Path,
     session_id: &str,
+    window: Option<&WindowDto>,
     channel: &str,
     kind: &str,
     width: u16,
@@ -420,6 +444,15 @@ pub fn fetch_raster_meta_via(
     if width == 0 || height == 0 {
         return Err(IpcError::new(IpcErrorKind::InvalidArgument, format!("width/height must be nonzero, got {width}x{height}")));
     }
+
+    // The window resolves before any sample is read, so an unknown lap or a
+    // range failing R119/R120 is `invalid_argument` rather than an empty
+    // raster (rulings R85, R123). `None` is the deprecated session_id form's
+    // whole-session behaviour, unchanged.
+    let span = match window {
+        Some(w) => Some(resolve_window(data_dir, w)?),
+        None => None,
+    };
 
     match kind {
         "spectrogram" => {
@@ -432,7 +465,7 @@ pub fn fetch_raster_meta_via(
             }
             let p = parse_spectrogram_params(params)?;
             let (window, detrend, scaling, window_size, noverlap) = resolve_spectrogram_params(&p)?;
-            let samples = ch.materialize();
+            let samples = windowed_samples(&ch, span);
             let meta = spectrogram_raster_meta(&samples, ch.nominal_rate_hz, window, window_size, noverlap, detrend, scaling);
             let magnitude_unit = idl_rs::math::units::spectral_output_unit(&ch.unit, scaling_token_wire_str(p.scaling));
             Ok(RasterMetaOut::from_core(
@@ -447,8 +480,8 @@ pub fn fetch_raster_meta_via(
             check_bins_match_pixels(&p, width, height)?;
             let x_ch = raster_channel(cache, data_dir, session_id, channel)?;
             let y_ch = raster_channel(cache, data_dir, session_id, &p.y_channel)?;
-            let xs = x_ch.materialize();
-            let ys = y_ch.materialize();
+            let xs = windowed_samples(&x_ch, span);
+            let ys = windowed_samples(&y_ch, span);
             if xs.len() != ys.len() {
                 // TODO(idl0): see fetch_raster_via — same deferred resampling decision.
                 return Err(IpcError::with_detail(
@@ -487,7 +520,7 @@ pub fn fetch_raster(
     data_dir: tauri::State<'_, DataDir>,
     cache: tauri::State<'_, SessionCache>,
 ) -> Result<tauri::ipc::Response, IpcError> {
-    let bytes = fetch_raster_via(&cache, &data_dir.0, &session_id, &channel, &kind, width, height, &params)?;
+    let bytes = fetch_raster_via(&cache, &data_dir.0, &session_id, None, &channel, &kind, width, height, &params)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -505,7 +538,57 @@ pub fn fetch_raster_meta(
     data_dir: tauri::State<'_, DataDir>,
     cache: tauri::State<'_, SessionCache>,
 ) -> Result<RasterMetaOut, IpcError> {
-    fetch_raster_meta_via(&cache, &data_dir.0, &session_id, &channel, &kind, width, height, &params)
+    fetch_raster_meta_via(&cache, &data_dir.0, &session_id, None, &channel, &kind, width, height, &params)
+}
+
+/// Largest raster a `_v2` request renders (C2 §5.3's spectrogram budget).
+/// Above it the request is **clamped, not refused**: a window wider than the
+/// screen is a picture slightly coarser than the screen, not an error. A
+/// `width` or `height` of `0` is still `invalid_argument` — zero pixels is a
+/// malformed request, not a coarse one.
+pub const MAX_RASTER_WIDTH: u16 = 2048;
+/// See [`MAX_RASTER_WIDTH`].
+pub const MAX_RASTER_HEIGHT: u16 = 1024;
+
+/// Fetches and encodes one raster over a [`WindowDto`] rather than a whole
+/// session (C3 §3.6, ruling R217 item 4) — the gap R117 closed for evaluation
+/// and R123 for the FFT, reaching the raster path last. Without it a
+/// spectrogram of one lap is unreachable: C2 §5.3's spectrogram cell fetches
+/// one raster per selected window and facets them, and a `session_id`
+/// argument can only ask for the whole session.
+#[tauri::command(async)]
+pub fn fetch_raster_v2(
+    window: WindowDto,
+    channel: String,
+    kind: String,
+    width: u16,
+    height: u16,
+    params: serde_json::Value,
+    data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, SessionCache>,
+) -> Result<tauri::ipc::Response, IpcError> {
+    let (w, h) = (width.min(MAX_RASTER_WIDTH), height.min(MAX_RASTER_HEIGHT));
+    let bytes =
+        fetch_raster_via(&cache, &data_dir.0, &window.session_id, Some(&window), &channel, &kind, w, h, &params)?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// One windowed raster's axis domains and colour scale, without decoding
+/// pixel bytes (C3 §3.6, ruling R217 item 4). Same arguments and same
+/// clamping as [`fetch_raster_v2`].
+#[tauri::command(async)]
+pub fn fetch_raster_meta_v2(
+    window: WindowDto,
+    channel: String,
+    kind: String,
+    width: u16,
+    height: u16,
+    params: serde_json::Value,
+    data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, SessionCache>,
+) -> Result<RasterMetaOut, IpcError> {
+    let (w, h) = (width.min(MAX_RASTER_WIDTH), height.min(MAX_RASTER_HEIGHT));
+    fetch_raster_meta_via(&cache, &data_dir.0, &window.session_id, Some(&window), &channel, &kind, w, h, &params)
 }
 
 /// Maps [`idl_rs::fft::FftError`] to the IPC `invalid_argument` shape
@@ -842,7 +925,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let bytes = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+        let bytes = fetch_raster_via(&SessionCache::new(), &root, "s1", None, "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
 
         // Assert — C3 §3.6: 16 + width*height*4 = 16 + 64*32*4 = 8208.
         assert_eq!(bytes.len(), 8208);
@@ -856,13 +939,79 @@ mod tests {
     }
 
     #[test]
+    fn fetch_raster_via_a_window_narrows_the_spectrogram_to_that_span_not_the_whole_session() {
+        // Arrange — the same channel, once session-wide and once over the
+        // first half of the recording.
+        let root = temp_root();
+        seed_session(&root);
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: SpanDto::Range { t0_us: 0, t1_us: 32_000_000 },
+            colour: "--chart-1".to_string(),
+        };
+
+        // Act
+        let whole =
+            fetch_raster_meta_via(&SessionCache::new(), &root, "s1", None, "Speed", "spectrogram", 64, 32, &spectrogram_params_json())
+                .unwrap();
+        let part = fetch_raster_meta_via(
+            &SessionCache::new(),
+            &root,
+            "s1",
+            Some(&window),
+            "Speed",
+            "spectrogram",
+            64,
+            32,
+            &spectrogram_params_json(),
+        )
+        .unwrap();
+
+        // Assert — a spectrogram of one window covers less time than the
+        // session's own; without this the cell would draw the same heatmap
+        // for every selected lap (C3 §3.6, R217 item 4).
+        assert!(part.x_domain.1 < whole.x_domain.1, "windowed x domain {:?} vs session {:?}", part.x_domain, whole.x_domain);
+        assert_eq!(part.y_domain, whole.y_domain, "the frequency axis is a property of the rate, not the window");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_raster_via_a_window_that_resolves_to_no_lap_is_invalid_argument_before_any_pixel() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root);
+        let window =
+            WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 99 }, colour: "--chart-1".to_string() };
+
+        // Act
+        let err = fetch_raster_via(
+            &SessionCache::new(),
+            &root,
+            "s1",
+            Some(&window),
+            "Speed",
+            "spectrogram",
+            64,
+            32,
+            &spectrogram_params_json(),
+        )
+        .unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn fetch_raster_histogram2d_x_bins_y_bins_equal_width_height_well_formed_bytes() {
         // Arrange
         let root = temp_root();
         seed_session(&root);
 
         // Act
-        let bytes = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let bytes = fetch_raster_via(&SessionCache::new(), &root, "s1", None, "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
 
         // Assert
         assert_eq!(bytes.len(), 16 + 16 * 8 * 4);
@@ -877,7 +1026,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(4, 8)).unwrap_err();
+        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", None, "Speed", "histogram2d", 16, 8, &histogram2d_params_json(4, 8)).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -897,7 +1046,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 0, 32, &spectrogram_params_json()).unwrap_err();
+        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", None, "Speed", "spectrogram", 0, 32, &spectrogram_params_json()).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -912,7 +1061,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", "NopeChannel", "spectrogram", 8, 8, &spectrogram_params_json()).unwrap_err();
+        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", None, "NopeChannel", "spectrogram", 8, 8, &spectrogram_params_json()).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -927,7 +1076,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", "Lap", "spectrogram", 8, 8, &spectrogram_params_json()).unwrap_err();
+        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", None, "Lap", "spectrogram", 8, 8, &spectrogram_params_json()).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -943,7 +1092,7 @@ mod tests {
         let bad_params = serde_json::json!({ "window_size": 16, "hop_size": 32, "window": "hann", "detrend": "mean", "scaling": "density" });
 
         // Act
-        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 8, 8, &bad_params).unwrap_err();
+        let err = fetch_raster_via(&SessionCache::new(), &root, "s1", None, "Speed", "spectrogram", 8, 8, &bad_params).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -961,7 +1110,7 @@ mod tests {
         let direct = spectrogram_raster_meta(&samples, ch.nominal_rate_hz, FftWindow::Hann, 32, 16, Detrend::Mean, Scaling::Density);
 
         // Act
-        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", None, "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
 
         // Assert — R38's guarantee, tested rather than trusted: same bounds
         // as calling the core meta function directly, regardless of width/height.
@@ -984,7 +1133,7 @@ mod tests {
         let want = idl_rs::math::units::spectral_output_unit("m/s", "density");
 
         // Act
-        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", None, "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
 
         // Assert
         assert_eq!(meta.magnitude_unit, Some(crate::commands::workbook::UnitLabel::from(&want)));
@@ -1000,7 +1149,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", None, "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
 
         // Assert
         assert_eq!(meta.magnitude_unit, None);
@@ -1015,7 +1164,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", None, "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
 
         // Assert
         assert_eq!(meta.x_label, "Speed (m/s)");
@@ -1046,7 +1195,7 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", None, "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
 
         // Assert — C3 §3.6: n >= 16, endpoints included, every stop opaque,
         // and the stops are core's ramp, never a second table here.
@@ -1067,8 +1216,8 @@ mod tests {
         seed_session(&root);
 
         // Act
-        let hist = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
-        let spec = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+        let hist = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", None, "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let spec = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", None, "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
 
         // Assert
         assert_eq!(hist.ramp_stops, spec.ramp_stops);
@@ -1082,10 +1231,10 @@ mod tests {
         // survives into the payload and must carry the ramp's t = 1.0 colour.
         let root = temp_root();
         seed_session(&root);
-        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let meta = fetch_raster_meta_via(&SessionCache::new(), &root, "s1", None, "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
 
         // Act
-        let bytes = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
+        let bytes = fetch_raster_via(&SessionCache::new(), &root, "s1", None, "Speed", "histogram2d", 16, 8, &histogram2d_params_json(16, 8)).unwrap();
         let pixels = opaque_pixels(&bytes);
 
         // Assert — the legend's top end is a colour the picture really uses.
@@ -1104,7 +1253,7 @@ mod tests {
         let ramp: Vec<[u8; 4]> = (0..=4096).map(|i| idl_rs::colormap::turbo_rgba8(i as f64 / 4096.0)).collect();
 
         // Act
-        let bytes = fetch_raster_via(&SessionCache::new(), &root, "s1", "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
+        let bytes = fetch_raster_via(&SessionCache::new(), &root, "s1", None, "Speed", "spectrogram", 64, 32, &spectrogram_params_json()).unwrap();
         let pixels = opaque_pixels(&bytes);
 
         // Assert — Turbo, not some other ramp, encoded these pixels.

@@ -19,6 +19,8 @@ pub mod fft;
 pub mod fft_wire;
 pub mod filters;
 pub mod gps;
+pub mod gps_projection;
+pub mod gps_wire;
 pub mod histogram;
 pub mod histogram2d;
 pub mod import;

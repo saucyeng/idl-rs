@@ -53,8 +53,49 @@ mod tests {
 
         // Assert
         assert_eq!(table.columns[0].template, None);
-        assert_eq!(table.rows[0].context, Some(RowContext { session_id: "s1".to_string(), lap_index: 1 }));
+        assert_eq!(table.rows[0].context, Some(RowContext { session_id: "s1".to_string(), lap_number: 1 }));
         assert_eq!(table.cells[0][1], Cell::default());
+    }
+
+    #[test]
+    fn row_context_the_retired_lap_index_key_and_the_current_lap_number_key_parse_to_the_same_row() {
+        // Arrange — the same table twice, spelled the old way and the new way.
+        let old = r#"{ "columns": [], "rows": [ { "id": "r0", "context": { "sessionId": "s1", "lapIndex": 4 } } ], "cells": [] }"#;
+        let new = r#"{ "columns": [], "rows": [ { "id": "r0", "context": { "sessionId": "s1", "lapNumber": 4 } } ], "cells": [] }"#;
+
+        // Act
+        let from_old = parse_table_cell("aaaaaaaa", old).unwrap();
+        let from_new = parse_table_cell("aaaaaaaa", new).unwrap();
+
+        // Assert — the rename fixed the name, not the numbers (C2 §4, R217 item 2.4).
+        assert_eq!(from_old.rows[0].context, from_new.rows[0].context);
+        assert_eq!(from_old.rows[0].context.as_ref().unwrap().lap_number, 4);
+    }
+
+    #[test]
+    fn table_model_row_source_defaults_to_authored_and_main_row_id_to_unset() {
+        // Arrange — a table written before either field existed.
+        let json = r#"{ "columns": [], "rows": [], "cells": [] }"#;
+
+        // Act
+        let table = parse_table_cell("aaaaaaaa", json).unwrap();
+
+        // Assert — nothing landed changes meaning (C2 §4, R217 items 2.1-2.2).
+        assert_eq!(table.row_source, crate::table::RowSource::Authored);
+        assert_eq!(table.main_row_id, None);
+    }
+
+    #[test]
+    fn table_model_window_laps_and_a_main_row_round_trip_through_the_fence() {
+        // Arrange
+        let json = r#"{ "columns": [], "rows": [], "cells": [], "rowSource": "windowLaps", "mainRowId": "fastest" }"#;
+
+        // Act
+        let table = parse_table_cell("aaaaaaaa", json).unwrap();
+
+        // Assert
+        assert_eq!(table.row_source, crate::table::RowSource::WindowLaps);
+        assert_eq!(table.main_row_id.as_deref(), Some(crate::table::MAIN_ROW_FASTEST));
     }
 
     #[test]
