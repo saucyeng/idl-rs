@@ -31,11 +31,21 @@ pub struct RebuildProgressEvent {
     pub total: usize,
     /// `"blobs"`, `"tracks"`, `"sessions"`, `"laps"` or `"workbooks"`.
     pub phase: &'static str,
+    /// `true` on the one observation emitted after the staged database has
+    /// swapped in, and on nothing else.
+    ///
+    /// This flag exists because `done == total` cannot mean "the run is
+    /// over": **every** phase ends that way, and the last workbook of the
+    /// last phase reaches it while the swap has still not happened. A
+    /// listener keyed on the shape alone would call the run finished, then
+    /// read a `rebuild_status()` whose `last_run` is still the previous
+    /// run's.
+    pub finished: bool,
 }
 
 impl From<&RebuildProgress> for RebuildProgressEvent {
     fn from(p: &RebuildProgress) -> Self {
-        Self { done: p.done, total: p.total, phase: p.phase.as_str() }
+        Self { done: p.done, total: p.total, phase: p.phase.as_str(), finished: false }
     }
 }
 
@@ -146,18 +156,20 @@ pub fn spawn_rebuild_job<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> bool {
         let job = app.state::<RebuildJob>();
         job.finish(summary, outcome.as_ref().err());
 
-        // The terminal observation, in the same shape as every other one:
-        // the `workbooks` phase with `done == total` and nothing left to do
-        // is how the chip knows the run is over. A failed run reports 0 / 0,
-        // which is also "nothing left to do" — its reason is in
-        // `rebuild_status().last_error`, not in the event.
-        let finished = outcome.as_ref().map_or(0, |r| r.workbooks_indexed);
+        // The terminal observation — the only one carrying `finished: true`,
+        // emitted after `job.finish` above, so a listener that acts on it can
+        // read this run's own counts from `rebuild_status()` rather than the
+        // previous run's. Its `done`/`total` are the last phase's, kept only
+        // so the payload shape never varies; a failed run reports 0 / 0 and
+        // its reason is in `rebuild_status().last_error`, not in the event.
+        let workbooks = outcome.as_ref().map_or(0, |r| r.workbooks_indexed);
         let _ = app.emit(
             "rebuild_progress",
             RebuildProgressEvent {
-                done: finished,
-                total: finished,
+                done: workbooks,
+                total: workbooks,
                 phase: idl_rs::store::catalog::RebuildPhase::Workbooks.as_str(),
+                finished: true,
             },
         );
 
@@ -186,6 +198,20 @@ mod tests {
         // Assert
         assert_eq!(event.phase, "sessions");
         assert_eq!((event.done, event.total), (12, 159));
+        assert!(!event.finished);
+    }
+
+    #[test]
+    fn rebuild_progress_event_a_phases_last_item_is_not_the_runs_end() {
+        // Arrange -- the final workbook of the final phase: `done == total`,
+        // but the staged database has not swapped in yet.
+        let progress = RebuildProgress { phase: RebuildPhase::Workbooks, done: 3, total: 3 };
+
+        // Act
+        let event = RebuildProgressEvent::from(&progress);
+
+        // Assert
+        assert!(!event.finished);
     }
 
     #[test]
