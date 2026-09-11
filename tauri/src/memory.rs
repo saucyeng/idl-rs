@@ -91,6 +91,19 @@ pub fn resource_exhausted(needed_bytes: u64, budget: u64, hint: &str) -> IpcErro
     )
 }
 
+/// `needed_bytes` with [`ESTIMATE_MARGIN`] applied — the figure every
+/// budget decision is actually made against.
+///
+/// Its own function because the margin is now applied in two places that
+/// must agree: [`ensure_fits`]'s one-shot check, and the byte-counting
+/// reservation `session_cache::SessionCache::reserve` holds for a decode's
+/// duration (ruling R211.2). Saturating, so an absurd estimate clamps
+/// rather than wrapping to a small number that would pass.
+pub fn with_estimate_margin(needed_bytes: u64) -> u64 {
+    let (num, den) = ESTIMATE_MARGIN;
+    needed_bytes.saturating_mul(num) / den
+}
+
 /// Refuses `needed_bytes` when it would not fit the budget with
 /// [`ESTIMATE_MARGIN`] applied, as [`IpcErrorKind::ResourceExhausted`].
 ///
@@ -100,8 +113,7 @@ pub fn resource_exhausted(needed_bytes: u64, budget: u64, hint: &str) -> IpcErro
 /// reservation, and nothing here allocates.
 pub fn ensure_fits(needed_bytes: u64, hint: &str) -> Result<(), IpcError> {
     let budget = budget_bytes();
-    let (num, den) = ESTIMATE_MARGIN;
-    let with_margin = needed_bytes.saturating_mul(num) / den;
+    let with_margin = with_estimate_margin(needed_bytes);
     if with_margin > budget {
         return Err(resource_exhausted(with_margin, budget, hint));
     }

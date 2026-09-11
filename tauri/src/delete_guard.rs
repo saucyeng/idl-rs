@@ -1,9 +1,14 @@
-//! Build-time guard over every place the engine deletes something (ruling
-//! R196). Test-only: it scans `core/src`, `transport/src` and `tauri/src` as
-//! *text* for `remove_dir_all`, `remove_dir(` and `remove_file(` outside
-//! `#[cfg(test)]`/`#[test]` code, and asserts the resulting set of
-//! `(file, function)` pairs is exactly the allowlist below — the one audited
-//! in `runs/2026-09-10/DELETE-AUDIT.md`.
+//! Build-time guards over two things the engine must not do by accident:
+//! delete a user's data (ruling R196), and decode a whole session at once
+//! (ruling R211.1). Test-only: both scan `core/src`, `transport/src` and
+//! `tauri/src` as *text* for a set of calls outside `#[cfg(test)]`/`#[test]`
+//! code and assert the resulting set of `(file, function)` pairs is exactly
+//! an allowlist.
+//!
+//! The delete guard's allowlist is [`tests::ALLOWLIST`], audited in
+//! `runs/2026-09-10/DELETE-AUDIT.md`; the whole-session-decode guard's is
+//! [`tests::WHOLE_SESSION_ALLOWLIST`], which ruling R211.1 fixes at the
+//! three purposes that genuinely need every channel.
 //!
 //! The point is not that deleting is forbidden. It is that a *new* delete
 //! site cannot appear without someone editing this list, which forces the
@@ -144,6 +149,26 @@ mod tests {
         line.contains("remove_dir_all") || line.contains("remove_dir(") || line.contains("remove_file(")
     }
 
+    /// `true` when the line decodes a whole session at once — every channel
+    /// of a `data.parquet`, f64, in one allocation (ruling R211.1).
+    ///
+    /// [`idl_rs::store::parquet::read_session_parquet`] is the decode
+    /// itself; `load_session` was `idl-rs-tauri`'s wrapper around it and is
+    /// named here so it cannot come back. `SessionHandle::from_session` is
+    /// not listed: it consumes a `Session` someone else already decoded, so
+    /// it adds no allocation the decode did not, and the importers build
+    /// handles that way from parsed (not read-back) sessions.
+    fn is_whole_session_decode(line: &str) -> bool {
+        // A `fn` line is the declaration, not a call — otherwise
+        // `read_session_parquet`'s own definition reads as a use of itself.
+        // The delete guard needs no such rule (nothing is named
+        // `remove_file`), so this is local to this predicate.
+        if line.contains("fn ") {
+            return false;
+        }
+        line.contains("read_session_parquet(") || line.contains("load_session(") || line.contains("load_session_handle(")
+    }
+
     /// The file a `#[cfg(test)] mod name;` declaration in `declaring_file`
     /// pulls in — that whole file is test code. Both layouts are checked
     /// (`name.rs` beside the declaring module, and `name/mod.rs`).
@@ -204,7 +229,7 @@ mod tests {
     /// Erring is one-directional by design. A `#[cfg(test)]` *function* is
     /// still scanned, so a delete inside one would be reported as
     /// unaudited — noisy, but visible. Nothing production is ever skipped.
-    fn scan(root: &Path, path: &Path, text: &str) -> Vec<(String, String)> {
+    fn scan(root: &Path, path: &Path, text: &str, is_hit: &dyn Fn(&str) -> bool) -> Vec<(String, String)> {
         let relative = path.strip_prefix(root).unwrap_or(path).display().to_string().replace('\\', "/");
         let lines: Vec<&str> = text.lines().collect();
         let mut hits = Vec::new();
@@ -228,7 +253,7 @@ mod tests {
             if let Some(name) = function_name(line) {
                 current_fn = name;
             }
-            if is_delete_call(line) {
+            if is_hit(line) {
                 hits.push((relative.clone(), current_fn.clone()));
             }
         }
@@ -246,7 +271,7 @@ mod tests {
                       #[cfg(test)]\nmod more_tests {\n    fn other() {\n        std::fs::remove_file(&q);\n    }\n}\n";
 
         // Act
-        let hits = scan(Path::new("/repo"), Path::new("/repo/core/src/thing.rs"), source);
+        let hits = scan(Path::new("/repo"), Path::new("/repo/core/src/thing.rs"), source, &is_delete_call);
 
         // Assert — both production sites, neither test site.
         assert_eq!(
@@ -266,7 +291,7 @@ mod tests {
                       fn after() {\n    std::fs::remove_file(&p);\n}\n";
 
         // Act
-        let hits = scan(Path::new("/repo"), Path::new("/repo/transport/src/sync/mod.rs"), source);
+        let hits = scan(Path::new("/repo"), Path::new("/repo/transport/src/sync/mod.rs"), source, &is_delete_call);
 
         // Assert
         assert_eq!(hits, vec![("transport/src/sync/mod.rs".to_string(), "after".to_string())]);
@@ -292,7 +317,7 @@ mod tests {
         let found: BTreeSet<(String, String)> = sources
             .iter()
             .filter(|(path, _)| !test_only.contains(path))
-            .flat_map(|(path, text)| scan(&root, path, text))
+            .flat_map(|(path, text)| scan(&root, path, text, &is_delete_call))
             .collect();
 
         // Assert
@@ -303,6 +328,62 @@ mod tests {
             "the set of non-test delete sites changed.\n\
              New, unaudited sites (add them to runs/2026-09-10/DELETE-AUDIT.md first, then to ALLOWLIST): {added:#?}\n\
              Allowlisted sites that no longer exist (remove them from ALLOWLIST): {gone:#?}",
+        );
+    }
+
+    /// The only non-test places a whole session may be decoded at once
+    /// (ruling R211.1), as `(path relative to the idl-rs workspace root,
+    /// enclosing function)`.
+    ///
+    /// R211.1 names three purposes, and only three: **import verification**,
+    /// **export**, and **rebuild** — the jobs that genuinely need every
+    /// channel of a session in memory at the same time. Everything that
+    /// serves samples to a chart, a cursor, a spectrum or the workbook
+    /// sandbox reads one channel at a time instead, through
+    /// `store::parquet::read_channel` (the CLI and importers) or the app's
+    /// byte-budgeted `SessionCache`.
+    ///
+    /// The list is **empty**, and that is the finding this lane recorded
+    /// rather than a mistake: none of the three purposes reaches
+    /// `read_session_parquet` in today's tree. Export and verification build
+    /// their handle from the source blob, not from `data.parquet`; the
+    /// catalog rebuild reads the file footer. `read_session_parquet` stays
+    /// `pub` for those three to use when one of them needs it — this guard
+    /// is what will make the addition a deliberate, reviewed edit.
+    const WHOLE_SESSION_ALLOWLIST: &[(&str, &str)] = &[];
+
+    #[test]
+    fn every_non_test_whole_session_decode_is_one_of_r211s_three_permitted_purposes() {
+        // Arrange
+        let root = workspace_root();
+        let mut files = Vec::new();
+        for crate_dir in ["core/src", "transport/src", "tauri/src"] {
+            rust_files(&root.join(crate_dir), &mut files);
+        }
+        assert!(files.len() > 20, "the scanner found almost no source files — it is looking in the wrong place");
+        let expected: BTreeSet<(String, String)> =
+            WHOLE_SESSION_ALLOWLIST.iter().map(|(f, n)| ((*f).to_string(), (*n).to_string())).collect();
+        let sources: Vec<(PathBuf, String)> =
+            files.iter().filter_map(|p| std::fs::read_to_string(p).ok().map(|t| (p.clone(), t))).collect();
+        let test_only: BTreeSet<PathBuf> =
+            sources.iter().flat_map(|(path, text)| test_only_module_files(path, text)).collect();
+
+        // Act
+        let found: BTreeSet<(String, String)> = sources
+            .iter()
+            .filter(|(path, _)| !test_only.contains(path))
+            .flat_map(|(path, text)| scan(&root, path, text, &is_whole_session_decode))
+            .collect();
+
+        // Assert
+        let added: Vec<_> = found.difference(&expected).collect();
+        let gone: Vec<_> = expected.difference(&found).collect();
+        assert!(
+            added.is_empty() && gone.is_empty(),
+            "the set of non-test whole-session decodes changed (ruling R211.1).\n\
+             New sites — if this is not import verification, export or rebuild, read one channel at a time \
+             (store::parquet::read_channel, or the app's SessionCache) instead of adding it here: {added:#?}\n\
+             Allowlisted sites that no longer exist (remove them from WHOLE_SESSION_ALLOWLIST): {gone:#?}",
         );
     }
 }

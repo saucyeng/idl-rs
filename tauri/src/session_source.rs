@@ -5,61 +5,122 @@
 //! [`idl_rs::session::SessionHandle`] or a [`MathLapContext`].
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use idl_rs::math::{ChannelLookup, MathLapContext, MathOverlay};
-use idl_rs::session::handle::SessionHandle;
-use idl_rs::session::synthesis::synthesize_base_channels;
-use idl_rs::session::Session;
-use idl_rs::store::parquet::read_session_parquet;
+use idl_rs::session::handle::{ChannelSource, SessionHandle};
+use idl_rs::session::Channel;
+use idl_rs::store::parquet::open_session_lazy_with;
 use idl_rs::store::session_json::{empty_session_json, read_session_json, LapJson, SessionJson};
 
 use crate::commands::workbook::LapContext;
 use crate::error::{IpcError, IpcErrorKind};
+use crate::session_cache::SessionCache;
 
 /// `<data>/sessions/<session_id>` (C4 §2).
 pub fn session_dir(data_dir: &Path, session_id: &str) -> PathBuf {
     data_dir.join("sessions").join(session_id)
 }
 
-/// Reads `session_id`'s `data.parquet` back into a [`Session`], running
-/// [`synthesize_base_channels`] before returning (`read_session_parquet`
-/// does not reconstruct `Time`/`Distance` itself — its own doc comment says
-/// so). A missing session directory or `data.parquet` is
-/// [`IpcErrorKind::NotFound`] (the id is named in the message); a parquet
-/// read failure is [`IpcErrorKind::Io`]; a session too large to decode
-/// inside the app's memory budget is [`IpcErrorKind::ResourceExhausted`],
-/// refused before any allocation (ruling R203.4).
+/// A [`ChannelSource`] that serves one session's channels out of the app's
+/// byte-budgeted [`SessionCache`] (rulings R211.1 and R211.2).
 ///
-/// This is the **whole-file** read: every channel, decoded fresh. It stays
-/// for the callers that genuinely need a whole `Session` — export, verify,
-/// rebuild, and the workbook evaluator's `SessionHandle` — while every
-/// caller that wants one channel goes through
-/// `crate::session_cache::SessionCache` instead (ruling R203.1). It is
-/// deliberately *not* served from that cache: assembling a `Session` out of
-/// cached channels would copy each one back out of its `Arc`, leaving the
-/// session resident twice.
-pub fn load_session(data_dir: &Path, session_id: &str) -> Result<Session, IpcError> {
+/// This is what makes the workbook evaluator read one channel at a time.
+/// Before it, every `eval_workbook`/`fetch_host_channel`/spectrum call
+/// decoded the **whole** session, f64, and nine notebook cells doing that at
+/// once is what exhausted the process: `memory allocation of 181132664
+/// bytes failed`. Each lookup here is one `read_channel`, admitted by the
+/// cache's byte semaphore, shared with every other command that wants the
+/// same channel.
+///
+/// [`ChannelSource`] cannot report an error (a `SessionHandle` has nowhere
+/// to put one), so a failure that is *not* "no such channel" is stashed in
+/// `first_error` and the lookup reads as absent. The command that built the
+/// source calls [`Self::take_first_error`] once evaluation is done and
+/// returns it, so a session refused for memory surfaces as
+/// `resource_exhausted` rather than as a document full of
+/// `math_unknown_channel`.
+#[derive(Debug)]
+pub struct CachedChannelSource {
+    cache: SessionCache,
+    session_dir: PathBuf,
+    session_id: String,
+    first_error: Mutex<Option<IpcError>>,
+}
+
+impl CachedChannelSource {
+    /// A source over `session_id`'s channels, served by `cache` (a clone of
+    /// which is the same cache — see [`SessionCache`]).
+    pub fn new(cache: &SessionCache, data_dir: &Path, session_id: &str) -> Self {
+        CachedChannelSource {
+            cache: cache.clone(),
+            session_dir: session_dir(data_dir, session_id),
+            session_id: session_id.to_string(),
+            first_error: Mutex::new(None),
+        }
+    }
+
+    /// The first non-`not_found` failure a lookup hit, taken out of the
+    /// source. `None` when every lookup either succeeded or named a channel
+    /// this session genuinely does not have.
+    pub fn take_first_error(&self) -> Option<IpcError> {
+        self.first_error.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+impl ChannelSource for CachedChannelSource {
+    fn channel(&self, channel_id: &str) -> Option<Channel> {
+        match self.cache.channel(&self.session_dir, &self.session_id, channel_id) {
+            // One copy out of the shared `Arc`: the evaluator's handle needs
+            // an owned `Channel`, and the cache keeps its own for the next
+            // command. Bounded by the channels one document actually names,
+            // and released when the evaluation returns.
+            Ok(samples) => Some(samples.to_channel()),
+            Err(e) => {
+                if e.kind != IpcErrorKind::NotFound {
+                    let mut slot = self.first_error.lock().unwrap_or_else(|p| p.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(e);
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
+/// A [`SessionHandle`] over `session_id` that decodes **one channel at a
+/// time**, through `cache`, and the source it reads from (rulings R211.1,
+/// R211.2).
+///
+/// The replacement for the whole-session `load_session_handle` this module
+/// used to export: the handle answers identity and the channel list from
+/// `data.parquet`'s footer and pulls a channel's samples only when an
+/// expression names it. `Time`/`Distance` are produced per channel by
+/// `store::parquet::read_channel`, byte-identically to the synthesis a
+/// whole-session read used to run, so results are unchanged.
+///
+/// The returned [`CachedChannelSource`] is the same object the handle reads
+/// through; the caller keeps it to call
+/// [`CachedChannelSource::take_first_error`] after evaluating.
+///
+/// A missing session directory or `data.parquet` is
+/// [`IpcErrorKind::NotFound`] (the id is named in the message); an
+/// unreadable or malformed file is [`IpcErrorKind::Io`].
+pub fn load_lazy_session_handle(
+    data_dir: &Path,
+    session_id: &str,
+    cache: &SessionCache,
+) -> Result<(SessionHandle, Arc<CachedChannelSource>), IpcError> {
     let dir = session_dir(data_dir, session_id);
     let parquet_path = dir.join("data.parquet");
     if !parquet_path.exists() {
         return Err(IpcError::new(IpcErrorKind::NotFound, format!("session '{session_id}' not found")));
     }
-    let needed = idl_rs::store::parquet::estimate_session_bytes(&dir)
-        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("sizing {}: {}", parquet_path.display(), e.message)))?;
-    crate::memory::ensure_fits(needed, &format!("decode every channel of session '{session_id}'"))?;
-    let mut session = read_session_parquet(&parquet_path)
+    let source = Arc::new(CachedChannelSource::new(cache, data_dir, session_id));
+    let handle = open_session_lazy_with(&dir, source.clone() as Arc<dyn ChannelSource>)
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {}", parquet_path.display(), e.message)))?;
-    synthesize_base_channels(&mut session);
-    Ok(session)
-}
-
-/// [`load_session`] wrapped in a [`SessionHandle`] via [`SessionHandle::
-/// from_session`] (ledger R40 — carries `source_format`/`blob_sha256`/
-/// per-channel `unit` through, unlike `from_channels`).
-pub fn load_session_handle(data_dir: &Path, session_id: &str) -> Result<SessionHandle, IpcError> {
-    let session = load_session(data_dir, session_id)?;
-    Ok(SessionHandle::from_session(session))
+    Ok((handle, source))
 }
 
 /// Builds an [`IpcErrorKind::InvalidArgument`] naming the unresolvable lap
@@ -165,18 +226,21 @@ pub enum SpanDto {
 /// integer axis as the caller's `t0_us`/`t1_us` rather than a lossy
 /// seconds round-trip.
 fn full_session_span_us(data_dir: &Path, session_id: &str) -> Result<(i64, i64), IpcError> {
-    let session = load_session(data_dir, session_id)?;
-    let mut start_us: Option<i64> = None;
-    let mut last_us: Option<i64> = None;
-    for c in &session.channels {
-        if let (Some(&first), Some(&last)) = (c.t_us.first(), c.t_us.last()) {
-            start_us = Some(start_us.map_or(first, |s| s.min(first)));
-            last_us = Some(last_us.map_or(last, |e| e.max(last)));
-        }
+    let dir = session_dir(data_dir, session_id);
+    if !dir.join("data.parquet").exists() {
+        return Err(IpcError::new(IpcErrorKind::NotFound, format!("session '{session_id}' not found")));
     }
-    match (start_us, last_us) {
-        (Some(start), Some(last)) => Ok((start, last + 1)),
-        _ => Ok((0, 0)),
+    // Read from `t`'s column statistics, not by decoding the session: `t` is
+    // the union of every channel's timestamps, so its minimum *is* the
+    // earliest first sample and its maximum the latest last sample — the
+    // same two numbers the per-channel scan above it used to produce, for
+    // the price of a footer read (ruling R211.1). Resolving a window used
+    // to cost a whole-session decode, on every window of every evaluation.
+    let bounds = idl_rs::store::parquet::read_time_axis_bounds(&dir)
+        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("sizing session '{session_id}': {}", e.message)))?;
+    match bounds {
+        Some((start, last)) => Ok((start, last + 1)),
+        None => Ok((0, 0)),
     }
 }
 
@@ -468,7 +532,7 @@ pub fn load_lap_context(
 mod tests {
     use super::*;
 
-    use idl_rs::session::{Channel, RawColumn, SourceFormat, TimestampSource};
+    use idl_rs::session::{RawColumn, Session, SourceFormat, TimestampSource};
     use idl_rs::store::parquet::write_session_parquet;
     use idl_rs::store::session_json::{empty_session_json, write_session_json, LapJson};
     use uuid::Uuid;
@@ -503,12 +567,12 @@ mod tests {
     }
 
     #[test]
-    fn load_session_unknown_id_not_found() {
+    fn load_lazy_session_handle_unknown_id_not_found() {
         // Arrange
         let root = temp_root();
 
         // Act
-        let err = load_session(&root, "nope").unwrap_err();
+        let err = load_lazy_session_handle(&root, "nope", &SessionCache::new()).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::NotFound);
@@ -517,20 +581,39 @@ mod tests {
     }
 
     #[test]
-    fn load_session_seeded_session_channels_and_units_survive_the_round_trip() {
+    fn load_lazy_session_handle_seeded_session_channels_and_units_survive_the_round_trip() {
         // Arrange
         let root = temp_root();
         seed_session(&root, "s1");
 
         // Act
-        let session = load_session(&root, "s1").unwrap();
+        let (handle, _source) = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap();
 
-        // Assert
-        assert_eq!(session.source_format, SourceFormat::Fit);
-        assert_eq!(session.blob_sha256, "a".repeat(64));
-        let speed = session.channels.iter().find(|c| c.channel_id == "Speed").unwrap();
-        assert_eq!(speed.unit, "m/s");
-        assert_eq!(speed.column, RawColumn::F64(vec![1.0, 2.0]));
+        // Assert — identity from the footer, samples and unit through the
+        // cache one channel at a time (ruling R211.1).
+        assert_eq!(handle.channel_samples("Speed"), vec![1.0, 2.0]);
+        assert_eq!(handle.unit_of("Speed").as_deref(), Some("m/s"));
+        assert!(handle.channels().iter().any(|c| c.channel_id == "Speed"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_lazy_session_handle_decodes_only_the_channels_actually_asked_for() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let cache = SessionCache::new();
+
+        // Act
+        let (handle, _source) = load_lazy_session_handle(&root, "s1", &cache).unwrap();
+        let before = cache.len();
+        let _ = handle.channel_samples("Speed");
+
+        // Assert — nothing is decoded by opening the session, and asking for
+        // one channel decodes exactly one.
+        assert_eq!(before, 0);
+        assert_eq!(cache.len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -540,7 +623,7 @@ mod tests {
         // Arrange
         let root = temp_root();
         seed_session(&root, "s1");
-        let handle = load_session_handle(&root, "s1").unwrap();
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
         let mut doc = empty_session_json("s1");
         doc.main_lap_number = Some(2);
         doc.laps = vec![
@@ -587,7 +670,7 @@ mod tests {
         // Arrange
         let root = temp_root();
         seed_session(&root, "s1");
-        let handle = load_session_handle(&root, "s1").unwrap();
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
 
         // Act
         let ctx = load_lap_context(&root, "nope", &handle, None).unwrap();
@@ -604,7 +687,7 @@ mod tests {
         // Arrange — this session's session.json has no laps[] at all.
         let root = temp_root();
         seed_session(&root, "s1");
-        let handle = load_session_handle(&root, "s1").unwrap();
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
         let doc = empty_session_json("s1");
         write_session_json(&root, "s1", &doc, None).unwrap();
         let selection = LapContext { main_lap: Some(1), overlay_laps: Vec::new() };
@@ -624,7 +707,7 @@ mod tests {
         // Arrange
         let root = temp_root();
         seed_session(&root, "s1");
-        let handle = load_session_handle(&root, "s1").unwrap();
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
         let doc = empty_session_json("s1");
         write_session_json(&root, "s1", &doc, None).unwrap();
         let selection = LapContext { main_lap: None, overlay_laps: vec![2, 3] };
@@ -648,7 +731,7 @@ mod tests {
         // session.json (C3 §3.4).
         let root = temp_root();
         seed_session(&root, "s1");
-        let handle = load_session_handle(&root, "s1").unwrap();
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
         let doc = empty_session_json("s1");
         write_session_json(&root, "s1", &doc, None).unwrap();
         let selection = LapContext { main_lap: None, overlay_laps: Vec::new() };
@@ -690,7 +773,7 @@ mod tests {
         // Arrange — a 4-lap session, overlay_laps = [2, 3].
         let root = temp_root();
         seed_session(&root, "s1");
-        let handle = load_session_handle(&root, "s1").unwrap();
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
         write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
         let selection = LapContext { main_lap: None, overlay_laps: vec![2, 3] };
 
@@ -715,7 +798,7 @@ mod tests {
         // overlay scan reached the bad entry).
         let root = temp_root();
         seed_session(&root, "s1");
-        let handle = load_session_handle(&root, "s1").unwrap();
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
         write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
         let selection = LapContext { main_lap: Some(1), overlay_laps: vec![2, 99] };
 
@@ -734,7 +817,7 @@ mod tests {
         // Arrange — a 4-lap session, overlay_laps explicitly empty.
         let root = temp_root();
         seed_session(&root, "s1");
-        let handle = load_session_handle(&root, "s1").unwrap();
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
         write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
         let selection = LapContext { main_lap: Some(1), overlay_laps: Vec::new() };
 
@@ -752,7 +835,7 @@ mod tests {
         // Arrange — two overlay laps.
         let root = temp_root();
         seed_session(&root, "s1");
-        let handle = load_session_handle(&root, "s1").unwrap();
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
         write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
         let selection = LapContext { main_lap: None, overlay_laps: vec![2, 3] };
 
@@ -1210,7 +1293,7 @@ mod tests {
         let root = temp_root();
         seed_session(&root, "s1");
         write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
-        let handle = load_session_handle(&root, "s1").unwrap();
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
         let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 3 }, colour: String::new() };
 
         // Act
@@ -1233,7 +1316,7 @@ mod tests {
         // it (ruling R126).
         let root = temp_root();
         seed_session(&root, "s1");
-        let handle = load_session_handle(&root, "s1").unwrap();
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
         let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Session, colour: String::new() };
 
         // Act
@@ -1252,7 +1335,7 @@ mod tests {
         let root = temp_root();
         seed_session(&root, "s1");
         write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
-        let handle = load_session_handle(&root, "s1").unwrap();
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
         let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 99 }, colour: String::new() };
 
         // Act

@@ -17,16 +17,20 @@ pub struct GpsFix {
 /// `GPS_EpochMs` channels: drop `(0,0)` fix-not-acquired sentinels, iterate to
 /// the shortest of the three. Empty when any channel is absent. Samples are
 /// copied verbatim (no rescaling).
+///
+/// Resolves the three by name ([`SessionHandle::channel_samples`]) rather
+/// than scanning `channel_data()`, so a lazy handle decodes exactly these
+/// three columns and no others (ruling R211.1/.3) — lap indexing after an
+/// import is this function's largest caller. Resolving by name also reaches
+/// the derived store, which the old scan did not; no caller writes a
+/// derived channel under a `GPS_*` name.
 pub fn build_gps_track(handle: &SessionHandle) -> Vec<GpsFix> {
-    let chans = handle.channel_data();
-    let find = |id: &str| chans.iter().find(|c| c.channel_id == id);
-    let (lat, lon, epoch) = match (find("GPS_Latitude"), find("GPS_Longitude"), find("GPS_EpochMs")) {
-        (Some(a), Some(b), Some(c)) => (a, b, c),
-        _ => return Vec::new(),
-    };
-    let lat_s = lat.materialize();
-    let lon_s = lon.materialize();
-    let epoch_s = epoch.materialize();
+    let lat_s = handle.channel_samples("GPS_Latitude");
+    let lon_s = handle.channel_samples("GPS_Longitude");
+    let epoch_s = handle.channel_samples("GPS_EpochMs");
+    if lat_s.is_empty() || lon_s.is_empty() || epoch_s.is_empty() {
+        return Vec::new();
+    }
     let n = lat_s.len().min(lon_s.len()).min(epoch_s.len());
     let mut fixes = Vec::with_capacity(n);
     for i in 0..n {

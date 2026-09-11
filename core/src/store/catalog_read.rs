@@ -22,7 +22,7 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::store::catalog::{open_catalog, rebuild_catalog, CatalogError, CatalogErrorKind, RebuildReport};
-use crate::store::parquet::{read_session_metadata, read_session_parquet};
+use crate::store::parquet::{read_channel_index, read_channel_sample_counts, read_session_metadata};
 use crate::store::session_json::{
     read_session_json, LapJson, NeutralZoneVisitJson, OverlayLapKeyJson, SectorJson, TrackVisitJson,
 };
@@ -343,6 +343,13 @@ pub fn list_stale_sessions(conn: &Connection) -> Result<Vec<StaleSession>, Catal
 /// C3 §3.2 `get_session(session_id)` — C1 `Session` metadata plus
 /// `session.json` content, read from canonical files only, never the
 /// catalog (C4 §5).
+///
+/// Reads the file **footer** only: this used to decode every channel of
+/// `data.parquet` to report each one's `sample_count`, which on the largest
+/// sessions meant a multi-gigabyte allocation every time the library
+/// screen opened one (ruling R211.1's incident). [`read_channel_index`]
+/// gives the identity and [`read_channel_sample_counts`] the exact counts,
+/// both from metadata.
 pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, CatalogError> {
     let session_dir = data_root.join("sessions").join(session_id);
     if !session_dir.is_dir() {
@@ -353,10 +360,10 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
     let sj_path = session_dir.join("session.json");
     let metadata = read_session_metadata(&dp_path).map_err(io_like)?;
     let doc = read_session_json(&sj_path).map_err(io_like)?;
-    let session = read_session_parquet(&dp_path).map_err(io_like)?;
+    let index = read_channel_index(&session_dir).map_err(io_like)?;
+    let counts = read_channel_sample_counts(&session_dir).map_err(io_like)?;
 
-    let channels = session
-        .channels
+    let channels = index
         .iter()
         .map(|c| ChannelSummary {
             channel_id: c.channel_id.clone(),
@@ -364,7 +371,7 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
             unit: c.unit.clone(),
             source_kind: c.source_kind.clone(),
             channel_kind: if c.nominal_rate_hz == 0.0 { "event".to_string() } else { "fixed-rate".to_string() },
-            sample_count: c.len() as u64,
+            sample_count: counts.iter().find(|(n, _)| *n == c.channel_id).map_or(0, |(_, n)| *n as u64),
         })
         .collect();
 
@@ -373,7 +380,10 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
         device_id: metadata.device_id,
         timestamp_utc_ms: crate::store::session_json::effective_start_ms(&doc, metadata.timestamp_utc_ms),
         config_checksum: metadata.config_checksum,
-        source_format: session.source_format.as_str().to_string(),
+        // The stored C1 §4.3 token verbatim (`"idl0"`/`"fit"`/`"gpx"`/
+        // `"csv"`) — the same string a parsed `SourceFormat::as_str()`
+        // round-trips to, without parsing it first.
+        source_format: metadata.source_format.clone(),
         blob_sha256: metadata.blob_sha256,
         channels,
         rider: doc.rider,

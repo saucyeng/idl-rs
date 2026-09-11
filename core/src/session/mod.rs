@@ -343,6 +343,13 @@ impl Channel {
         self.column.materialize()
     }
 
+    /// Widen all samples to physical f64, or `None` when the allocation
+    /// cannot be made (ruling R211.4). See
+    /// [`RawColumn::try_materialize`](crate::session::RawColumn::try_materialize).
+    pub fn try_materialize(&self) -> Option<Vec<f64>> {
+        self.column.try_materialize()
+    }
+
     /// Widen the half-open index window `[start, end)` to physical f64, clamped.
     pub fn materialize_range(&self, start: usize, end: usize) -> Vec<f64> {
         self.column.materialize_range(start, end)

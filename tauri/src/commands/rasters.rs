@@ -680,7 +680,7 @@ mod tests {
     use idl_rs::store::session_json::{empty_session_json, write_session_json, LapJson};
     use uuid::Uuid;
 
-    use crate::session_source::{load_session, load_session_handle, SpanDto};
+    use crate::session_source::{load_lazy_session_handle, SpanDto};
 
     fn temp_root() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("idl-rs-tauri-rasters-test-{}", Uuid::new_v4()));
@@ -956,8 +956,7 @@ mod tests {
         // Arrange
         let root = temp_root();
         seed_session(&root);
-        let session = load_session(&root, "s1").unwrap();
-        let ch = session.channels.iter().find(|c| c.channel_id == "Speed").unwrap();
+        let ch = idl_rs::store::parquet::read_channel(&root.join("sessions").join("s1"), "Speed").unwrap();
         let samples = ch.materialize();
         let direct = spectrogram_raster_meta(&samples, ch.nominal_rate_hz, FftWindow::Hann, 32, 16, Detrend::Mean, Scaling::Density);
 
@@ -1327,7 +1326,7 @@ mod tests {
         // Act
         let got = fetch_fft_via(&SessionCache::new(), &root, "s1", "Speed", Some(2), &fft_params(), Averaging::Mean).unwrap();
 
-        let handle = load_session_handle(&root, "s1").unwrap();
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
         let (t0, t1) = resolve_lap_window(&root, "s1", 2).unwrap();
         let window_samples = handle.slice_by_time("Speed", t0, t1);
         let want_rate_hz = 64.0;

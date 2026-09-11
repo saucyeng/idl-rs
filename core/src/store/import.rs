@@ -19,7 +19,8 @@ use crate::store::catalog::{index_session, open_catalog};
 use crate::store::derived::remove_session_derived;
 use crate::store::lap_index::{index_laps, LapIndexReport};
 use crate::store::parquet::{
-    read_session_metadata, write_session_parquet, write_session_parquet_replacing, ParquetStoreError, SessionParquetMetadata,
+    open_session_lazy, read_session_metadata, write_session_parquet, write_session_parquet_replacing, ParquetStoreError,
+    SessionParquetMetadata,
 };
 use crate::store::session_json::{empty_session_json, write_session_json, SessionJsonError};
 
@@ -477,17 +478,33 @@ fn finish_import(
         false
     };
 
+    // The parsed session is dropped **before** lap indexing, not carried
+    // into it (ruling R211.3). Handing it to `SessionHandle::from_session`
+    // kept every channel of a hundreds-of-MB log resident for the whole
+    // indexing pass, on top of the Arrow batch the write had just built —
+    // one of the two whole-session copies that made a 395 MB import fail to
+    // allocate. Lap indexing reads three GPS columns and a track library;
+    // the lazy handle below decodes exactly those, out of the
+    // `data.parquet` this function has just written (or verified, on
+    // `Skip`), so the samples it indexes are the same samples that are on
+    // disk.
+    drop(session);
+
     // Lap indexing (IDL0_SPEC §17.4), non-fatal (mirrors idl0's
     // `_detectAndSaveVisits`): a failure here must not fail the import, and
     // recovers on the next import or an explicit `rescan`. Runs with
     // `force = false` on every plan reaching this point (`Collision` already
     // returned above) — on `Skip` this costs one hash + one read and lets a
     // session imported before this lane pick up laps on its next import.
-    // Building the handle from `session` (moved, not cloned) is why this is
-    // the last thing this function does with it — the sessions this pipeline
-    // imports are hundreds of MB, so a clone here is not an option.
-    let handle = SessionHandle::from_session(session);
-    let (lap_index, lap_index_warning, catalog_index_warning) = index_and_catalog(data_root, &session_id, &handle);
+    let session_dir = data_root.join("sessions").join(&session_id);
+    let (lap_index, lap_index_warning, catalog_index_warning) = match open_session_lazy(&session_dir) {
+        Ok(handle) => index_and_catalog(data_root, &session_id, &handle),
+        // An unreadable `data.parquet` one statement after writing it is a
+        // filesystem-level failure; it is reported the same non-fatal way
+        // as any other lap-indexing failure rather than failing an import
+        // whose bytes are already durable.
+        Err(e) => (None, Some(format!("reading {} for lap indexing: {e}", session_dir.join("data.parquet").display())), None),
+    };
 
     Ok(ImportReport {
         session_id,
@@ -598,8 +615,15 @@ pub fn reimport_session(data_root: &Path, session_id: &str) -> Result<ImportRepo
     // data (design doc §5).
     let derived_warning = remove_session_derived(data_root, session_id).err().map(|e| e.to_string());
 
-    let handle = SessionHandle::from_session(session);
-    let (lap_index, lap_index_warning, catalog_index_warning) = index_and_catalog(data_root, session_id, &handle);
+    // Same R211.3 ordering as `finish_import`: the re-parsed session is
+    // dropped before lap indexing, which re-reads the columns it needs out
+    // of the `data.parquet` just written.
+    drop(session);
+    let session_dir = data_root.join("sessions").join(session_id);
+    let (lap_index, lap_index_warning, catalog_index_warning) = match open_session_lazy(&session_dir) {
+        Ok(handle) => index_and_catalog(data_root, session_id, &handle),
+        Err(e) => (None, Some(format!("reading {} for lap indexing: {e}", session_dir.join("data.parquet").display())), None),
+    };
 
     Ok(ImportReport {
         session_id: session_id.to_string(),

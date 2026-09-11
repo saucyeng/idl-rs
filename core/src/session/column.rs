@@ -58,52 +58,75 @@ impl RawColumn {
         self.len() == 0
     }
 
-    /// Widen the whole column to physical f64. Transient — the f64 form is never
-    /// resident. For `F64` this clones verbatim.
-    pub fn materialize(&self) -> Vec<f64> {
+    /// Widen the whole column to physical f64, or `None` when the allocation
+    /// cannot be made (ruling R211.4).
+    ///
+    /// This is the single largest allocation in the engine — 8 B/sample, so
+    /// 181,132,664 bytes for the 22.6 M-sample channel whose failure printed
+    /// exactly that number and aborted the process. `Vec::try_reserve_exact`
+    /// asks the allocator instead of asserting: a refusal comes back as
+    /// `None`, which callers with an error path turn into
+    /// `resource_exhausted` and callers without treat as an absent channel.
+    /// Nothing here panics.
+    pub fn try_materialize(&self) -> Option<Vec<f64>> {
+        let mut out: Vec<f64> = Vec::new();
+        out.try_reserve_exact(self.len()).ok()?;
         match self {
-            RawColumn::I16 { data, scale, offset } => {
-                data.iter().map(|&r| r as f64 * scale + offset).collect()
-            }
-            RawColumn::I32 { data, scale, offset } => {
-                data.iter().map(|&r| r as f64 * scale + offset).collect()
-            }
-            RawColumn::F32 { data, scale, offset } => {
-                data.iter().map(|&r| r as f64 * scale + offset).collect()
-            }
-            RawColumn::F64(data) => data.clone(),
-            RawColumn::Ramp { len, rate } => (0..*len).map(|i| ramp_value(i, *rate)).collect(),
+            RawColumn::I16 { data, scale, offset } => out.extend(data.iter().map(|&r| r as f64 * scale + offset)),
+            RawColumn::I32 { data, scale, offset } => out.extend(data.iter().map(|&r| r as f64 * scale + offset)),
+            RawColumn::F32 { data, scale, offset } => out.extend(data.iter().map(|&r| r as f64 * scale + offset)),
+            RawColumn::F64(data) => out.extend_from_slice(data),
+            RawColumn::Ramp { len, rate } => out.extend((0..*len).map(|i| ramp_value(i, *rate))),
             RawColumn::Interp { base, base_rate, out_rate, len } => {
-                (0..*len).map(|i| interp_value(base, *base_rate, *out_rate, i)).collect()
+                out.extend((0..*len).map(|i| interp_value(base, *base_rate, *out_rate, i)))
             }
         }
+        Some(out)
     }
 
-    /// Widen the half-open index window `[start, end)` to physical f64, clamped
-    /// to the column length. Empty when `start >= end` or `start >= len`.
-    pub fn materialize_range(&self, start: usize, end: usize) -> Vec<f64> {
+    /// Widen the whole column to physical f64. Transient — the f64 form is never
+    /// resident. For `F64` this clones verbatim.
+    ///
+    /// An allocation the machine cannot make yields an **empty** `Vec`, not a
+    /// panic (ruling R211.4): a blank channel is a recoverable, visible
+    /// failure and an abort is not. Callers that can report a typed error
+    /// should call [`Self::try_materialize`] and do so.
+    pub fn materialize(&self) -> Vec<f64> {
+        self.try_materialize().unwrap_or_default()
+    }
+
+    /// Widen the half-open index window `[start, end)` to physical f64, or
+    /// `None` when the allocation cannot be made (ruling R211.4). A window can
+    /// be the whole channel, so this scales with a session exactly as
+    /// [`Self::try_materialize`] does.
+    pub fn try_materialize_range(&self, start: usize, end: usize) -> Option<Vec<f64>> {
         let len = self.len();
         let lo = start.min(len);
         let hi = end.min(len);
         if lo >= hi {
-            return Vec::new();
+            return Some(Vec::new());
         }
+        let mut out: Vec<f64> = Vec::new();
+        out.try_reserve_exact(hi - lo).ok()?;
         match self {
-            RawColumn::I16 { data, scale, offset } => {
-                data[lo..hi].iter().map(|&r| r as f64 * scale + offset).collect()
-            }
-            RawColumn::I32 { data, scale, offset } => {
-                data[lo..hi].iter().map(|&r| r as f64 * scale + offset).collect()
-            }
-            RawColumn::F32 { data, scale, offset } => {
-                data[lo..hi].iter().map(|&r| r as f64 * scale + offset).collect()
-            }
-            RawColumn::F64(data) => data[lo..hi].to_vec(),
-            RawColumn::Ramp { rate, .. } => (lo..hi).map(|i| ramp_value(i, *rate)).collect(),
+            RawColumn::I16 { data, scale, offset } => out.extend(data[lo..hi].iter().map(|&r| r as f64 * scale + offset)),
+            RawColumn::I32 { data, scale, offset } => out.extend(data[lo..hi].iter().map(|&r| r as f64 * scale + offset)),
+            RawColumn::F32 { data, scale, offset } => out.extend(data[lo..hi].iter().map(|&r| r as f64 * scale + offset)),
+            RawColumn::F64(data) => out.extend_from_slice(&data[lo..hi]),
+            RawColumn::Ramp { rate, .. } => out.extend((lo..hi).map(|i| ramp_value(i, *rate))),
             RawColumn::Interp { base, base_rate, out_rate, .. } => {
-                (lo..hi).map(|i| interp_value(base, *base_rate, *out_rate, i)).collect()
+                out.extend((lo..hi).map(|i| interp_value(base, *base_rate, *out_rate, i)))
             }
         }
+        Some(out)
+    }
+
+    /// Widen the half-open index window `[start, end)` to physical f64, clamped
+    /// to the column length. Empty when `start >= end` or `start >= len`, and
+    /// empty rather than a panic when the allocation fails (ruling R211.4 —
+    /// see [`Self::materialize`]).
+    pub fn materialize_range(&self, start: usize, end: usize) -> Vec<f64> {
+        self.try_materialize_range(start, end).unwrap_or_default()
     }
 
     /// Physical value at index `i`, or `None` if out of range.
@@ -425,5 +448,56 @@ mod tests {
         assert_eq!(RawColumn::F64(Vec::new()).min_max(), None);
         assert_eq!(RawColumn::F64(vec![f64::NAN]).min_max(), None);
         assert_eq!(RawColumn::I16 { data: Vec::new(), scale: 1.0, offset: 0.0 }.min_max(), None);
+    }
+
+    #[test]
+    fn try_materialize_a_column_the_allocator_cannot_serve_returns_none_instead_of_aborting() {
+        // Arrange — a `Ramp` costs nothing to declare and everything to
+        // widen: `len` samples at 8 B each, well past any address space.
+        let column = RawColumn::Ramp { len: usize::MAX / 16, rate: 1000.0 };
+
+        // Act
+        let got = column.try_materialize();
+
+        // Assert — ruling R211.4: the allocator is asked, not asserted at.
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn materialize_a_column_the_allocator_cannot_serve_is_empty_rather_than_a_panic() {
+        // Arrange
+        let column = RawColumn::Ramp { len: usize::MAX / 16, rate: 1000.0 };
+
+        // Act
+        let got = column.materialize();
+
+        // Assert
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn try_materialize_a_column_that_fits_returns_the_same_values_materialize_does() {
+        // Arrange
+        let column = RawColumn::I16 { data: vec![-2, 0, 5], scale: 0.5, offset: 1.0 };
+
+        // Act
+        let got = column.try_materialize().unwrap();
+
+        // Assert
+        assert_eq!(got, column.materialize());
+        assert_eq!(got, vec![0.0, 1.0, 3.5]);
+    }
+
+    #[test]
+    fn try_materialize_range_a_window_that_fits_returns_the_same_values_materialize_range_does() {
+        // Arrange
+        let column = RawColumn::F64(vec![1.0, 2.0, 3.0, 4.0]);
+
+        // Act
+        let got = column.try_materialize_range(1, 3).unwrap();
+
+        // Assert
+        assert_eq!(got, column.materialize_range(1, 3));
+        assert_eq!(got, vec![2.0, 3.0]);
     }
 }
