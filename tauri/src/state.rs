@@ -140,6 +140,96 @@ impl IndexJob {
     }
 }
 
+/// The background catalog rebuild (ruling R219 items 2–3): at most one run
+/// at a time, and its live progress.
+///
+/// Managed state rather than a thread handle, for [`IndexJob`]'s reason: a
+/// chip mounting halfway through a rebuild has to be able to ask
+/// `rebuild_status()` what is happening. The thread is detached; a process
+/// that exits mid-run loses the staging database in `tmp/` and nothing else,
+/// since the swap onto `catalog.sqlite` is the last thing a run does (C4 §5).
+///
+/// There is no cancel flag here, unlike `IndexJob`: the index job commits
+/// per session, so stopping it keeps what it has, whereas a rebuild's only
+/// commit is its final atomic swap — stopping one early would throw away the
+/// whole run's work, so the run is left to finish.
+#[derive(Default)]
+pub struct RebuildJob {
+    progress: Mutex<RebuildJobProgress>,
+}
+
+/// [`RebuildJob`]'s mutable half, behind its mutex.
+#[derive(Default)]
+struct RebuildJobProgress {
+    running: bool,
+    done: usize,
+    total: usize,
+    phase: Option<&'static str>,
+    last_run: Option<crate::commands::rebuild::RebuildRunSummary>,
+    last_error: Option<crate::error::IpcError>,
+}
+
+impl RebuildJob {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RebuildJobProgress> {
+        self.progress.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Claims the single run slot: `true` when this caller may start a
+    /// rebuild, `false` when one is already in flight.
+    pub fn try_claim(&self) -> bool {
+        let mut progress = self.lock();
+        if progress.running {
+            return false;
+        }
+        progress.running = true;
+        progress.done = 0;
+        progress.total = 0;
+        progress.phase = None;
+        progress.last_error = None;
+        true
+    }
+
+    /// Records one `rebuild_progress` observation from the job thread.
+    pub fn observe(&self, p: &idl_rs::store::catalog::RebuildProgress) {
+        let mut progress = self.lock();
+        progress.done = p.done;
+        progress.total = p.total;
+        progress.phase = Some(p.phase.as_str());
+    }
+
+    /// Releases the run slot and records how the run ended: either its
+    /// counts (`summary`) or the failure that stopped it (`error`). Exactly
+    /// one of the two is `Some` — a background job has no promise to reject,
+    /// so `error` is the only place a broken data root becomes visible
+    /// (CLAUDE.md §5).
+    pub fn finish(
+        &self,
+        summary: Option<crate::commands::rebuild::RebuildRunSummary>,
+        error: Option<&crate::error::IpcError>,
+    ) {
+        let mut progress = self.lock();
+        progress.running = false;
+        progress.phase = None;
+        progress.last_error = error.cloned();
+        if summary.is_some() {
+            progress.last_run = summary;
+        }
+    }
+
+    /// The C3 §3.2 `rebuild_status()` value.
+    pub fn snapshot(&self) -> crate::commands::rebuild::RebuildStatus {
+        let progress = self.lock();
+        crate::commands::rebuild::RebuildStatus {
+            running: progress.running,
+            done: progress.done,
+            total: progress.total,
+            phase: progress.phase.map(str::to_string),
+            last_run: progress.last_run.clone(),
+            last_error: progress.last_error.clone(),
+        }
+    }
+}
+
 /// The firmware/OTA state machine's current state (C3 §3.8, ruling R198).
 /// One per app: only one device can be updated at a time, and the sequence
 /// owns the BLE link while it runs. `push_firmware`/`confirm_firmware` write
@@ -439,6 +529,62 @@ mod tests {
         assert!(claimed);
         assert_eq!(job.snapshot().last_error, None);
         assert!(!job.cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    // -- RebuildJob (ruling R219 items 2-3) ------------------------------
+
+    #[test]
+    fn rebuild_job_a_second_claim_while_one_run_is_in_flight_is_refused() {
+        // Arrange
+        let job = RebuildJob::default();
+
+        // Act
+        let first = job.try_claim();
+        let second = job.try_claim();
+
+        // Assert
+        assert!(first);
+        assert!(!second);
+        assert!(job.snapshot().running);
+    }
+
+    #[test]
+    fn rebuild_job_a_run_that_failed_reports_its_error_and_keeps_no_summary() {
+        // Arrange
+        let job = RebuildJob::default();
+        job.try_claim();
+        let error = crate::error::IpcError::new(crate::error::IpcErrorKind::Io, "cannot read <data>/blobs/");
+
+        // Act
+        job.finish(None, Some(&error));
+
+        // Assert
+        let status = job.snapshot();
+        assert!(!status.running);
+        assert_eq!(status.last_error, Some(error));
+        assert!(status.last_run.is_none());
+    }
+
+    #[test]
+    fn rebuild_job_a_finished_run_keeps_its_counts_and_a_new_claim_clears_the_error() {
+        // Arrange
+        let job = RebuildJob::default();
+        job.try_claim();
+        job.finish(
+            Some(crate::commands::rebuild::RebuildRunSummary { sessions_indexed: 159, blobs_carried: 158, ..Default::default() }),
+            None,
+        );
+        job.try_claim();
+        job.finish(None, Some(&crate::error::IpcError::new(crate::error::IpcErrorKind::Io, "gone")));
+
+        // Act
+        let claimed = job.try_claim();
+
+        // Assert
+        assert!(claimed);
+        let status = job.snapshot();
+        assert_eq!(status.last_error, None);
+        assert_eq!(status.last_run.map(|r| (r.sessions_indexed, r.blobs_carried)), Some((159, 158)));
     }
 
     fn discovered_peer(addr: &str) -> DiscoveredPeer {

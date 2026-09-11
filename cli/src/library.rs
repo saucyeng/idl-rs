@@ -261,7 +261,12 @@ pub fn run(action: LibraryAction) -> ExitCode {
             });
             // One catalog rebuild for the whole run, not one per file: the
             // catalog is an index, deletable and rebuildable (CLAUDE.md §3).
-            let catalog_error = catalog::rebuild_catalog(&data_dir).err().map(|e| e.to_string());
+            // Incremental by default (C4 §5 step 1 as amended, ruling R219):
+            // a fold-in that added two files re-hashes two blobs, not the
+            // whole library.
+            let catalog_result = catalog::rebuild_catalog(&data_dir);
+            let catalog_counts = catalog_result.as_ref().ok().map(|r| (r.blobs_carried, r.blobs_hashed));
+            let catalog_error = catalog_result.err().map(|e| e.to_string());
             // …then index what was folded in, so the library opens ready
             // (ruling R208.1 item 5). A rebuilt catalog has no laps until
             // this has run.
@@ -269,6 +274,8 @@ pub fn run(action: LibraryAction) -> ExitCode {
             if json {
                 let mut object = fold_summary_json(&summary);
                 object["catalog_error"] = catalog_error.clone().map_or(Value::Null, Value::String);
+                object["blobs_carried"] = catalog_counts.map_or(Value::Null, |(c, _)| json!(c));
+                object["blobs_hashed"] = catalog_counts.map_or(Value::Null, |(_, h)| json!(h));
                 object["index"] = index_json(&index_report);
                 let code = print_json(&json!({ "fold_in": object }));
                 if summary.failed > 0 || catalog_error.is_some() {
@@ -277,6 +284,9 @@ pub fn run(action: LibraryAction) -> ExitCode {
                 code
             } else {
                 print_fold_summary(&summary);
+                if let Some((carried, hashed)) = catalog_counts {
+                    println!("catalog: {carried} blobs carried, {hashed} hashed");
+                }
                 print_index_summary(&index_report);
                 if let Some(e) = &catalog_error {
                     eprintln!("error: catalog rebuild: {e}");

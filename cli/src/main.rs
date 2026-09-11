@@ -1088,9 +1088,11 @@ fn cmd_import(file: &Path, data_dir: &Path) -> ExitCode {
     match catalog::rebuild_catalog(data_dir) {
         Ok(rr) => {
             println!(
-                "catalog: {} sessions, {} blobs, {} laps ({} skipped)",
+                "catalog: {} sessions, {} blobs ({} carried, {} hashed), {} laps ({} skipped)",
                 rr.sessions_indexed,
                 rr.blobs_indexed,
+                rr.blobs_carried,
+                rr.blobs_hashed,
                 rr.laps_indexed,
                 rr.skipped.len()
             );

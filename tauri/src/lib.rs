@@ -63,6 +63,8 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::index::start_index_job,
         commands::index::index_status,
         commands::index::cancel_index_job,
+        commands::rebuild::start_rebuild_job,
+        commands::rebuild::rebuild_status,
         commands::workbook::open_workbook,
         commands::workbook::read_workbook,
         commands::workbook::eval_workbook,
