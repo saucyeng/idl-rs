@@ -556,15 +556,39 @@ pub fn get_session(session_id: String, data_dir: tauri::State<'_, DataDir>) -> R
 }
 
 /// C3 §3.2 `list_laps(session_id)`.
+///
+/// Indexes this one session first when its lap/track index is missing or
+/// stale (ruling R207 item 1: "opening a workbook or a session needs only
+/// that session's index"). The check is a `session.json` read, so the
+/// common case — an already-indexed session — costs nothing; the
+/// library-wide job is never waited on here, and an indexing failure is not
+/// fatal, since a session with no laps yet still lists (empty) rather than
+/// refusing to open.
 #[tauri::command(async)]
-pub fn list_laps(session_id: String, data_dir: tauri::State<'_, DataDir>) -> Result<Vec<LapSummary>, IpcError> {
+pub fn list_laps(
+    session_id: String,
+    data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, crate::session_cache::SessionCache>,
+) -> Result<Vec<LapSummary>, IpcError> {
+    let _ = idl_rs::store::index_job::index_one_session(&data_dir.0, &session_id, cache.inner());
     list_laps_via(&data_dir.0, &session_id)
 }
 
 /// C3 §3.2 `rebuild_catalog()`.
+///
+/// Starts the library-wide lap/track index job when the rebuild succeeds
+/// (ruling R207 item 1) and returns without waiting for it: a rebuild
+/// re-derives the catalog from what is on disk, and a library that has
+/// never been indexed has no laps to copy until the job has run. Progress
+/// arrives as `index_progress`; `index_status()` reports it.
 #[tauri::command(async)]
-pub fn rebuild_catalog(data_dir: tauri::State<'_, DataDir>) -> Result<RebuildReport, IpcError> {
-    rebuild_catalog_via(&data_dir.0)
+pub fn rebuild_catalog<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    data_dir: tauri::State<'_, DataDir>,
+) -> Result<RebuildReport, IpcError> {
+    let report = rebuild_catalog_via(&data_dir.0)?;
+    crate::commands::index::spawn_index_job(app);
+    Ok(report)
 }
 
 /// C3 §3.2 `list_workbooks()`.

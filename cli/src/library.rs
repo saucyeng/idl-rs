@@ -19,6 +19,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
 
 use clap::Subcommand;
 use serde_json::{json, Value};
@@ -26,6 +27,9 @@ use serde_json::{json, Value};
 use idl_rs::store::atomic::sha256_hex;
 use idl_rs::store::blob::blob_exists;
 use idl_rs::store::catalog::{self, CatalogError};
+use idl_rs::store::index_job::{
+    self, ByteBudget, IndexJobError, IndexJobOptions, IndexJobReport, IndexPhase, IndexProgress,
+};
 use idl_rs::store::catalog_read::{list_stale_sessions, StaleSession};
 use idl_rs::store::import::{self, ImportError, ImportOutcome};
 use idl_rs::store::scan::{scan_folder_with_blob_check, ScanEntry, ScanError};
@@ -79,6 +83,33 @@ pub enum LibraryAction {
         #[arg(long)]
         data_dir: PathBuf,
         /// Emit one JSON object instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Detect track visits and laps for sessions whose index is missing or
+    /// stale, and refresh their catalog rows (ruling R208.1 item 5).
+    Index {
+        /// Session ids to index. Mutually exclusive with `--all`; with
+        /// neither, every session whose index is stale is indexed.
+        session_ids: Vec<String>,
+        /// Data directory root (contract C4 §1's `<data>`).
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Consider every session, not only the ones whose index is stale.
+        /// Each is still skipped if its stamps are current (pass `--force`
+        /// to recompute regardless) — what this changes is the reported
+        /// total, and it is the flag to reach for when the staleness check
+        /// itself is in doubt.
+        #[arg(long, conflicts_with = "session_ids")]
+        all: bool,
+        /// Recompute even for sessions whose stamps are already current.
+        #[arg(long)]
+        force: bool,
+        /// Pool width. Defaults to physical cores − 1; `--workers 1` is the
+        /// serial baseline a measurement compares against.
+        #[arg(long)]
+        workers: Option<usize>,
+        /// Emit one JSON object instead of the human progress lines.
         #[arg(long)]
         json: bool,
     },
@@ -230,10 +261,22 @@ pub fn run(action: LibraryAction) -> ExitCode {
             });
             // One catalog rebuild for the whole run, not one per file: the
             // catalog is an index, deletable and rebuildable (CLAUDE.md §3).
-            let catalog_error = catalog::rebuild_catalog(&data_dir).err().map(|e| e.to_string());
+            // Incremental by default (C4 §5 step 1 as amended, ruling R219):
+            // a fold-in that added two files re-hashes two blobs, not the
+            // whole library.
+            let catalog_result = catalog::rebuild_catalog(&data_dir);
+            let catalog_counts = catalog_result.as_ref().ok().map(|r| (r.blobs_carried, r.blobs_hashed));
+            let catalog_error = catalog_result.err().map(|e| e.to_string());
+            // …then index what was folded in, so the library opens ready
+            // (ruling R208.1 item 5). A rebuilt catalog has no laps until
+            // this has run.
+            let index_report = run_index(&data_dir, &[], true, false, None, !json);
             if json {
                 let mut object = fold_summary_json(&summary);
                 object["catalog_error"] = catalog_error.clone().map_or(Value::Null, Value::String);
+                object["blobs_carried"] = catalog_counts.map_or(Value::Null, |(c, _)| json!(c));
+                object["blobs_hashed"] = catalog_counts.map_or(Value::Null, |(_, h)| json!(h));
+                object["index"] = index_json(&index_report);
                 let code = print_json(&json!({ "fold_in": object }));
                 if summary.failed > 0 || catalog_error.is_some() {
                     return ExitCode::FAILURE;
@@ -241,11 +284,33 @@ pub fn run(action: LibraryAction) -> ExitCode {
                 code
             } else {
                 print_fold_summary(&summary);
+                if let Some((carried, hashed)) = catalog_counts {
+                    println!("catalog: {carried} blobs carried, {hashed} hashed");
+                }
+                print_index_summary(&index_report);
                 if let Some(e) = &catalog_error {
                     eprintln!("error: catalog rebuild: {e}");
                     return ExitCode::FAILURE;
                 }
                 if summary.failed > 0 {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+        }
+        LibraryAction::Index { session_ids, data_dir, all, force, workers, json } => {
+            let report = run_index(&data_dir, &session_ids, all, force, workers, !json);
+            let failed = report.as_ref().map_or(1, |r| r.failed.len());
+            if json {
+                let code = print_json(&json!({ "index": index_json(&report) }));
+                if failed > 0 {
+                    return ExitCode::FAILURE;
+                }
+                code
+            } else {
+                print_index_summary(&report);
+                if failed > 0 {
                     ExitCode::FAILURE
                 } else {
                     ExitCode::SUCCESS
@@ -280,14 +345,24 @@ pub fn run(action: LibraryAction) -> ExitCode {
                     println!("{}", rebuild_line(result));
                 }
             });
+            // A re-imported session's `data.parquet` is new, so its laps
+            // must be detected again before the library opens ready
+            // (ruling R208.1 item 5). `force`, because a reimport does not
+            // itself change the track library hash the stamps compare.
+            let rebuilt_ids: Vec<String> =
+                results.iter().filter(|r| r.error.is_none()).map(|r| r.session_id.clone()).collect();
+            let index_report = run_index(&data_dir, &rebuilt_ids, false, true, None, !json);
             let failed = results.iter().filter(|r| r.error.is_some()).count();
             if json {
-                let code = print_json(&json!({ "rebuild": rebuild_json(&results) }));
+                let code = print_json(
+                    &json!({ "rebuild": rebuild_json(&results), "index": index_json(&index_report) }),
+                );
                 if failed > 0 {
                     return ExitCode::FAILURE;
                 }
                 code
             } else {
+                print_index_summary(&index_report);
                 println!("rebuilt {} session(s), {failed} failed", results.len() - failed);
                 if failed > 0 {
                     ExitCode::FAILURE
@@ -614,6 +689,101 @@ fn stale_json(rows: &[StaleSession]) -> Value {
     )
 }
 
+// ── index ────────────────────────────────────────────────────────────────
+
+/// Memory the CLI's indexing pool may hold in flight at once, bytes: 2 GiB,
+/// the same ceiling `idl-rs-tauri`'s `memory::MAX_BUDGET_BYTES` puts on the
+/// app. Fixed rather than a fraction of RAM because `idl-rs` is pure and has
+/// no physical-memory query (CLAUDE.md §2), and because a shell tool with no
+/// webview alongside it can afford the ceiling on any machine that can run
+/// an import.
+const CLI_INDEX_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Runs the lap/track index job, printing one line per session when
+/// `verbose`.
+///
+/// Which sessions, in precedence order: the ones `session_ids` names; else
+/// every session when `all`; else only the ones whose index is stale. The
+/// last two index the same set — a current session is skipped either way —
+/// but they report different totals, which is the difference between "159
+/// considered, 159 already current" and "nothing to do".
+///
+/// Shared by `library index`, the tail of `library fold-in` and the tail of
+/// `library rebuild`, so all three run the *same* core job on the same pool
+/// (ruling R208.1 item 5) — there is no second indexing implementation to
+/// drift.
+fn run_index(
+    data_root: &Path,
+    session_ids: &[String],
+    all: bool,
+    force: bool,
+    workers: Option<usize>,
+    verbose: bool,
+) -> Result<IndexJobReport, IndexJobError> {
+    let ids: Vec<String> = if !session_ids.is_empty() {
+        session_ids.to_vec()
+    } else if all {
+        index_job::list_session_ids(data_root)?
+    } else {
+        index_job::stale_session_ids(data_root)?
+    };
+    if ids.is_empty() {
+        return Ok(IndexJobReport::default());
+    }
+
+    let budget = ByteBudget::new(CLI_INDEX_BUDGET_BYTES);
+    let cancel = AtomicBool::new(false);
+    // One line per session, on the phase that starts its work — printing
+    // both phases would double the output for no extra information.
+    let on_progress = |p: IndexProgress| {
+        if verbose && p.phase == IndexPhase::Tracks {
+            println!("[{:>4}/{:>4}] indexing {}", p.done + 1, p.total, p.current_session_id);
+        }
+    };
+    let opts = IndexJobOptions {
+        workers: workers.unwrap_or_else(index_job::worker_count),
+        budget: &budget,
+        cancel: &cancel,
+        progress: &on_progress,
+    };
+    index_job::index_sessions(data_root, &ids, force, &opts)
+}
+
+/// The index job's counts as JSON, or its setup error.
+fn index_json(report: &Result<IndexJobReport, IndexJobError>) -> Value {
+    match report {
+        Ok(r) => json!({
+            "total": r.total,
+            "indexed": r.indexed,
+            "skipped_up_to_date": r.skipped_up_to_date,
+            "cancelled": r.cancelled,
+            "failed": r.failed.iter()
+                .map(|f| json!({ "session_id": f.session_id, "error": f.message }))
+                .collect::<Vec<Value>>(),
+        }),
+        Err(e) => json!({ "error": e.to_string() }),
+    }
+}
+
+/// The index job's one-line human summary, plus one line per failure.
+fn print_index_summary(report: &Result<IndexJobReport, IndexJobError>) {
+    match report {
+        Ok(r) => {
+            println!(
+                "indexed {} session(s), {} already current, {} failed{}",
+                r.indexed,
+                r.skipped_up_to_date,
+                r.failed.len(),
+                if r.cancelled { " (cancelled)" } else { "" }
+            );
+            for failure in &r.failed {
+                eprintln!("error: index {}: {}", failure.session_id, failure.message);
+            }
+        }
+        Err(e) => eprintln!("error: index: {e}"),
+    }
+}
+
 /// [`import::reimport_session`] per id, in the order given, never stopping at
 /// the first failure — one unrebuildable session must not strand the rest.
 pub fn rebuild(data_root: &Path, session_ids: &[String], mut on_session: impl FnMut(&RebuildResult)) -> Vec<RebuildResult> {
@@ -651,6 +821,66 @@ fn rebuild_json(results: &[RebuildResult]) -> Value {
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    #[test]
+    fn run_index_on_a_data_root_with_no_sessions_is_an_empty_ok_report() {
+        // Arrange -- a bare directory: no sessions/, no tracks/, no catalog.
+        let dir = std::env::temp_dir().join(format!("idl-rs-cli-index-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Act
+        let report = run_index(&dir, &[], true, false, Some(1), false).unwrap();
+
+        // Assert -- nothing to do is not a failure.
+        assert_eq!(report, IndexJobReport::default());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_json_a_report_with_one_failure_names_the_session_and_its_error() {
+        // Arrange
+        let report = Ok(IndexJobReport {
+            total: 2,
+            indexed: 1,
+            skipped_up_to_date: 0,
+            failed: vec![idl_rs::store::index_job::IndexFailure {
+                session_id: "ghost".to_string(),
+                message: "no data.parquet".to_string(),
+            }],
+            cancelled: false,
+        });
+
+        // Act
+        let value = index_json(&report);
+
+        // Assert
+        assert_eq!(value["indexed"], 1);
+        assert_eq!(value["failed"][0]["session_id"], "ghost");
+        assert_eq!(value["failed"][0]["error"], "no data.parquet");
+    }
+
+    #[test]
+    fn index_json_a_setup_failure_is_one_error_string_not_a_count_of_zero() {
+        // Arrange -- the run never started, so there are no counts at all.
+        let report: Result<IndexJobReport, IndexJobError> = Err(IndexJobError {
+            kind: idl_rs::store::index_job::IndexJobErrorKind::Catalog,
+            message: "catalog.sqlite is locked".to_string(),
+        });
+
+        // Act
+        let value = index_json(&report);
+
+        // Assert
+        assert!(value["error"].as_str().unwrap().contains("catalog.sqlite is locked"));
+        assert!(value.get("indexed").is_none());
+    }
 }
 
 #[cfg(test)]

@@ -229,6 +229,24 @@ impl From<idl_rs::store::lap_index::LapIndexError> for IpcError {
     }
 }
 
+/// C3 §3.2 `index_status`/`start_index_job`.
+/// `idl_rs::store::index_job::IndexJobError` — `Io` (reading
+/// `<data>/sessions/` or `<data>/tracks/`) maps to `IpcErrorKind::Io`;
+/// `Catalog` (`catalog.sqlite` will not open) folds into `Internal`, the
+/// same bucket `CatalogErrorKind::Sql` uses (ruling R46 precedent). Note
+/// that a *per-session* indexing failure never reaches here: it lands in
+/// `IndexJobReport::failed` and the run continues (ruling R208.1 item 2).
+impl From<idl_rs::store::index_job::IndexJobError> for IpcError {
+    fn from(e: idl_rs::store::index_job::IndexJobError) -> Self {
+        use idl_rs::store::index_job::IndexJobErrorKind;
+        let kind = match e.kind {
+            IndexJobErrorKind::Io => IpcErrorKind::Io,
+            IndexJobErrorKind::Catalog => IpcErrorKind::Internal,
+        };
+        IpcError::new(kind, e.message)
+    }
+}
+
 /// C3 §3.4 (Workbook). `idl_rs::math::MathEvalError` (evaluation-time,
 /// per-definition failures, C2 §3.5.B) — every variant gets its own
 /// `math_*` `IpcErrorKind` (C3 §2's naming rule: prefix every source enum's

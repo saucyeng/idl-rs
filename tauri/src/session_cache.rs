@@ -336,6 +336,46 @@ impl Drop for Reservation<'_> {
     }
 }
 
+/// The fraction of the budget one indexing worker's reservation is clamped
+/// to, as `(numerator, denominator)` — 4/5, chosen so that
+/// [`crate::memory::with_estimate_margin`]'s own 5/4 lifts it back to
+/// exactly the budget and never past it. See [`DecodeBudget for
+/// SessionCache`](SessionCache#impl-DecodeBudget-for-SessionCache).
+const INDEX_RESERVATION_CAP: (u64, u64) = (4, 5);
+
+/// The indexing job's memory gate (ruling R208.1 item 3): a worker about to
+/// decode a session's GPS reserves against the *same* budget every command's
+/// decode reserves against, so N indexing workers plus whatever the notebook
+/// is doing can never exceed one ceiling.
+///
+/// **Waits, never fails** (ruling R211's rule for the indexing path, where
+/// there is no user to show a toast to). Two things make that safe:
+///
+/// - the request is clamped to [`INDEX_RESERVATION_CAP`] of the budget
+///   before [`SessionCache::reserve`] applies its margin, so the
+///   "larger than the whole budget" branch is unreachable and no amount of
+///   waiting is ever futile;
+/// - a [`RESERVE_TIMEOUT`] elapsing is retried rather than surfaced, because
+///   a background job that gives up on a busy minute would leave the library
+///   half-indexed for no reason.
+///
+/// A clamped reservation under-charges a genuinely enormous session, but
+/// such a session can only run when nothing else holds the budget — which
+/// is the same guarantee an unclamped wait would have given.
+impl idl_rs::store::index_job::DecodeBudget for SessionCache {
+    fn acquire<'a>(&'a self, bytes: u64, hint: &str) -> Box<dyn idl_rs::store::index_job::BudgetGuard + 'a> {
+        let (num, den) = INDEX_RESERVATION_CAP;
+        let capped = bytes.min(self.budget_bytes() / den * num).max(1);
+        loop {
+            if let Ok(reservation) = self.reserve(capped, hint) {
+                return Box::new(reservation);
+            }
+        }
+    }
+}
+
+impl idl_rs::store::index_job::BudgetGuard for Reservation<'_> {}
+
 /// The C3 §1 `resource_exhausted` error for a decode that waited
 /// [`RESERVE_TIMEOUT`] for the budget and never got it (ruling R211.2).
 ///

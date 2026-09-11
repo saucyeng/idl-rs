@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod catalog_read;
 pub mod derived;
 pub mod import;
+pub mod index_job;
 pub mod lap_index;
 pub mod parquet;
 pub mod profile;

@@ -246,7 +246,51 @@ pub fn index_laps(
     handle: &SessionHandle,
     force: bool,
 ) -> Result<LapIndexReport, LapIndexError> {
-    let sj_path = data_root.join("sessions").join(session_id).join("session.json");
+    let (tracks, warnings) = load_track_library(data_root)?;
+    index_laps_with_tracks(data_root, session_id, handle, &tracks, &warnings, force)
+}
+
+/// The `session.json` path of `session_id` under `data_root`.
+fn session_json_path(data_root: &Path, session_id: &str) -> std::path::PathBuf {
+    data_root.join("sessions").join(session_id).join("session.json")
+}
+
+/// Whether `session_id`'s cached lap/track index is current against
+/// `fresh_library_hash` — the same staleness test [`index_laps`] makes, but
+/// reading only `session.json` (no `data.parquet`, no decode). The
+/// library-wide index job (`store::index_job`) calls this to skip a session
+/// in microseconds rather than opening it (ruling R208.1: a restarted job
+/// "skips sessions whose stored `lap_detector_version`/
+/// `track_visits_library_hash` are current").
+///
+/// A missing or unparseable `session.json` is **not** current — the session
+/// needs indexing (or needs its parse failure surfaced by the index itself),
+/// never a silent skip.
+pub fn session_index_is_current(data_root: &Path, session_id: &str, fresh_library_hash: &str) -> bool {
+    let path = session_json_path(data_root, session_id);
+    let Ok(bytes) = fs::read(&path) else { return false };
+    let Ok(doc) = parse_session_json(&bytes) else { return false };
+    doc.track_visits_library_hash.as_deref() == Some(fresh_library_hash)
+        && doc.lap_detector_version.as_deref() == Some(LAP_DETECTOR_VERSION)
+}
+
+/// [`index_laps`] against a track library the caller has already loaded.
+///
+/// Exists for the library-wide index job, which reads `<data_root>/tracks/`
+/// once for the whole run instead of once per session (159 sessions × the
+/// whole track library was pure repeated I/O). `library_warnings` are the
+/// warnings that load produced; they are carried into the report exactly as
+/// [`index_laps`]' own load would have. Every staleness, merge and
+/// flag-reconciliation rule is [`index_laps`]'.
+pub fn index_laps_with_tracks(
+    data_root: &Path,
+    session_id: &str,
+    handle: &SessionHandle,
+    tracks: &[Track],
+    library_warnings: &[String],
+    force: bool,
+) -> Result<LapIndexReport, LapIndexError> {
+    let sj_path = session_json_path(data_root, session_id);
     let (mut doc, based_on_hash) = if sj_path.is_file() {
         let bytes = fs::read(&sj_path)
             .map_err(|e| LapIndexError::new(LapIndexErrorKind::Io, format!("reading {}: {e}", sj_path.display())))?;
@@ -257,8 +301,8 @@ pub fn index_laps(
         (empty_session_json(session_id), None)
     };
 
-    let (tracks, mut warnings) = load_track_library(data_root)?;
-    let fresh_hash = track_library_hash(&tracks);
+    let mut warnings: Vec<String> = library_warnings.to_vec();
+    let fresh_hash = track_library_hash(tracks);
 
     let stale = force
         || doc.track_visits_library_hash.as_deref() != Some(fresh_hash.as_str())
@@ -275,7 +319,7 @@ pub fn index_laps(
         });
     }
 
-    let index = compute_lap_index(handle, &tracks, &doc.ignored_lap_numbers);
+    let index = compute_lap_index(handle, tracks, &doc.ignored_lap_numbers);
     warnings.extend(index.warnings);
 
     let valid: HashSet<u32> = index.laps.iter().map(|l| l.lap_number).collect();

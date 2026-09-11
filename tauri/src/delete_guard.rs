@@ -80,7 +80,7 @@ mod tests {
         ("tauri/src/inbox.rs", "import_one"),
         // (d) catalog.sqlite and its -wal/-shm sidecars — a rebuildable
         // index, never `blobs/` or `sessions/`.
-        ("core/src/store/catalog.rs", "rebuild_catalog"),
+        ("core/src/store/catalog.rs", "rebuild_catalog_with_progress"),
         // (g) an explicit single-profile delete, no-op if absent.
         ("core/src/store/profile.rs", "delete"),
         // `delete_track`: one `tracks/<id>.idl0t`, the explicit "delete
