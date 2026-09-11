@@ -42,7 +42,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use idl_rs::session::ChannelSamples;
-use idl_rs::store::parquet::{estimate_channel_bytes, read_channel, ParquetStoreErrorKind};
+use idl_rs::store::parquet::{estimate_channel_bytes, read_channel_with_progress, ParquetStoreErrorKind};
 
 use crate::error::{IpcError, IpcErrorKind};
 use crate::memory::{budget_bytes, resource_exhausted, with_estimate_margin};
@@ -53,6 +53,57 @@ use crate::memory::{budget_bytes, resource_exhausted, with_estimate_margin};
 /// waiting rather than failing — and short enough that a genuinely stuck
 /// app tells the user instead of hanging.
 pub const RESERVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a decode runs before it starts reporting progress (ruling R221
+/// item 1's "more than ~200 ms").
+///
+/// A decode is not timed in advance — its duration is only known by living
+/// through it — so the rule is applied as a delay: nothing is reported until
+/// the decode has already been running this long, and a decode that finishes
+/// first reports nothing at all. That is the point: a ring that appears and
+/// vanishes inside two frames is noise, and every hover and pan in the app
+/// goes through this same function.
+pub const PROGRESS_AFTER: Duration = Duration::from_millis(200);
+
+/// Minimum gap between two `decode_progress` events for one decode.
+///
+/// The reader hands back a `RecordBatch` every 1024 rows or so, which on a
+/// multi-million-row session is thousands of observations a second —
+/// far more than a ring redrawing at 60 Hz can use, and every one of them
+/// crosses IPC. Ten a second is enough to look continuous.
+pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// C3 §3.2 `decode_progress` — one observation of one channel's decode
+/// (ruling R221 item 1). Field names are the contract; `app/src/ipc/
+/// decode_progress.ts` mirrors them byte for byte.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DecodeProgressEvent {
+    /// The session whose `data.parquet` is being decoded.
+    pub session_id: String,
+    /// The channel being decoded, as the cell's binding spells it.
+    pub channel: String,
+    /// Rows decoded so far, over every pass this decode makes (a
+    /// synthesized `Distance` makes two — see
+    /// `idl_rs::store::parquet::read_channel_with_progress`).
+    pub done_rows: u64,
+    /// Rows this decode has to get through in total. Never `0` on an event
+    /// the app renders, so `done_rows / total_rows` is always defined.
+    pub total_rows: u64,
+    /// `true` on the one terminal observation for this decode, whether it
+    /// succeeded or failed. A consumer that only ever saw `false` would
+    /// leave a ring spinning forever on a decode that errored, so this is
+    /// emitted on the error path too (with whatever counts were last seen).
+    pub finished: bool,
+}
+
+/// Where [`SessionCache`] sends its [`DecodeProgressEvent`]s — the Tauri
+/// event emitter in the app, a recording closure in tests.
+///
+/// `Arc<dyn Fn>` rather than a `tauri::AppHandle`: this module is the one
+/// piece of decode plumbing that is otherwise free of Tauri, and a cache
+/// that could only report through an `AppHandle` could not be tested without
+/// a running app.
+pub type ProgressSink = Arc<dyn Fn(DecodeProgressEvent) + Send + Sync>;
 
 /// Cache key: which session, which channel.
 type Key = (String, String);
@@ -81,12 +132,43 @@ struct Inner {
 
 /// Everything a cache is, behind one `Arc` — see [`SessionCache`]'s note on
 /// cloning.
-#[derive(Debug)]
 struct Shared {
     inner: Mutex<Inner>,
     /// Signalled whenever bytes are given back — a reservation dropped, or
     /// an entry evicted — so waiting decodes re-check the budget.
     released: Condvar,
+    /// Where decode progress goes and how often, cloned out once per decode
+    /// and never held across one.
+    progress: Mutex<Progress>,
+}
+
+/// The decode-progress reporting settings — see
+/// [`SessionCache::set_progress_sink`].
+#[derive(Clone)]
+struct Progress {
+    /// `None` when nobody is listening: the CLI, every test that has not
+    /// installed one, and the app before its setup hook runs. A decode then
+    /// behaves exactly as it did before ruling R221.
+    sink: Option<ProgressSink>,
+    /// [`PROGRESS_AFTER`], unless a test shortened it.
+    after: Duration,
+    /// [`PROGRESS_INTERVAL`], unless a test shortened it.
+    interval: Duration,
+}
+
+impl Default for Progress {
+    fn default() -> Self {
+        Progress { sink: None, after: PROGRESS_AFTER, interval: PROGRESS_INTERVAL }
+    }
+}
+
+/// Hand-written because a [`ProgressSink`] is a `dyn Fn` and cannot derive
+/// it; the sink is reported as present or absent rather than printed.
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let has_sink = self.progress.lock().map(|p| p.sink.is_some()).unwrap_or(false);
+        f.debug_struct("Shared").field("inner", &self.inner).field("has_progress_sink", &has_sink).finish()
+    }
 }
 
 /// Per-channel decoded-sample cache, LRU by bytes (ruling R203.2), and the
@@ -135,8 +217,34 @@ impl SessionCache {
                     in_flight_bytes: 0,
                 }),
                 released: Condvar::new(),
+                progress: Mutex::new(Progress::default()),
             }),
         }
+    }
+
+    /// Installs the sink every later decode reports progress to (ruling
+    /// R221 item 1), replacing any previous one.
+    ///
+    /// Called once, from the app's setup hook, with a closure that emits the
+    /// C3 §3.2 `decode_progress` event. A cache with no sink decodes exactly
+    /// as it did before this ruling: the callback threaded into
+    /// `read_channel_with_progress` is never even built.
+    pub fn set_progress_sink(&self, sink: ProgressSink) {
+        self.set_progress_sink_with_timings(sink, PROGRESS_AFTER, PROGRESS_INTERVAL);
+    }
+
+    /// [`Self::set_progress_sink`] with explicit thresholds. Exists so tests
+    /// can pin the delay and the throttle in milliseconds instead of waiting
+    /// out [`PROGRESS_AFTER`]; production always uses `set_progress_sink`.
+    pub fn set_progress_sink_with_timings(&self, sink: ProgressSink, after: Duration, interval: Duration) {
+        let mut slot = self.shared.progress.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Progress { sink: Some(sink), after, interval };
+    }
+
+    /// The current reporting settings. Cloned per decode so the lock is
+    /// never held while one runs.
+    fn progress(&self) -> Progress {
+        self.shared.progress.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The budget this cache was built with, bytes.
@@ -276,13 +384,77 @@ impl SessionCache {
         let needed = estimate_channel_bytes(session_dir, channel).map_err(|e| store_error(session_id, channel, 0, e))?;
         let reservation = self.reserve(needed, &format!("decode channel '{channel}' of session '{session_id}'"))?;
 
-        let samples = Arc::new(read_channel(session_dir, channel).map_err(|e| store_error(session_id, channel, needed, e))?);
+        let decoded = self.decode_reporting_progress(session_dir, session_id, channel);
+        let samples = Arc::new(decoded.map_err(|e| store_error(session_id, channel, needed, e))?);
         // Insert first, then give the reservation back: releasing it before
         // the bytes are accounted as resident would let a waiter through on
         // a budget this decode is still occupying.
         self.lock().insert(key, samples.clone());
         drop(reservation);
         Ok(samples)
+    }
+
+    /// One `read_channel`, reporting `decode_progress` to the installed sink
+    /// (ruling R221 item 1).
+    ///
+    /// Two rules shape what is sent, both in this function rather than in
+    /// core: nothing at all until the decode has been running
+    /// [`PROGRESS_AFTER`] (a hover-speed decode must not flash a ring), and
+    /// at most one event per [`PROGRESS_INTERVAL`] after that (a reader
+    /// yielding a batch per 1024 rows would otherwise flood IPC). The one
+    /// exception to the interval is the terminal `finished` event, which is
+    /// always sent when any progress was — including on the error path,
+    /// since a ring whose decode failed must stop, not spin.
+    ///
+    /// With no sink installed this is exactly `read_channel`.
+    fn decode_reporting_progress(
+        &self,
+        session_dir: &Path,
+        session_id: &str,
+        channel: &str,
+    ) -> Result<ChannelSamples, idl_rs::store::parquet::ParquetStoreError> {
+        let settings = self.progress();
+        let Some(sink) = settings.sink else {
+            return read_channel_with_progress(session_dir, channel, &mut |_, _| {});
+        };
+
+        let started = Instant::now();
+        let mut last_sent: Option<Instant> = None;
+        let mut last_counts = (0u64, 0u64);
+
+        let result = {
+            let mut report = |done: usize, total: usize| {
+                last_counts = (done as u64, total as u64);
+                let now = Instant::now();
+                let due = match last_sent {
+                    None => now.duration_since(started) >= settings.after,
+                    Some(sent) => now.duration_since(sent) >= settings.interval,
+                };
+                if !due || total == 0 {
+                    return;
+                }
+                last_sent = Some(now);
+                (*sink)(DecodeProgressEvent {
+                    session_id: session_id.to_string(),
+                    channel: channel.to_string(),
+                    done_rows: done as u64,
+                    total_rows: total as u64,
+                    finished: false,
+                });
+            };
+            read_channel_with_progress(session_dir, channel, &mut report)
+        };
+
+        if last_sent.is_some() {
+            (*sink)(DecodeProgressEvent {
+                session_id: session_id.to_string(),
+                channel: channel.to_string(),
+                done_rows: last_counts.0,
+                total_rows: last_counts.1,
+                finished: true,
+            });
+        }
+        result
     }
 
     /// Drops every resident channel of `session_id`.
@@ -303,6 +475,27 @@ impl SessionCache {
         self.lock().retain(|_| false);
         self.shared.released.notify_all();
     }
+}
+
+/// Points the app's managed [`SessionCache`] at the C3 §3.2
+/// `decode_progress` event (ruling R221 item 1).
+///
+/// Called once from the app's setup hook, after `app.manage(SessionCache)`.
+/// It lives here rather than in `app/src-tauri` so that the event name and
+/// the payload type stay in the same file as the struct that defines them —
+/// the app crate only says *when*, never *what*.
+///
+/// Emission failures are ignored, exactly as every other event in this crate
+/// ignores them: a webview that has gone away is not a decode failure, and
+/// there is no promise left to reject on a background decode.
+pub fn install_progress_sink<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    use tauri::{Emitter, Manager};
+
+    let handle = app.clone();
+    let sink: ProgressSink = Arc::new(move |event: DecodeProgressEvent| {
+        let _ = handle.emit("decode_progress", event);
+    });
+    app.state::<SessionCache>().set_progress_sink(sink);
 }
 
 /// One decode's claim on the budget, released when it is dropped (ruling
@@ -789,6 +982,100 @@ mod tests {
         // Assert
         assert_eq!(err.kind, IpcErrorKind::ResourceExhausted);
         assert_eq!(twin.in_flight_bytes(), cache.in_flight_bytes());
+    }
+
+    /// A sink that records every event it is handed, and the recording.
+    fn recording_sink() -> (ProgressSink, Arc<Mutex<Vec<DecodeProgressEvent>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let into_sink = Arc::clone(&seen);
+        let sink: ProgressSink = Arc::new(move |e: DecodeProgressEvent| {
+            into_sink.lock().unwrap().push(e);
+        });
+        (sink, seen)
+    }
+
+    #[test]
+    fn decode_progress_a_decode_shorter_than_the_delay_reports_nothing_at_all() {
+        // Arrange -- production thresholds against a four-channel toy
+        // session: nothing here takes 200 ms.
+        let root = temp_root();
+        seed(&root, "s1", 100);
+        let cache = SessionCache::with_budget(1 << 30);
+        let (sink, seen) = recording_sink();
+        cache.set_progress_sink(sink);
+
+        // Act
+        cache.channel(&session_dir(&root, "s1"), "s1", "A").unwrap();
+
+        // Assert -- a ring that appears and vanishes within a frame is noise.
+        assert!(seen.lock().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn decode_progress_a_decode_past_the_delay_reports_the_session_channel_and_a_single_finished_event() {
+        // Arrange -- zero delay, so every observation is past it.
+        let root = temp_root();
+        seed(&root, "s1", 100);
+        let cache = SessionCache::with_budget(1 << 30);
+        let (sink, seen) = recording_sink();
+        cache.set_progress_sink_with_timings(sink, Duration::ZERO, Duration::ZERO);
+
+        // Act
+        cache.channel(&session_dir(&root, "s1"), "s1", "B").unwrap();
+
+        // Assert
+        let events = seen.lock().unwrap().clone();
+        assert!(events.len() >= 2);
+        assert!(events.iter().all(|e| e.session_id == "s1" && e.channel == "B" && e.total_rows > 0));
+        assert!(events.iter().rev().skip(1).all(|e| !e.finished));
+        let last = events.last().unwrap();
+        assert!(last.finished);
+        assert_eq!(last.done_rows, last.total_rows);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn decode_progress_a_cache_hit_reports_nothing_because_it_decodes_nothing() {
+        // Arrange -- the first decode is warmed with no sink installed.
+        let root = temp_root();
+        seed(&root, "s1", 100);
+        let dir = session_dir(&root, "s1");
+        let cache = SessionCache::with_budget(1 << 30);
+        cache.channel(&dir, "s1", "C").unwrap();
+        let (sink, seen) = recording_sink();
+        cache.set_progress_sink_with_timings(sink, Duration::ZERO, Duration::ZERO);
+
+        // Act
+        cache.channel(&dir, "s1", "C").unwrap();
+
+        // Assert
+        assert!(seen.lock().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn decode_progress_a_failed_decode_still_sends_its_finished_event() {
+        // Arrange -- `Distance` needs a GPS speed channel the seed has no
+        // trace of, so its second pass fails after the first has reported.
+        let root = temp_root();
+        seed(&root, "s1", 100);
+        let cache = SessionCache::with_budget(1 << 30);
+        let (sink, seen) = recording_sink();
+        cache.set_progress_sink_with_timings(sink, Duration::ZERO, Duration::ZERO);
+
+        // Act
+        let err = cache.channel(&session_dir(&root, "s1"), "s1", "Distance").unwrap_err();
+
+        // Assert -- a ring whose decode failed must stop, not spin.
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+        let events = seen.lock().unwrap().clone();
+        assert!(events.last().is_some_and(|e| e.finished));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
