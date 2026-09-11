@@ -1161,8 +1161,8 @@ pub struct MathBuiltinDto {
     /// when the function has more than one call form).
     pub arity: Vec<u32>,
     /// `"implemented"` or `"not_implemented"` (R64.2's wire enum; no
-    /// `unit_rule` field — dropped by that ruling, no source defines its
-    /// vocabulary).
+    /// vocabulary defined since by C2 §3.3.1, carried in `unit_rule`
+    /// below as of ruling R222 item 1).
     pub status: String,
     /// Retired names that now migrate to this one (C2 §3.8), drawn from
     /// [`idl_rs::math::math_name_migrations`] — added so the notebook's
@@ -1170,6 +1170,25 @@ pub struct MathBuiltinDto {
     /// (plan `runs/2026-09-08/scipy-alignment-plan.md` §4 Task 3). `[]` for
     /// every function nothing was ever renamed from.
     pub renamed_from: Vec<String>,
+    /// C2 §3.3's Category column — how the generated reference groups the
+    /// entry, and the heading the editor's hover card prints above it
+    /// (ruling R222 items 1-2).
+    pub category: String,
+    /// The call form(s) as a human reads them.
+    pub signature: String,
+    /// How the call's output unit is derived from its arguments' units
+    /// (C2 §3.3.1's rule vocabulary).
+    pub unit_rule: String,
+    /// The result's value shape in C2 §3.6's vocabulary.
+    pub shape: String,
+    /// One line saying what the function computes.
+    pub description: String,
+    /// One runnable example call.
+    pub example: String,
+    /// The anchor this function's entry has in the bundled
+    /// `WORKBOOK-REFERENCE.md`, so `F1` in the editor can scroll the help
+    /// panel to it without the frontend reimplementing the slug rule.
+    pub doc_anchor: String,
 }
 
 impl From<&idl_rs::math::MathBuiltin> for MathBuiltinDto {
@@ -1183,7 +1202,19 @@ impl From<&idl_rs::math::MathBuiltin> for MathBuiltinDto {
             .filter(|m| m.new == b.name)
             .map(|m| m.old.to_string())
             .collect();
-        Self { name: b.name.to_string(), arity: b.arity.to_vec(), status: status.to_string(), renamed_from }
+        Self {
+            name: b.name.to_string(),
+            arity: b.arity.to_vec(),
+            status: status.to_string(),
+            renamed_from,
+            category: b.category.to_string(),
+            signature: b.signature.to_string(),
+            unit_rule: b.unit_rule.to_string(),
+            shape: b.shape.to_string(),
+            description: b.description.to_string(),
+            example: b.example.to_string(),
+            doc_anchor: idl_rs::docs::builtin_anchor(b.name),
+        }
     }
 }
 
