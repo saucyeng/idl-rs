@@ -60,8 +60,8 @@ use std::time::{Duration, Instant};
 use idl_rs::session::ChannelSamples;
 use idl_rs::store::index_job::worker_count;
 use idl_rs::store::parquet::{
-    estimate_channel_bytes, read_axis_column, read_channel_index, read_channel_with_axes, read_channel_with_progress,
-    recorded_axis_column, AxisColumn, ChannelAxes, ParquetStoreErrorKind,
+    estimate_channel_bytes, read_channel_index, read_channel_sharing_axes, read_channel_with_progress,
+    recorded_axis_column, AxisColumn, BorrowedAxes, ParquetStoreErrorKind,
 };
 
 use crate::error::{IpcError, IpcErrorKind};
@@ -564,18 +564,23 @@ impl SessionCache {
     /// axes rather than decompressing them again (ruling R232.1).
     ///
     /// The union `t` column and the channel's `<source>_t_recorded_us`
-    /// companion are taken from the cache when resident and decoded into it
-    /// when not — deduped exactly as a channel decode is, so six channels of
-    /// one source fanned out over the pool decode their axis once between
-    /// them. A synthesized `Time`/`Distance`, and any name this file does
-    /// not carry, falls through to the ordinary whole-decode read, which
-    /// owns the answer (and the error message) for both.
+    /// companion are taken from the cache when resident. When they are not,
+    /// **this decode reads them in its own single pass** and leaves them
+    /// behind for every later channel of that session and source --
+    /// `read_channel_sharing_axes` projects the axes alongside the value
+    /// column, so priming the cache costs no extra pass over the file.
     ///
-    /// **Progress stays monotonic across the axis reads** (ruling R232.3):
-    /// this decode's passes are counted before the first one starts — the
-    /// axes it will actually have to read, plus its own column — and each
-    /// pass reports against that whole, so a ring advances smoothly instead
-    /// of restarting per column.
+    /// A cold axis is claimed before the read (`t` first, then the recorded
+    /// companion -- one order for every caller, so two threads can never
+    /// each hold the axis the other is waiting for). A thread that does not
+    /// win the claim waits for the axis to land and then reads only its own
+    /// column. That is what makes a cold fan-out worth doing: the first
+    /// channel pays for the axes once, and the rest decode in parallel
+    /// against them.
+    ///
+    /// A synthesized `Time`/`Distance`, and any name this file does not
+    /// carry, falls through to the ordinary whole-decode read, which owns
+    /// the answer and the error message for both.
     fn decode_borrowing_axes(
         &self,
         session_dir: &Path,
@@ -587,71 +592,40 @@ impl SessionCache {
         let Some(info) = index.iter().find(|c| c.channel_id == channel) else {
             return read_channel_with_progress(session_dir, channel, on_progress);
         };
-        let file_rows = info.file_rows;
         let t_key: AxisKey = (session_id.to_string(), "t".to_string());
         let recorded_key: AxisKey = (session_id.to_string(), recorded_axis_column(&info.source_kind));
 
-        let (mut t, mut recorded) = {
+        // Claimed in this order by every caller, always: `t`, then the
+        // recorded companion. A second order would let two threads each
+        // wait on the axis the other holds.
+        let t_claim = self.claim(Pending::Axis(t_key.clone()), |inner| inner.axis(&t_key));
+        let recorded_claim = self.claim(Pending::Axis(recorded_key.clone()), |inner| inner.axis(&recorded_key));
+        let (held_t, held_recorded) = {
             let inner = self.lock();
             (inner.axis(&t_key), inner.axis(&recorded_key))
         };
-        let passes = 1 + usize::from(t.is_none()) + usize::from(recorded.is_none());
-        let mut done = 0usize;
 
-        if t.is_none() {
-            let base = done;
-            t = self.axis(session_dir, &t_key, &mut |d, total| on_progress(base + d, total * passes))?;
-            done += file_rows;
-            // A file with no `t` column is malformed; the ordinary read owns
-            // that schema error rather than this one inventing a new one.
-            if t.is_none() {
-                return read_channel_with_progress(session_dir, channel, on_progress);
-            }
-        }
-        if recorded.is_none() {
-            let base = done;
-            recorded = self.axis(session_dir, &recorded_key, &mut |d, total| on_progress(base + d, total * passes))?;
-            done += file_rows;
-        }
-
-        let t = t.expect("t axis is Some by the check above");
-        let base = done;
-        read_channel_with_axes(
+        let decoded = read_channel_sharing_axes(
             session_dir,
             channel,
-            ChannelAxes { t: &t, recorded: recorded.as_deref() },
-            &mut |d, total| on_progress(base + d, total * passes),
-        )
-    }
+            BorrowedAxes { t: held_t.as_deref(), recorded: held_recorded.as_deref() },
+            on_progress,
+        )?;
 
-    /// One axis column, decoded at most once while resident (ruling
-    /// R232.1). `Ok(None)` when the file carries no such column — a source
-    /// that records no hardware timestamps, which is not a failure.
-    fn axis(
-        &self,
-        session_dir: &Path,
-        key: &AxisKey,
-        on_progress: &mut dyn FnMut(usize, usize),
-    ) -> Result<Option<Arc<AxisColumn>>, idl_rs::store::parquet::ParquetStoreError> {
-        let name = key.1.clone();
-        loop {
-            let claimed = self.claim(Pending::Axis(key.clone()), |inner| inner.axis(key));
-            if let Some(hit) = self.lock().axis(key) {
-                return Ok(Some(hit));
-            }
-            // Nothing resident and no claim: the leader failed, or found the
-            // column absent and cached nothing. Lead the next attempt.
-            let Some(_in_flight) = claimed else { continue };
-
-            let Some(decoded) = read_axis_column(session_dir, &name, on_progress)? else {
-                return Ok(None);
-            };
-            let axis = Arc::new(decoded);
+        {
             let mut inner = self.lock();
-            inner.axis_decodes += 1;
-            inner.insert_axis(key.clone(), Arc::clone(&axis));
-            return Ok(Some(axis));
+            if let Some(t) = decoded.t {
+                inner.axis_decodes += 1;
+                inner.insert_axis(t_key, Arc::new(t));
+            }
+            if let Some(recorded) = decoded.recorded {
+                inner.axis_decodes += 1;
+                inner.insert_axis(recorded_key, Arc::new(recorded));
+            }
         }
+        drop(t_claim);
+        drop(recorded_claim);
+        Ok(decoded.samples)
     }
 
     /// How many axis columns this cache has decoded since it was built
