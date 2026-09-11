@@ -1341,8 +1341,21 @@ mod tests {
     #[test]
     fn rebuild_catalog_with_progress_reports_every_phase_in_c4_scan_order() {
         // Arrange
+        use crate::workbook::v3::front_matter::{render_front_matter, FrontMatter};
+
         let root = temp_root();
         write_full_session(&root, "s1", 0, &empty_session_json("s1"));
+        let workbooks_dir = root.join("workbooks");
+        std::fs::create_dir_all(&workbooks_dir).unwrap();
+        let front_matter = FrontMatter {
+            id: "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d".to_string(),
+            name: "Fork tuning".to_string(),
+            constants: Default::default(),
+            units: Default::default(),
+            version: 3,
+            unknown: Default::default(),
+        };
+        std::fs::write(workbooks_dir.join("fork.idl1wb"), render_front_matter(&front_matter)).unwrap();
         let seen = std::cell::RefCell::new(Vec::new());
 
         // Act
@@ -1351,9 +1364,15 @@ mod tests {
         // Assert
         let seen = seen.into_inner();
         let phases: Vec<&'static str> = seen.iter().map(|(phase, _, _)| phase.as_str()).collect();
-        assert_eq!(phases, vec!["blobs", "sessions", "laps"]);
+        assert_eq!(phases, vec!["blobs", "sessions", "laps", "workbooks"]);
         assert_eq!(seen[0], (RebuildPhase::Blobs, 1, 1));
         assert_eq!(seen[1], (RebuildPhase::Sessions, 1, 1));
+        // The last phase's last item reaches `done == total` here, inside
+        // the scan — before the staging database has swapped in. It is
+        // therefore NOT the run's terminal signal; `RebuildProgress` carries
+        // no such signal at all, and the tauri layer's `finished` flag is
+        // what marks the run over (ruling R219 item 2).
+        assert_eq!(seen[3], (RebuildPhase::Workbooks, 1, 1));
 
         let _ = std::fs::remove_dir_all(&root);
     }
