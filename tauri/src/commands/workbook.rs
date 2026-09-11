@@ -2629,10 +2629,17 @@ mod tests {
         let flags = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
         let length = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         let t_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        assert_eq!(version, 1);
+        // IDLH is v2 since 2026-09-11 (R217 item 5): `axis_kind` took the
+        // first two of v1's eight reserved bytes, so the header is still 24
+        // bytes and every payload offset below is unchanged -- which is why
+        // only this one number moved.
+        assert_eq!(version, 2);
         assert_eq!(flags & 1, 1, "ChanA has a recorded time axis");
         assert_eq!(length, 3);
         assert_eq!(t_length, 3);
+        let axis_kind = u16::from_le_bytes(bytes[16..18].try_into().unwrap());
+        assert_eq!(axis_kind, idl_rs::workbook::v3::AxisKind::Time as u16, "a definition's axis is seconds today");
+        assert_eq!(&bytes[18..24], &[0u8; 6], "reserved stays zero-filled");
         assert_eq!(bytes.len(), 24 + 3 * 8 + 3 * 8);
 
         let v0 = f64::from_le_bytes(bytes[48..56].try_into().unwrap());
