@@ -16,6 +16,7 @@
 
 use nalgebra::Vector3;
 
+pub mod json;
 pub mod rigid;
 
 /// Computes per-axis bias by averaging N static samples.
