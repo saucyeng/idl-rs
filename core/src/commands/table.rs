@@ -277,6 +277,7 @@ pub const VERBS_RULED: &[(&str, &str)] = &[
     ("workbook", "R222"),
     ("cli", "R230 item 2"),
     ("wire", "R236"),
+    ("synth", "R187"),
 ];
 
 /// Whether `verb` is in either vocabulary.
@@ -490,6 +491,77 @@ pub const COMMANDS: &[CommandRow] = &[
         tier: Tier::Core,
         status: Status::Current,
         data_dir: true,
+        writer: true,
+    },
+    CommandRow {
+        noun: "session",
+        verb: "synth",
+        args: &[],
+        flags: &[
+            Flag::value("out", ValueKind::Path, "File to write the `.idl0` log to; the truth JSON goes beside it"),
+            Flag {
+                long: "laps",
+                kind: Some(ValueKind::Integer),
+                repeatable: false,
+                choices: &[],
+                default: Some("3"),
+                help: "Complete circuits of the loop",
+            },
+            Flag {
+                long: "lap-length-m",
+                kind: Some(ValueKind::Integer),
+                repeatable: false,
+                choices: &[],
+                default: Some("400"),
+                help: "Loop perimeter in metres",
+            },
+            Flag {
+                long: "rate-hz",
+                kind: Some(ValueKind::Integer),
+                repeatable: false,
+                choices: &[],
+                default: Some("800"),
+                help: "IMU output data rate in Hz",
+            },
+            Flag {
+                long: "gps-hz",
+                kind: Some(ValueKind::Integer),
+                repeatable: false,
+                choices: &[],
+                default: Some("5"),
+                help: "GPS fix rate in Hz",
+            },
+            Flag {
+                long: "seed",
+                kind: Some(ValueKind::Integer),
+                repeatable: false,
+                choices: &[],
+                default: Some("1"),
+                help: "PRNG seed; the same seed and flags give byte-identical output",
+            },
+            Flag {
+                long: "imu-count",
+                kind: Some(ValueKind::Integer),
+                repeatable: false,
+                choices: &[],
+                default: Some("3"),
+                help: "How many of the three sensors to instrument (1-3)",
+            },
+            Flag {
+                long: "noise",
+                kind: Some(ValueKind::Text),
+                repeatable: false,
+                choices: &[],
+                default: Some("1.0"),
+                help: "Multiplies every sensor noise sigma; 0 gives a noiseless recording",
+            },
+        ],
+        core_fn: "synth::generate",
+        json_shape: Some("SynthReport"),
+        help: "Generate a synthetic .idl0 session with a ground-truth JSON beside it (ruling R187)",
+        tier: Tier::Rare,
+        status: Status::Current,
+        data_dir: false,
         writer: true,
     },
     // --- workbook ---------------------------------------------------------
@@ -857,6 +929,7 @@ mod tests {
         // Arrange
         let expected = [
             "set-start", "set-meta", "cells", "data", "detect", "laps", "stale", "workbook", "cli", "wire",
+            "synth",
         ];
 
         // Act

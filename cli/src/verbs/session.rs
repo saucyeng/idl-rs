@@ -1,5 +1,5 @@
 //! The `session` verbs (ruling R229): `list`, `show`, `laps`, `set-start`,
-//! `set-meta`, `import`.
+//! `set-meta`, `import`, and `synth` (ruling R187).
 //!
 //! Every function here is a wrapper: read the arguments the table declared,
 //! make one `idl_rs` call, project the result into the two renderings
@@ -17,9 +17,10 @@ use idl_rs::store::catalog_read::{
 };
 use idl_rs::store::import::import_file_path;
 use idl_rs::store::session_json::{set_session_start, SessionJson};
+use idl_rs::synth::{generate, SynthConfig};
 
 use crate::envelope::{CliError, ErrorKind};
-use crate::verbs::{integer, opt_integer, opt_text, path, text, Ctx, VerbOutput};
+use crate::verbs::{integer, opt_integer, opt_path, opt_text, path, text, Ctx, VerbOutput};
 
 /// `session list` — every catalogued session the filters keep.
 pub fn list(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
@@ -317,9 +318,273 @@ fn session_json(doc: &SessionJson) -> Value {
     })
 }
 
+/// `session synth` — a generated `.idl0` log plus its ground truth
+/// (contract C1 §9, ruling R187).
+///
+/// The engine does the generating; this reads the flags, writes the two files
+/// and reports them. The truth file's path is `--out` with its extension
+/// replaced by `truth.json`.
+pub fn synth(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
+    let out = opt_path(m, "out").ok_or_else(|| {
+        CliError::usage("missing --out: the file to write the .idl0 log to".to_string())
+    })?;
+    let truth_path = out.with_extension("truth.json");
+
+    let config = synth_config(m)?;
+    let result = generate(&config).map_err(|e| CliError::new(ErrorKind::Usage, e.to_string()))?;
+
+    let mut truth_text = serde_json::to_string_pretty(&result.truth)
+        .map_err(|e| CliError::new(ErrorKind::Internal, e.to_string()))?;
+    truth_text.push('\n');
+
+    let summary = json!({
+        "log": out.display().to_string(),
+        "truth": truth_path.display().to_string(),
+        "log_bytes": result.log.len(),
+        "truth_bytes": truth_text.len(),
+        "session_id": result.truth.session.session_id,
+        "laps": result.truth.laps.len(),
+        "imu_sample_count": result.truth.session.imu_sample_count,
+        "gps_fix_count": result.truth.session.gps_fix_count,
+        "duration_s": result.truth.session.duration_s,
+        "written": !ctx.dry_run,
+    });
+
+    if ctx.dry_run {
+        return Ok(VerbOutput::new(
+            format!(
+                "would write {} ({} bytes) and {} ({} bytes)",
+                out.display(),
+                result.log.len(),
+                truth_path.display(),
+                truth_text.len()
+            ),
+            summary,
+        ));
+    }
+
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CliError::io(format!("creating {}: {e}", parent.display())))?;
+        }
+    }
+    std::fs::write(&out, &result.log)
+        .map_err(|e| CliError::io(format!("writing {}: {e}", out.display())))?;
+    // `as_bytes`, not a text write: the string holds `\n` only, and going
+    // through `write` keeps it that way on Windows too, so a fixture
+    // generated here and one generated on Linux are the same bytes.
+    std::fs::write(&truth_path, truth_text.as_bytes())
+        .map_err(|e| CliError::io(format!("writing {}: {e}", truth_path.display())))?;
+
+    Ok(VerbOutput::new(
+        format!(
+            "wrote {} ({} bytes, {} lap(s)) and {}",
+            out.display(),
+            result.log.len(),
+            result.truth.laps.len(),
+            truth_path.display()
+        ),
+        summary,
+    ))
+}
+
+/// Reads the `session synth` flags into a [`SynthConfig`].
+///
+/// Every flag carries a table-declared default, so clap always supplies a
+/// value; the fallbacks restate [`SynthConfig::default`] rather than relying
+/// on that. `--noise` is [`crate::verbs::opt_text`] because the command table
+/// has no floating-point [`idl_rs::commands::table::ValueKind`] — adding one
+/// would change a shape every noun shares, which is not this lane's to change.
+fn synth_config(m: &ArgMatches) -> Result<SynthConfig, CliError> {
+    let defaults = SynthConfig::default();
+
+    let noise_scale = match opt_text(m, "noise") {
+        Some(text) => text
+            .parse::<f64>()
+            .map_err(|_| CliError::usage(format!("--noise must be a number, got {text}")))?,
+        None => defaults.noise_scale,
+    };
+
+    Ok(SynthConfig {
+        laps: narrow(opt_integer(m, "laps").unwrap_or(defaults.laps as i64), "--laps")?,
+        lap_length_m: opt_integer(m, "lap-length-m").unwrap_or(defaults.lap_length_m as i64) as f64,
+        imu_rate_hz: narrow(
+            opt_integer(m, "rate-hz").unwrap_or(defaults.imu_rate_hz as i64),
+            "--rate-hz",
+        )?,
+        gps_rate_hz: narrow(
+            opt_integer(m, "gps-hz").unwrap_or(defaults.gps_rate_hz as i64),
+            "--gps-hz",
+        )?,
+        seed: narrow(opt_integer(m, "seed").unwrap_or(defaults.seed as i64), "--seed")?,
+        noise_scale,
+        imu_count: narrow(
+            opt_integer(m, "imu-count").unwrap_or(defaults.imu_count as i64),
+            "--imu-count",
+        )?,
+    })
+}
+
+/// Narrows a clap-parsed `i64` into the config field's own integer type, so
+/// an out-of-range value is a usage error rather than a silent wrap.
+fn narrow<T: TryFrom<i64>>(value: i64, flag: &str) -> Result<T, CliError> {
+    T::try_from(value).map_err(|_| CliError::usage(format!("{flag} is out of range: {value}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A fresh directory under the system temp root, unique per test.
+    fn temp_dir() -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("idl-rs-session-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Parses `argv` through the table-generated clap tree and returns the
+    /// `session synth` subcommand's own matches — the same `ArgMatches`
+    /// `dispatch` hands the verb.
+    fn synth_matches(argv: &[&str]) -> ArgMatches {
+        let tree = crate::verbs::augment(clap::Command::new("idl-rs"));
+        let mut full = vec!["idl-rs", "session", "synth"];
+        full.extend_from_slice(argv);
+        let parsed = tree.try_get_matches_from(full).expect("argv parses");
+        let (_, m) = parsed.subcommand().unwrap();
+        let (_, m) = m.subcommand().unwrap();
+        m.clone()
+    }
+
+    #[test]
+    fn synth_writes_the_log_and_the_truth_beside_it() {
+        // Arrange
+        let out = temp_dir().join("gen.idl0");
+        let m = synth_matches(&[
+            "--out",
+            out.to_str().unwrap(),
+            "--laps",
+            "1",
+            "--lap-length-m",
+            "120",
+            "--rate-hz",
+            "25",
+        ]);
+        let ctx = Ctx { json: false, dry_run: false, data_dir: None };
+
+        // Act
+        let result = synth(&ctx, &m).unwrap();
+
+        // Assert
+        let truth = out.with_extension("truth.json");
+        assert!(out.is_file(), "log not written");
+        assert!(truth.is_file(), "truth not written");
+        assert_eq!(result.data["written"], serde_json::json!(true));
+        assert_eq!(result.data["laps"], serde_json::json!(1));
+        assert_eq!(&std::fs::read(&out).unwrap()[0..4], b"IDL0");
+    }
+
+    #[test]
+    fn synth_dry_run_reports_both_paths_and_writes_nothing() {
+        // Arrange
+        let out = temp_dir().join("gen.idl0");
+        let m = synth_matches(&[
+            "--out",
+            out.to_str().unwrap(),
+            "--laps",
+            "1",
+            "--lap-length-m",
+            "120",
+            "--rate-hz",
+            "25",
+        ]);
+        let ctx = Ctx { json: false, dry_run: true, data_dir: None };
+
+        // Act
+        let result = synth(&ctx, &m).unwrap();
+
+        // Assert
+        assert!(!out.exists(), "log was written under --dry-run");
+        assert!(!out.with_extension("truth.json").exists(), "truth was written under --dry-run");
+        assert_eq!(result.data["written"], serde_json::json!(false));
+        assert!(result.data["log_bytes"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn synth_config_takes_the_tables_declared_defaults() {
+        // Arrange
+        let m = synth_matches(&["--out", "unused.idl0"]);
+
+        // Act
+        let config = synth_config(&m).unwrap();
+
+        // Assert
+        assert_eq!(config, SynthConfig::default());
+    }
+
+    #[test]
+    fn a_non_numeric_noise_is_a_usage_error() {
+        // Arrange
+        let m = synth_matches(&["--out", "unused.idl0", "--noise", "loud"]);
+
+        // Act
+        let err = synth_config(&m).unwrap_err();
+
+        // Assert
+        assert!(matches!(err.kind, ErrorKind::Usage), "{err:?}");
+    }
+
+    #[test]
+    fn an_out_of_range_flag_is_a_usage_error_rather_than_a_wrapped_value() {
+        // Arrange
+        let m = synth_matches(&["--out", "unused.idl0", "--imu-count", "300"]);
+
+        // Act
+        let err = synth_config(&m).unwrap_err();
+
+        // Assert
+        assert!(matches!(err.kind, ErrorKind::Usage), "{err:?}");
+        assert!(err.message.contains("--imu-count"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_configuration_the_engine_rejects_surfaces_as_a_usage_error() {
+        // Arrange
+        let out = temp_dir().join("gen.idl0");
+        let m = synth_matches(&["--out", out.to_str().unwrap(), "--laps", "0"]);
+        let ctx = Ctx { json: false, dry_run: false, data_dir: None };
+
+        // Act
+        let err = match synth(&ctx, &m) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a usage error"),
+        };
+
+        // Assert
+        assert!(matches!(err.kind, ErrorKind::Usage), "{err:?}");
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn synth_without_an_out_is_a_usage_error() {
+        // Arrange
+        let m = synth_matches(&[]);
+        let ctx = Ctx { json: false, dry_run: false, data_dir: None };
+
+        // Act
+        let err = match synth(&ctx, &m) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a usage error"),
+        };
+
+        // Assert
+        assert!(matches!(err.kind, ErrorKind::Usage), "{err:?}");
+    }
 
     #[test]
     fn an_unset_string_prints_as_a_dash() {

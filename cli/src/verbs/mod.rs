@@ -207,6 +207,7 @@ pub fn dispatch(noun: &str, matches: &ArgMatches) -> Option<ExitCode> {
         ("session", "set-start") => session::set_start(&ctx, m),
         ("session", "set-meta") => session::set_meta(&ctx, m),
         ("session", "import") => session::import(&ctx, m),
+        ("session", "synth") => session::synth(&ctx, m),
         ("workbook", "new") => workbook::new(&ctx, m),
         ("workbook", "check") => workbook::check(&ctx, m),
         ("workbook", "cells") => workbook::cells(&ctx, m),

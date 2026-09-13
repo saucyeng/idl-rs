@@ -40,6 +40,7 @@ pub mod session;
 pub mod spectrogram;
 pub mod statistics;
 pub mod store;
+pub mod synth;
 pub mod table;
 pub mod tile;
 pub mod track_artifact;
