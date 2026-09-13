@@ -1,0 +1,218 @@
+{
+  "schema_version": 1,
+  "generator_version": "1.0.0",
+  "config": {
+    "laps": 3,
+    "lap_length_m": 120.0,
+    "imu_rate_hz": 25,
+    "gps_rate_hz": 5,
+    "seed": 1,
+    "noise_scale": 1.0,
+    "imu_count": 3
+  },
+  "session": {
+    "session_id": "782e2e81d9ce45d9322a5d219f7209b6",
+    "device_id": "87c9a3806fd3",
+    "start_utc_ms": 1767225600000,
+    "device_t0_us": 4000000,
+    "imu_rate_hz": 25,
+    "gps_rate_hz": 5,
+    "imu_sample_count": 886,
+    "gps_fix_count": 177,
+    "duration_s": 35.451409144252494
+  },
+  "loop": {
+    "semi_major_m": 24.77176886707178,
+    "semi_minor_m": 12.38588443353589,
+    "perimeter_m": 119.99999999999973,
+    "origin_lat_deg": 51.5,
+    "origin_lon_deg": -1.5,
+    "metres_per_deg_north": 111320.0,
+    "metres_per_deg_east": 69298.32935049981,
+    "gate": {
+      "east_m": 24.77176886707178,
+      "north_m": 0.0,
+      "normal_east": 0.0,
+      "normal_north": 0.9999999999999998
+    }
+  },
+  "laps": [
+    {
+      "index": 1,
+      "start_s": 0.0,
+      "end_s": 11.817136381417498,
+      "start_utc_ms": 1767225600000,
+      "end_utc_ms": 1767225611817,
+      "duration_s": 11.817136381417498,
+      "distance_m": 119.99999999999973
+    },
+    {
+      "index": 2,
+      "start_s": 11.817136381417498,
+      "end_s": 23.634272762834996,
+      "start_utc_ms": 1767225611817,
+      "end_utc_ms": 1767225623634,
+      "duration_s": 11.817136381417498,
+      "distance_m": 119.99999999999973
+    },
+    {
+      "index": 3,
+      "start_s": 23.634272762834996,
+      "end_s": 35.451409144252494,
+      "start_utc_ms": 1767225623634,
+      "end_utc_ms": 1767225635451,
+      "duration_s": 11.817136381417498,
+      "distance_m": 119.99999999999973
+    }
+  ],
+  "sensors": [
+    {
+      "index": 0,
+      "role": "frame",
+      "euler_zyx_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation_body_to_sensor": [
+        [
+          1.0,
+          0.0,
+          -0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "lever_arm_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "gyro_bias_rad_s": [
+        0.001,
+        -0.0015,
+        0.0007
+      ],
+      "accel_bias_m_s2": [
+        0.02,
+        -0.035,
+        0.015
+      ],
+      "accel_scale_g_per_lsb": 0.0009765625,
+      "gyro_scale_dps_per_lsb": 0.06103515625,
+      "clipped_sample_count": 0
+    },
+    {
+      "index": 1,
+      "role": "fork",
+      "euler_zyx_deg": [
+        5.0,
+        -12.0,
+        3.0
+      ],
+      "rotation_body_to_sensor": [
+        [
+          0.9744254538021788,
+          0.08525118065879463,
+          0.20791169081775934
+        ],
+        [
+          -0.09787614951570926,
+          0.993881083831132,
+          0.05119229003114495
+        ],
+        [
+          -0.20227529344533532,
+          -0.0702326661813141,
+          0.976807083442103
+        ]
+      ],
+      "lever_arm_m": [
+        0.64,
+        0.0,
+        -0.18
+      ],
+      "gyro_bias_rad_s": [
+        -0.0022,
+        0.0009,
+        0.0014
+      ],
+      "accel_bias_m_s2": [
+        -0.041,
+        0.012,
+        0.028
+      ],
+      "accel_scale_g_per_lsb": 0.0009765625,
+      "gyro_scale_dps_per_lsb": 0.06103515625,
+      "clipped_sample_count": 0
+    },
+    {
+      "index": 2,
+      "role": "rear",
+      "euler_zyx_deg": [
+        -7.0,
+        4.0,
+        -9.0
+      ],
+      "rotation_body_to_sensor": [
+        [
+          0.9901283591011188,
+          -0.12157247580974431,
+          -0.0697564737441253
+        ],
+        [
+          0.1095379516575692,
+          0.9816561383442686,
+          -0.15605339854576158
+        ],
+        [
+          0.0874486686599044,
+          0.14687191418548134,
+          0.9852823814384903
+        ]
+      ],
+      "lever_arm_m": [
+        -0.43,
+        0.02,
+        -0.26
+      ],
+      "gyro_bias_rad_s": [
+        0.0005,
+        0.0021,
+        -0.0011
+      ],
+      "accel_bias_m_s2": [
+        0.033,
+        0.026,
+        -0.019
+      ],
+      "accel_scale_g_per_lsb": 0.0009765625,
+      "gyro_scale_dps_per_lsb": 0.06103515625,
+      "clipped_sample_count": 0
+    }
+  ],
+  "noise": {
+    "scale": 1.0,
+    "gyro_sigma_rad_s": 0.003,
+    "accel_sigma_m_s2": 0.05,
+    "distribution": "irwin-hall-12"
+  },
+  "gps": {
+    "speed_accuracy_mm_s": 50.0,
+    "total_distance_m": 359.9999999999992,
+    "fields_omitted": [
+      "sAcc",
+      "velD",
+      "odo_distance",
+      "odo_distance_std"
+    ]
+  }
+}

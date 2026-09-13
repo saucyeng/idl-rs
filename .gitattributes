@@ -1,0 +1,6 @@
+# `core.autocrlf` is on for this checkout, and the synthetic generator's
+# committed fixtures (contract C1 §9.8) are compared byte for byte by
+# `synth`'s own tests. A CRLF translation on checkout would fail those tests
+# on Windows and nowhere else, which is the worst kind of failure to debug.
+core/tests/fixtures/*.idl0 binary
+core/tests/fixtures/*.truth.json text eol=lf
