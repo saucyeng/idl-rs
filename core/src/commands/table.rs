@@ -278,6 +278,7 @@ pub const VERBS_RULED: &[(&str, &str)] = &[
     ("cli", "R230 item 2"),
     ("wire", "R236"),
     ("synth", "R187"),
+    ("calibrate", "M6.3 brief"),
 ];
 
 /// Whether `verb` is in either vocabulary.
@@ -325,6 +326,9 @@ pub fn rows_for(noun: &str) -> Vec<&'static CommandRow> {
 // ---------------------------------------------------------------------------
 // Argument and flag definitions, shared where two rows take the same thing.
 // ---------------------------------------------------------------------------
+
+/// The motions `session synth` can generate (`synth::Protocol`).
+const SYNTH_PROTOCOLS: &[&str] = &["loop", "calibration"];
 
 const SESSION_ID_ARG: Arg = Arg {
     name: "id",
@@ -555,6 +559,14 @@ pub const COMMANDS: &[CommandRow] = &[
                 default: Some("1.0"),
                 help: "Multiplies every sensor noise sigma; 0 gives a noiseless recording",
             },
+            Flag {
+                long: "protocol",
+                kind: Some(ValueKind::Choice),
+                repeatable: false,
+                choices: SYNTH_PROTOCOLS,
+                default: Some("loop"),
+                help: "Motion to simulate: `loop` rides a circuit, `calibration` is the two-body rigid-body manoeuvre",
+            },
         ],
         core_fn: "synth::generate",
         json_shape: Some("SynthReport"),
@@ -563,6 +575,30 @@ pub const COMMANDS: &[CommandRow] = &[
         status: Status::Current,
         data_dir: false,
         writer: true,
+    },
+    CommandRow {
+        noun: "session",
+        verb: "calibrate",
+        args: &[Arg {
+            name: "file",
+            kind: ValueKind::Path,
+            required: true,
+            repeatable: false,
+            choices: &[],
+            help: "`.idl0` log of the calibration manoeuvre to fit",
+        }],
+        flags: &[Flag::value(
+            "truth",
+            ValueKind::Path,
+            "Ground-truth JSON from `session synth`; adds the error against it to the report",
+        )],
+        core_fn: "calibration::rigid::calibrate",
+        json_shape: Some("CalibrationReport"),
+        help: "Fit the rigid-body IMU calibration to a held-in-the-air session (ruling M6.3 brief)",
+        tier: Tier::Rare,
+        status: Status::Current,
+        data_dir: false,
+        writer: false,
     },
     // --- workbook ---------------------------------------------------------
     CommandRow {

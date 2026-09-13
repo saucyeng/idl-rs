@@ -17,6 +17,7 @@
 //! - [`session_ops`] — the filtering and metadata edits behind `session list`/`set-meta`.
 //! - [`workbook_ops`] — the skeletons behind `workbook new`.
 
+pub mod calibration_ops;
 pub mod lap_ops;
 pub mod markdown;
 pub mod session_ops;
