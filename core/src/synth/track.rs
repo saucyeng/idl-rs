@@ -120,6 +120,8 @@ impl Loop {
 
         let unit_speeds: Vec<f64> =
             (0..=n).map(|i| speed_of_parameter(1.0, AXIS_RATIO, i as f64 * du)).collect();
+        // `last().unwrap()` here and below: `cumulative_trapezoid` always
+        // pushes at least the leading zero, so its result is never empty.
         let unit_perimeter = *cumulative_trapezoid(du, &unit_speeds).last().unwrap();
 
         let semi_major_m = lap_length_m / unit_perimeter;

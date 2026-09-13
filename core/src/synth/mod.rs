@@ -515,6 +515,12 @@ fn hex(bytes: &[u8]) -> String {
 /// `serde_json`'s map is ordered, so this string is stable for a given
 /// configuration; including [`SYNTH_VERSION`] means a generator change gives
 /// the session a new identity rather than silently reusing the old one.
+///
+/// # Panics
+///
+/// Never in practice. Serialising a [`SynthConfig`] fails only on a non-finite
+/// `f64`, and the only two `f64` fields are rejected by
+/// [`SynthConfig::validate`], which every caller runs first.
 fn identity_bytes(config: &SynthConfig) -> Vec<u8> {
     let value = serde_json::json!({
         "generator": "idl-rs session synth",
