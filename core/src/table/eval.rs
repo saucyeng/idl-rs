@@ -6,11 +6,11 @@
 
 use std::collections::HashMap;
 
-use crate::laps::model::Lap;
+use crate::math::eval::LapSpan;
 use crate::math::parse::parse;
 use crate::math::{evaluate_scalar, ChannelLookup, LookupChannel, MathLapContext};
 use crate::session::handle::SessionHandle;
-use crate::table::model::{CellResult, TableModel, TableProblem};
+use crate::table::model::{Cell, CellResult, Row, RowContext, RowSource, TableModel, TableProblem, MAIN_ROW_FASTEST};
 
 /// A cell coordinate, `(row, col)`.
 pub type Addr = (usize, usize);
@@ -201,15 +201,154 @@ fn single_addr(l: &CellLookup, body: &str) -> Option<Addr> {
     l.col_by_name.get(body).map(|&ci| (l.row, ci))
 }
 
-/// Evaluate every cell. `row_windows[r]` is row `r`'s `[t0, t1]` (or `None` for
-/// the full channel). Single-handle convenience over [`evaluate_table_multi`].
+/// What one table row is evaluated against: the time window its `[Channel]`
+/// references resolve in, and the lap it is bound to when it is bound to one.
+///
+/// The two are not the same fact and are not derivable from each other. A row
+/// can have a window without a lap (a range binding), and the lap is what
+/// makes `lap_time()` a scalar in that row rather than a `[lap]` series
+/// (`MathLapContext::row_lap`, ruling R217 item 3) — a window alone cannot say
+/// which lap number a cell is speaking for.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RowBinding {
+    /// The row's `[t0, t1)` in session-relative seconds, or `None` to read the
+    /// whole channel.
+    pub window: Option<(f64, f64)>,
+    /// The lap this row is a row *of*, when it is one.
+    pub lap: Option<LapSpan>,
+}
+
+/// One selected window, resolved to the laps it covers — the input to C2 §4's
+/// `rowSource: "windowLaps"` derivation. The caller resolves the selection
+/// (which is a UI fact, and out here a `WindowDto`) into this; `core` never
+/// reads a selection itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowLaps {
+    /// The session the window names, for the derived rows' `RowContext`.
+    pub session_id: String,
+    /// That window's laps, in lap order.
+    pub laps: Vec<LapSpan>,
+}
+
+/// Applies C2 §4's `rowSource` rule, returning the table as it is actually
+/// evaluated plus one [`RowBinding`] per row.
+///
+/// Under [`RowSource::Authored`] (the default, and every table written before
+/// the field existed) this is the identity on the model, and the bindings come
+/// from matching each row's `context.lap_number` against `session_laps`.
+///
+/// Under [`RowSource::WindowLaps`] the row set is **derived**: one row per lap
+/// of each selected window, in window order then lap order, and the authored
+/// `rows`/`cells` are ignored — not merged and not appended, because two row
+/// sets would have two orderings and no rule for interleaving them. A derived
+/// row has no authored cells, so every one of its cells falls through to its
+/// column's `template`; a column with no template renders empty in every
+/// derived row. The returned model's `cells` is therefore a rows × columns
+/// grid of blank [`Cell`]s, which is exactly what `effective_formula` reads as
+/// "use the template".
+///
+/// `session_laps` is unused under `WindowLaps` (the windows carry their own
+/// laps) and is the authored path's lap source; `windows` is unused under
+/// `Authored`. Both are taken so one call site covers both row sources.
+pub fn plan_rows(
+    table: &TableModel,
+    session_laps: &[LapSpan],
+    windows: &[WindowLaps],
+) -> (TableModel, Vec<RowBinding>) {
+    match table.row_source {
+        RowSource::Authored => {
+            let bindings = table
+                .rows
+                .iter()
+                .map(|row| match &row.context {
+                    Some(ctx) => {
+                        // Matched by lap *number*, never by position (C2 §4,
+                        // ruling R217 item 2.4). Indexing `session_laps`
+                        // directly would silently make the field 0-based while
+                        // every other lap-numbered surface — C3's
+                        // `LapSummary.lap_number`, `Lap::lap_number`,
+                        // `current_lap()` — is 1-based, and matching by number
+                        // also survives an ignored or renumbered lap, where a
+                        // position quietly slides to a neighbour instead of
+                        // resolving to nothing.
+                        match session_laps.iter().find(|l| l.lap_number == ctx.lap_number) {
+                            Some(lap) => RowBinding {
+                                window: Some((lap.start_secs, lap.end_secs)),
+                                lap: Some(lap.clone()),
+                            },
+                            None => RowBinding::default(),
+                        }
+                    }
+                    None => RowBinding::default(),
+                })
+                .collect();
+            (table.clone(), bindings)
+        }
+        RowSource::WindowLaps => {
+            let mut rows = Vec::new();
+            let mut bindings = Vec::new();
+            for window in windows {
+                for lap in &window.laps {
+                    rows.push(Row {
+                        // Stable and readable: the session and lap a row
+                        // stands for are exactly what identifies it, and a
+                        // derived row has no authored id to keep.
+                        id: format!("{}#{}", window.session_id, lap.lap_number),
+                        context: Some(RowContext {
+                            session_id: window.session_id.clone(),
+                            lap_number: lap.lap_number,
+                        }),
+                    });
+                    bindings.push(RowBinding {
+                        window: Some((lap.start_secs, lap.end_secs)),
+                        lap: Some(lap.clone()),
+                    });
+                }
+            }
+            let cells = vec![vec![Cell::default(); table.columns.len()]; rows.len()];
+            (TableModel { columns: table.columns.clone(), rows, cells, ..table.clone() }, bindings)
+        }
+    }
+}
+
+/// Resolves C2 §4's `mainRowId` to the row index `main({col[]})` reads from
+/// (`MathLapContext::baseline_row`). `None` when the field is absent, names no
+/// row, or asks for something this row source cannot provide.
+///
+/// The reserved literal `"fastest"` is the row with the smallest `lap_time()`
+/// among the derived rows — idl0's own default Main row — and is legal **only**
+/// under [`RowSource::WindowLaps`]. Under `Authored` it resolves to nothing and
+/// [`validate`] reports it: an authored table's rows are named, so a magic id
+/// there would shadow a real row id.
+///
+/// A lap whose recorded time is `NaN` is skipped rather than compared; ties go
+/// to the lowest index, so the answer does not depend on iteration luck.
+pub fn resolve_baseline_row(table: &TableModel, bindings: &[RowBinding]) -> Option<usize> {
+    let id = table.main_row_id.as_deref()?;
+    if id == MAIN_ROW_FASTEST {
+        if table.row_source != RowSource::WindowLaps {
+            return None;
+        }
+        return bindings
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.lap.as_ref().map(|l| (i, l.lap_time_secs)))
+            .filter(|(_, t)| !t.is_nan())
+            .min_by(|(ia, a), (ib, b)| a.partial_cmp(b).unwrap().then(ia.cmp(ib)))
+            .map(|(i, _)| i);
+    }
+    table.rows.iter().position(|r| r.id == id)
+}
+
+/// Evaluate every cell. `bindings[r]` is row `r`'s window and lap (see
+/// [`RowBinding`]). Single-handle convenience over [`evaluate_table_multi`].
 pub fn evaluate_table(
     handle: &SessionHandle,
     table: &TableModel,
-    row_windows: &[Option<(f64, f64)>],
+    bindings: &[RowBinding],
 ) -> Vec<Vec<CellResult>> {
     let row_handles = vec![0usize; table.rows.len()];
-    evaluate_table_multi(&[handle], &row_handles, table, row_windows, None)
+    evaluate_table_multi(&[handle], &row_handles, table, bindings, None)
 }
 
 /// Evaluate a table whose rows may bind different sessions. `handles` is the
@@ -221,7 +360,7 @@ pub fn evaluate_table_multi(
     handles: &[&SessionHandle],
     row_handles: &[usize],
     table: &TableModel,
-    row_windows: &[Option<(f64, f64)>],
+    bindings: &[RowBinding],
     baseline_row: Option<usize>,
 ) -> Vec<Vec<CellResult>> {
     let cols = table.columns.len();
@@ -246,7 +385,18 @@ pub fn evaluate_table_multi(
     };
 
     let mut values: HashMap<Addr, f64> = HashMap::new();
-    let lap_ctx = MathLapContext { baseline_row, ..MathLapContext::empty() };
+    // One context per row, not one per table: a row bound to a lap makes the
+    // lap-shaped builtins scalars *for that row* (ruling R217 item 3), and the
+    // lap they speak for differs row to row. `main_lap_bounds` stays empty —
+    // the row's window narrows channels in `CellLookup` (which reports rate 0,
+    // so `window_index_range` never narrows again) and setting it here would
+    // window an already-windowed slice a second time.
+    let row_ctx = |binding: &RowBinding| MathLapContext {
+        baseline_row,
+        laps: binding.lap.clone().into_iter().collect(),
+        row_lap: binding.lap.as_ref().map(|l| l.lap_number),
+        ..MathLapContext::empty()
+    };
     for (r, c) in order {
         // Literal short-circuit.
         if let Some(v) = table.cells[r][c].literal {
@@ -259,9 +409,11 @@ pub fn evaluate_table_multi(
         };
         // Row r resolves `[Channel]` against its own session handle.
         let handle = handles[row_handles.get(r).copied().unwrap_or(0)];
+        let binding = bindings.get(r).cloned().unwrap_or_default();
+        let lap_ctx = row_ctx(&binding);
         let lookup = CellLookup {
             handle,
-            window: row_windows.get(r).copied().flatten(),
+            window: binding.window,
             values: &values,
             col_by_name: &col_by_name,
             row: r,
@@ -280,28 +432,6 @@ pub fn evaluate_table_multi(
     out
 }
 
-/// Map each row's lap binding to its recording-time `(t0, t1)` window. Returns
-/// `None` for a row with no `context` or whose `lap_number` names no lap of
-/// `laps`. The result is the `row_windows` argument of [`evaluate_table`].
-///
-/// **Matched by lap *number*, not by position** (C2 §4, ruling R217 item 2.4).
-/// Until 2026-09-11 this indexed `laps` directly, which silently made the
-/// field 0-based while every other lap-numbered surface in the app — C3's
-/// `LapSummary.lap_number`, [`crate::laps::model::Lap::lap_number`], the
-/// `current_lap()` builtin — is 1-based. Matching by number also survives an
-/// ignored or renumbered lap, where a position would quietly slide to a
-/// neighbouring lap rather than resolving to nothing.
-pub fn lap_windows(table: &TableModel, laps: &[Lap]) -> Vec<Option<(f64, f64)>> {
-    table
-        .rows
-        .iter()
-        .map(|row| {
-            row.context.as_ref().and_then(|ctx| {
-                laps.iter().find(|l| l.lap_number == ctx.lap_number).map(|l| (l.start_time_secs, l.end_time_secs))
-            })
-        })
-        .collect()
-}
 
 /// Static validation of a table (no session): `cells` is rows×cols, every
 /// effective formula parses, every `{…}` reference resolves to a real
@@ -362,7 +492,26 @@ pub fn validate(table: &TableModel) -> Vec<TableProblem> {
         }
     }
 
-    // 3. Cycle detection over the whole grid.
+    // 3. The reserved Main row id (C2 §4 rule 2). `"fastest"` names the
+    //    fastest *derived* row, so it only means anything under
+    //    `rowSource: "windowLaps"`. Under `"authored"` it is reported rather
+    //    than silently ignored: an authored table's rows are named, so a magic
+    //    id there would shadow a real row id, and a Main row that quietly
+    //    resolved to nothing turns every `main(...)` into NaN with no clue why.
+    if table.main_row_id.as_deref() == Some(MAIN_ROW_FASTEST)
+        && table.row_source != RowSource::WindowLaps
+    {
+        problems.push(TableProblem {
+            row: None,
+            col: None,
+            kind: "invalid_main_row".into(),
+            message: format!(
+                "mainRowId '{MAIN_ROW_FASTEST}' is reserved for rowSource \"windowLaps\";                  name one of this table's own row ids instead"
+            ),
+        });
+    }
+
+    // 4. Cycle detection over the whole grid.
     if let Err(cycle) = topo_order(table) {
         let cells: Vec<String> = cycle.iter().map(|(r, c)| format!("({r},{c})")).collect();
         problems.push(TableProblem {
@@ -379,6 +528,14 @@ pub fn validate(table: &TableModel) -> Vec<TableProblem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::lap_ops::lap_spans;
+    use crate::laps::model::Lap;
+
+    /// A row bound to a plain time window and no lap — what most of these
+    /// tests need, since they are about cell addressing, not lap shapes.
+    fn windowed(t0: f64, t1: f64) -> RowBinding {
+        RowBinding { window: Some((t0, t1)), lap: None }
+    }
     use crate::session::handle::{ChannelInput, SessionMetaInput};
     use crate::table::model::*;
 
@@ -397,10 +554,10 @@ mod tests {
     }
 
     #[test]
-    fn lap_windows_matches_the_1_based_lap_number_and_is_none_for_unbound_or_unknown() {
+    fn plan_rows_authored_matches_the_1_based_lap_number_and_is_unbound_for_no_or_unknown_context() {
         // Arrange — laps numbered 1 and 2; rows bound to lap 1, unbound, and
         // to a lap number no lap carries.
-        let laps = vec![lap(0, 10.0, 20.0), lap(1, 20.0, 35.0)];
+        let laps = lap_spans(&[lap(0, 10.0, 20.0), lap(1, 20.0, 35.0)]);
         let t = TableModel {
             columns: vec![],
             rows: vec![
@@ -414,13 +571,15 @@ mod tests {
         };
 
         // Act
-        let w = lap_windows(&t, &laps);
+        let (planned, bindings) = plan_rows(&t, &laps, &[]);
 
         // Assert — lap *number* 1 is the first lap (C2 §4, R217 item 2.4); it
         // was the second one while this field was an index into `laps`.
-        assert_eq!(w[0], Some((10.0, 20.0)));
-        assert_eq!(w[1], None);
-        assert_eq!(w[2], None);
+        assert_eq!(planned.rows, t.rows, "authored rows pass through untouched");
+        assert_eq!(bindings[0].window, Some((10.0, 20.0)));
+        assert_eq!(bindings[0].lap.as_ref().unwrap().lap_number, 1);
+        assert_eq!(bindings[1], RowBinding::default());
+        assert_eq!(bindings[2], RowBinding::default());
     }
 
     #[test]
@@ -580,7 +739,7 @@ mod tests {
             row_source: RowSource::Authored,
             main_row_id: None,
         };
-        let res = evaluate_table(&h, &t, &[Some((0.0, 1.0))]);
+        let res = evaluate_table(&h, &t, &[windowed(0.0, 1.0)]);
         assert_eq!(res[0][0].value, Some(9.0)); // max over [0..9]
         assert_eq!(res[0][1].value, Some(0.0)); // 9 - min(column {9}) = 0
     }
@@ -608,7 +767,7 @@ mod tests {
             config_checksum: None,
         };
         let h = SessionHandle::from_channels(meta, vec![]);
-        let res = evaluate_table(&h, &t, &[None, None]);
+        let res = evaluate_table(&h, &t, &[RowBinding::default(), RowBinding::default()]);
         assert!(res.iter().flatten().any(|c| c.error.as_deref() == Some("Circular reference")));
     }
 
@@ -660,7 +819,7 @@ mod tests {
         };
 
         // Act — full-channel windows; Main row = 0 (session A, fmax 9).
-        let res = evaluate_table_multi(&[&a, &b], &[0, 1], &t, &[None, None], Some(0));
+        let res = evaluate_table_multi(&[&a, &b], &[0, 1], &t, &[RowBinding::default(), RowBinding::default()], Some(0));
 
         // Assert — fmax: A=9, B=4. delta vs Main(A=9): A→0, B→-5.
         assert_eq!(res[0][0].value, Some(9.0));
@@ -701,9 +860,165 @@ mod tests {
         };
 
         // Act
-        let res = evaluate_table(&h, &t, &[Some((0.0, 1.0))]);
+        let res = evaluate_table(&h, &t, &[windowed(0.0, 1.0)]);
 
         // Assert
         assert_eq!(res[0][0].value, Some(9.0));
+    }
+
+    // ---- C2 §4 row derivation (ruling R217 item 2, R233) ----
+
+    fn span(lap_number: u32, start: f64, end: f64, lap_time: f64) -> LapSpan {
+        LapSpan { lap_number, start_secs: start, end_secs: end, lap_time_secs: lap_time, sectors: vec![] }
+    }
+
+    /// A one-column table whose column has a template, and one authored row
+    /// that derivation must ignore.
+    fn derived_table(main_row_id: Option<&str>) -> TableModel {
+        TableModel {
+            columns: vec![Column { id: "c0".into(), name: Some("best".into()), template: Some("lap_time()".into()) }],
+            rows: vec![Row { id: "authored".into(), context: None }],
+            cells: vec![vec![Cell::default()]],
+            row_source: RowSource::WindowLaps,
+            main_row_id: main_row_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn plan_rows_window_laps_is_one_row_per_lap_in_window_order_then_lap_order() {
+        // Arrange — two windows over two sessions, three laps between them.
+        let t = derived_table(None);
+        let windows = vec![
+            WindowLaps { session_id: "s1".into(), laps: vec![span(2, 0.0, 90.0, 90.0), span(3, 90.0, 175.0, 85.0)] },
+            WindowLaps { session_id: "s2".into(), laps: vec![span(1, 0.0, 88.0, 88.0)] },
+        ];
+
+        // Act
+        let (planned, bindings) = plan_rows(&t, &[], &windows);
+
+        // Assert — the authored row is gone, not merged or appended.
+        let ids: Vec<&str> = planned.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["s1#2", "s1#3", "s2#1"]);
+        assert_eq!(
+            planned.rows[2].context,
+            Some(RowContext { session_id: "s2".into(), lap_number: 1 })
+        );
+        assert_eq!(bindings[1].window, Some((90.0, 175.0)));
+        assert_eq!(bindings.len(), 3);
+    }
+
+    #[test]
+    fn plan_rows_window_laps_gives_every_derived_cell_the_columns_template() {
+        // Arrange
+        let t = derived_table(None);
+        let windows = vec![WindowLaps { session_id: "s1".into(), laps: vec![span(1, 0.0, 90.0, 90.0)] }];
+
+        // Act
+        let (planned, _) = plan_rows(&t, &[], &windows);
+
+        // Assert — a derived row carries no authored cells, so every cell
+        // falls through to the column's template.
+        assert_eq!(planned.cells, vec![vec![Cell::default()]]);
+        assert_eq!(effective_formula(&planned, 0, 0), Some("lap_time()"));
+    }
+
+    #[test]
+    fn resolve_baseline_row_fastest_is_the_smallest_recorded_lap_time_among_derived_rows() {
+        // Arrange — lap 3 is the quickest, and it is not the first row.
+        let t = derived_table(Some(MAIN_ROW_FASTEST));
+        let windows = vec![WindowLaps {
+            session_id: "s1".into(),
+            laps: vec![span(1, 0.0, 90.0, 90.0), span(3, 90.0, 175.0, 85.0), span(4, 175.0, 268.0, 93.0)],
+        }];
+        let (planned, bindings) = plan_rows(&t, &[], &windows);
+
+        // Act
+        let baseline = resolve_baseline_row(&planned, &bindings);
+
+        // Assert
+        assert_eq!(baseline, Some(1));
+    }
+
+    #[test]
+    fn resolve_baseline_row_fastest_under_authored_rows_resolves_to_nothing() {
+        // Arrange — the reserved id is meaningless here; validate() reports it.
+        let t = TableModel { row_source: RowSource::Authored, ..derived_table(Some(MAIN_ROW_FASTEST)) };
+        let (planned, bindings) = plan_rows(&t, &[], &[]);
+
+        // Act / Assert — never a guess at which authored row was meant.
+        assert_eq!(resolve_baseline_row(&planned, &bindings), None);
+    }
+
+    #[test]
+    fn resolve_baseline_row_an_ordinary_id_names_the_row_that_carries_it() {
+        // Arrange
+        let t = TableModel {
+            row_source: RowSource::Authored,
+            main_row_id: Some("r1".into()),
+            rows: vec![Row { id: "r0".into(), context: None }, Row { id: "r1".into(), context: None }],
+            cells: vec![vec![Cell::default()], vec![Cell::default()]],
+            ..derived_table(None)
+        };
+
+        // Act / Assert
+        assert_eq!(resolve_baseline_row(&t, &[RowBinding::default(); 0]), Some(1));
+    }
+
+    #[test]
+    fn validate_flags_the_reserved_fastest_id_under_authored_rows() {
+        // Arrange
+        let t = TableModel {
+            row_source: RowSource::Authored,
+            rows: vec![],
+            cells: vec![],
+            ..derived_table(Some(MAIN_ROW_FASTEST))
+        };
+
+        // Act
+        let problems = validate(&t);
+
+        // Assert
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind, "invalid_main_row");
+    }
+
+    #[test]
+    fn validate_accepts_the_reserved_fastest_id_under_window_laps() {
+        // Arrange — the same id, on the row source it is reserved for.
+        let t = TableModel { rows: vec![], cells: vec![], ..derived_table(Some(MAIN_ROW_FASTEST)) };
+
+        // Act
+        let problems = validate(&t);
+
+        // Assert
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_derived_rows_lap_time_cell_is_that_laps_own_time_as_a_scalar() {
+        // Arrange — the end-to-end shape: derived rows, a `lap_time()`
+        // template, evaluated through the table path.
+        let h = SessionHandle::from_channels(
+            crate::session::handle::SessionMetaInput {
+                session_id: "s1".into(),
+                device_id: None,
+                timestamp_utc_ms: 0,
+                config_checksum: None,
+            },
+            vec![],
+        );
+        let t = derived_table(None);
+        let windows = vec![WindowLaps {
+            session_id: "s1".into(),
+            laps: vec![span(1, 0.0, 90.0, 86.0), span(2, 90.0, 178.5, 88.5)],
+        }];
+        let (planned, bindings) = plan_rows(&t, &[], &windows);
+
+        // Act
+        let res = evaluate_table(&h, &planned, &bindings);
+
+        // Assert — one value per row, each its own lap's recorded time.
+        assert_eq!(res[0][0].value, Some(86.0));
+        assert_eq!(res[1][0].value, Some(88.5));
     }
 }

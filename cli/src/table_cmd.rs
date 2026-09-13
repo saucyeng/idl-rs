@@ -13,7 +13,9 @@ use idl_rs::laps::detect_laps;
 use idl_rs::laps::model::Lap;
 use idl_rs::session::handle::SessionHandle;
 use idl_rs::table::{
-    evaluate_table, lap_windows, validate, CellResult, Column, RowContext, TableProblem,
+    evaluate_table, evaluate_table_multi, plan_rows, resolve_baseline_row, validate, CellResult,
+    Column, RowBinding,
+    RowContext, TableProblem, WindowLaps,
 };
 use idl_rs::track_artifact;
 use idl_rs::workbook::{self, WorkbookTable};
@@ -241,9 +243,18 @@ fn cmd_eval(
     let mut warnings: Vec<Warning> = Vec::new();
     let mut payloads: Vec<EvalTablePayload> = Vec::new();
 
+    // A headless run has no UI selection, so the whole bound session stands in
+    // for it — the same reading `SpanDto::Session` gives a window. Without
+    // this a `rowSource: "windowLaps"` table would print no rows at all in the
+    // CLI, which reads as "this table is empty" rather than "you picked
+    // nothing".
+    let session_window =
+        [WindowLaps { session_id: session_id.clone(), laps: idl_rs::commands::lap_ops::lap_spans(&laps) }];
+    let session_spans = idl_rs::commands::lap_ops::lap_spans(&laps);
+
     for wt in &selected {
-        let windows = lap_windows(&wt.table, &laps);
-        for (r, row) in wt.table.rows.iter().enumerate() {
+        let (planned, bindings) = plan_rows(&wt.table, &session_spans, &session_window);
+        for (r, row) in planned.rows.iter().enumerate() {
             if let Some(ctx) = &row.context {
                 if !ctx.session_id.is_empty() && ctx.session_id != session_id {
                     warnings.push(Warning {
@@ -254,7 +265,7 @@ fn cmd_eval(
                         ),
                     });
                 }
-                // Matched by lap *number*, the way `lap_windows` resolves it
+                // Matched by lap *number*, the way `plan_rows` resolves it
                 // (C2 §4, ruling R217 item 2.4) — a count comparison would
                 // still pass for a number no lap carries after a renumber.
                 if !laps.iter().any(|l| l.lap_number == ctx.lap_number) {
@@ -268,8 +279,9 @@ fn cmd_eval(
                 }
             }
         }
-        let results = evaluate_table(&handle, &wt.table, &windows);
-        payloads.push(build_eval_payload(wt, &windows, results));
+        let baseline = resolve_baseline_row(&planned, &bindings);
+        let results = evaluate_table_multi(&[&handle], &vec![0; planned.rows.len()], &planned, &bindings, baseline);
+        payloads.push(build_eval_payload(wt, &planned, &bindings, results));
     }
 
     match format {
@@ -293,17 +305,19 @@ fn cmd_eval(
 
 fn build_eval_payload(
     wt: &WorkbookTable,
-    windows: &[Option<(f64, f64)>],
+    planned: &idl_rs::table::TableModel,
+    bindings: &[RowBinding],
     results: Vec<Vec<CellResult>>,
 ) -> EvalTablePayload {
-    let rows = wt
-        .table
+    // `planned`, not `wt.table`: under `rowSource: "windowLaps"` the rows that
+    // were evaluated are the derived ones, and the payload must describe those.
+    let rows = planned
         .rows
         .iter()
         .enumerate()
         .map(|(r, row)| EvalRowPayload {
             context: row.context.clone(),
-            window: windows[r].map(|(t0, t1)| Window { t0, t1 }),
+            window: bindings[r].window.map(|(t0, t1)| Window { t0, t1 }),
             cells: results[r].clone(),
         })
         .collect();
@@ -398,12 +412,11 @@ fn cmd_check(
     for wt in &tables {
         let mut problems = validate(&wt.table);
         if let Some((handle, laps)) = &session_eval {
-            let windows = if laps.is_empty() {
-                vec![None; wt.table.rows.len()]
-            } else {
-                lap_windows(&wt.table, laps)
-            };
-            let results = evaluate_table(handle, &wt.table, &windows);
+            let spans = idl_rs::commands::lap_ops::lap_spans(laps);
+            let windows =
+                [WindowLaps { session_id: handle.metadata().session_id, laps: spans.clone() }];
+            let (planned, bindings) = plan_rows(&wt.table, &spans, &windows);
+            let results = evaluate_table(handle, &planned, &bindings);
             for (r, row) in results.iter().enumerate() {
                 for (c, cell) in row.iter().enumerate() {
                     if let Some(msg) = &cell.error {

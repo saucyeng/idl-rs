@@ -27,6 +27,25 @@ pub enum MainLap {
     Number(u32),
 }
 
+/// Every lap as the `[lap]` axis reads it (C2 §3.6.1, ruling R233) — the one
+/// place a [`Lap`] becomes a [`LapSpan`], so the table evaluator, the CLI and
+/// [`lap_context`] cannot disagree about what a lap's time is.
+///
+/// `lap_time_secs` is the recorded `lap_time_ms`, **not** `end - start`: a
+/// neutral-zone visit is already subtracted from it, and the two agree on
+/// every lap without one, which is what makes the wrong choice hard to see.
+pub fn lap_spans(laps: &[Lap]) -> Vec<LapSpan> {
+    laps.iter()
+        .map(|lap| LapSpan {
+            lap_number: lap.lap_number,
+            start_secs: lap.start_time_secs,
+            end_secs: lap.end_time_secs,
+            lap_time_secs: lap.lap_time_ms as f64 / 1000.0,
+            sectors: lap.sectors.iter().map(|s| (s.start_time_secs, s.end_time_secs)).collect(),
+        })
+        .collect()
+}
+
 /// Builds the context from `laps`.
 ///
 /// `main_lap` names the designated main lap. Bounds are in session-relative
@@ -60,19 +79,7 @@ pub fn lap_context(laps: &[Lap], main_lap: MainLap) -> Result<MathLapContext, Ve
     // `main_lap_bounds`/`main_sectors` above: those flatten the numbering away
     // and flatten the sectors across laps, which is right for the windowing
     // they serve and wrong for a per-lap value.
-    ctx.laps = laps
-        .iter()
-        .map(|lap| LapSpan {
-            lap_number: lap.lap_number,
-            start_secs: lap.start_time_secs,
-            end_secs: lap.end_time_secs,
-            // The recorded lap time, not `end - start`: a neutral-zone visit
-            // is already subtracted from `lap_time_ms` (C2 §3.3's `lap_time()`
-            // row names `LapSummary.lap_time_ms` as its source).
-            lap_time_secs: lap.lap_time_ms as f64 / 1000.0,
-            sectors: lap.sectors.iter().map(|s| (s.start_time_secs, s.end_time_secs)).collect(),
-        })
-        .collect();
+    ctx.laps = lap_spans(laps);
     Ok(ctx)
 }
 

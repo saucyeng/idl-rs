@@ -119,7 +119,8 @@ pub struct CellResult {
 pub struct TableProblem {
     pub row: Option<usize>,
     pub col: Option<usize>,
-    /// "dimension_mismatch" | "parse_error" | "unknown_reference" | "cycle".
+    /// "dimension_mismatch" | "parse_error" | "unknown_reference" | "cycle" |
+    /// "invalid_main_row" (C2 §4's reserved `mainRowId`, added 2026-09-13).
     pub kind: String,
     pub message: String,
 }

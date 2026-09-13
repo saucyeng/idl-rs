@@ -17,7 +17,7 @@ use std::time::SystemTime;
 use idl_rs::math::MathLapContext;
 use idl_rs::session::handle::{SessionHandle, SessionMetaInput};
 use idl_rs::store::atomic::{sha256_hex, write_atomic, AtomicWriteErrorKind};
-use idl_rs::table::eval::evaluate_table;
+use idl_rs::table::{evaluate_table_multi, plan_rows, resolve_baseline_row, WindowLaps};
 use idl_rs::workbook::v3::front_matter::{parse_front_matter, render_front_matter, FrontMatter};
 use idl_rs::workbook::v3::{parse_workbook, render_prose_html, CellDoc, CellError, CellKindToken, WorkbookError};
 
@@ -569,7 +569,7 @@ fn build_cell_outputs(
                 })
                 .collect();
 
-            let value = table_cell_value(cell_eval.kind, cell_doc, session_bound, handle);
+            let value = table_cell_value(cell_eval.kind, cell_doc, session_bound, handle, lap_ctx);
 
             let before = cell_doc
                 .prose_before
@@ -860,19 +860,42 @@ fn fetch_host_channel_v2_via(
 /// nothing to evaluate against, not an error — or the JSON didn't parse,
 /// whose structural error already lives in `CellOutput.errors`). `null` for
 /// `math`/`js` cells unconditionally (their results live in `defs`).
-/// Wave 1's `row_windows` is `vec![None; rows.len()]` — C2 §4's per-row
-/// `context {sessionId, lapIndex}` binding has no C3 argument to carry it
-/// yet.
-// TODO(idl0): wire per-row `context` binding once a C3 argument exists for
-// it — wave 1 evaluates every table row over the whole bound session.
-fn table_cell_value(kind: CellKindToken, cell_doc: &CellDoc, session_bound: bool, handle: &SessionHandle) -> Option<serde_json::Value> {
+///
+/// **The window is `lap_ctx`** (ruling R233), which closes wave 1's
+/// `row_windows = vec![None; rows.len()]` and the TODO that stood here: C2
+/// §4's per-row `context { sessionId, lapNumber }` binding needed no new C3
+/// argument in the end, because the laps of the caller's selection already
+/// reach this function on the lap context. An authored row bound to lap 3 now
+/// evaluates over lap 3's samples instead of the whole session.
+///
+/// `model` is the **planned** model, not the cell's literal one: under C2 §4's
+/// `rowSource: "windowLaps"` the rows are derived from the selection, and the
+/// caller needs the rows that were actually evaluated — `results` is indexed
+/// against them, so returning the authored model would hand the app a grid
+/// whose two halves disagree about how many rows there are.
+///
+/// One window per call, and that is the right shape rather than a compromise:
+/// `eval_workbook_v2` already evaluates once per selected window and returns
+/// one `CellOutput[]` for each (C2 §4, "No new wire"), so a two-window
+/// selection yields two derived tables, each over its own window's laps.
+fn table_cell_value(
+    kind: CellKindToken,
+    cell_doc: &CellDoc,
+    session_bound: bool,
+    handle: &SessionHandle,
+    lap_ctx: &MathLapContext,
+) -> Option<serde_json::Value> {
     if kind != CellKindToken::Table || !session_bound {
         return None;
     }
     let model = cell_doc.table.as_ref()?;
-    let row_windows = vec![None; model.rows.len()];
-    let results = evaluate_table(handle, model, &row_windows);
-    Some(serde_json::json!({ "model": model, "results": results }))
+    let windows =
+        [WindowLaps { session_id: handle.metadata().session_id, laps: lap_ctx.laps.clone() }];
+    let (planned, bindings) = plan_rows(model, &lap_ctx.laps, &windows);
+    let baseline = resolve_baseline_row(&planned, &bindings);
+    let row_handles = vec![0usize; planned.rows.len()];
+    let results = evaluate_table_multi(&[handle], &row_handles, &planned, &bindings, baseline);
+    Some(serde_json::json!({ "model": planned, "results": results }))
 }
 
 /// Transport-agnostic core of `save_workbook`. Order of operations (C4 §4):
@@ -2188,6 +2211,56 @@ mod tests {
         assert_eq!(out1[0].defs[0].value.as_ref().unwrap().length, 1);
         assert_eq!(scalar_for(&windows[0]), 1.0);
         assert_eq!(scalar_for(&windows[1]), 2.0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eval_workbook_v2_via_a_window_laps_table_derives_one_row_per_lap_of_that_window() {
+        // Arrange — a 4-lap session and a table whose rows follow the
+        // selection: one authored row that derivation must ignore, one column
+        // templated on `lap_time()`, and `mainRowId: "fastest"`. The window is
+        // the whole session, so the derived row set is all four laps — which
+        // needs samples spanning all four (`four_lap_doc`'s laps run 0..4 s,
+        // and a `Session` window is the recorded span, not the laps' union).
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![0, 1_000_000, 2_000_000, 3_000_000, 4_000_000]);
+        write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
+        let table = r#"{"columns":[{"id":"c0","name":"lap_s","template":"lap_time()"}],
+             "rows":[{"id":"authored"}],"cells":[[{}]],
+             "rowSource":"windowLaps","mainRowId":"fastest"}"#;
+        let markdown =
+            format!("---
+id: {WB_ID}
+name: Test
+version: 3
+---
+
+```table id=bbbbbbbb
+{table}
+```
+");
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let windows = vec![WindowDto {
+            session_id: "s1".to_string(),
+            span: crate::session_source::SpanDto::Session,
+            colour: "--chart-1".to_string(),
+        }];
+
+        // Act
+        let out = eval_workbook_v2_via(&SessionCache::new(), &root, WB_ID, &windows).unwrap();
+
+        // Assert — four derived rows, not the one authored row, and each cell
+        // carries its own lap's time (1 s each in `four_lap_doc`).
+        let WindowEval::Ok { ok } = &out[0] else { panic!("expected the window to resolve, got {:?}", out[0]) };
+        let value = ok[0].value.as_ref().expect("a table cell has a value when a session is bound");
+        let rows = value["model"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 4, "one row per lap of the window, authored rows ignored");
+        assert_eq!(rows[0]["context"]["lapNumber"], 1);
+        assert_eq!(rows[3]["id"], "s1#4");
+        let results = value["results"].as_array().unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[2][0]["value"], 1.0);
 
         let _ = std::fs::remove_dir_all(&root);
     }
