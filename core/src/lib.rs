@@ -8,6 +8,10 @@ pub mod calibration;
 pub mod chart_decimation;
 pub mod clip_reconstruct;
 pub mod colormap;
+/// The one command table (ruling R230) and the core operations behind the
+/// rows R229 added. Pure data plus pure functions; the CLI builds its clap
+/// tree from it and `docs cli` renders it.
+pub mod commands;
 pub mod config;
 pub mod cursor;
 /// Renders `docs/WORKBOOK-REFERENCE.md` from the engine's own catalogs

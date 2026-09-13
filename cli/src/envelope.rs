@@ -117,6 +117,48 @@ impl Warning {
 // Engine-error → CliError mappings (design §4).
 // ---------------------------------------------------------------------------
 
+impl From<idl_rs::store::catalog::CatalogError> for CliError {
+    fn from(e: idl_rs::store::catalog::CatalogError) -> Self {
+        use idl_rs::store::catalog::CatalogErrorKind;
+        // `Sql` is a driver/schema/corruption failure, never "you asked for
+        // something that isn't there" (ruling R46) — it points at
+        // `catalog rebuild`, which is an internal fault, not bad input.
+        let kind = match e.kind {
+            CatalogErrorKind::Io => ErrorKind::Io,
+            CatalogErrorKind::NotFound => ErrorKind::NotFound,
+            _ => ErrorKind::Internal,
+        };
+        CliError::new(kind, e.message)
+    }
+}
+
+impl From<idl_rs::store::session_json::SessionJsonError> for CliError {
+    fn from(e: idl_rs::store::session_json::SessionJsonError) -> Self {
+        use idl_rs::store::session_json::SessionJsonErrorKind;
+        let kind = match e.kind {
+            SessionJsonErrorKind::Io => ErrorKind::Io,
+            SessionJsonErrorKind::InvalidArgument => ErrorKind::Usage,
+            _ => ErrorKind::InvalidInput,
+        };
+        CliError::new(kind, e.message)
+    }
+}
+
+impl From<idl_rs::store::import::ImportError> for CliError {
+    fn from(e: idl_rs::store::import::ImportError) -> Self {
+        use idl_rs::store::import::ImportErrorKind;
+        let kind = match e.kind {
+            ImportErrorKind::Io => ErrorKind::Io,
+            // A refusal to overwrite a `data.parquet` written from a
+            // different blob is the operator's problem to resolve, not a
+            // malformed file.
+            ImportErrorKind::Collision => ErrorKind::Usage,
+            _ => ErrorKind::InvalidInput,
+        };
+        CliError::new(kind, e.message)
+    }
+}
+
 impl From<ParseError> for CliError {
     fn from(e: ParseError) -> Self {
         match e {
