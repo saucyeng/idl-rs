@@ -278,6 +278,7 @@ fn identity_overlay_ctx(main_lap_number: Option<u32>, window: (f64, f64)) -> Mat
             lap_start_uniform_sec: 0.0,
         }],
         baseline_row: None,
+        ..MathLapContext::empty()
     }
 }
 
