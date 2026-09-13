@@ -46,6 +46,13 @@ use track::Loop;
 /// This generator's own version, SemVer 2.0.0. Bump it whenever a change
 /// alters the bytes a given [`SynthConfig`] produces; the committed fixture
 /// test (§9.8) is what will tell you that you must.
+///
+/// [`Protocol::Calibration`] did **not** bump it: the rule above is about
+/// bytes, and every configuration that could be written before this generator
+/// grew a second protocol still produces the same file down to the session
+/// UUID ([`SynthConfig::protocol`] is skipped when it is the default, so it
+/// never enters [`identity_bytes`]). Bumping would have changed the identity
+/// of every existing session for a purely additive feature.
 pub const SYNTH_VERSION: &str = "1.0.0";
 
 /// `schema_version` of the truth file (C1 §9.6).
@@ -92,6 +99,60 @@ const PITCH_FREQ_HZ: f64 = 0.23;
 /// Imposed pitch phase offset, radians.
 const PITCH_PHASE_RAD: f64 = 1.0;
 
+// ── the calibration protocol (rigid-body calibration spec §5.1) ──────────
+//
+// Three segments, in order: a stationary hold, a tumble with the bars held
+// straight, then a bar turn while the tumble continues. The angle amplitudes
+// and frequencies below are chosen so the tumble clears the spec §3 gates
+// (median ‖ω_R‖ ≥ 2 rad/s, cond(Σ ω ωᵀ) ≤ 20) with margin, and no two
+// frequencies are rationally related — equal or harmonic rates would make the
+// three body-rate components dependent, the degeneracy §2.5.2 says a fit
+// cannot resolve.
+
+/// Stationary hold at the head of a `--protocol calibration` session, seconds.
+pub const CAL_REST_S: f64 = 10.0;
+/// Tumble segment length, seconds. Longer than the spec's 30 s minimum so the
+/// 1.5 s ramp at its head does not eat into the window.
+pub const CAL_TUMBLE_S: f64 = 33.0;
+/// Bar-turn segment length, seconds.
+pub const CAL_STEER_S: f64 = 12.0;
+/// Smoothstep ramp from rest into the tumble, seconds.
+const CAL_RAMP_S: f64 = 1.5;
+/// Smoothstep ramp into the bar turn, seconds.
+const CAL_STEER_RAMP_S: f64 = 1.0;
+
+/// Tumble attitude, ZYX Euler: `(amplitude rad, frequency Hz, phase rad)` for
+/// yaw, then pitch, then roll — two components each.
+const CAL_ATTITUDE: [[(f64, f64, f64); 2]; 3] = [
+    [(0.90, 0.31, 0.0), (0.60, 0.53, 0.7)],   // yaw
+    [(0.70, 0.43, 1.3), (0.40, 0.67, 0.0)],   // pitch
+    [(1.10, 0.37, 2.1), (0.50, 0.61, 0.4)],   // roll
+];
+
+/// Inertial acceleration of the R-body origin in the world frame during the
+/// tumble: `(amplitude m/s², frequency Hz, phase rad)` per world axis. Hand-
+/// held translation, zero-mean so it integrates to a bounded trajectory.
+const CAL_TRANSLATION: [(f64, f64, f64); 3] =
+    [(2.0, 0.27, 0.0), (1.6, 0.41, 0.9), (1.2, 0.33, 2.0)];
+
+/// Steering-axis tilt off vertical, radians — the reference bike's 63.5° head
+/// angle (`BikeGeometry::reference_bike`), so the truth is a plausible one.
+const CAL_STEER_TILT_RAD: f64 = 0.46251225177849266; // (90 − 63.5)°
+
+/// Steer-angle amplitude, radians. Peak-to-peak 1.5 rad clears the spec §3
+/// gate of 0.5 rad three times over.
+const CAL_STEER_AMPLITUDE_RAD: f64 = 0.75;
+/// Steer-angle frequency, Hz.
+const CAL_STEER_FREQ_HZ: f64 = 0.45;
+
+/// Steering-hinge point in the R body frame, metres — where the steering axis
+/// passes through, relative to `IMU0`.
+const CAL_HINGE_POINT_M: Vec3 = [0.60, 0.0, 0.25];
+/// Vector from the hinge point to the F body origin (`IMU1`), in the F frame,
+/// metres. The F origin is `IMU1` by the spec's `r₁ ≡ 0` convention, so this
+/// is the only place the front sensor's position is recorded.
+const CAL_FORK_OFFSET_M: Vec3 = [0.09, 0.0, -0.30];
+
 /// Local projection origin latitude, degrees north (C1 §9.5).
 pub const ORIGIN_LAT_DEG: f64 = 51.5;
 /// Local projection origin longitude, degrees east.
@@ -109,10 +170,40 @@ const SATELLITES: u8 = 12;
 /// `sAcc` field (C1 §9.5).
 const SPEED_ACCURACY_MM_S: f64 = 50.0;
 
+/// Which motion the generator simulates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Protocol {
+    /// One rigid body carrying every sensor around a closed planar loop
+    /// (C1 §9.3). The original and the default.
+    #[default]
+    Loop,
+    /// The rigid-body calibration manoeuvre: two bodies joined by a steering
+    /// hinge, held in the air, through a stationary hold, a tumble and a bar
+    /// turn (calibration spec §5.1). `laps` and `lap_length_m` are ignored —
+    /// the duration is fixed by [`CAL_REST_S`] + [`CAL_TUMBLE_S`] +
+    /// [`CAL_STEER_S`] — and the GPS fixes are all at the projection origin,
+    /// because the machine does not go anywhere.
+    Calibration,
+}
+
+impl Protocol {
+    /// Whether this is the default [`Protocol::Loop`]. Used to keep the field
+    /// out of a serialised [`SynthConfig`], which is what makes adding it a
+    /// byte-for-byte non-event for every configuration written before it
+    /// existed (see [`SYNTH_VERSION`]).
+    fn is_loop(&self) -> bool {
+        matches!(self, Protocol::Loop)
+    }
+}
+
 /// Everything a caller can choose. Every field has a default, and the
 /// defaults are what `idl-rs session synth --out <file>` alone produces.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SynthConfig {
+    /// Which motion to simulate.
+    #[serde(default, skip_serializing_if = "Protocol::is_loop")]
+    pub protocol: Protocol,
     /// Complete circuits of the loop. Lap 1 begins at `t = 0`.
     pub laps: u32,
     /// Loop perimeter, metres. The loop is scaled to hit it exactly.
@@ -132,6 +223,7 @@ pub struct SynthConfig {
 impl Default for SynthConfig {
     fn default() -> Self {
         SynthConfig {
+            protocol: Protocol::Loop,
             laps: 3,
             lap_length_m: 400.0,
             imu_rate_hz: 800,
@@ -273,8 +365,10 @@ pub const SENSORS: [SensorSpec; 3] = [
 // true — and to read — when the operation order is written out here.
 // ---------------------------------------------------------------------------
 
-type Vec3 = [f64; 3];
-type Mat3 = [[f64; 3]; 3];
+/// A 3-vector. Public because the truth file's hinge block is written in it.
+pub type Vec3 = [f64; 3];
+/// A row-major 3×3 matrix.
+pub type Mat3 = [[f64; 3]; 3];
 
 fn mat_vec(m: &Mat3, v: &Vec3) -> Vec3 {
     [
@@ -290,6 +384,46 @@ fn cross(a: &Vec3, b: &Vec3) -> Vec3 {
 
 fn add(a: &Vec3, b: &Vec3) -> Vec3 {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn scaled(v: &Vec3, k: f64) -> Vec3 {
+    [v[0] * k, v[1] * k, v[2] * k]
+}
+
+fn transpose(m: &Mat3) -> Mat3 {
+    [
+        [m[0][0], m[1][0], m[2][0]],
+        [m[0][1], m[1][1], m[2][1]],
+        [m[0][2], m[1][2], m[2][2]],
+    ]
+}
+
+/// `exp([axis]ₓ · angle)` by Rodrigues' formula — the rotation of `angle`
+/// radians about the unit vector `axis`, right-handed, row-major, applied
+/// with [`mat_vec`]. `axis` must be normalized; the caller guarantees it.
+pub fn rotation_about_axis(axis: &Vec3, angle: f64) -> Mat3 {
+    let (s, c) = sin_cos(angle);
+    let t = 1.0 - c;
+    let (x, y, z) = (axis[0], axis[1], axis[2]);
+    [
+        [t * x * x + c, t * x * y - s * z, t * x * z + s * y],
+        [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
+        [t * x * z - s * y, t * y * z + s * x, t * z * z + c],
+    ]
+}
+
+/// Quintic smoothstep `u³(10 − 15u + 6u²)` clamped to `0..=1`, with its
+/// derivative `30u²(1 − u)²` with respect to `u`. `C²` at both ends, so a
+/// ramp built from it leaves no step in angular acceleration for the centred
+/// difference in [`differentiate`] to turn into a spike.
+fn smoothstep5(u: f64) -> (f64, f64) {
+    if u <= 0.0 {
+        return (0.0, 0.0);
+    }
+    if u >= 1.0 {
+        return (1.0, 0.0);
+    }
+    (u * u * u * (10.0 - 15.0 * u + 6.0 * u * u), 30.0 * u * u * (1.0 - u) * (1.0 - u))
 }
 
 /// `Rx(roll) · Ry(pitch) · Rz(yaw)` — the ZYX Euler rotation that takes a
@@ -389,6 +523,40 @@ pub struct Truth {
     pub sensors: Vec<TruthSensor>,
     pub noise: TruthNoise,
     pub gps: TruthGps,
+    /// The two-body steering hinge and the protocol's segment boundaries.
+    /// Present only under [`Protocol::Calibration`]; absent (and omitted from
+    /// the JSON entirely) under [`Protocol::Loop`], where there is one body
+    /// and no hinge. Strictly additive, so [`TRUTH_SCHEMA_VERSION`] stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hinge: Option<TruthHinge>,
+}
+
+/// The steering hinge as generated, plus the segment boundaries a solver is
+/// expected to rediscover from the data (calibration spec §2.0).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TruthHinge {
+    /// Sensor indices rigidly attached to body R (frame + swingarm).
+    pub rear_sensors: Vec<u8>,
+    /// Sensor indices rigidly attached to body F (fork + steerer + bar).
+    pub front_sensors: Vec<u8>,
+    /// Steering-axis unit vector in the R body frame, pointing up.
+    pub steer_axis_r: Vec3,
+    /// Where the steering axis passes through, in the R body frame, metres.
+    pub hinge_point_r_m: Vec3,
+    /// Hinge point → F body origin, in the F body frame, metres.
+    pub fork_offset_f_m: Vec3,
+    /// `C₀`, the F→R rotation at `δ = 0`, row-major. Identity by the spec
+    /// §1.2a gauge: with one sensor on body F only `C₀R₁` is observable, so
+    /// the generator adopts the same convention a fit must.
+    pub datum_rotation_f_to_r: Mat3,
+    /// Peak-to-peak steer angle over the bar-turn segment, radians.
+    pub steer_peak_to_peak_rad: f64,
+    /// `[start, end)` of the stationary hold, seconds from session start.
+    pub rest_window_s: [f64; 2],
+    /// `[start, end)` of the tumble with the bars straight (`δ ≡ 0`).
+    pub datum_window_s: [f64; 2],
+    /// `[start, end)` of the bar turn.
+    pub steer_window_s: [f64; 2],
 }
 
 /// Identity and shape of the generated session.
@@ -551,7 +719,10 @@ pub fn generate(config: &SynthConfig) -> Result<SynthOutput, SynthError> {
     let config_crc = crc32(&identity);
 
     let lp = Loop::build(config.lap_length_m);
-    let duration_s = lp.lap_time_s * config.laps as f64;
+    let duration_s = match config.protocol {
+        Protocol::Loop => lp.lap_time_s * config.laps as f64,
+        Protocol::Calibration => CAL_REST_S + CAL_TUMBLE_S + CAL_STEER_S,
+    };
 
     let imu_dt = 1.0 / config.imu_rate_hz as f64;
     let imu_sample_count = (duration_s * config.imu_rate_hz as f64).floor() as usize;
@@ -564,52 +735,20 @@ pub fn generate(config: &SynthConfig) -> Result<SynthOutput, SynthError> {
     let accel_scale_g = ACCEL_RANGE_G / 32768.0;
     let gyro_scale_dps = GYRO_RANGE_DPS / 32768.0;
 
-    // ── body kinematics, sample by sample ────────────────────────────────
-    let mut speeds = Vec::with_capacity(imu_sample_count);
-    let mut headings = Vec::with_capacity(imu_sample_count);
-    let mut yaw_rates = Vec::with_capacity(imu_sample_count);
-    let mut omegas: Vec<Vec3> = Vec::with_capacity(imu_sample_count);
-    let mut attitudes: Vec<(f64, f64)> = Vec::with_capacity(imu_sample_count);
-
-    for k in 0..imu_sample_count {
-        let t = k as f64 * imu_dt;
-        let state = lp.state_at(lap_local_time(t, lp.lap_time_s, config.laps));
-
-        let (roll, roll_rate) = imposed_angle(ROLL_AMPLITUDE_RAD, ROLL_FREQ_HZ, 0.0, t);
-        let (pitch, pitch_rate) =
-            imposed_angle(PITCH_AMPLITUDE_RAD, PITCH_FREQ_HZ, PITCH_PHASE_RAD, t);
-
-        speeds.push(state.speed_m_s);
-        headings.push(state.heading_rad);
-        yaw_rates.push(state.yaw_rate_rad_s);
-        attitudes.push((roll, pitch));
-        omegas.push(body_rates(state.yaw_rate_rad_s, pitch, pitch_rate, roll, roll_rate));
-    }
-
-    let tangential = differentiate_scalar(&speeds, imu_dt);
-    let omega_dots = differentiate(&omegas, imu_dt);
-
-    // Specific force at the body origin, in the body frame (C1 §9.4).
-    let mut specific_forces: Vec<Vec3> = Vec::with_capacity(imu_sample_count);
-    for k in 0..imu_sample_count {
-        let (sy, cy) = sin_cos(headings[k]);
-        let lateral = speeds[k] * yaw_rates[k];
-        let world = [
-            tangential[k] * cy - lateral * sy,
-            tangential[k] * sy + lateral * cy,
-            GRAVITY_M_S2,
-        ];
-        let (roll, pitch) = attitudes[k];
-        let r_wb = rotation_zyx(headings[k], pitch, roll);
-        specific_forces.push(mat_vec(&r_wb, &world));
-    }
-
     // ── sensor rotations, resolved once ──────────────────────────────────
     let deg = PI / 180.0;
     let rotations: Vec<Mat3> = SENSORS[..sensor_count]
         .iter()
         .map(|s| rotation_zyx(s.euler_zyx_deg[0] * deg, s.euler_zyx_deg[1] * deg, s.euler_zyx_deg[2] * deg))
         .collect();
+
+    // ── kinematics: what each sensor would read, before bias and noise ───
+    let kin = match config.protocol {
+        Protocol::Loop => {
+            loop_kinematics(&lp, config, imu_sample_count, imu_dt, &rotations)
+        }
+        Protocol::Calibration => calibration_kinematics(imu_sample_count, imu_dt, &rotations),
+    };
 
     // ── emission ─────────────────────────────────────────────────────────
     let mut registry = Vec::with_capacity(sensor_count * 6);
@@ -664,16 +803,10 @@ pub fn generate(config: &SynthConfig) -> Result<SynthOutput, SynthError> {
             next_fix += 1;
         }
 
-        for (i, rotation) in rotations.iter().enumerate() {
+        for i in 0..sensor_count {
             let spec = &SENSORS[i];
-            let omega = omegas[k];
-            let lever = spec.lever_arm_m;
-            let euler = cross(&omega_dots[k], &lever);
-            let centripetal = cross(&omega, &cross(&omega, &lever));
-            let at_sensor = add(&add(&specific_forces[k], &euler), &centripetal);
-
-            let gyro_body = mat_vec(rotation, &omega);
-            let accel_body = mat_vec(rotation, &at_sensor);
+            let gyro_body = kin.gyro[i][k];
+            let accel_body = kin.accel[i][k];
 
             let mut axes = [0i16; 6];
             for axis in 0..3 {
@@ -710,7 +843,13 @@ pub fn generate(config: &SynthConfig) -> Result<SynthOutput, SynthError> {
 
     // ── truth ────────────────────────────────────────────────────────────
     let (gate_e, gate_n, gate_ne, gate_nn) = lp.gate();
-    let laps = (1..=config.laps)
+    // A calibration session is held in the air: it has no laps and covers no
+    // ground, so the lap table is empty rather than fictional.
+    let lap_count = match config.protocol {
+        Protocol::Loop => config.laps,
+        Protocol::Calibration => 0,
+    };
+    let laps = (1..=lap_count)
         .map(|index| {
             let start_s = (index - 1) as f64 * lp.lap_time_s;
             let end_s = index as f64 * lp.lap_time_s;
@@ -779,9 +918,10 @@ pub fn generate(config: &SynthConfig) -> Result<SynthOutput, SynthError> {
             accel_sigma_m_s2: accel_sigma,
             distribution: "irwin-hall-12".to_string(),
         },
+        hinge: kin.hinge,
         gps: TruthGps {
             speed_accuracy_mm_s: SPEED_ACCURACY_MM_S,
-            total_distance_m: lp.perimeter_m * config.laps as f64,
+            total_distance_m: lp.perimeter_m * lap_count as f64,
             fields_omitted: ["sAcc", "velD", "odo_distance", "odo_distance_std"]
                 .iter()
                 .map(|s| s.to_string())
@@ -790,6 +930,249 @@ pub fn generate(config: &SynthConfig) -> Result<SynthOutput, SynthError> {
     };
 
     Ok(SynthOutput { log, truth })
+}
+
+/// What every sensor would read, sample by sample, in its own frame, before
+/// bias and noise are added: gyro in rad/s and specific force in m/s², indexed
+/// `[sensor][sample]`.
+struct Kinematics {
+    gyro: Vec<Vec<Vec3>>,
+    accel: Vec<Vec<Vec3>>,
+    /// The hinge truth, under [`Protocol::Calibration`] only.
+    hinge: Option<TruthHinge>,
+}
+
+/// [`Protocol::Loop`]: one rigid body around the closed planar loop (C1 §9.3).
+fn loop_kinematics(
+    lp: &Loop,
+    config: &SynthConfig,
+    n: usize,
+    dt: f64,
+    rotations: &[Mat3],
+) -> Kinematics {
+    let mut speeds = Vec::with_capacity(n);
+    let mut headings = Vec::with_capacity(n);
+    let mut yaw_rates = Vec::with_capacity(n);
+    let mut omegas: Vec<Vec3> = Vec::with_capacity(n);
+    let mut attitudes: Vec<(f64, f64)> = Vec::with_capacity(n);
+
+    for k in 0..n {
+        let t = k as f64 * dt;
+        let state = lp.state_at(lap_local_time(t, lp.lap_time_s, config.laps));
+
+        let (roll, roll_rate) = imposed_angle(ROLL_AMPLITUDE_RAD, ROLL_FREQ_HZ, 0.0, t);
+        let (pitch, pitch_rate) =
+            imposed_angle(PITCH_AMPLITUDE_RAD, PITCH_FREQ_HZ, PITCH_PHASE_RAD, t);
+
+        speeds.push(state.speed_m_s);
+        headings.push(state.heading_rad);
+        yaw_rates.push(state.yaw_rate_rad_s);
+        attitudes.push((roll, pitch));
+        omegas.push(body_rates(state.yaw_rate_rad_s, pitch, pitch_rate, roll, roll_rate));
+    }
+
+    let tangential = differentiate_scalar(&speeds, dt);
+    let omega_dots = differentiate(&omegas, dt);
+
+    // Specific force at the body origin, in the body frame (C1 §9.4).
+    let mut specific_forces: Vec<Vec3> = Vec::with_capacity(n);
+    for k in 0..n {
+        let (sy, cy) = sin_cos(headings[k]);
+        let lateral = speeds[k] * yaw_rates[k];
+        let world = [
+            tangential[k] * cy - lateral * sy,
+            tangential[k] * sy + lateral * cy,
+            GRAVITY_M_S2,
+        ];
+        let (roll, pitch) = attitudes[k];
+        let r_wb = rotation_zyx(headings[k], pitch, roll);
+        specific_forces.push(mat_vec(&r_wb, &world));
+    }
+
+    let mut gyro = Vec::with_capacity(rotations.len());
+    let mut accel = Vec::with_capacity(rotations.len());
+    for (i, rotation) in rotations.iter().enumerate() {
+        let lever = SENSORS[i].lever_arm_m;
+        let mut g = Vec::with_capacity(n);
+        let mut a = Vec::with_capacity(n);
+        for k in 0..n {
+            let omega = omegas[k];
+            let euler = cross(&omega_dots[k], &lever);
+            let centripetal = cross(&omega, &cross(&omega, &lever));
+            let at_sensor = add(&add(&specific_forces[k], &euler), &centripetal);
+            g.push(mat_vec(rotation, &omega));
+            a.push(mat_vec(rotation, &at_sensor));
+        }
+        gyro.push(g);
+        accel.push(a);
+    }
+
+    Kinematics { gyro, accel, hinge: None }
+}
+
+/// [`Protocol::Calibration`]: the two-body manoeuvre of calibration spec §5.1.
+///
+/// Body **R** carries sensors 0 and 2 and is driven directly, by a prescribed
+/// ZYX Euler attitude (analytic, so its body rates are analytic too) and a
+/// prescribed world-frame origin acceleration. Body **F** carries sensor 1 and
+/// hangs off the steering hinge: its rate comes from the spec's equation (4)
+/// inverted, `ω_F = C(δ)ᵀ(ω_R + δ̇ s)`, and the specific force at its origin is
+/// the full moving-frame transport of the R body's, Coriolis term included,
+/// because the F origin moves *within* the R frame whenever the bars turn.
+fn calibration_kinematics(n: usize, dt: f64, rotations: &[Mat3]) -> Kinematics {
+    let (sin_tilt, cos_tilt) = sin_cos(CAL_STEER_TILT_RAD);
+    let s_axis: Vec3 = [-sin_tilt, 0.0, cos_tilt];
+
+    let mut omega_r: Vec<Vec3> = Vec::with_capacity(n);
+    let mut specific_forces: Vec<Vec3> = Vec::with_capacity(n);
+    let mut deltas = Vec::with_capacity(n);
+    let mut delta_rates = Vec::with_capacity(n);
+
+    for k in 0..n {
+        let t = k as f64 * dt;
+        let (angles, rates) = cal_attitude(t);
+        omega_r.push(body_rates(rates[0], angles[1], rates[1], angles[2], rates[2]));
+
+        // Specific force at the R origin: inertial acceleration less gravity,
+        // rotated into the body frame. Gravity is −Z in the world, so −g is
+        // +GRAVITY_M_S2 on the world Z axis.
+        let translation = cal_translation(t);
+        let world = [translation[0], translation[1], translation[2] + GRAVITY_M_S2];
+        specific_forces.push(mat_vec(&rotation_zyx(angles[0], angles[1], angles[2]), &world));
+
+        let (delta, delta_rate) = cal_steer(t);
+        deltas.push(delta);
+        delta_rates.push(delta_rate);
+    }
+
+    let omega_dots = differentiate(&omega_r, dt);
+
+    // The F origin's position in the R frame, and its motion relative to R.
+    let c_delta: Vec<Mat3> = deltas.iter().map(|&d| rotation_about_axis(&s_axis, d)).collect();
+    let q: Vec<Vec3> = c_delta
+        .iter()
+        .map(|c| add(&CAL_HINGE_POINT_M, &mat_vec(c, &CAL_FORK_OFFSET_M)))
+        .collect();
+    let q_dot = differentiate(&q, dt);
+    let q_ddot = differentiate(&q_dot, dt);
+
+    let mut gyro = Vec::with_capacity(rotations.len());
+    let mut accel = Vec::with_capacity(rotations.len());
+    for (i, rotation) in rotations.iter().enumerate() {
+        let mut g = Vec::with_capacity(n);
+        let mut a = Vec::with_capacity(n);
+        for k in 0..n {
+            let (omega_body, at_sensor) = if i == FRONT_SENSOR_INDEX {
+                let c_t = transpose(&c_delta[k]);
+                let omega_f = mat_vec(
+                    &c_t,
+                    &add(&omega_r[k], &scaled(&s_axis, delta_rates[k])),
+                );
+                // Transport to a point that both rides body R and moves within
+                // it: rigid terms, plus the relative acceleration and Coriolis.
+                let rigid = add(
+                    &cross(&omega_dots[k], &q[k]),
+                    &cross(&omega_r[k], &cross(&omega_r[k], &q[k])),
+                );
+                let relative = add(&q_ddot[k], &scaled(&cross(&omega_r[k], &q_dot[k]), 2.0));
+                let in_r = add(&add(&specific_forces[k], &rigid), &relative);
+                (omega_f, mat_vec(&c_t, &in_r))
+            } else {
+                let lever = SENSORS[i].lever_arm_m;
+                let euler = cross(&omega_dots[k], &lever);
+                let centripetal = cross(&omega_r[k], &cross(&omega_r[k], &lever));
+                (omega_r[k], add(&add(&specific_forces[k], &euler), &centripetal))
+            };
+            g.push(mat_vec(rotation, &omega_body));
+            a.push(mat_vec(rotation, &at_sensor));
+        }
+        gyro.push(g);
+        accel.push(a);
+    }
+
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for &d in &deltas {
+        lo = lo.min(d);
+        hi = hi.max(d);
+    }
+
+    let rear: Vec<u8> = (0..rotations.len() as u8).filter(|&i| i as usize != FRONT_SENSOR_INDEX).collect();
+    let front: Vec<u8> = (0..rotations.len() as u8).filter(|&i| i as usize == FRONT_SENSOR_INDEX).collect();
+    let steer_start = CAL_REST_S + CAL_TUMBLE_S;
+
+    Kinematics {
+        gyro,
+        accel,
+        hinge: Some(TruthHinge {
+            rear_sensors: rear,
+            front_sensors: front,
+            steer_axis_r: s_axis,
+            hinge_point_r_m: CAL_HINGE_POINT_M,
+            fork_offset_f_m: CAL_FORK_OFFSET_M,
+            datum_rotation_f_to_r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            steer_peak_to_peak_rad: hi - lo,
+            rest_window_s: [0.0, CAL_REST_S],
+            datum_window_s: [CAL_REST_S, steer_start],
+            steer_window_s: [steer_start, steer_start + CAL_STEER_S],
+        }),
+    }
+}
+
+/// Which entry of [`SENSORS`] rides body F. `IMU1` is the fork sensor
+/// (`IDL0_SPEC.md` §3.2), so it is the one on the far side of the hinge.
+const FRONT_SENSOR_INDEX: usize = 1;
+
+/// The tumble's ZYX Euler angles `(yaw, pitch, roll)` in radians and their
+/// rates in rad/s at session time `t`, ramped in from the stationary hold.
+fn cal_attitude(t: f64) -> ([f64; 3], [f64; 3]) {
+    let (w, dw_du) = smoothstep5((t - CAL_REST_S) / CAL_RAMP_S);
+    let dw = dw_du / CAL_RAMP_S;
+
+    let mut angles = [0.0; 3];
+    let mut rates = [0.0; 3];
+    for (axis, components) in CAL_ATTITUDE.iter().enumerate() {
+        let mut base = 0.0;
+        let mut base_rate = 0.0;
+        for &(amplitude, freq_hz, phase) in components {
+            let omega = TAU * freq_hz;
+            let (s, c) = sin_cos(omega * t + phase);
+            base += amplitude * s;
+            base_rate += amplitude * omega * c;
+        }
+        angles[axis] = w * base;
+        rates[axis] = dw * base + w * base_rate;
+    }
+    (angles, rates)
+}
+
+/// Inertial acceleration of the R-body origin in the world frame, m/s².
+fn cal_translation(t: f64) -> Vec3 {
+    let (w, _) = smoothstep5((t - CAL_REST_S) / CAL_RAMP_S);
+    let mut out = [0.0; 3];
+    for (axis, &(amplitude, freq_hz, phase)) in CAL_TRANSLATION.iter().enumerate() {
+        let (s, _) = sin_cos(TAU * freq_hz * t + phase);
+        out[axis] = w * amplitude * s;
+    }
+    out
+}
+
+/// Steer angle `δ` in radians and its rate `δ̇` in rad/s at session time `t`.
+/// Exactly zero — value *and* rate — through the rest and tumble segments,
+/// which is what makes the datum segment a datum.
+fn cal_steer(t: f64) -> (f64, f64) {
+    let start = CAL_REST_S + CAL_TUMBLE_S;
+    if t <= start {
+        return (0.0, 0.0);
+    }
+    let (w, dw_du) = smoothstep5((t - start) / CAL_STEER_RAMP_S);
+    let dw = dw_du / CAL_STEER_RAMP_S;
+    let omega = TAU * CAL_STEER_FREQ_HZ;
+    let (s, c) = sin_cos(omega * (t - start));
+    (
+        CAL_STEER_AMPLITUDE_RAD * w * s,
+        CAL_STEER_AMPLITUDE_RAD * (dw * s + w * omega * c),
+    )
 }
 
 /// Metres per degree of longitude at the projection origin. Computed through
@@ -838,7 +1221,22 @@ fn axis_registry_specs(
 
 /// Appends one `GPS_FIX` record for session time `fix_t` (C1 §9.5).
 fn push_fix(log: &mut Vec<u8>, lp: &Loop, config: &SynthConfig, fix_t: f64, fix_ts_us: i64) {
-    let state = lp.state_at(lap_local_time(fix_t, lp.lap_time_s, config.laps));
+    // Under `--protocol calibration` the machine is held in the air and goes
+    // nowhere, so every fix sits on the projection origin at zero speed. The
+    // records are still emitted: a real recording would have them, and an
+    // importer that only ever saw GPS-free synthetic logs would be untested.
+    let state = match config.protocol {
+        Protocol::Loop => lp.state_at(lap_local_time(fix_t, lp.lap_time_s, config.laps)),
+        Protocol::Calibration => track::BodyState {
+            u: 0.0,
+            east_m: 0.0,
+            north_m: 0.0,
+            heading_rad: 0.0,
+            speed_m_s: 0.0,
+            yaw_rate_rad_s: 0.0,
+            arc_m: 0.0,
+        },
+    };
 
     let lat_deg = ORIGIN_LAT_DEG + state.north_m / METRES_PER_DEG_NORTH;
     let lon_deg = ORIGIN_LON_DEG + state.east_m / metres_per_deg_east();
