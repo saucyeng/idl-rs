@@ -276,6 +276,7 @@ pub const VERBS_RULED: &[(&str, &str)] = &[
     ("stale", "R197"),
     ("workbook", "R222"),
     ("cli", "R230 item 2"),
+    ("wire", "R236"),
 ];
 
 /// Whether `verb` is in either vocabulary.
@@ -793,6 +794,23 @@ pub const COMMANDS: &[CommandRow] = &[
         core_fn: "commands::markdown::render_command_reference",
         json_shape: Some("CommandTable"),
         help: "Emit this command table as Markdown, or as JSON with --json",
+        tier: Tier::Rare,
+        status: Status::Current,
+        data_dir: false,
+        writer: true,
+    },
+    CommandRow {
+        noun: "docs",
+        verb: "wire",
+        args: &[],
+        flags: &[Flag::value(
+            "out",
+            ValueKind::Path,
+            "Directory to write the golden `<format>-v<n>.bin`/`.json` pairs into",
+        )],
+        core_fn: "wire_golden::build_wire_fixtures",
+        json_shape: None,
+        help: "Regenerate the cross-language wire golden fixtures (ruling R236)",
         tier: Tier::Rare,
         status: Status::Current,
         data_dir: false,

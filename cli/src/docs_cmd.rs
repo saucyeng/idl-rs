@@ -19,6 +19,7 @@ use std::process::ExitCode;
 use clap::Subcommand;
 
 use idl_rs::docs::{render_workbook_reference, CuratedSection};
+use idl_rs::wire_golden::build_wire_fixtures;
 
 use crate::envelope::{emit_bulk, CliError, ErrorKind};
 
@@ -37,6 +38,13 @@ pub enum DocsAction {
         #[arg(long, default_value = "docs/reference-src")]
         src: PathBuf,
     },
+    /// Regenerate the cross-language wire golden fixtures (ruling R236):
+    /// one `<format>-v<n>.bin`/`.json` pair per binary IPC format.
+    Wire {
+        /// Directory to write the fixture pairs into. Created if missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 /// Runs one `docs` action. Bulk-shaped: on success it writes its artifact
@@ -44,6 +52,7 @@ pub enum DocsAction {
 pub fn run(action: DocsAction) -> ExitCode {
     match action {
         DocsAction::Workbook { out, src } => emit_bulk("docs workbook", workbook(&out, &src)),
+        DocsAction::Wire { out } => emit_bulk("docs wire", wire(&out)),
     }
 }
 
@@ -64,6 +73,33 @@ fn workbook(out: &Path, src: &Path) -> Result<(), CliError> {
         .map_err(|e| CliError::io(format!("writing {}: {e}", out.display())))?;
 
     eprintln!("wrote {} ({} curated sections)", out.display(), curated.len());
+    Ok(())
+}
+
+/// Writes every [`build_wire_fixtures`] fixture to `out` as a `.bin`/`.json`
+/// pair. `out` is created if missing. The JSON is pretty-printed with `\n`
+/// line endings only and a trailing newline, so a Windows-generated file and
+/// a Linux-generated one are the same bytes (CI's `git diff --exit-code`
+/// depends on it, same as [`workbook`]'s reference).
+fn wire(out: &Path) -> Result<(), CliError> {
+    std::fs::create_dir_all(out)
+        .map_err(|e| CliError::io(format!("creating {}: {e}", out.display())))?;
+
+    let fixtures = build_wire_fixtures();
+    for fixture in &fixtures {
+        let bin_path = out.join(format!("{}.bin", fixture.name));
+        std::fs::write(&bin_path, &fixture.bin)
+            .map_err(|e| CliError::io(format!("writing {}: {e}", bin_path.display())))?;
+
+        let mut text = serde_json::to_string_pretty(&fixture.json)
+            .map_err(|e| CliError::new(ErrorKind::Internal, e.to_string()))?;
+        text.push('\n');
+        let json_path = out.join(format!("{}.json", fixture.name));
+        std::fs::write(&json_path, text.as_bytes())
+            .map_err(|e| CliError::io(format!("writing {}: {e}", json_path.display())))?;
+    }
+
+    eprintln!("wrote {} wire golden fixture(s) to {}", fixtures.len(), out.display());
     Ok(())
 }
 
@@ -201,6 +237,50 @@ mod tests {
 
         // Assert — CI's gate is `git diff --exit-code` over exactly this.
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn wire_writes_one_bin_and_json_pair_per_fixture() {
+        // Arrange
+        let dir = temp_dir();
+
+        // Act
+        wire(&dir).unwrap();
+
+        // Assert
+        let fixtures = idl_rs::wire_golden::build_wire_fixtures();
+        for fixture in &fixtures {
+            assert!(dir.join(format!("{}.bin", fixture.name)).is_file(), "{} missing .bin", fixture.name);
+            assert!(dir.join(format!("{}.json", fixture.name)).is_file(), "{} missing .json", fixture.name);
+        }
+    }
+
+    #[test]
+    fn wire_run_twice_writes_identical_bytes() {
+        // Arrange
+        let dir = temp_dir();
+
+        // Act
+        wire(&dir).unwrap();
+        let first = std::fs::read(dir.join("idlh-v2-time.json")).unwrap();
+        wire(&dir).unwrap();
+        let second = std::fs::read(dir.join("idlh-v2-time.json")).unwrap();
+
+        // Assert — CI's gate is `git diff --exit-code` over exactly this.
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn wire_json_output_contains_no_carriage_returns() {
+        // Arrange
+        let dir = temp_dir();
+
+        // Act
+        wire(&dir).unwrap();
+
+        // Assert
+        let bytes = std::fs::read(dir.join("idls-v1.json")).unwrap();
+        assert!(!bytes.contains(&b'\r'));
     }
 
     #[test]
