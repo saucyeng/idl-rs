@@ -88,13 +88,16 @@ fn idlh_lap() -> WireFixture {
     WireFixture { name: "idlh-v2-lap", bin, json }
 }
 
-/// `IDLT` v2 (chart tile). Eight raw samples at tier 0 (bucket size 1) fit
-/// entirely inside pixel column 0 of a 4-column tile — column 0 carries the
-/// real min/max/mean, columns 1–3 land past the sample range and exercise
-/// the all-NaN / `i64::MIN` sentinel column path (C3 §3.5).
+/// `IDLT` v2 (chart tile). At tier 0 a tile always spans exactly
+/// `TILE_SIZE_BUCKETS` (1024) raw samples, one per bucket — `samples.len() ==
+/// 1024` fills every bucket and every one of the 4 pixel columns (each a
+/// clean 256-sample slice) with real data, so this fixture has no
+/// NaN/sentinel value for the JSON expectation to represent (`serde_json`
+/// has no JSON spelling for `NaN`). Plain `0..1024` values, so every
+/// min/max/mean is exact in `f32` (no rounding below 2^24).
 fn idlt_v2() -> WireFixture {
-    let samples: Vec<f64> = (1..=8).map(|i| i as f64).collect();
-    let t_us: Vec<i64> = (0..8).map(|i| i * 1000).collect();
+    let samples: Vec<f64> = (0..1024).map(|i| i as f64).collect();
+    let t_us: Vec<i64> = (0..1024).map(|i| i * 1000).collect();
     let (tier, tile_index, column_count) = (0u32, 0u32, 4u32);
 
     let bin = build_tile_bytes(&samples, &t_us, tier, tile_index, column_count);

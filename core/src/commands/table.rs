@@ -855,8 +855,9 @@ mod tests {
     #[test]
     fn the_ruled_verb_list_is_exactly_what_the_rulings_added() {
         // Arrange
-        let expected =
-            ["set-start", "set-meta", "cells", "data", "detect", "laps", "stale", "workbook", "cli"];
+        let expected = [
+            "set-start", "set-meta", "cells", "data", "detect", "laps", "stale", "workbook", "cli", "wire",
+        ];
 
         // Act
         let actual: Vec<&str> = VERBS_RULED.iter().map(|(v, _)| *v).collect();
