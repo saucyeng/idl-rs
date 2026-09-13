@@ -356,6 +356,18 @@ const TRACK_PATH_FLAG: Flag = Flag::value(
     "`.idl0t` track artifact, required only when a cell is lap-bound",
 );
 
+/// `--main-lap`, naming the lap a lap-scoped expression means.
+///
+/// There is no default. A `.idl0` file carries no designation (that lives in
+/// a data directory's `session.json`), and defaulting to lap 1 would answer
+/// a question the user did not ask. Without it, lap-scoped functions have no
+/// window and the command says so on stderr.
+const MAIN_LAP_FLAG: Flag = Flag::value(
+    "main-lap",
+    ValueKind::Integer,
+    "1-based lap number that lap-scoped expressions mean; needs --track",
+);
+
 /// The templates `workbook new` knows. Kept a closed set in the table so
 /// adding one is a new value rather than a new verb.
 pub const WORKBOOK_TEMPLATES: &[&str] = &["blank", "session"];
@@ -516,7 +528,7 @@ pub const COMMANDS: &[CommandRow] = &[
         noun: "workbook",
         verb: "check",
         args: &[WORKBOOK_FILE_ARG],
-        flags: &[SESSION_PATH_FLAG, TRACK_PATH_FLAG],
+        flags: &[SESSION_PATH_FLAG, TRACK_PATH_FLAG, MAIN_LAP_FLAG],
         core_fn: "workbook::v3::parse_workbook",
         json_shape: Some("WorkbookCheckReport"),
         help: "Parse a workbook and report every structural problem",
@@ -542,7 +554,7 @@ pub const COMMANDS: &[CommandRow] = &[
         noun: "workbook",
         verb: "eval",
         args: &[WORKBOOK_FILE_ARG],
-        flags: &[SESSION_PATH_FLAG, TRACK_PATH_FLAG],
+        flags: &[SESSION_PATH_FLAG, TRACK_PATH_FLAG, MAIN_LAP_FLAG],
         core_fn: "workbook::v3::eval_cells",
         json_shape: Some("WorkbookEvalReport"),
         help: "Evaluate a workbook's math and table cells against a session",
@@ -565,7 +577,7 @@ pub const COMMANDS: &[CommandRow] = &[
                 help: "Cell id, as `workbook cells` prints it",
             },
         ],
-        flags: &[SESSION_PATH_FLAG, TRACK_PATH_FLAG],
+        flags: &[SESSION_PATH_FLAG, TRACK_PATH_FLAG, MAIN_LAP_FLAG],
         core_fn: "workbook::v3::eval_cells",
         json_shape: Some("WorkbookCellData"),
         help: "Print one cell's evaluated series or table",
@@ -590,6 +602,7 @@ pub const COMMANDS: &[CommandRow] = &[
             },
             SESSION_PATH_FLAG,
             TRACK_PATH_FLAG,
+            MAIN_LAP_FLAG,
         ],
         core_fn: "workbook::v3::render_workbook",
         json_shape: None,

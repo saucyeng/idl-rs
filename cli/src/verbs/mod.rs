@@ -465,6 +465,30 @@ mod tests {
     }
 
     #[test]
+    fn every_workbook_verb_that_takes_a_track_also_takes_a_main_lap() {
+        // Arrange
+        let tree = tree();
+        // A track *artifact*, not `session list --track`, which is a text
+        // filter on a track id and has no laps to number.
+        let rows: Vec<&CommandRow> = COMMANDS
+            .iter()
+            .filter(|r| {
+                r.flags.iter().any(|f| f.long == "track" && f.kind == Some(ValueKind::Path))
+            })
+            .collect();
+
+        // Act / Assert — a track without a main lap means lap-scoped
+        // expressions silently read the whole session, so the two flags
+        // travel together.
+        assert!(!rows.is_empty());
+        for row in rows {
+            let parsed =
+                tree.clone().try_get_matches_from(sample_argv(row, &["--main-lap", "2"]));
+            assert!(parsed.is_ok(), "`{row} --main-lap` did not parse");
+        }
+    }
+
+    #[test]
     fn a_missing_required_positional_is_a_parse_error() {
         // Arrange
         let tree = tree();

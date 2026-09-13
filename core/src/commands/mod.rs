@@ -13,9 +13,11 @@
 //!
 //! - [`table`] — the row shape, the closed vocabularies, and [`table::COMMANDS`].
 //! - [`markdown`] — the table rendered as Markdown and as JSON (`docs cli`).
+//! - [`lap_ops`] — assembling a `MathLapContext` from detected laps.
 //! - [`session_ops`] — the filtering and metadata edits behind `session list`/`set-meta`.
 //! - [`workbook_ops`] — the skeletons behind `workbook new`.
 
+pub mod lap_ops;
 pub mod markdown;
 pub mod session_ops;
 pub mod table;

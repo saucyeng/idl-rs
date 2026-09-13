@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use clap::ArgMatches;
 use serde_json::{json, Value};
 
+use idl_rs::commands::lap_ops::{self, MainLap};
 use idl_rs::commands::workbook_ops::{
     new_workbook_id, new_workbook_source, NewWorkbook, WorkbookTemplate,
 };
@@ -28,7 +29,7 @@ use idl_rs::workbook::v3::{
 };
 
 use crate::envelope::{CliError, ErrorKind};
-use crate::verbs::{opt_path, opt_text, path, text, Ctx, VerbOutput};
+use crate::verbs::{opt_integer, opt_path, opt_text, path, text, Ctx, VerbOutput};
 
 /// Why a `js` cell has no value in a headless run.
 const JS_NOT_EVALUATED: &str =
@@ -328,15 +329,29 @@ fn session_context(m: &ArgMatches) -> Result<Option<(SessionHandle, MathLapConte
     // Without a track there are no laps, and `MathLapContext::empty()` makes
     // every lap-aware function report `NoLapContext` rather than a wrong
     // number — which is the honest headless answer.
-    let lap_ctx = match opt_path(m, "track") {
-        Some(track) => lap_context(&handle, &track)?,
-        None => MathLapContext::empty(),
+    let Some(track) = opt_path(m, "track") else {
+        if opt_integer(m, "main-lap").is_some() {
+            return Err(CliError::usage("--main-lap needs --track: there are no laps to number"));
+        }
+        return Ok(Some((handle, MathLapContext::empty())));
     };
+    let lap_ctx = lap_context(&handle, &track, opt_integer(m, "main-lap"))?;
     Ok(Some((handle, lap_ctx)))
 }
 
 /// Detects laps against `track` and folds them into a [`MathLapContext`].
-fn lap_context(handle: &SessionHandle, track: &Path) -> Result<MathLapContext, CliError> {
+///
+/// `main_lap` is the 1-based lap a lap-scoped expression means. There is no
+/// default: a `.idl0` file carries no designation, and an absent main lap
+/// means lap-scoped aggregates read the whole session (`main_lap_window`
+/// treats `None` as "no window", R128). That is a wrong answer to a
+/// lap-scoped question, so it is said out loud on stderr rather than left
+/// for the reader to notice in the numbers.
+fn lap_context(
+    handle: &SessionHandle,
+    track: &Path,
+    main_lap: Option<i64>,
+) -> Result<MathLapContext, CliError> {
     let artifact = track_artifact::read_track(track).map_err(CliError::from)?;
     let timing = artifact.timing.as_ref().ok_or_else(|| {
         CliError::with_details(
@@ -348,9 +363,28 @@ fn lap_context(handle: &SessionHandle, track: &Path) -> Result<MathLapContext, C
     let laps: Vec<Lap> =
         detect_laps(handle, timing, &artifact.sector_gates, &artifact.neutral_zones, None);
 
-    let mut ctx = MathLapContext::empty();
-    ctx.main_lap_bounds = laps.iter().map(|lap| (lap.start_time_secs, lap.end_time_secs)).collect();
-    Ok(ctx)
+    let designated = match main_lap {
+        Some(n) => MainLap::Number(u32::try_from(n).map_err(|_| {
+            CliError::usage(format!("--main-lap must be a positive lap number, got {n}"))
+        })?),
+        None => {
+            if !laps.is_empty() {
+                eprintln!(
+                    "note: no --main-lap given, so lap-scoped expressions read the whole session, not one lap ({} lap(s) detected)",
+                    laps.len()
+                );
+            }
+            MainLap::None
+        }
+    };
+
+    lap_ops::lap_context(&laps, designated).map_err(|available| {
+        CliError::with_details(
+            ErrorKind::NotFound,
+            "--main-lap names a lap this session does not have",
+            json!({ "available_lap_numbers": available }),
+        )
+    })
 }
 
 /// Writes `bytes`, creating the parent directory.
