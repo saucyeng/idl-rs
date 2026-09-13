@@ -1,5 +1,6 @@
 //! The `session` verbs (ruling R229): `list`, `show`, `laps`, `set-start`,
-//! `set-meta`, `import`, and `synth` (ruling R187).
+//! `set-meta`, `import`, `synth` (ruling R187) and `calibrate` (ruling
+//! "M6.3 brief").
 //!
 //! Every function here is a wrapper: read the arguments the table declared,
 //! make one `idl_rs` call, project the result into the two renderings
@@ -17,7 +18,11 @@ use idl_rs::store::catalog_read::{
 };
 use idl_rs::store::import::import_file_path;
 use idl_rs::store::session_json::{set_session_start, SessionJson};
-use idl_rs::synth::{generate, SynthConfig};
+use idl_rs::calibration::json::CalibrationJson;
+use idl_rs::calibration::rigid;
+use idl_rs::commands::calibration_ops::{calibration_input_from_session, truth_errors};
+use idl_rs::parse::parse;
+use idl_rs::synth::{generate, Protocol, SynthConfig, Truth};
 
 use crate::envelope::{CliError, ErrorKind};
 use crate::verbs::{integer, opt_integer, opt_path, opt_text, path, text, Ctx, VerbOutput};
@@ -406,7 +411,18 @@ fn synth_config(m: &ArgMatches) -> Result<SynthConfig, CliError> {
         None => defaults.noise_scale,
     };
 
+    let protocol = match opt_text(m, "protocol").as_deref() {
+        None | Some("loop") => Protocol::Loop,
+        Some("calibration") => Protocol::Calibration,
+        Some(other) => {
+            return Err(CliError::usage(format!(
+                "--protocol must be `loop` or `calibration`, got {other}"
+            )))
+        }
+    };
+
     Ok(SynthConfig {
+        protocol,
         laps: narrow(opt_integer(m, "laps").unwrap_or(defaults.laps as i64), "--laps")?,
         lap_length_m: opt_integer(m, "lap-length-m").unwrap_or(defaults.lap_length_m as i64) as f64,
         imu_rate_hz: narrow(
@@ -430,6 +446,133 @@ fn synth_config(m: &ArgMatches) -> Result<SynthConfig, CliError> {
 /// an out-of-range value is a usage error rather than a silent wrap.
 fn narrow<T: TryFrom<i64>>(value: i64, flag: &str) -> Result<T, CliError> {
     T::try_from(value).map_err(|_| CliError::usage(format!("{flag} is out of range: {value}")))
+}
+
+/// `session calibrate` — the rigid-body IMU calibration fitted to one
+/// held-in-the-air session (`docs/superpowers/specs/2026-09-10-idl1-rigid-
+/// body-calibration.md`, ruling "M6.3 brief").
+///
+/// A wrapper, like every function here: read the file, make two `idl_rs` calls
+/// and project the record, the excitation diagnostics and — with `--truth` —
+/// the error against the generated ground truth. Nothing is written; a
+/// calibration is a reading, not an edit.
+pub fn calibrate(_ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
+    let file = path(m, "file")?;
+    let bytes = std::fs::read(&file)
+        .map_err(|e| CliError::io(format!("reading {}: {e}", file.display())))?;
+    let parsed = parse(&bytes).map_err(|e| CliError::new(ErrorKind::Usage, e.to_string()))?;
+
+    let input = calibration_input_from_session(&parsed.session)
+        .map_err(|e| CliError::new(ErrorKind::Usage, e.to_string()))?;
+    let sample_rate_hz = input.sample_rate_hz;
+    let sample_count = input.sensors[0].gyro_rad_s.len();
+    let record =
+        rigid::calibrate(&input).map_err(|e| CliError::new(ErrorKind::Usage, e.to_string()))?;
+    let report = CalibrationJson::from(&record);
+
+    let mut summary = serde_json::to_value(&report)
+        .map_err(|e| CliError::new(ErrorKind::Internal, e.to_string()))?;
+    summary["sample_rate_hz"] = json!(sample_rate_hz);
+    summary["sample_count"] = json!(sample_count);
+
+    let mut lines = vec![
+        format!(
+            "{} — {} sensor(s), {:.1} s at {:.1} Hz, source {}",
+            file.display(),
+            report.sensors.len(),
+            sample_count as f64 / sample_rate_hz,
+            sample_rate_hz,
+            report.source
+        ),
+        format!(
+            "  excitation: rest {:.1} s, tumble {:.1} s, condition {}, median rate {} rad/s, lever richness {} s^-4, steer {} rad",
+            report.quality.rest_duration_s,
+            report.quality.datum_duration_s,
+            decimals(report.quality.rotation_condition, 2),
+            decimals(report.quality.median_rate_rad_s, 3),
+            decimals(report.quality.lever_richness_s4, 1),
+            decimals(report.quality.steer_peak_to_peak_rad, 3),
+        ),
+    ];
+    for sensor in &report.sensors {
+        lines.push(format!(
+            "  IMU{} ({}): mount {} [{}], lever {} m, gyro bias {} rad/s",
+            sensor.imu_index,
+            sensor.body,
+            quadruple(&sensor.mount),
+            sensor.mount_origin,
+            triple(sensor.lever_m.as_ref()),
+            triple(sensor.gyro_bias_rad_s.as_ref()),
+        ));
+    }
+    for difference in &report.accel_bias_differences {
+        lines.push(format!(
+            "  accel bias IMU{} less IMU{}: {} m/s^2",
+            difference.from_imu,
+            difference.to_imu,
+            triple(Some(&difference.value_m_s2)),
+        ));
+    }
+    lines.push(format!("  steer axis: {}", triple(report.steer_axis.as_ref())));
+    lines.push(format!(
+        "  rear-body residual: {} rad/s, LM steps accepted: {}",
+        decimals(report.quality.rear_body_residual_rad_s, 4),
+        report.quality.lm_iterations
+    ));
+    if report.quality.shortfalls.is_empty() {
+        lines.push("  every excitation gate passed".to_string());
+    } else {
+        for shortfall in &report.quality.shortfalls {
+            lines.push(format!("  shortfall ({}): {}", shortfall.metric, shortfall.message));
+        }
+    }
+
+    if let Some(truth_path) = opt_path(m, "truth") {
+        let text = std::fs::read_to_string(&truth_path)
+            .map_err(|e| CliError::io(format!("reading {}: {e}", truth_path.display())))?;
+        let truth: Truth = serde_json::from_str(&text).map_err(|e| {
+            CliError::usage(format!("{} is not a synth truth file: {e}", truth_path.display()))
+        })?;
+        let errors = truth_errors(&record, &truth);
+        lines.push(format!(
+            "  vs truth: worst mount {:.4} deg, worst lever {} mm, steer axis {} deg, worst gyro bias {} rad/s",
+            errors.worst_mount_deg,
+            decimals(errors.worst_lever_mm, 2),
+            decimals(errors.steer_axis_deg, 4),
+            decimals(errors.worst_gyro_bias_rad_s, 6),
+        ));
+        summary["truth_error"] = json!({
+            "truth": truth_path.display().to_string(),
+            "worst_mount_deg": errors.worst_mount_deg,
+            "worst_lever_mm": errors.worst_lever_mm,
+            "steer_axis_deg": errors.steer_axis_deg,
+            "worst_gyro_bias_rad_s": errors.worst_gyro_bias_rad_s,
+        });
+    }
+
+    Ok(VerbOutput::new(lines.join("\n"), summary))
+}
+
+/// A measured value at `places` decimals, or an em dash when it is absent —
+/// the text rendering of R190's "blank means not applicable".
+fn decimals(value: Option<f64>, places: usize) -> String {
+    match value {
+        Some(v) => format!("{v:.places$}"),
+        None => "—".to_string(),
+    }
+}
+
+/// A 3-vector at four decimals, or an em dash when absent.
+fn triple(value: Option<&[f64; 3]>) -> String {
+    match value {
+        Some(v) => format!("[{:.4}, {:.4}, {:.4}]", v[0], v[1], v[2]),
+        None => "—".to_string(),
+    }
+}
+
+/// A quaternion `(w, x, y, z)` at four decimals.
+fn quadruple(value: &[f64; 4]) -> String {
+    format!("({:.4}, {:.4}, {:.4}, {:.4})", value[0], value[1], value[2], value[3])
 }
 
 #[cfg(test)]
@@ -459,6 +602,151 @@ mod tests {
         let (_, m) = parsed.subcommand().unwrap();
         let (_, m) = m.subcommand().unwrap();
         m.clone()
+    }
+
+    /// A `session calibrate` subcommand's own matches.
+    fn calibrate_matches(argv: &[&str]) -> ArgMatches {
+        let tree = crate::verbs::augment(clap::Command::new("idl-rs"));
+        let mut full = vec!["idl-rs", "session", "calibrate"];
+        full.extend_from_slice(argv);
+        let parsed = tree.try_get_matches_from(full).expect("argv parses");
+        let (_, m) = parsed.subcommand().unwrap();
+        let (_, m) = m.subcommand().unwrap();
+        m.clone()
+    }
+
+    /// Generates a calibration-protocol session at the rate and noise level
+    /// the spec's error budget assumes, and returns `(log, truth)` paths.
+    fn generated_calibration_session() -> (PathBuf, PathBuf) {
+        let out = temp_dir().join("cal.idl0");
+        let m = synth_matches(&[
+            "--out",
+            out.to_str().unwrap(),
+            "--protocol",
+            "calibration",
+            "--rate-hz",
+            "833",
+            // The generator's sigma is per-sample while the spec's is an
+            // angle-random-walk coefficient; sqrt(ODR) puts them on the same
+            // footing, so this exercises the thresholds as written.
+            "--noise",
+            "28.861739379323623",
+        ]);
+        let ctx = Ctx { json: false, dry_run: false, data_dir: None };
+
+        synth(&ctx, &m).unwrap();
+
+        let truth = out.with_extension("truth.json");
+        (out, truth)
+    }
+
+    #[test]
+    fn synth_protocol_calibration_writes_a_hinge_into_the_truth() {
+        // Arrange + Act
+        let (log, truth) = generated_calibration_session();
+
+        // Assert
+        assert!(log.is_file());
+        let text = std::fs::read_to_string(&truth).unwrap();
+        assert!(text.contains("\"hinge\""), "the calibration truth carries a hinge");
+        assert!(text.contains("\"steer_axis_r\""));
+    }
+
+    #[test]
+    fn calibrate_reports_the_record_and_every_excitation_gate() {
+        // Arrange
+        let (log, _) = generated_calibration_session();
+        let m = calibrate_matches(&[log.to_str().unwrap()]);
+        let ctx = Ctx { json: false, dry_run: false, data_dir: None };
+
+        // Act
+        let result = match calibrate(&ctx, &m) {
+            Ok(r) => r,
+            Err(e) => panic!("{}", e.message),
+        };
+
+        // Assert
+        assert_eq!(result.data["source"], serde_json::json!("rigid_body"));
+        assert_eq!(result.data["model_version"], serde_json::json!(1));
+        assert_eq!(result.data["sensors"].as_array().unwrap().len(), 3);
+        assert!(result.data["steer_axis"].is_array());
+        assert!(result.text.contains("every excitation gate passed"), "{}", result.text);
+        assert!(result.text.contains("IMU1 (front)"), "{}", result.text);
+    }
+
+    #[test]
+    fn calibrate_with_truth_scores_the_fit_against_the_generated_extrinsics() {
+        // Arrange
+        let (log, truth) = generated_calibration_session();
+        let m = calibrate_matches(&[log.to_str().unwrap(), "--truth", truth.to_str().unwrap()]);
+        let ctx = Ctx { json: false, dry_run: false, data_dir: None };
+
+        // Act
+        let result = match calibrate(&ctx, &m) {
+            Ok(r) => r,
+            Err(e) => panic!("{}", e.message),
+        };
+
+        // Assert — the spec §5 acceptance table, through the real CLI path.
+        let error = &result.data["truth_error"];
+        assert!(error["worst_mount_deg"].as_f64().unwrap() < 0.5, "{error}");
+        assert!(error["worst_lever_mm"].as_f64().unwrap() < 10.0, "{error}");
+        assert!(error["steer_axis_deg"].as_f64().unwrap() < 1.0, "{error}");
+        assert!(error["worst_gyro_bias_rad_s"].as_f64().unwrap() < 0.002, "{error}");
+        assert!(result.text.contains("vs truth"), "{}", result.text);
+    }
+
+    #[test]
+    fn calibrate_refuses_a_truth_file_that_is_not_one() {
+        // Arrange
+        let (log, _) = generated_calibration_session();
+        let bogus = temp_dir().join("not-truth.json");
+        std::fs::write(&bogus, b"{\"hello\": 1}").unwrap();
+        let m = calibrate_matches(&[log.to_str().unwrap(), "--truth", bogus.to_str().unwrap()]);
+        let ctx = Ctx { json: false, dry_run: false, data_dir: None };
+
+        // Act
+        let err = match calibrate(&ctx, &m) {
+            Ok(_) => panic!("a bogus truth file must be refused"),
+            Err(e) => e,
+        };
+
+        // Assert
+        assert!(err.message.contains("is not a synth truth file"), "{}", err.message);
+    }
+
+    #[test]
+    fn calibrate_refuses_a_ride_log_and_names_the_gates_it_failed() {
+        // Arrange — a loop session is not a calibration manoeuvre.
+        let out = temp_dir().join("ride.idl0");
+        let ctx = Ctx { json: false, dry_run: false, data_dir: None };
+        synth(
+            &ctx,
+            &synth_matches(&[
+                "--out",
+                out.to_str().unwrap(),
+                "--laps",
+                "1",
+                "--lap-length-m",
+                "200",
+                "--rate-hz",
+                "100",
+            ]),
+        )
+        .unwrap();
+        let m = calibrate_matches(&[out.to_str().unwrap()]);
+
+        // Act
+        let err = match calibrate(&ctx, &m) {
+            Ok(_) => panic!("a ride log is not a calibration manoeuvre"),
+            Err(e) => e,
+        };
+
+        // Assert — never a bare failure: the message says which gates and by
+        // how much (calibration spec §3).
+        let message = err.message;
+        assert!(message.contains("not rich enough"), "{message}");
+        assert!(message.contains("too slow"), "{message}");
     }
 
     #[test]

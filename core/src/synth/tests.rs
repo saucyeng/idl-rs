@@ -437,3 +437,127 @@ fn the_committed_fixture_stays_under_two_hundred_kilobytes() {
     assert!(len <= 200 * 1024, "fixture is {len} bytes");
 }
 
+
+// ── the calibration protocol (rigid-body calibration spec §5.1) ──────────
+
+fn calibration() -> SynthConfig {
+    SynthConfig {
+        protocol: Protocol::Calibration,
+        imu_rate_hz: 50,
+        noise_scale: 0.0,
+        ..SynthConfig::default()
+    }
+}
+
+/// Magnitude of one sensor's gyro triple at sample `k`, rad/s.
+fn gyro_magnitude(session: &Session, index: usize, k: usize) -> f64 {
+    let dps_to_rad = PI / 180.0;
+    let mut sum = 0.0;
+    for axis in ["X", "Y", "Z"] {
+        let v = channel(session, &format!("IMU{index}_Gyro{axis}"))[k] * dps_to_rad;
+        sum += v * v;
+    }
+    sum.sqrt()
+}
+
+#[test]
+fn calibration_protocol_runs_rest_then_tumble_then_bar_turn_for_a_fixed_duration() {
+    // Arrange
+    let config = calibration();
+
+    // Act
+    let out = generate(&config).unwrap();
+    let hinge = out.truth.hinge.as_ref().expect("calibration truth carries a hinge");
+
+    // Assert — duration is the three segments, and they tile it end to end.
+    assert_eq!(out.truth.session.duration_s, CAL_REST_S + CAL_TUMBLE_S + CAL_STEER_S);
+    assert_eq!(hinge.rest_window_s, [0.0, CAL_REST_S]);
+    assert_eq!(hinge.datum_window_s[0], hinge.rest_window_s[1]);
+    assert_eq!(hinge.steer_window_s[0], hinge.datum_window_s[1]);
+    assert_eq!(hinge.steer_window_s[1], out.truth.session.duration_s);
+    assert!(out.truth.laps.is_empty(), "a calibration session has no laps");
+}
+
+#[test]
+fn calibration_protocol_puts_the_fork_sensor_on_the_far_side_of_the_hinge() {
+    // Arrange
+    let config = calibration();
+
+    // Act
+    let hinge = generate(&config).unwrap().truth.hinge.expect("hinge present");
+
+    // Assert — IMU1 is the fork sensor (SPEC §3.2), IMU0 and IMU2 the frame.
+    assert_eq!(hinge.front_sensors, vec![1]);
+    assert_eq!(hinge.rear_sensors, vec![0, 2]);
+    // C₀ is the identity gauge of calibration spec §1.2a.
+    assert_eq!(hinge.datum_rotation_f_to_r, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+}
+
+#[test]
+fn calibration_steer_axis_is_a_unit_vector_tilted_back_by_the_head_angle() {
+    // Arrange + Act
+    let hinge = generate(&calibration()).unwrap().truth.hinge.expect("hinge present");
+    let s = hinge.steer_axis_r;
+
+    // Assert — unit, pointing up (+Z) and rearward (−X), 26.5° off vertical.
+    let norm = (s[0] * s[0] + s[1] * s[1] + s[2] * s[2]).sqrt();
+    assert!((norm - 1.0).abs() < 1e-12, "{norm}");
+    assert!(s[2] > 0.0 && s[0] < 0.0, "{s:?}");
+    let off_vertical_deg = atan2((s[0] * s[0] + s[1] * s[1]).sqrt(), s[2]) * 180.0 / PI;
+    assert!((off_vertical_deg - 26.5).abs() < 1e-6, "{off_vertical_deg}");
+}
+
+#[test]
+fn calibration_bar_turn_sweeps_further_than_the_excitation_gate_needs() {
+    // Arrange + Act
+    let hinge = generate(&calibration()).unwrap().truth.hinge.expect("hinge present");
+
+    // Assert — calibration spec §3 wants 0.5 rad peak to peak; the generated
+    // sweep is ±0.75 rad, three times the gate.
+    assert!(hinge.steer_peak_to_peak_rad > 1.4, "{}", hinge.steer_peak_to_peak_rad);
+}
+
+#[test]
+fn calibration_front_and_rear_rates_agree_through_the_datum_and_diverge_on_the_turn() {
+    // Arrange — noiseless, so any difference is the hinge and nothing else.
+    let config = calibration();
+    let out = generate(&config).unwrap();
+    let session = parse_log(&out.log);
+    let rate = config.imu_rate_hz as usize;
+
+    // Act — one sample deep in the tumble, one deep in the bar turn.
+    let datum_k = (CAL_REST_S as usize + 20) * rate;
+    let steer_k = (CAL_REST_S as usize + CAL_TUMBLE_S as usize + 6) * rate;
+    let datum_gap = (gyro_magnitude(&session, 1, datum_k) - gyro_magnitude(&session, 0, datum_k)).abs();
+    let steer_gap = (gyro_magnitude(&session, 1, steer_k) - gyro_magnitude(&session, 0, steer_k)).abs();
+
+    // Assert — with δ ≡ δ̇ ≡ 0 the bodies share a rate exactly (spec §2.2);
+    // the residual here is the constant gyro bias plus i16 quantisation.
+    assert!(datum_gap < 0.01, "datum gap {datum_gap} rad/s");
+    assert!(steer_gap > 0.2, "steer gap {steer_gap} rad/s");
+}
+
+#[test]
+fn calibration_gps_fixes_stay_on_the_origin_because_the_bike_is_held_in_the_air() {
+    // Arrange + Act
+    let out = generate(&calibration()).unwrap();
+    let session = parse_log(&out.log);
+
+    // Assert — every fix is the projection origin at zero speed.
+    let speeds = channel(&session, "GPS_SpeedKmh");
+    assert!(!speeds.is_empty());
+    assert!(speeds.iter().all(|&v| v == 0.0), "a held bike has no ground speed");
+    assert_eq!(out.truth.gps.total_distance_m, 0.0);
+}
+
+#[test]
+fn loop_protocol_truth_omits_the_hinge_block_entirely() {
+    // Arrange + Act
+    let out = generate(&small()).unwrap();
+    let json = serde_json::to_string(&out.truth).unwrap();
+
+    // Assert — the block is additive and absent, so TRUTH_SCHEMA_VERSION stands.
+    assert!(out.truth.hinge.is_none());
+    assert!(!json.contains("hinge"), "loop truth must not grow a hinge key");
+    assert!(!json.contains("protocol"), "the default protocol stays out of the identity");
+}

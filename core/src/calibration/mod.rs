@@ -5,8 +5,22 @@
 //! in idl0_config.json.
 //!
 //! See docs/calibration.md and IDL0_SPEC.md §11, §18.
+//!
+//! These two functions are the **rest-only** end of the calibration spec
+//! (`docs/superpowers/specs/2026-09-10-idl1-rigid-body-calibration.md` §4):
+//! with the machine stationary no lever arm is observable and a sensor's
+//! rotation is fixed only up to yaw about gravity. [`rigid`] is the full
+//! model — two bodies, a steering hinge, lever arms and biases — but it is
+//! deliberately frame-relative: its rear body frame is a gauge (spec §1.2a),
+//! and it is a *consumer* of a calibration record, not `rigid` itself, that
+//! applies [`rotation_from_gravity`] to the rest hold to tie that frame to the
+//! world. The yaw about gravity stays unobservable either way and must be
+//! authored.
 
 use nalgebra::Vector3;
+
+pub mod json;
+pub mod rigid;
 
 /// Computes per-axis bias by averaging N static samples.
 ///

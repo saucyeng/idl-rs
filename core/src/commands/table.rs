@@ -278,6 +278,10 @@ pub const VERBS_RULED: &[(&str, &str)] = &[
     ("cli", "R230 item 2"),
     ("wire", "R236"),
     ("synth", "R187"),
+    // Not `R192`: that ruling adopted the calibration *design*, and said
+    // nothing about the CLI vocabulary. The verb itself was granted by the
+    // M6.3 task brief, which is the narrower and more honest citation.
+    ("calibrate", "M6.3 brief"),
 ];
 
 /// Whether `verb` is in either vocabulary.
@@ -325,6 +329,9 @@ pub fn rows_for(noun: &str) -> Vec<&'static CommandRow> {
 // ---------------------------------------------------------------------------
 // Argument and flag definitions, shared where two rows take the same thing.
 // ---------------------------------------------------------------------------
+
+/// The motions `session synth` can generate (`synth::Protocol`).
+const SYNTH_PROTOCOLS: &[&str] = &["loop", "calibration"];
 
 const SESSION_ID_ARG: Arg = Arg {
     name: "id",
@@ -555,6 +562,14 @@ pub const COMMANDS: &[CommandRow] = &[
                 default: Some("1.0"),
                 help: "Multiplies every sensor noise sigma; 0 gives a noiseless recording",
             },
+            Flag {
+                long: "protocol",
+                kind: Some(ValueKind::Choice),
+                repeatable: false,
+                choices: SYNTH_PROTOCOLS,
+                default: Some("loop"),
+                help: "Motion to simulate: `loop` rides a circuit, `calibration` is the two-body rigid-body manoeuvre",
+            },
         ],
         core_fn: "synth::generate",
         json_shape: Some("SynthReport"),
@@ -563,6 +578,30 @@ pub const COMMANDS: &[CommandRow] = &[
         status: Status::Current,
         data_dir: false,
         writer: true,
+    },
+    CommandRow {
+        noun: "session",
+        verb: "calibrate",
+        args: &[Arg {
+            name: "file",
+            kind: ValueKind::Path,
+            required: true,
+            repeatable: false,
+            choices: &[],
+            help: "`.idl0` log of the calibration manoeuvre to fit",
+        }],
+        flags: &[Flag::value(
+            "truth",
+            ValueKind::Path,
+            "Ground-truth JSON from `session synth`; adds the error against it to the report",
+        )],
+        core_fn: "calibration::rigid::calibrate",
+        json_shape: Some("CalibrationReport"),
+        help: "Fit the rigid-body IMU calibration to a held-in-the-air session (ruling M6.3 brief)",
+        tier: Tier::Rare,
+        status: Status::Current,
+        data_dir: false,
+        writer: false,
     },
     // --- workbook ---------------------------------------------------------
     CommandRow {
@@ -929,7 +968,7 @@ mod tests {
         // Arrange
         let expected = [
             "set-start", "set-meta", "cells", "data", "detect", "laps", "stale", "workbook", "cli", "wire",
-            "synth",
+            "synth", "calibrate",
         ];
 
         // Act
@@ -954,12 +993,19 @@ mod tests {
 
     #[test]
     fn every_ruled_verb_names_the_ruling_that_added_it() {
-        // Arrange
+        // Arrange — a verb is granted either by a numbered ruling (`R229`) or
+        // by the task brief that commissioned it (`M6.3 brief`), which is how
+        // `calibrate` arrived. Anything else names nothing and is the thing
+        // this test exists to catch.
         let rows = VERBS_RULED;
+        let names_a_source = |ruling: &str| {
+            ruling.starts_with('R') && ruling[1..].starts_with(|c: char| c.is_ascii_digit())
+                || ruling.ends_with(" brief")
+        };
 
         // Act
         let unnamed: Vec<&str> =
-            rows.iter().filter(|(_, ruling)| !ruling.starts_with('R')).map(|(v, _)| *v).collect();
+            rows.iter().filter(|(_, ruling)| !names_a_source(ruling)).map(|(v, _)| *v).collect();
 
         // Assert
         assert!(unnamed.is_empty(), "no ruling recorded for: {unnamed:?}");
