@@ -334,7 +334,11 @@ pub fn resolve_baseline_row(table: &TableModel, bindings: &[RowBinding]) -> Opti
             .enumerate()
             .filter_map(|(i, b)| b.lap.as_ref().map(|l| (i, l.lap_time_secs)))
             .filter(|(_, t)| !t.is_nan())
-            .min_by(|(ia, a), (ib, b)| a.partial_cmp(b).unwrap().then(ia.cmp(ib)))
+            // `total_cmp`, not `partial_cmp(..).unwrap()`: the NaN filter above
+            // makes the unwrap unreachable today, but that is an invariant held
+            // three lines away, and a later change to the filter would turn a
+            // lap time into a panic. A total order needs no invariant.
+            .min_by(|(ia, a), (ib, b)| a.total_cmp(b).then(ia.cmp(ib)))
             .map(|(i, _)| i);
     }
     table.rows.iter().position(|r| r.id == id)
@@ -506,7 +510,7 @@ pub fn validate(table: &TableModel) -> Vec<TableProblem> {
             col: None,
             kind: "invalid_main_row".into(),
             message: format!(
-                "mainRowId '{MAIN_ROW_FASTEST}' is reserved for rowSource \"windowLaps\";                  name one of this table's own row ids instead"
+                "mainRowId '{MAIN_ROW_FASTEST}' is reserved for rowSource \"windowLaps\"; name one of this table's own row ids instead"
             ),
         });
     }
