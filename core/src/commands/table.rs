@@ -965,7 +965,7 @@ mod tests {
         // Arrange
         let expected = [
             "set-start", "set-meta", "cells", "data", "detect", "laps", "stale", "workbook", "cli", "wire",
-            "synth",
+            "synth", "calibrate",
         ];
 
         // Act
@@ -990,12 +990,19 @@ mod tests {
 
     #[test]
     fn every_ruled_verb_names_the_ruling_that_added_it() {
-        // Arrange
+        // Arrange — a verb is granted either by a numbered ruling (`R229`) or
+        // by the task brief that commissioned it (`M6.3 brief`), which is how
+        // `calibrate` arrived. Anything else names nothing and is the thing
+        // this test exists to catch.
         let rows = VERBS_RULED;
+        let names_a_source = |ruling: &str| {
+            ruling.starts_with('R') && ruling[1..].starts_with(|c: char| c.is_ascii_digit())
+                || ruling.ends_with(" brief")
+        };
 
         // Act
         let unnamed: Vec<&str> =
-            rows.iter().filter(|(_, ruling)| !ruling.starts_with('R')).map(|(v, _)| *v).collect();
+            rows.iter().filter(|(_, ruling)| !names_a_source(ruling)).map(|(v, _)| *v).collect();
 
         // Assert
         assert!(unnamed.is_empty(), "no ruling recorded for: {unnamed:?}");
