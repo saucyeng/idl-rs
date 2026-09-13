@@ -278,6 +278,9 @@ pub const VERBS_RULED: &[(&str, &str)] = &[
     ("cli", "R230 item 2"),
     ("wire", "R236"),
     ("synth", "R187"),
+    // Not `R192`: that ruling adopted the calibration *design*, and said
+    // nothing about the CLI vocabulary. The verb itself was granted by the
+    // M6.3 task brief, which is the narrower and more honest citation.
     ("calibrate", "M6.3 brief"),
 ];
 
