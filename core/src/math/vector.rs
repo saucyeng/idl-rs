@@ -13,7 +13,7 @@
 use nalgebra::{Matrix3, Rotation3, Unit, Vector3};
 
 use crate::math::eval::{elemwise, map_value};
-use crate::math::value::{ChannelValue, Value, Vec3Value};
+use crate::math::value::{ChannelValue, Value, ValueAxis, Vec3Value};
 use crate::math::{MathEvalError, MathEvalErrorKind};
 
 fn err(kind: MathEvalErrorKind, msg: impl Into<String>) -> MathEvalError {
@@ -338,6 +338,7 @@ fn chan_or_scalar(samples: Vec<f64>, rate: f64) -> Value {
             sample_rate_hz: rate,
             channel_id: None,
             t_us: std::sync::Arc::from(&[] as &[i64]),
+            axis: ValueAxis::Time,
         })
     } else {
         Value::Scalar(samples[0])
@@ -356,6 +357,7 @@ mod tests {
             sample_rate_hz: rate,
             channel_id: None,
             t_us: std::sync::Arc::from(&[] as &[i64]),
+            axis: ValueAxis::Time,
         })
     }
     fn vec3(x: f64, y: f64, z: f64) -> Value {

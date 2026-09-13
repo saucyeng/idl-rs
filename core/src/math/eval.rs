@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::math::parse::{Ast, BinOp, UnOp};
-use crate::math::value::{ChannelValue, Value};
+use crate::math::value::{ChannelValue, Value, ValueAxis};
 use crate::math::{MathEvalError, MathEvalErrorKind};
 
 /// A channel resolved by [`ChannelLookup`]. Samples are an `Arc<[f64]>`: the
@@ -186,6 +186,43 @@ impl std::fmt::Debug for MathOverlay {
     }
 }
 
+/// One lap of the selected window, as the lap-shaped builtins read it (C2
+/// §3.6.1's `lap` axis, ruling R233). Session-relative seconds, matching
+/// [`MathLapContext::main_lap_bounds`].
+///
+/// Kept apart from `main_lap_bounds`/`main_sectors` rather than folded into
+/// them: those two are the *windowing* state (which span a scalar aggregate
+/// reads, which sectors `sector_number()` counts through) and a window is
+/// deliberately not "the Nth lap" — `load_window_context` collapses every
+/// window to a single unnumbered bounds pair for exactly that reason. A
+/// `[lap]` value needs the opposite thing: every lap, each with its own
+/// number and its own sectors. Merging the two would re-create the indexing
+/// confusion `main_lap_window`'s doc comment describes at length.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LapSpan {
+    /// 1-based lap number (C1 `laps[]`, `LapSummary.lap_number`). This is the
+    /// value's axis coordinate, not its position in the vec — an ignored or
+    /// renumbered lap leaves a gap, and the gap is the truth.
+    pub lap_number: u32,
+    /// Lap start, session-relative seconds.
+    pub start_secs: f64,
+    /// Lap end, session-relative seconds.
+    pub end_secs: f64,
+    /// The lap's **time**, seconds — C1 `laps[].lap_time_ms` / C3
+    /// `LapSummary.lap_time_ms`, converted, which is what C2 §3.3's
+    /// `lap_time()` row names as its source.
+    ///
+    /// Deliberately not `end_secs - start_secs`: that difference is the raw
+    /// elapsed wall-clock span, and a lap with a neutral-zone visit has its
+    /// visit subtracted from `lap_time_ms`. The two agree on most laps, which
+    /// is exactly what makes computing the wrong one here hard to notice.
+    pub lap_time_secs: f64,
+    /// This lap's own sectors, `(start_secs, end_secs)` in arrival order —
+    /// *not* flattened across laps the way `main_sectors` is, because
+    /// `sector_time(i)` asks for sector `i` **of each lap**.
+    pub sectors: Vec<(f64, f64)>,
+}
+
 /// Injected lap/overlay state for the lap-aware and variance functions.
 /// Bounds and sectors are session-relative seconds (the Dart side converts
 /// epoch-ms → uniform-time before constructing this). `overlay` carries the
@@ -210,6 +247,22 @@ pub struct MathLapContext {
     /// lap's row). `None` outside the table-cell path — `main()` then yields
     /// `NaN`, so it never crosses into channel math (the firewall).
     pub baseline_row: Option<usize>,
+    /// The laps of the selected window, in lap order — the domain of the
+    /// `[lap]` axis (C2 §3.6.1, ruling R233). Empty means "no lap context",
+    /// and the lap-shaped builtins answer [`MathEvalErrorKind::NoLapContext`]
+    /// rather than an empty series: a chart of no laps and a chart of laps
+    /// nobody detected must not look the same.
+    pub laps: Vec<LapSpan>,
+    /// The 1-based lap this evaluation is scoped to a **single** row of, when
+    /// it is — set only by the table evaluator, for a row bound to a lap.
+    ///
+    /// This is what makes the lap builtins shape-polymorphic (ruling R217
+    /// item 3): in a table row `lap_time()` is that row's lap time, a scalar,
+    /// because a cell holds one value; in a `math` cell it is `[lap]`, one
+    /// entry per lap. The distinction is declared by the caller, never
+    /// inferred from the length of `laps` — a session with one lap is not a
+    /// row context, and guessing from a length is how the two silently swap.
+    pub row_lap: Option<u32>,
 }
 
 impl MathLapContext {
@@ -223,6 +276,8 @@ impl MathLapContext {
             main_lap_number: None,
             overlay: Vec::new(),
             baseline_row: None,
+            laps: Vec::new(),
+            row_lap: None,
         }
     }
 }
@@ -239,7 +294,14 @@ pub struct EvalOutput {
     /// outer return value, not an intermediate widened once per pass. Empty
     /// for a scalar result or a channel with no established time axis; see
     /// [`ChannelValue::t_us`]'s doc comment (C1 §8 item 5).
+    ///
+    /// On a [`ValueAxis::Lap`] result these are 1-based lap numbers, not
+    /// microseconds — see [`ChannelValue::t_us`].
     pub t_us: Vec<i64>,
+    /// What [`Self::t_us`] measures (C2 §3.6.1, minimal subset). Every caller
+    /// that turns this output into a host channel or a stored channel must
+    /// branch on it rather than assume seconds.
+    pub axis: ValueAxis,
 }
 
 fn err(kind: MathEvalErrorKind, msg: impl Into<String>) -> MathEvalError {
@@ -276,10 +338,15 @@ pub fn evaluate_with_constants(
     let memo = MemoLookup::new(lookup);
     let value = eval(&ast, &memo, lap_ctx)?;
     match value {
-        Value::Channel(c) => {
-            Ok(EvalOutput { samples: c.samples.to_vec(), sample_rate_hz: c.sample_rate_hz, t_us: c.t_us.to_vec() })
+        Value::Channel(c) => Ok(EvalOutput {
+            samples: c.samples.to_vec(),
+            sample_rate_hz: c.sample_rate_hz,
+            t_us: c.t_us.to_vec(),
+            axis: c.axis,
+        }),
+        Value::Scalar(v) => {
+            Ok(EvalOutput { samples: vec![v], sample_rate_hz: 0.0, t_us: Vec::new(), axis: ValueAxis::Time })
         }
-        Value::Scalar(v) => Ok(EvalOutput { samples: vec![v], sample_rate_hz: 0.0, t_us: Vec::new() }),
         Value::Str(_) => Err(err(
             MathEvalErrorKind::Type,
             "Expression evaluated to a string, not a channel or scalar",
@@ -338,6 +405,12 @@ pub fn eval(
                 sample_rate_hz: ch.sample_rate_hz,
                 channel_id: Some(name.clone()),
                 t_us: ch.t_us,
+                // Every channel reachable through a `[Name]` lookup is on the
+                // time axis: session channels are recorded against `t_us`, and
+                // `resolve_dependencies` refuses to store a lap-shaped math
+                // definition into the handle precisely so a `[lap]` value can
+                // never re-enter evaluation wearing a time axis.
+                axis: ValueAxis::Time,
             }))
         }
         Ast::CellRef(name) => {
@@ -356,6 +429,7 @@ pub fn eval(
                     // Rate-0 table-column source — empty is the "no time
                     // axis" marker (L3-R12), never a synthetic ramp.
                     t_us: Arc::from(&[] as &[i64]),
+                    axis: ValueAxis::Time,
                 }))
             } else {
                 let v = lookup.lookup_cell(name).ok_or_else(|| {
@@ -446,6 +520,11 @@ pub(crate) fn elemwise(
     match (left, right) {
         (Value::Scalar(a), Value::Scalar(b)) => Ok(Value::Scalar(op(a, b)?)),
         (Value::Channel(a), Value::Channel(b)) => {
+            // Shape before rate: a `[lap]` value has no sample rate, so
+            // combining one with a time series otherwise reports "different
+            // sample rates (0 Hz vs 100 Hz). Use resample()" — advice that
+            // cannot work, for a mismatch that is not about rates at all.
+            let axis = combine_axis(op_name, a.axis, b.axis)?;
             if a.sample_rate_hz != b.sample_rate_hz {
                 return Err(err(
                     MathEvalErrorKind::Runtime,
@@ -476,6 +555,7 @@ pub(crate) fn elemwise(
                 sample_rate_hz: a.sample_rate_hz,
                 channel_id: None,
                 t_us,
+                axis,
             }))
         }
         (Value::Channel(a), Value::Scalar(b)) => {
@@ -487,6 +567,7 @@ pub(crate) fn elemwise(
                 // L3-R12: a channel×scalar op keeps the channel operand's
                 // t_us unchanged — the scalar contributes no time axis.
                 t_us: a.t_us,
+                axis: a.axis,
             }))
         }
         (Value::Scalar(a), Value::Channel(b)) => {
@@ -496,6 +577,7 @@ pub(crate) fn elemwise(
                 sample_rate_hz: b.sample_rate_hz,
                 channel_id: None,
                 t_us: b.t_us,
+                axis: b.axis,
             }))
         }
         (l, r) => Err(err(
@@ -503,6 +585,39 @@ pub(crate) fn elemwise(
             format!("\"{op_name}\": unexpected value types ({}, {})", type_name(&l), type_name(&r)),
         )),
     }
+}
+
+/// Resolves the axis of a channel×channel [`elemwise`] result (C2 §3.6.2
+/// broadcasting rule 2, minimal-shapes subset): both operands must be on the
+/// same axis, and the result is that axis. `[lap]` combined with `[t]` is a
+/// typed error naming both shapes — never a positional pairing of lap 3 with
+/// the third sample, which is C2 §3.6.2's whole reason for naming axes.
+///
+/// Reported as [`MathEvalErrorKind::Type`], not a new `ShapeMismatch` kind:
+/// C3's error-kind enum is contract, this lane does not widen it, and a shape
+/// mismatch *is* an operand-type mismatch. The message carries the shapes in
+/// §3.6.1's written form so the reader sees `[lap]` and `[t]`, not prose.
+///
+/// Scalar operands never reach here — C2 §3.6.2 rule 1 makes a rank-0 value
+/// combine with any shape, so the channel×scalar arms keep the channel's axis
+/// unexamined.
+fn combine_axis(
+    op_name: &str,
+    a: ValueAxis,
+    b: ValueAxis,
+) -> Result<ValueAxis, MathEvalError> {
+    if a == b {
+        return Ok(a);
+    }
+    Err(err(
+        MathEvalErrorKind::Type,
+        format!(
+            "\"{op_name}\": cannot combine a [{}] value with a [{}] value — they run along \
+             different axes. Reduce one to a scalar first (e.g. mean(...)).",
+            a.symbol(),
+            b.symbol()
+        ),
+    ))
 }
 
 /// Resolves the `t_us` of a channel×channel [`elemwise`] result per L3-R12:
@@ -547,6 +662,7 @@ pub(crate) fn map_value(v: Value, f: impl Fn(f64) -> f64) -> Result<Value, MathE
             channel_id: None,
             // Elementwise 1:1 map — same sample positions, same real times.
             t_us: c.t_us,
+            axis: c.axis,
         })),
         Value::Str(_) => {
             Err(err(MathEvalErrorKind::Type, "Cannot apply numeric operation to a string"))
@@ -670,9 +786,71 @@ fn estimator_channel_id(name: &str, arg: &str) -> Result<&'static str, MathEvalE
     }
 }
 
-fn channel(samples: Vec<f64>, sample_rate_hz: f64, t_us: Arc<[i64]>) -> Value {
-    Value::Channel(ChannelValue { samples: Arc::from(samples), sample_rate_hz, channel_id: None, t_us })
+/// A `[lap]` value (C2 §3.6.1): one entry per lap, `lap_numbers` carrying each
+/// entry's 1-based lap number as its axis coordinate. Rate 0 — a lap axis has
+/// no sample rate, and 0 is already the evaluator's "no rate" marker, which is
+/// also what makes a scalar aggregate over a `[lap]` value read every lap
+/// instead of the selected time window (`window_index_range` returns the whole
+/// range at rate 0).
+fn lap_channel(samples: Vec<f64>, lap_numbers: Vec<i64>) -> Value {
+    Value::Channel(ChannelValue {
+        samples: Arc::from(samples),
+        sample_rate_hz: 0.0,
+        channel_id: None,
+        t_us: Arc::from(lap_numbers),
+        axis: ValueAxis::Lap,
+    })
 }
+
+/// Evaluates a per-lap quantity `f` in whichever shape the caller's context
+/// asks for (ruling R217 item 3, R233): a **scalar** when the evaluation is
+/// scoped to one table row's lap ([`MathLapContext::row_lap`]), a **`[lap]`
+/// value** otherwise. The three lap-shaped builtins differ only in `f`, so the
+/// polymorphism is written once — three copies of this rule is three chances
+/// for one of them to answer the wrong shape.
+///
+/// # Errors
+/// [`MathEvalErrorKind::NoLapContext`] when no laps are available at all, and
+/// when `row_lap` names a lap the context does not carry — a row bound to a
+/// lap that no longer exists must say so, not quietly answer for a neighbour.
+fn lap_shaped(
+    name: &str,
+    lap_ctx: &MathLapContext,
+    f: impl Fn(&LapSpan) -> f64,
+) -> Result<Value, MathEvalError> {
+    if lap_ctx.laps.is_empty() {
+        return Err(err(
+            MathEvalErrorKind::NoLapContext,
+            format!("{name}(): this session has no detected laps. Run lap detection first."),
+        ));
+    }
+    match lap_ctx.row_lap {
+        Some(n) => match lap_ctx.laps.iter().find(|lap| lap.lap_number == n) {
+            Some(lap) => Ok(Value::Scalar(f(lap))),
+            None => Err(err(
+                MathEvalErrorKind::NoLapContext,
+                format!("{name}(): this row is bound to lap {n}, which this session does not have."),
+            )),
+        },
+        None => Ok(lap_channel(
+            lap_ctx.laps.iter().map(&f).collect(),
+            lap_ctx.laps.iter().map(|lap| lap.lap_number as i64).collect(),
+        )),
+    }
+}
+
+/// A derived `[t]` channel. The overwhelming majority of results: everything
+/// that operates on session samples stays on the time axis.
+fn channel(samples: Vec<f64>, sample_rate_hz: f64, t_us: Arc<[i64]>) -> Value {
+    Value::Channel(ChannelValue {
+        samples: Arc::from(samples),
+        sample_rate_hz,
+        channel_id: None,
+        t_us,
+        axis: ValueAxis::Time,
+    })
+}
+
 
 // Like require_channel but also demands a direct-reference channel_id (variance
 // needs it to find the same-named overlay channel), plus the channel's t_us —
@@ -1572,6 +1750,41 @@ fn call_function(
             Ok(channel(out, rate, Arc::from(&[] as &[i64])))
         }
 
+        // ---- C2 §3.6 lap-shaped builtins (R217 item 3, R233) ----
+        // Each is a scalar in a table row bound to a lap and a `[lap]` value
+        // in a `math` cell; `lap_shaped` holds that rule.
+        "lap_number" => {
+            require_arg_count(name, &args, 0)?;
+            lap_shaped(name, lap_ctx, |lap| lap.lap_number as f64)
+        }
+        "lap_time" => {
+            require_arg_count(name, &args, 0)?;
+            lap_shaped(name, lap_ctx, |lap| lap.lap_time_secs)
+        }
+        "sector_time" => {
+            require_arg_count(name, &args, 1)?;
+            let i = require_scalar(&args[0], "sector_time()")?;
+            // **0-based**, as C2 §3.3's own row states, matching
+            // `sector_number()`'s "0-based sector index at each sample". Lap
+            // *numbers* are 1-based and sector indices are not, which reads
+            // as an inconsistency until you notice they come from different
+            // places: a lap number is recorded in the file, a sector index is
+            // a position in a list.
+            if !i.is_finite() || i < 0.0 {
+                return Err(err(
+                    MathEvalErrorKind::Runtime,
+                    format!("sector_time(): sector index is 0-based and cannot be negative; got {i}"),
+                ));
+            }
+            let idx = i.round() as usize;
+            // A lap with fewer sectors than asked for yields NaN, not an
+            // error: a lap cut short has genuinely no third sector, and one
+            // such lap must not blank the whole definition (C2 §3.5.B).
+            lap_shaped(name, lap_ctx, move |lap| {
+                lap.sectors.get(idx).map(|(start, end)| end - start).unwrap_or(f64::NAN)
+            })
+        }
+
         // ---- B2: variance (overlay second handle(s)) ----
         // Both fold: with N overlay laps designated, each contributes its own
         // delta series (main vs that one overlay) and the cell's value is the
@@ -1611,6 +1824,7 @@ fn call_function(
                 sample_rate_hz: main_rate,
                 channel_id: None,
                 t_us: main_t_us,
+                axis: ValueAxis::Time,
             }))
         }
         "lap_delta_dist" => {
@@ -1646,6 +1860,7 @@ fn call_function(
                 sample_rate_hz: main_rate,
                 channel_id: None,
                 t_us: main_t_us,
+                axis: ValueAxis::Time,
             }))
         }
 
@@ -2849,6 +3064,7 @@ mod tests {
             main_lap_number: None,
             overlay: Vec::new(),
             baseline_row: None,
+            ..MathLapContext::empty()
         }
     }
     fn eval_with_laps(src: &str, lk: &dyn ChannelLookup, ctx: &MathLapContext) -> Value {
@@ -2957,6 +3173,7 @@ mod tests {
                 lap_start_uniform_sec: 0.0,
             }],
             baseline_row: None,
+            ..MathLapContext::empty()
         };
 
         // Act
@@ -3020,6 +3237,7 @@ mod tests {
                 },
             ],
             baseline_row: None,
+            ..MathLapContext::empty()
         };
 
         // Act
@@ -3078,6 +3296,7 @@ mod tests {
                 },
             ],
             baseline_row: None,
+            ..MathLapContext::empty()
         };
 
         // Act
@@ -3107,6 +3326,7 @@ mod tests {
             main_lap_number: Some(1),
             overlay: Vec::new(),
             baseline_row: None,
+            ..MathLapContext::empty()
         };
 
         // Act
@@ -3157,6 +3377,7 @@ mod tests {
                 lap_start_uniform_sec: 0.0,
             }],
             baseline_row: None,
+            ..MathLapContext::empty()
         };
 
         // Act
@@ -3814,5 +4035,270 @@ mod tests {
 
         // Assert — t_us matches [X]'s t_us exactly (channel × scalar keeps it).
         assert_eq!(out.t_us, t);
+    }
+
+    // ---- C2 §3.6 minimal shapes (R233) ----
+
+    /// A `[lap]` value as the evaluator makes one: rate 0, lap numbers for
+    /// coordinates. Built by hand here because the builtins that produce them
+    /// are exercised through `evaluate` elsewhere; this file's subject is the
+    /// combination rule, not the producers.
+    fn lap_value(samples: Vec<f64>, laps: Vec<i64>) -> Value {
+        Value::Channel(ChannelValue {
+            samples: Arc::from(samples),
+            sample_rate_hz: 0.0,
+            channel_id: None,
+            t_us: Arc::from(laps),
+            axis: ValueAxis::Lap,
+        })
+    }
+
+    fn time_value(samples: Vec<f64>, rate: f64) -> Value {
+        Value::Channel(ChannelValue {
+            samples: Arc::from(samples),
+            sample_rate_hz: rate,
+            channel_id: None,
+            t_us: Arc::from(&[] as &[i64]),
+            axis: ValueAxis::Time,
+        })
+    }
+
+    #[test]
+    fn elemwise_a_lap_value_with_a_time_channel_is_a_typed_error_naming_both_shapes() {
+        // Arrange — three laps and three samples: the lengths match, which is
+        // exactly when a positional pairing would look plausible.
+        let laps = lap_value(vec![94.1, 92.8, 93.5], vec![1, 2, 3]);
+        let series = time_value(vec![1.0, 2.0, 3.0], 0.0);
+
+        // Act
+        let e = elemwise(laps, series, "-", |a, b| Ok(a - b)).unwrap_err();
+
+        // Assert
+        assert_eq!(e.kind, MathEvalErrorKind::Type);
+        assert!(e.message.contains("[lap]"), "message names the lap shape: {}", e.message);
+        assert!(e.message.contains("[t]"), "message names the time shape: {}", e.message);
+    }
+
+    #[test]
+    fn elemwise_a_lap_value_with_a_scalar_stays_on_the_lap_axis() {
+        // Arrange — §3.6.2 rule 1: a rank-0 operand combines with any shape.
+        let laps = lap_value(vec![94.0, 92.0], vec![1, 2]);
+
+        // Act
+        let out = elemwise(laps, Value::Scalar(2.0), "*", |a, b| Ok(a * b)).unwrap();
+
+        // Assert — values scaled, axis and coordinates untouched.
+        match out {
+            Value::Channel(c) => {
+                assert_eq!(c.samples.as_ref(), &[188.0, 184.0]);
+                assert_eq!(c.axis, ValueAxis::Lap);
+                assert_eq!(c.t_us.as_ref(), &[1, 2]);
+            }
+            other => panic!("expected a channel, got {}", type_name(&other)),
+        }
+    }
+
+    #[test]
+    fn elemwise_two_lap_values_combine_and_keep_the_lap_axis() {
+        // Arrange — two per-lap series over the same laps.
+        let a = lap_value(vec![94.0, 92.0], vec![1, 2]);
+        let b = lap_value(vec![4.0, 2.0], vec![1, 2]);
+
+        // Act
+        let out = elemwise(a, b, "-", |x, y| Ok(x - y)).unwrap();
+
+        // Assert
+        match out {
+            Value::Channel(c) => {
+                assert_eq!(c.samples.as_ref(), &[90.0, 90.0]);
+                assert_eq!(c.axis, ValueAxis::Lap);
+            }
+            other => panic!("expected a channel, got {}", type_name(&other)),
+        }
+    }
+
+    // ---- C2 §3.3/§3.6 lap-shaped builtins (R217 item 3, R233) ----
+
+    /// A lookup with no channels — the lap builtins read only the context.
+    struct NoChannels;
+    impl ChannelLookup for NoChannels {
+        fn lookup(&self, _name: &str) -> Option<LookupChannel> {
+            None
+        }
+    }
+
+    /// Two laps: lap 1 is 90 s with two sectors, lap 4 is 88.5 s with one.
+    /// Non-consecutive numbers on purpose — a lap number is a coordinate, not
+    /// a position, and a test that uses 1 and 2 cannot tell the two apart.
+    fn two_lap_ctx() -> MathLapContext {
+        MathLapContext {
+            laps: vec![
+                LapSpan {
+                    lap_number: 1,
+                    start_secs: 0.0,
+                    end_secs: 90.0,
+                    // 4 s short of the wall-clock span: this lap visited a
+                    // neutral zone, and `lap_time()` must report the adjusted
+                    // time, not the difference of the bounds.
+                    lap_time_secs: 86.0,
+                    sectors: vec![(0.0, 30.0), (30.0, 90.0)],
+                },
+                LapSpan {
+                    lap_number: 4,
+                    start_secs: 90.0,
+                    end_secs: 178.5,
+                    lap_time_secs: 88.5,
+                    sectors: vec![(90.0, 120.0)],
+                },
+            ],
+            ..MathLapContext::empty()
+        }
+    }
+
+    #[test]
+    fn lap_number_in_a_math_cell_is_a_lap_shaped_value_of_the_lap_numbers() {
+        // Arrange
+        let ctx = two_lap_ctx();
+
+        // Act
+        let out = eval_with_laps("lap_number()", &NoChannels, &ctx);
+
+        // Assert — values and axis coordinates are both the lap numbers.
+        match out {
+            Value::Channel(c) => {
+                assert_eq!(c.samples.as_ref(), &[1.0, 4.0]);
+                assert_eq!(c.axis, ValueAxis::Lap);
+                assert_eq!(c.t_us.as_ref(), &[1, 4]);
+                assert_eq!(c.sample_rate_hz, 0.0, "a lap axis has no sample rate");
+            }
+            other => panic!("expected a lap-shaped channel, got {}", type_name(&other)),
+        }
+    }
+
+    #[test]
+    fn lap_time_in_a_math_cell_is_the_recorded_lap_time_per_lap_not_the_bounds_span() {
+        // Arrange
+        let ctx = two_lap_ctx();
+
+        // Act
+        let out = eval_with_laps("lap_time()", &NoChannels, &ctx);
+
+        // Assert
+        match out {
+            Value::Channel(c) => {
+                // Lap 1: 86, its adjusted lap time — not 90, its wall-clock span.
+                assert_eq!(c.samples.as_ref(), &[86.0, 88.5]);
+                assert_eq!(c.t_us.as_ref(), &[1, 4]);
+            }
+            other => panic!("expected a lap-shaped channel, got {}", type_name(&other)),
+        }
+    }
+
+    #[test]
+    fn lap_time_in_a_row_context_is_that_rows_lap_as_a_scalar() {
+        // Arrange — the table evaluator's shape: the row is bound to lap 4.
+        let ctx = MathLapContext { row_lap: Some(4), ..two_lap_ctx() };
+
+        // Act
+        let out = eval_with_laps("lap_time()", &NoChannels, &ctx);
+
+        // Assert — a cell holds one value, so the builtin yields one.
+        assert!(matches!(out, Value::Scalar(v) if v == 88.5), "got {out:?}");
+    }
+
+    #[test]
+    fn lap_number_in_a_row_context_is_the_rows_own_lap_number() {
+        // Arrange
+        let ctx = MathLapContext { row_lap: Some(4), ..two_lap_ctx() };
+
+        // Act
+        let out = eval_with_laps("lap_number()", &NoChannels, &ctx);
+
+        // Assert — 4, not 2: the number, never the position in `laps`.
+        assert!(matches!(out, Value::Scalar(v) if v == 4.0), "got {out:?}");
+    }
+
+    #[test]
+    fn sector_time_counts_sectors_from_zero_within_each_lap() {
+        // Arrange
+        let ctx = two_lap_ctx();
+
+        // Act
+        let out = eval_with_laps("sector_time(0)", &NoChannels, &ctx);
+
+        // Assert — lap 1's first sector is 30 s, lap 4's is 30 s.
+        match out {
+            Value::Channel(c) => assert_eq!(c.samples.as_ref(), &[30.0, 30.0]),
+            other => panic!("expected a lap-shaped channel, got {}", type_name(&other)),
+        }
+    }
+
+    #[test]
+    fn sector_time_for_a_sector_a_lap_does_not_have_is_nan_not_an_error() {
+        // Arrange — lap 4 has only one sector.
+        let ctx = two_lap_ctx();
+
+        // Act
+        let out = eval_with_laps("sector_time(1)", &NoChannels, &ctx);
+
+        // Assert — a lap cut short must not blank the whole definition.
+        match out {
+            Value::Channel(c) => {
+                assert_eq!(c.samples[0], 60.0);
+                assert!(c.samples[1].is_nan(), "lap 4 has no second sector");
+            }
+            other => panic!("expected a lap-shaped channel, got {}", type_name(&other)),
+        }
+    }
+
+    #[test]
+    fn sector_time_with_a_negative_index_is_a_typed_error_saying_it_counts_from_zero() {
+        // Arrange
+        let ctx = two_lap_ctx();
+
+        // Act
+        let e = evaluate("sector_time(0 - 1)", &NoChannels, &ctx).unwrap_err();
+
+        // Assert
+        assert_eq!(e.kind, MathEvalErrorKind::Runtime);
+        assert!(e.message.contains("0-based"), "{}", e.message);
+    }
+
+    #[test]
+    fn the_lap_shaped_builtins_with_no_detected_laps_are_no_lap_context() {
+        // Arrange — the headless/never-detected case.
+        let ctx = MathLapContext::empty();
+
+        // Act
+        let e = evaluate("lap_time()", &NoChannels, &ctx).unwrap_err();
+
+        // Assert — an empty series would draw the same picture as a session
+        // whose laps genuinely all measured nothing.
+        assert_eq!(e.kind, MathEvalErrorKind::NoLapContext);
+    }
+
+    #[test]
+    fn a_row_bound_to_a_lap_the_session_no_longer_has_is_no_lap_context() {
+        // Arrange — the row names lap 7; the session has laps 1 and 4.
+        let ctx = MathLapContext { row_lap: Some(7), ..two_lap_ctx() };
+
+        // Act
+        let e = evaluate("lap_time()", &NoChannels, &ctx).unwrap_err();
+
+        // Assert — never a neighbouring lap's answer.
+        assert_eq!(e.kind, MathEvalErrorKind::NoLapContext);
+        assert!(e.message.contains('7'), "{}", e.message);
+    }
+
+    #[test]
+    fn a_reduction_over_a_lap_shaped_value_reads_every_lap_and_yields_a_scalar() {
+        // Arrange — C2 §3.6.3: `mean(x)` reduces every axis, so `[lap] → []`.
+        let ctx = two_lap_ctx();
+
+        // Act
+        let out = evaluate_scalar("mean(lap_time())", &NoChannels, &ctx).unwrap();
+
+        // Assert — (86 + 88.5) / 2, not a window-narrowed subset.
+        assert_eq!(out, 87.25);
     }
 }

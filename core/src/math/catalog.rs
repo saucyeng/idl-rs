@@ -25,7 +25,7 @@
 //! three entries without removing any — `fft` split into `periodogram` +
 //! `welch` (task 6), `cumtrapz` added as `cumulative_trapezoid`'s permanent
 //! second spelling (task 10, R151 item 6), and `gradient` added alongside
-//! `differentiate` (task 11, R151 item 3) — so this catalog now has 72
+//! `differentiate` (task 11, R151 item 3) — so this catalog now has 75
 //! entries; C2 §3.3 itself needs the matching row-count update
 //! (spec-during, not done in this lane's Rust-only scope).
 //!
@@ -104,7 +104,7 @@ pub struct MathBuiltin {
     pub example: &'static str,
 }
 
-/// Returns the full 72-entry math builtin catalog (C2 §3.3, minus
+/// Returns the full 75-entry math builtin catalog (C2 §3.3, minus
 /// `main(col[])` and the `and`/`or`/`not` grammar keywords — see module
 /// doc). Order matches C2 §3.3's table row order.
 pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
@@ -671,6 +671,44 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             description: "0-based sector index at each sample, NaN outside any sector.",
             example: "sector_number()",
         },
+        // The lap-shaped trio C2 §3.3 has listed since the spec was written
+        // and `math_builtin_catalog()` lacked until 2026-09-13 (the drift the
+        // docs lane filed, closed by ruling R233). `shape` is the pair the
+        // signature's own result annotation gives: a table row binds one lap,
+        // so a cell gets a scalar; a `math` cell gets one entry per lap.
+        MathBuiltin {
+            name: "lap_number",
+            arity: &[0],
+            status: I,
+            category: "Lap",
+            signature: "lap_number()",
+            unit_rule: "Dimensionless",
+            shape: "scalar | [lap]",
+            description: "The 1-based lap number: this row's lap in a table cell, every lap in a math cell.",
+            example: "lap_number()",
+        },
+        MathBuiltin {
+            name: "lap_time",
+            arity: &[0],
+            status: I,
+            category: "Lap",
+            signature: "lap_time()",
+            unit_rule: "Fixed(s)",
+            shape: "scalar | [lap]",
+            description: "Lap duration in seconds: this row's lap in a table cell, every lap in a math cell.",
+            example: "lap_time()",
+        },
+        MathBuiltin {
+            name: "sector_time",
+            arity: &[1],
+            status: I,
+            category: "Lap",
+            signature: "sector_time(i)",
+            unit_rule: "Fixed(s)",
+            shape: "scalar | [lap]",
+            description: "Duration of the lap's `i`-th sector (0-based, as `sector_number()` counts) in seconds; NaN when the lap has no such sector.",
+            example: "sector_time(1)",
+        },
         MathBuiltin {
             name: "lap_delta_time",
             arity: &[1],
@@ -921,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn math_builtin_catalog_len_is_72_after_the_scipy_alignment_lanes_splits() {
+    fn math_builtin_catalog_len_is_75_after_the_scipy_splits_and_the_lap_shaped_trio() {
         // Arrange / Act
         let n = math_builtin_catalog().len();
 
@@ -932,12 +970,13 @@ mod tests {
         // `cumtrapz` added as `cumulative_trapezoid`'s permanent second
         // spelling (net +1, task 10, R151 item 6), and `gradient` added
         // alongside `differentiate` (net +1, task 11, R151 item 3) —
-        // 69 + 3 = 72.
-        assert_eq!(n, 72);
+        // 69 + 3 = 72; then `lap_number`/`lap_time`/`sector_time`, which C2
+        // §3.3 has listed all along and this catalog lacked (R233), 72 + 3 = 75.
+        assert_eq!(n, 75);
     }
 
     #[test]
-    fn implemented_and_not_implemented_counts_split_66_and_6() {
+    fn implemented_and_not_implemented_counts_split_69_and_6() {
         // Arrange
         let catalog = math_builtin_catalog();
 
@@ -947,11 +986,11 @@ mod tests {
         let implemented =
             catalog.iter().filter(|b| b.status == MathBuiltinStatus::Implemented).count();
 
-        // Assert — was 63/6; the scipy-alignment lane's three net-new
-        // entries (see the length test above) are all Implemented, so only
-        // that side of the split moves.
+        // Assert — was 63/6; the scipy-alignment lane's three net-new entries
+        // and the lap-shaped trio (see the length test above) are all
+        // Implemented, so only that side of the split moves.
         assert_eq!(not_implemented, 6);
-        assert_eq!(implemented, 66);
+        assert_eq!(implemented, 69);
     }
 
     #[test]
@@ -1044,7 +1083,7 @@ mod tests {
         let catalog = math_builtin_catalog();
 
         // Act / Assert — the cheapest guard against a copy-paste row, which
-        // is the realistic transcription error in a 72-row hand-typed table.
+        // is the realistic transcription error in a 75-row hand-typed table.
         for entry in catalog {
             assert!(
                 entry.signature.starts_with(&format!("{}(", entry.name)),

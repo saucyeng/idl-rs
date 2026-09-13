@@ -181,7 +181,7 @@ fn math_cell_defs(
                 Ok(out) => CellDefResult {
                     name: def.name.clone(),
                     label: def.label.clone(),
-                    value: Some(to_host_channel(&out.t_us, &out.samples, unit.clone())),
+                    value: Some(to_host_channel(&out.t_us, &out.samples, unit.clone(), out.axis)),
                     // 0.0 is EvalOutput::sample_rate_hz's own "scalar-as-channel /
                     // no rate" marker — normalize it to None so this field means
                     // "not applicable" the same way for a scalar as for a failure.

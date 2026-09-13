@@ -28,7 +28,7 @@ pub use eval::{
     MathOverlay,
 };
 pub use resolve::{channel_refs, resolve_dependencies};
-pub use value::{ChannelValue, Value, Vec3Value};
+pub use value::{ChannelValue, Value, ValueAxis, Vec3Value};
 
 #[cfg(test)]
 mod tests_ahrs;

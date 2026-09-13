@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use idl_rs::math::eval::LapSpan;
 use idl_rs::math::{ChannelLookup, MathLapContext, MathOverlay};
 use idl_rs::session::handle::{ChannelSource, SessionHandle};
 use idl_rs::session::Channel;
@@ -407,6 +408,34 @@ pub fn resolve_lap_window(data_root: &Path, session_id: &str, lap: u32) -> Resul
     )
 }
 
+/// One [`LapJson`] as the `[lap]` axis reads it (C2 §3.6.1, ruling R233).
+/// `lap_time_secs` comes from the recorded `lap_time_ms`, **not** from the
+/// bounds: a neutral-zone visit is already subtracted from `lap_time_ms`, so
+/// the two differ on exactly the laps where it matters.
+fn lap_span(lap: &LapJson) -> LapSpan {
+    LapSpan {
+        lap_number: lap.lap_number,
+        start_secs: lap.start_time_secs,
+        end_secs: lap.end_time_secs,
+        lap_time_secs: lap.lap_time_ms as f64 / 1000.0,
+        sectors: lap.sectors.iter().map(|s| (s.start_time_secs, s.end_time_secs)).collect(),
+    }
+}
+
+/// The laps of `laps` that a window `[start, end)` covers, in lap order —
+/// the domain of a `[lap]` value evaluated under that window.
+///
+/// Overlap, not containment, and half-open on both sides: a lap counts when
+/// it shares any time with the window. That one rule covers all three
+/// [`SpanDto`] kinds without a match on the kind — a `Lap` window's bounds are
+/// that lap's own, and half-openness stops the next lap (which starts exactly
+/// where this one ends) from joining it; a `Session` window covers every lap;
+/// a `Range` window covers the laps it cuts across, including the partial ones
+/// at its ends, which is what a reader dragging a selection means by it.
+fn laps_in_window(laps: &[LapJson], (start, end): (f64, f64)) -> Vec<LapSpan> {
+    laps.iter().filter(|l| l.start_time_secs < end && l.end_time_secs > start).map(lap_span).collect()
+}
+
 /// Builds a [`MathLapContext`] scoped to a single resolved [`WindowDto`]
 /// (C1 §6.1, R115) — the per-window replacement for [`load_lap_context`]'s
 /// per-session lap selection, used by `eval_workbook_v2` and its siblings
@@ -431,12 +460,24 @@ pub fn load_window_context(
     _handle: &SessionHandle,
 ) -> Result<MathLapContext, IpcError> {
     let bounds = resolve_window(data_dir, window)?;
+    // `laps` is the one part of the context a window does *not* collapse: the
+    // `[lap]` axis needs every lap the window covers, each still carrying its
+    // own number. Reading it from `session.json` here is what lets a lap
+    // progression chart draw under a whole-session window and still know it
+    // is looking at laps 1..N rather than one unnumbered span.
+    let laps = try_read_session_json(data_dir, &window.session_id)
+        .map(|doc| laps_in_window(&doc.laps, bounds))
+        .unwrap_or_default();
     Ok(MathLapContext {
         main_lap_bounds: vec![bounds],
         main_sectors: Vec::new(),
         main_lap_number: Some(1),
         overlay: Vec::new(),
         baseline_row: None,
+        laps,
+        // Never a row context: a window is a chart's selection, not a table
+        // row's binding. Only `evaluate_table_multi` sets this.
+        row_lap: None,
     })
 }
 
@@ -486,6 +527,7 @@ pub fn load_lap_context(
         return Ok(MathLapContext {
             main_lap_bounds: doc.laps.iter().map(|l| (l.start_time_secs, l.end_time_secs)).collect(),
             main_lap_number: doc.main_lap_number,
+            laps: doc.laps.iter().map(lap_span).collect(),
             ..MathLapContext::empty()
         });
     };
@@ -525,7 +567,23 @@ pub fn load_lap_context(
             .collect()
     };
 
-    Ok(MathLapContext { main_lap_bounds, main_sectors: Vec::new(), main_lap_number, overlay, baseline_row: None })
+    // `laps` follows the same rule as `main_lap_bounds` above: a designated
+    // main lap narrows the `[lap]` axis to that lap, no designation leaves it
+    // over every lap of the session.
+    let laps = match main_lap_json {
+        Some(l) => vec![lap_span(l)],
+        None => doc.laps.iter().map(lap_span).collect(),
+    };
+
+    Ok(MathLapContext {
+        main_lap_bounds,
+        main_sectors: Vec::new(),
+        main_lap_number,
+        overlay,
+        baseline_row: None,
+        laps,
+        row_lap: None,
+    })
 }
 
 #[cfg(test)]

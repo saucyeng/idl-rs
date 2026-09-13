@@ -763,6 +763,12 @@ fn function_unit_rule(name: &str, arg_count: usize) -> (FnUnitRule, Vec<FnUnitCh
         "lap_start_time" => (Fixed("s"), no_checks),
         "lap_start_distance" => (Fixed("m"), no_checks),
         "sector_number" => (Dimensionless, no_checks),
+        // The lap-shaped trio (C2 §3.6, R233). `lap_number()` counts laps, so
+        // it is dimensionless; the two durations are seconds. The shape these
+        // return (scalar in a table row, `[lap]` in a math cell) does not
+        // enter here — a unit is a property of the quantity, not of its shape.
+        "lap_number" => (Dimensionless, no_checks),
+        "lap_time" | "sector_time" => (Fixed("s"), no_checks),
         // A difference of two [ch] series, not a duration/distance —
         // corrected from the original brief's Fixed(s)/Fixed(m) (lead
         // ruling, this dispatch's message).
