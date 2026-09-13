@@ -321,6 +321,14 @@ fn read_workbook(file: &Path) -> Result<(WorkbookDoc, Vec<idl_rs::workbook::v3::
 /// Loads `--session` (and `--track`, when given) into the pair `eval_cells`
 /// needs. `Ok(None)` when no session was given.
 fn session_context(m: &ArgMatches) -> Result<Option<(SessionHandle, MathLapContext)>, CliError> {
+    // A flag that cannot mean anything is a usage error before it is an I/O
+    // one: without `--track` there are no laps, so nothing can be numbered.
+    // Checked ahead of the session load so the message names the real fault
+    // rather than whichever file happened to be missing too.
+    if opt_integer(m, "main-lap").is_some() && opt_path(m, "track").is_none() {
+        return Err(CliError::usage("--main-lap needs --track: there are no laps to number"));
+    }
+
     let Some(session) = opt_path(m, "session") else {
         return Ok(None);
     };
@@ -330,9 +338,6 @@ fn session_context(m: &ArgMatches) -> Result<Option<(SessionHandle, MathLapConte
     // every lap-aware function report `NoLapContext` rather than a wrong
     // number — which is the honest headless answer.
     let Some(track) = opt_path(m, "track") else {
-        if opt_integer(m, "main-lap").is_some() {
-            return Err(CliError::usage("--main-lap needs --track: there are no laps to number"));
-        }
         return Ok(Some((handle, MathLapContext::empty())));
     };
     let lap_ctx = lap_context(&handle, &track, opt_integer(m, "main-lap"))?;
@@ -526,5 +531,55 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, ErrorKind::Io);
+    }
+
+    /// Parses `argv` against the generated tree and returns the leaf matches
+    /// for `workbook eval`.
+    fn eval_matches(argv: &[&str]) -> ArgMatches {
+        let mut full = vec!["idl-rs", "workbook", "eval"];
+        full.extend_from_slice(argv);
+        crate::verbs::augment(clap::Command::new("idl-rs"))
+            .try_get_matches_from(full)
+            .unwrap()
+            .remove_subcommand()
+            .unwrap()
+            .1
+            .remove_subcommand()
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn main_lap_without_track_is_a_usage_error_and_never_reads_the_session() {
+        // Arrange — a session path that does not exist, so an I/O error
+        // would win if the flags were checked after the load.
+        let missing = std::env::temp_dir().join("idl-rs-wb-verbs-no-such-session.idl0");
+        let _ = std::fs::remove_file(&missing);
+        let m = eval_matches(&[
+            "wb.idl0wb",
+            "--session",
+            &missing.display().to_string(),
+            "--main-lap",
+            "2",
+        ]);
+
+        // Act
+        let err = session_context(&m).unwrap_err();
+
+        // Assert — the fault is the flag pair, not the file.
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(err.message.contains("--main-lap needs --track"), "{}", err.message);
+    }
+
+    #[test]
+    fn no_session_at_all_is_no_context_rather_than_an_error() {
+        // Arrange
+        let m = eval_matches(&["wb.idl0wb"]);
+
+        // Act
+        let ctx = session_context(&m).unwrap();
+
+        // Assert — a workbook with no session still parses and reports.
+        assert!(ctx.is_none());
     }
 }
