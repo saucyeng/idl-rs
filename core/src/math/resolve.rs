@@ -74,10 +74,23 @@ pub fn resolve_dependencies(
         visited.insert(name.clone());
         resolve_dependencies(handle, &def.expression, defs, lap_ctx, visited);
         if let Ok(out) = evaluate(&def.expression, handle, lap_ctx) {
-            // store_math_with_times, not store_math: a dependency channel
-            // keeps its source's real per-sample time (C1 §8 item 5, L3-R11)
-            // rather than a synthesized i/rate ramp.
-            handle.store_math_with_times(&name, out.sample_rate_hz, out.samples, out.t_us);
+            // A non-time-axis result is **not** stored (C2 §3.6, ruling
+            // R233). The session store holds channels against recorded
+            // microseconds; a `[lap]` definition's axis is lap numbers, and
+            // storing it would hand the next `[Name]` lookup a value whose
+            // three entries read as three microseconds of recording. The
+            // consumer then fails with "not in this session", which is wrong
+            // in its wording but right in its effect — a visible failure
+            // rather than a lap series silently plotted as time (R129 item b:
+            // an interim shim may narrow scope, never widen it). Referencing
+            // a lap-shaped definition from another definition is the work of
+            // the lane that gives the store an axis.
+            if out.axis == crate::math::ValueAxis::Time {
+                // store_math_with_times, not store_math: a dependency channel
+                // keeps its source's real per-sample time (C1 §8 item 5, L3-R11)
+                // rather than a synthesized i/rate ramp.
+                handle.store_math_with_times(&name, out.sample_rate_hz, out.samples, out.t_us);
+            }
         }
         visited.remove(&name);
     }

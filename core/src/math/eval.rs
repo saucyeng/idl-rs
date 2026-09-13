@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::math::parse::{Ast, BinOp, UnOp};
-use crate::math::value::{ChannelValue, Value};
+use crate::math::value::{ChannelValue, Value, ValueAxis};
 use crate::math::{MathEvalError, MathEvalErrorKind};
 
 /// A channel resolved by [`ChannelLookup`]. Samples are an `Arc<[f64]>`: the
@@ -239,7 +239,14 @@ pub struct EvalOutput {
     /// outer return value, not an intermediate widened once per pass. Empty
     /// for a scalar result or a channel with no established time axis; see
     /// [`ChannelValue::t_us`]'s doc comment (C1 §8 item 5).
+    ///
+    /// On a [`ValueAxis::Lap`] result these are 1-based lap numbers, not
+    /// microseconds — see [`ChannelValue::t_us`].
     pub t_us: Vec<i64>,
+    /// What [`Self::t_us`] measures (C2 §3.6.1, minimal subset). Every caller
+    /// that turns this output into a host channel or a stored channel must
+    /// branch on it rather than assume seconds.
+    pub axis: ValueAxis,
 }
 
 fn err(kind: MathEvalErrorKind, msg: impl Into<String>) -> MathEvalError {
@@ -276,10 +283,15 @@ pub fn evaluate_with_constants(
     let memo = MemoLookup::new(lookup);
     let value = eval(&ast, &memo, lap_ctx)?;
     match value {
-        Value::Channel(c) => {
-            Ok(EvalOutput { samples: c.samples.to_vec(), sample_rate_hz: c.sample_rate_hz, t_us: c.t_us.to_vec() })
+        Value::Channel(c) => Ok(EvalOutput {
+            samples: c.samples.to_vec(),
+            sample_rate_hz: c.sample_rate_hz,
+            t_us: c.t_us.to_vec(),
+            axis: c.axis,
+        }),
+        Value::Scalar(v) => {
+            Ok(EvalOutput { samples: vec![v], sample_rate_hz: 0.0, t_us: Vec::new(), axis: ValueAxis::Time })
         }
-        Value::Scalar(v) => Ok(EvalOutput { samples: vec![v], sample_rate_hz: 0.0, t_us: Vec::new() }),
         Value::Str(_) => Err(err(
             MathEvalErrorKind::Type,
             "Expression evaluated to a string, not a channel or scalar",
@@ -338,6 +350,12 @@ pub fn eval(
                 sample_rate_hz: ch.sample_rate_hz,
                 channel_id: Some(name.clone()),
                 t_us: ch.t_us,
+                // Every channel reachable through a `[Name]` lookup is on the
+                // time axis: session channels are recorded against `t_us`, and
+                // `resolve_dependencies` refuses to store a lap-shaped math
+                // definition into the handle precisely so a `[lap]` value can
+                // never re-enter evaluation wearing a time axis.
+                axis: ValueAxis::Time,
             }))
         }
         Ast::CellRef(name) => {
@@ -356,6 +374,7 @@ pub fn eval(
                     // Rate-0 table-column source — empty is the "no time
                     // axis" marker (L3-R12), never a synthetic ramp.
                     t_us: Arc::from(&[] as &[i64]),
+                    axis: ValueAxis::Time,
                 }))
             } else {
                 let v = lookup.lookup_cell(name).ok_or_else(|| {
@@ -446,6 +465,11 @@ pub(crate) fn elemwise(
     match (left, right) {
         (Value::Scalar(a), Value::Scalar(b)) => Ok(Value::Scalar(op(a, b)?)),
         (Value::Channel(a), Value::Channel(b)) => {
+            // Shape before rate: a `[lap]` value has no sample rate, so
+            // combining one with a time series otherwise reports "different
+            // sample rates (0 Hz vs 100 Hz). Use resample()" — advice that
+            // cannot work, for a mismatch that is not about rates at all.
+            let axis = combine_axis(op_name, a.axis, b.axis)?;
             if a.sample_rate_hz != b.sample_rate_hz {
                 return Err(err(
                     MathEvalErrorKind::Runtime,
@@ -476,6 +500,7 @@ pub(crate) fn elemwise(
                 sample_rate_hz: a.sample_rate_hz,
                 channel_id: None,
                 t_us,
+                axis,
             }))
         }
         (Value::Channel(a), Value::Scalar(b)) => {
@@ -487,6 +512,7 @@ pub(crate) fn elemwise(
                 // L3-R12: a channel×scalar op keeps the channel operand's
                 // t_us unchanged — the scalar contributes no time axis.
                 t_us: a.t_us,
+                axis: a.axis,
             }))
         }
         (Value::Scalar(a), Value::Channel(b)) => {
@@ -496,6 +522,7 @@ pub(crate) fn elemwise(
                 sample_rate_hz: b.sample_rate_hz,
                 channel_id: None,
                 t_us: b.t_us,
+                axis: b.axis,
             }))
         }
         (l, r) => Err(err(
@@ -503,6 +530,39 @@ pub(crate) fn elemwise(
             format!("\"{op_name}\": unexpected value types ({}, {})", type_name(&l), type_name(&r)),
         )),
     }
+}
+
+/// Resolves the axis of a channel×channel [`elemwise`] result (C2 §3.6.2
+/// broadcasting rule 2, minimal-shapes subset): both operands must be on the
+/// same axis, and the result is that axis. `[lap]` combined with `[t]` is a
+/// typed error naming both shapes — never a positional pairing of lap 3 with
+/// the third sample, which is C2 §3.6.2's whole reason for naming axes.
+///
+/// Reported as [`MathEvalErrorKind::Type`], not a new `ShapeMismatch` kind:
+/// C3's error-kind enum is contract, this lane does not widen it, and a shape
+/// mismatch *is* an operand-type mismatch. The message carries the shapes in
+/// §3.6.1's written form so the reader sees `[lap]` and `[t]`, not prose.
+///
+/// Scalar operands never reach here — C2 §3.6.2 rule 1 makes a rank-0 value
+/// combine with any shape, so the channel×scalar arms keep the channel's axis
+/// unexamined.
+fn combine_axis(
+    op_name: &str,
+    a: ValueAxis,
+    b: ValueAxis,
+) -> Result<ValueAxis, MathEvalError> {
+    if a == b {
+        return Ok(a);
+    }
+    Err(err(
+        MathEvalErrorKind::Type,
+        format!(
+            "\"{op_name}\": cannot combine a [{}] value with a [{}] value — they run along \
+             different axes. Reduce one to a scalar first (e.g. mean(...)).",
+            a.symbol(),
+            b.symbol()
+        ),
+    ))
 }
 
 /// Resolves the `t_us` of a channel×channel [`elemwise`] result per L3-R12:
@@ -547,6 +607,7 @@ pub(crate) fn map_value(v: Value, f: impl Fn(f64) -> f64) -> Result<Value, MathE
             channel_id: None,
             // Elementwise 1:1 map — same sample positions, same real times.
             t_us: c.t_us,
+            axis: c.axis,
         })),
         Value::Str(_) => {
             Err(err(MathEvalErrorKind::Type, "Cannot apply numeric operation to a string"))
@@ -670,9 +731,18 @@ fn estimator_channel_id(name: &str, arg: &str) -> Result<&'static str, MathEvalE
     }
 }
 
+/// A derived `[t]` channel. The overwhelming majority of results: everything
+/// that operates on session samples stays on the time axis.
 fn channel(samples: Vec<f64>, sample_rate_hz: f64, t_us: Arc<[i64]>) -> Value {
-    Value::Channel(ChannelValue { samples: Arc::from(samples), sample_rate_hz, channel_id: None, t_us })
+    Value::Channel(ChannelValue {
+        samples: Arc::from(samples),
+        sample_rate_hz,
+        channel_id: None,
+        t_us,
+        axis: ValueAxis::Time,
+    })
 }
+
 
 // Like require_channel but also demands a direct-reference channel_id (variance
 // needs it to find the same-named overlay channel), plus the channel's t_us —
@@ -1611,6 +1681,7 @@ fn call_function(
                 sample_rate_hz: main_rate,
                 channel_id: None,
                 t_us: main_t_us,
+                axis: ValueAxis::Time,
             }))
         }
         "lap_delta_dist" => {
@@ -1646,6 +1717,7 @@ fn call_function(
                 sample_rate_hz: main_rate,
                 channel_id: None,
                 t_us: main_t_us,
+                axis: ValueAxis::Time,
             }))
         }
 
@@ -3814,5 +3886,85 @@ mod tests {
 
         // Assert — t_us matches [X]'s t_us exactly (channel × scalar keeps it).
         assert_eq!(out.t_us, t);
+    }
+
+    // ---- C2 §3.6 minimal shapes (R233) ----
+
+    /// A `[lap]` value as the evaluator makes one: rate 0, lap numbers for
+    /// coordinates. Built by hand here because the builtins that produce them
+    /// are exercised through `evaluate` elsewhere; this file's subject is the
+    /// combination rule, not the producers.
+    fn lap_value(samples: Vec<f64>, laps: Vec<i64>) -> Value {
+        Value::Channel(ChannelValue {
+            samples: Arc::from(samples),
+            sample_rate_hz: 0.0,
+            channel_id: None,
+            t_us: Arc::from(laps),
+            axis: ValueAxis::Lap,
+        })
+    }
+
+    fn time_value(samples: Vec<f64>, rate: f64) -> Value {
+        Value::Channel(ChannelValue {
+            samples: Arc::from(samples),
+            sample_rate_hz: rate,
+            channel_id: None,
+            t_us: Arc::from(&[] as &[i64]),
+            axis: ValueAxis::Time,
+        })
+    }
+
+    #[test]
+    fn elemwise_a_lap_value_with_a_time_channel_is_a_typed_error_naming_both_shapes() {
+        // Arrange — three laps and three samples: the lengths match, which is
+        // exactly when a positional pairing would look plausible.
+        let laps = lap_value(vec![94.1, 92.8, 93.5], vec![1, 2, 3]);
+        let series = time_value(vec![1.0, 2.0, 3.0], 0.0);
+
+        // Act
+        let e = elemwise(laps, series, "-", |a, b| Ok(a - b)).unwrap_err();
+
+        // Assert
+        assert_eq!(e.kind, MathEvalErrorKind::Type);
+        assert!(e.message.contains("[lap]"), "message names the lap shape: {}", e.message);
+        assert!(e.message.contains("[t]"), "message names the time shape: {}", e.message);
+    }
+
+    #[test]
+    fn elemwise_a_lap_value_with_a_scalar_stays_on_the_lap_axis() {
+        // Arrange — §3.6.2 rule 1: a rank-0 operand combines with any shape.
+        let laps = lap_value(vec![94.0, 92.0], vec![1, 2]);
+
+        // Act
+        let out = elemwise(laps, Value::Scalar(2.0), "*", |a, b| Ok(a * b)).unwrap();
+
+        // Assert — values scaled, axis and coordinates untouched.
+        match out {
+            Value::Channel(c) => {
+                assert_eq!(c.samples.as_ref(), &[188.0, 184.0]);
+                assert_eq!(c.axis, ValueAxis::Lap);
+                assert_eq!(c.t_us.as_ref(), &[1, 2]);
+            }
+            other => panic!("expected a channel, got {}", type_name(&other)),
+        }
+    }
+
+    #[test]
+    fn elemwise_two_lap_values_combine_and_keep_the_lap_axis() {
+        // Arrange — two per-lap series over the same laps.
+        let a = lap_value(vec![94.0, 92.0], vec![1, 2]);
+        let b = lap_value(vec![4.0, 2.0], vec![1, 2]);
+
+        // Act
+        let out = elemwise(a, b, "-", |x, y| Ok(x - y)).unwrap();
+
+        // Assert
+        match out {
+            Value::Channel(c) => {
+                assert_eq!(c.samples.as_ref(), &[90.0, 90.0]);
+                assert_eq!(c.axis, ValueAxis::Lap);
+            }
+            other => panic!("expected a channel, got {}", type_name(&other)),
+        }
     }
 }

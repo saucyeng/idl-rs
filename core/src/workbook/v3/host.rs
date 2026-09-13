@@ -46,6 +46,20 @@ pub struct HostChannel {
     /// `Option<String>`, which would recreate the ambiguity this model
     /// exists to remove.
     pub unit: crate::math::units::UnitLabel,
+    /// What [`Self::t`] measures (C3 §3.4's `axis_kind`, IDLH v2). Carried on
+    /// the value rather than chosen at the encoder, so a `[lap]` definition
+    /// cannot be serialised as seconds by a call site that forgot to ask.
+    /// [`AxisKind::None`] whenever `t` is empty.
+    ///
+    /// `serde(skip)`: this struct's JSON form is C2 §5.1's host-variable
+    /// shape, and the axis does **not** join it. A host variable's axis
+    /// crosses on the byte path, as C3 §3.4's `axis_kind` header field, which
+    /// the JS decoder already reads; adding a fifth JSON key would be a
+    /// second, redundant channel for the same fact, and the two could then
+    /// disagree. Engine-internal: set by [`to_host_channel`], read by
+    /// [`encode_host_channel_idlh`](super::encode_host_channel_idlh).
+    #[serde(skip)]
+    pub axis: super::AxisKind,
 }
 
 /// Converts a resolved channel's `(t_us, v)` pair into the [`HostChannel`]
@@ -61,10 +75,29 @@ pub struct HostChannel {
 /// no `ChannelLookup`, so it cannot infer one; each caller supplies its own
 /// (a `math`-cell definition's already-inferred [`crate::math::units::UnitLabel`],
 /// or [`channel`]'s direct base-channel lookup).
-pub fn to_host_channel(t_us: &[i64], v: &[f64], unit: crate::math::units::UnitLabel) -> HostChannel {
+///
+/// `axis` says what `t_us` holds, and the conversion branches on it: a
+/// [`ValueAxis::Time`] value's entries are microseconds and are divided by
+/// 1e6; a [`ValueAxis::Lap`] value's entries are already 1-based lap numbers
+/// (C2 §3.6.1's axis coordinate) and are carried across verbatim. Dividing a
+/// lap number by a million is how a lap-progression chart draws lap 3 at three
+/// microseconds, so the branch is the point of the argument.
+pub fn to_host_channel(
+    t_us: &[i64],
+    v: &[f64],
+    unit: crate::math::units::UnitLabel,
+    axis: crate::math::ValueAxis,
+) -> HostChannel {
     let n = t_us.len().min(v.len());
-    let t = t_us[..n].iter().map(|&us| us as f64 / 1e6).collect();
-    HostChannel { length: v.len(), t, v: v.to_vec(), unit }
+    let t: Vec<f64> = match axis {
+        crate::math::ValueAxis::Time => t_us[..n].iter().map(|&us| us as f64 / 1e6).collect(),
+        crate::math::ValueAxis::Lap => t_us[..n].iter().map(|&n| n as f64).collect(),
+    };
+    // `AxisKind::None` is the only honest kind for an absent axis — see
+    // `encode_host_channel_idlh`, which refuses to claim a kind for an empty
+    // `t` for the same reason.
+    let kind = if t.is_empty() { super::AxisKind::None } else { super::AxisKind::from(axis) };
+    HostChannel { length: v.len(), t, v: v.to_vec(), unit, axis: kind }
 }
 
 /// General host-variable channel lookup (C2 §5.1's `channel(name, {lap,
@@ -137,7 +170,7 @@ pub fn channel(
     };
 
     let Some(lap_number) = lap else {
-        return Ok(to_host_channel(&t_us, &samples, unit));
+        return Ok(to_host_channel(&t_us, &samples, unit, crate::math::ValueAxis::Time));
     };
 
     let window = (lap_number as usize).checked_sub(1).and_then(|i| lap_ctx.main_lap_bounds.get(i));
@@ -165,7 +198,7 @@ pub fn channel(
         .filter(|(&t, _)| t >= start_us && t <= end_us)
         .map(|(&t, &v)| (t, v))
         .unzip();
-    Ok(to_host_channel(&win_t_us, &win_v, unit))
+    Ok(to_host_channel(&win_t_us, &win_v, unit, crate::math::ValueAxis::Time))
 }
 
 /// One lap of the active session's lap table, as exposed to JS host code
@@ -256,7 +289,7 @@ mod tests {
         let v = [10.0, 20.0, 30.0];
 
         // Act
-        let got = to_host_channel(&t_us, &v, crate::math::units::UnitLabel::Dimensionless);
+        let got = to_host_channel(&t_us, &v, crate::math::units::UnitLabel::Dimensionless, crate::math::ValueAxis::Time);
 
         // Assert
         assert_eq!(got.t, vec![0.0, 1.0, 2.5]);
@@ -271,7 +304,7 @@ mod tests {
         let v = [1.0, 2.0, 3.0];
 
         // Act
-        let got = to_host_channel(&t_us, &v, crate::math::units::UnitLabel::Dimensionless);
+        let got = to_host_channel(&t_us, &v, crate::math::units::UnitLabel::Dimensionless, crate::math::ValueAxis::Time);
 
         // Assert
         assert_eq!(got.length, 3);
@@ -286,7 +319,7 @@ mod tests {
         let v: [f64; 0] = [];
 
         // Act
-        let got = to_host_channel(&t_us, &v, crate::math::units::UnitLabel::Dimensionless);
+        let got = to_host_channel(&t_us, &v, crate::math::units::UnitLabel::Dimensionless, crate::math::ValueAxis::Time);
 
         // Assert
         assert_eq!(got.length, 0);
@@ -295,6 +328,34 @@ mod tests {
     }
 
     // ---- Step 2: channel() (L3-R22) ----
+
+    #[test]
+    fn to_host_channel_a_lap_axis_carries_lap_numbers_across_not_microseconds() {
+        // Arrange — three laps; on a lap axis `t_us` already holds the 1-based
+        // lap number (C2 §3.6.1's coordinate), not a recording time.
+        let coords = [1i64, 2, 3];
+        let v = [94.1, 92.8, 93.5];
+
+        // Act
+        let got = to_host_channel(&coords, &v, crate::math::units::UnitLabel::Dimensionless, crate::math::ValueAxis::Lap);
+
+        // Assert — verbatim, not divided by 1e6, and the kind travels with it.
+        assert_eq!(got.t, vec![1.0, 2.0, 3.0]);
+        assert_eq!(got.axis, crate::workbook::v3::AxisKind::Lap);
+    }
+
+    #[test]
+    fn to_host_channel_an_empty_axis_reports_no_kind_whatever_the_value_claims() {
+        // Arrange — a scalar result: no coordinates at all.
+        let v = [5.0];
+
+        // Act
+        let got = to_host_channel(&[], &v, crate::math::units::UnitLabel::Dimensionless, crate::math::ValueAxis::Lap);
+
+        // Assert — an absent axis has no kind to describe.
+        assert!(got.t.is_empty());
+        assert_eq!(got.axis, crate::workbook::v3::AxisKind::None);
+    }
 
     #[test]
     fn channel_with_no_lap_or_session_same_as_lookup_converted_via_to_host_channel() {
@@ -310,7 +371,8 @@ mod tests {
             to_host_channel(
                 &[0, 100_000],
                 &[1.0, 2.0],
-                crate::math::units::UnitLabel::Unknown { reason: "no unit recorded for this channel".to_string() }
+                crate::math::units::UnitLabel::Unknown { reason: "no unit recorded for this channel".to_string() },
+                crate::math::ValueAxis::Time
             )
         );
     }

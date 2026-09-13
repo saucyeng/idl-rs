@@ -766,12 +766,11 @@ fn fetch_host_channel_via(
         IpcError::new(IpcErrorKind::Internal, format!("definition '{def_name}' has neither a value nor an error"))
     })?;
 
-    // `AxisKind::Time` because that is the only axis a definition can
-    // carry today: C2 §3.6's shape system (and with it `[f]`/`[lap]`
-    // values) is contract text the engine has not implemented yet, so a
-    // non-time axis has no way to reach this point. When it does, the kind
-    // is read off the value's own shape here.
-    Ok(idl_rs::workbook::v3::encode_host_channel_idlh(hc, budget, idl_rs::workbook::v3::AxisKind::Time))
+    // The axis kind rides on the value (C2 §3.6, ruling R233): a `[lap]`
+    // definition reaches here carrying `AxisKind::Lap` and serialises its lap
+    // numbers as its `t`. This call site no longer chooses — choosing is what
+    // made every definition claim seconds regardless of its shape.
+    Ok(idl_rs::workbook::v3::encode_host_channel_idlh(hc, budget))
 }
 
 /// Transport-agnostic core of `fetch_host_channel_v2` (C3 §3.4, R117.7).
@@ -849,12 +848,11 @@ fn fetch_host_channel_v2_via(
         IpcError::new(IpcErrorKind::Internal, format!("definition '{def_name}' has neither a value nor an error"))
     })?;
 
-    // `AxisKind::Time` because that is the only axis a definition can
-    // carry today: C2 §3.6's shape system (and with it `[f]`/`[lap]`
-    // values) is contract text the engine has not implemented yet, so a
-    // non-time axis has no way to reach this point. When it does, the kind
-    // is read off the value's own shape here.
-    Ok(idl_rs::workbook::v3::encode_host_channel_idlh(hc, budget, idl_rs::workbook::v3::AxisKind::Time))
+    // The axis kind rides on the value (C2 §3.6, ruling R233): a `[lap]`
+    // definition reaches here carrying `AxisKind::Lap` and serialises its lap
+    // numbers as its `t`. This call site no longer chooses — choosing is what
+    // made every definition claim seconds regardless of its shape.
+    Ok(idl_rs::workbook::v3::encode_host_channel_idlh(hc, budget))
 }
 
 /// A `table` cell's `value` (C3 §3.4): `{ model, results }` when a session is

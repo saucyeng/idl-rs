@@ -42,6 +42,23 @@ pub enum AxisKind {
     Lap = 3,
 }
 
+/// The one mapping from the evaluator's value-side axis vocabulary (C2
+/// §3.6.1) to this wire-side one (C3 §3.4). Kept here, beside the numbers it
+/// produces, so the wire codes live in exactly one file.
+///
+/// [`AxisKind::None`] has no [`crate::math::ValueAxis`] counterpart — "no
+/// axis" is a property of an *empty* `t`, not of a value's shape, and both
+/// [`super::to_host_channel`] and [`encode_host_channel_idlh`] derive it from
+/// emptiness rather than from the value.
+impl From<crate::math::ValueAxis> for AxisKind {
+    fn from(axis: crate::math::ValueAxis) -> Self {
+        match axis {
+            crate::math::ValueAxis::Time => AxisKind::Time,
+            crate::math::ValueAxis::Lap => AxisKind::Lap,
+        }
+    }
+}
+
 /// Encodes `hc`, decimated to at most `budget` points, as `IDLH` v1 bytes
 /// (C3 §3.4, ruling R59 Q3(a)'s 24-byte padded header). Little-endian
 /// throughout: `magic` (4 bytes, ASCII "IDLH") at offset 0, `version`
@@ -69,7 +86,12 @@ pub enum AxisKind {
 /// argument (C3 §3.4's `1..=65536` range) is the calling command's job,
 /// before this function is ever reached; this function does not exceed
 /// `budget` but does not itself validate it.
-pub fn encode_host_channel_idlh(hc: &HostChannel, budget: u32, axis_kind: AxisKind) -> Vec<u8> {
+///
+/// The `axis_kind` field is read off `hc` (ruling R233), never passed in: an
+/// argument here is a question every call site has to answer again, and every
+/// one of them answered `Time` because that was the only shape that existed.
+/// The value knows its own axis, so the encoder asks it.
+pub fn encode_host_channel_idlh(hc: &HostChannel, budget: u32) -> Vec<u8> {
     let budget = budget.max(1) as usize;
     let step = hc.v.len().div_ceil(budget).max(1);
 
@@ -88,7 +110,7 @@ pub fn encode_host_channel_idlh(hc: &HostChannel, budget: u32, axis_kind: AxisKi
     out.extend_from_slice(&t_length.to_le_bytes());
     // `axis_kind` is `None` whenever there is no axis to describe, so the
     // field can never claim a kind for an empty `t`.
-    let kind = if has_t { axis_kind } else { AxisKind::None };
+    let kind = if has_t { hc.axis } else { AxisKind::None };
     out.extend_from_slice(&(kind as u16).to_le_bytes());
     out.extend_from_slice(&[0u8; 6]);
 
@@ -121,10 +143,10 @@ mod tests {
     #[test]
     fn encode_host_channel_idlh_a_channel_with_a_recorded_axis_round_trips_every_value_and_flag() {
         // Arrange
-        let hc = HostChannel { length: 3, t: vec![0.0, 0.1, 0.2], v: vec![1.0, 2.0, 3.0], unit: crate::math::units::UnitLabel::Dimensionless };
+        let hc = HostChannel { length: 3, t: vec![0.0, 0.1, 0.2], v: vec![1.0, 2.0, 3.0], unit: crate::math::units::UnitLabel::Dimensionless, axis: AxisKind::Time };
 
         // Act
-        let bytes = encode_host_channel_idlh(&hc, 65536, AxisKind::Time);
+        let bytes = encode_host_channel_idlh(&hc, 65536);
 
         // Assert — header
         assert_eq!(&bytes[0..4], b"IDLH");
@@ -151,10 +173,10 @@ mod tests {
     #[test]
     fn encode_host_channel_idlh_an_empty_t_channel_encodes_t_length_zero_flag_clear_and_v_starts_at_24() {
         // Arrange — a scalar/table-column result: no recorded axis.
-        let hc = HostChannel { length: 1, t: Vec::new(), v: vec![5.0], unit: crate::math::units::UnitLabel::Dimensionless };
+        let hc = HostChannel { length: 1, t: Vec::new(), v: vec![5.0], unit: crate::math::units::UnitLabel::Dimensionless, axis: AxisKind::Time };
 
         // Act
-        let bytes = encode_host_channel_idlh(&hc, 65536, AxisKind::Time);
+        let bytes = encode_host_channel_idlh(&hc, 65536);
 
         // Assert
         assert_eq!(read_u16(&bytes, 6), 0, "flags bit 0 (has_t) must be clear");
@@ -169,10 +191,10 @@ mod tests {
         // Arrange — 10 samples, budget 3: step = ceil(10/3) = 4, indices 0,4,8 -> 3 points.
         let v: Vec<f64> = (0..10).map(|i| i as f64).collect();
         let t: Vec<f64> = (0..10).map(|i| i as f64 * 0.1).collect();
-        let hc = HostChannel { length: 10, t, v, unit: crate::math::units::UnitLabel::Dimensionless };
+        let hc = HostChannel { length: 10, t, v, unit: crate::math::units::UnitLabel::Dimensionless, axis: AxisKind::Time };
 
         // Act
-        let bytes = encode_host_channel_idlh(&hc, 3, AxisKind::Time);
+        let bytes = encode_host_channel_idlh(&hc, 3);
 
         // Assert
         let length = read_u32(&bytes, 8);
@@ -191,10 +213,10 @@ mod tests {
     #[test]
     fn encode_host_channel_idlh_source_at_or_under_budget_is_a_no_op() {
         // Arrange
-        let hc = HostChannel { length: 3, t: vec![0.0, 0.1, 0.2], v: vec![1.0, 2.0, 3.0], unit: crate::math::units::UnitLabel::Dimensionless };
+        let hc = HostChannel { length: 3, t: vec![0.0, 0.1, 0.2], v: vec![1.0, 2.0, 3.0], unit: crate::math::units::UnitLabel::Dimensionless, axis: AxisKind::Time };
 
         // Act
-        let bytes = encode_host_channel_idlh(&hc, 100, AxisKind::Time);
+        let bytes = encode_host_channel_idlh(&hc, 100);
 
         // Assert
         assert_eq!(read_u32(&bytes, 8), 3);
@@ -204,12 +226,12 @@ mod tests {
     #[test]
     fn encode_host_channel_idlh_header_is_exactly_24_bytes_in_every_case() {
         // Arrange
-        let with_t = HostChannel { length: 2, t: vec![0.0, 1.0], v: vec![1.0, 2.0], unit: crate::math::units::UnitLabel::Dimensionless };
-        let without_t = HostChannel { length: 2, t: Vec::new(), v: vec![1.0, 2.0], unit: crate::math::units::UnitLabel::Dimensionless };
+        let with_t = HostChannel { length: 2, t: vec![0.0, 1.0], v: vec![1.0, 2.0], unit: crate::math::units::UnitLabel::Dimensionless, axis: AxisKind::Time };
+        let without_t = HostChannel { length: 2, t: Vec::new(), v: vec![1.0, 2.0], unit: crate::math::units::UnitLabel::Dimensionless, axis: AxisKind::Time };
 
         // Act
-        let a = encode_host_channel_idlh(&with_t, 65536, AxisKind::Time);
-        let b = encode_host_channel_idlh(&without_t, 65536, AxisKind::Time);
+        let a = encode_host_channel_idlh(&with_t, 65536);
+        let b = encode_host_channel_idlh(&without_t, 65536);
 
         // Assert — the first `t` byte always sits at offset 24 (the header's
         // own fixed size); the first `v` byte sits at `24 + t_length*8`,
@@ -226,10 +248,10 @@ mod tests {
     #[test]
     fn encode_host_channel_idlh_a_lap_axis_is_carried_in_axis_kind_not_inferred_by_the_reader() {
         // Arrange — a per-lap series: three laps, one value each.
-        let hc = HostChannel { length: 3, t: vec![1.0, 2.0, 3.0], v: vec![94.1, 92.8, 93.5], unit: crate::math::units::UnitLabel::Dimensionless };
+        let hc = HostChannel { length: 3, t: vec![1.0, 2.0, 3.0], v: vec![94.1, 92.8, 93.5], unit: crate::math::units::UnitLabel::Dimensionless, axis: AxisKind::Lap };
 
         // Act
-        let bytes = encode_host_channel_idlh(&hc, 65536, AxisKind::Lap);
+        let bytes = encode_host_channel_idlh(&hc, 65536);
 
         // Assert
         assert_eq!(read_u16(&bytes, 4), 2, "version 2 carries axis_kind");
@@ -238,12 +260,13 @@ mod tests {
     }
 
     #[test]
-    fn encode_host_channel_idlh_an_axisless_value_reports_axis_kind_none_whatever_the_caller_asked_for() {
-        // Arrange — a scalar result: no recorded axis to describe.
-        let hc = HostChannel { length: 1, t: Vec::new(), v: vec![5.0], unit: crate::math::units::UnitLabel::Dimensionless };
+    fn encode_host_channel_idlh_an_axisless_value_reports_axis_kind_none_whatever_the_value_claims() {
+        // Arrange — a scalar result: no recorded axis to describe, even though
+        // the value carries a kind.
+        let hc = HostChannel { length: 1, t: Vec::new(), v: vec![5.0], unit: crate::math::units::UnitLabel::Dimensionless, axis: AxisKind::Lap };
 
         // Act
-        let bytes = encode_host_channel_idlh(&hc, 65536, AxisKind::Lap);
+        let bytes = encode_host_channel_idlh(&hc, 65536);
 
         // Assert — the field can never claim a kind for an empty `t`.
         assert_eq!(read_u16(&bytes, 16), AxisKind::None as u16);
@@ -252,10 +275,10 @@ mod tests {
     #[test]
     fn encode_host_channel_idlh_version_2_keeps_every_version_1_payload_offset() {
         // Arrange
-        let hc = HostChannel { length: 2, t: vec![0.0, 1.0], v: vec![7.0, 8.0], unit: crate::math::units::UnitLabel::Dimensionless };
+        let hc = HostChannel { length: 2, t: vec![0.0, 1.0], v: vec![7.0, 8.0], unit: crate::math::units::UnitLabel::Dimensionless, axis: AxisKind::Time };
 
         // Act
-        let bytes = encode_host_channel_idlh(&hc, 65536, AxisKind::Time);
+        let bytes = encode_host_channel_idlh(&hc, 65536);
 
         // Assert — header still 24 bytes, t at 24, v at 24 + t_length*8.
         assert_eq!(bytes.len(), 24 + 2 * 8 + 2 * 8);

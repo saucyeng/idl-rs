@@ -8,7 +8,7 @@
 //! second handle (spec §6). Pure geometry; data in, data out.
 
 use crate::math::eval::{ChannelLookup, LookupChannel, MathOverlay};
-use crate::math::value::{ChannelValue, Value};
+use crate::math::value::{ChannelValue, Value, ValueAxis};
 use crate::math::{MathEvalError, MathEvalErrorKind};
 
 /// Cumulative arc length (metres) along a polyline given by parallel E/N
@@ -216,6 +216,7 @@ pub fn eval_variance_time(
         sample_rate_hz: main_rate,
         channel_id: None,
         t_us: std::sync::Arc::from(main_t_us),
+        axis: ValueAxis::Time,
     }))
 }
 
@@ -294,6 +295,7 @@ pub fn eval_variance_dist(
         sample_rate_hz: main_rate,
         channel_id: None,
         t_us: std::sync::Arc::from(main_t_us),
+        axis: ValueAxis::Time,
     }))
 }
 
