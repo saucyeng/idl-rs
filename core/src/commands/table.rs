@@ -276,6 +276,7 @@ pub const VERBS_RULED: &[(&str, &str)] = &[
     ("stale", "R197"),
     ("workbook", "R222"),
     ("cli", "R230 item 2"),
+    ("wire", "R236"),
 ];
 
 /// Whether `verb` is in either vocabulary.
@@ -798,6 +799,23 @@ pub const COMMANDS: &[CommandRow] = &[
         data_dir: false,
         writer: true,
     },
+    CommandRow {
+        noun: "docs",
+        verb: "wire",
+        args: &[],
+        flags: &[Flag::value(
+            "out",
+            ValueKind::Path,
+            "Directory to write the golden `<format>-v<n>.bin`/`.json` pairs into",
+        )],
+        core_fn: "wire_golden::build_wire_fixtures",
+        json_shape: None,
+        help: "Regenerate the cross-language wire golden fixtures (ruling R236)",
+        tier: Tier::Rare,
+        status: Status::Current,
+        data_dir: false,
+        writer: true,
+    },
 ];
 
 #[cfg(test)]
@@ -837,8 +855,9 @@ mod tests {
     #[test]
     fn the_ruled_verb_list_is_exactly_what_the_rulings_added() {
         // Arrange
-        let expected =
-            ["set-start", "set-meta", "cells", "data", "detect", "laps", "stale", "workbook", "cli"];
+        let expected = [
+            "set-start", "set-meta", "cells", "data", "detect", "laps", "stale", "workbook", "cli", "wire",
+        ];
 
         // Act
         let actual: Vec<&str> = VERBS_RULED.iter().map(|(v, _)| *v).collect();

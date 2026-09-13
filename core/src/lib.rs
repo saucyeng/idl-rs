@@ -46,6 +46,7 @@ pub mod track_artifact;
 pub mod track_projection;
 pub mod tracks;
 pub mod variance;
+pub mod wire_golden;
 pub mod workbook;
 
 /// The engine's crate version, stamped into derived-file hashes and reported
