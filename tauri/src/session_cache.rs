@@ -27,22 +27,42 @@
 //! function of (blob, importer version) and a changed file makes every
 //! decode of it stale at once.
 //!
+//! A session's **timestamp axes are cached apart from its channels**
+//! (ruling R232.1). `data.parquet`'s union `t` column and each source's
+//! `<source>_t_recorded_us` companion used to be decompressed inside every
+//! channel decode, so six `imu0` channels of a 516 MB session paid for the
+//! same two i64 columns six times — the cost the R221 measurement found
+//! behind the two silent minutes. They are now their own entries, decoded
+//! once per session (`t`) and once per source (the companion) and borrowed
+//! by every channel that reads through them. An axis is counted in
+//! residency exactly once, and is never evicted while a channel that
+//! borrows it is resident.
+//!
 //! The lock is held to look a channel up and to insert it, but **not**
-//! across the decode in between, so two commands racing for the same
-//! not-yet-resident channel (a `fetch_tile` and the `cursor_readout` that
-//! settles behind it) can both decode it once. Both results are correct
-//! and byte accounting stays consistent — the loser's copy is simply
-//! dropped — so this costs one redundant decode on a cold channel, never
-//! correctness. Holding the lock across the decode instead would serialise
-//! every sample-serving command in the app behind the slowest read.
+//! across the decode in between, so every sample-serving command in the app
+//! is not serialised behind the slowest read. A channel already being
+//! decoded by another thread is **not** decoded a second time (ruling
+//! R232.2): the key is marked in flight, later callers wait on
+//! [`Shared::decoded`] and take the result the leader inserts. One decode,
+//! many waiters — which is what makes a request for nine channels at once
+//! safe to fan out.
+//!
+//! [`SessionCache::channels`] is that fan-out: several channels of one
+//! request (a cell bind, a report, a raster) decode on a shared rayon pool,
+//! each worker reserving through the same byte semaphore, so they queue on
+//! memory rather than failing on it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use idl_rs::session::ChannelSamples;
-use idl_rs::store::parquet::{estimate_channel_bytes, read_channel_with_progress, ParquetStoreErrorKind};
+use idl_rs::store::index_job::worker_count;
+use idl_rs::store::parquet::{
+    estimate_channel_bytes, read_channel_index, read_channel_sharing_axes, read_channel_with_progress,
+    recorded_axis_column, AxisColumn, BorrowedAxes, ParquetStoreErrorKind,
+};
 
 use crate::error::{IpcError, IpcErrorKind};
 use crate::memory::{budget_bytes, resource_exhausted, with_estimate_margin};
@@ -108,6 +128,35 @@ pub type ProgressSink = Arc<dyn Fn(DecodeProgressEvent) + Send + Sync>;
 /// Cache key: which session, which channel.
 type Key = (String, String);
 
+/// Cache key for a shared timestamp axis (ruling R232.1): which session,
+/// which axis column — `"t"` for the union axis, or the
+/// `<source>_t_recorded_us` spelling
+/// [`idl_rs::store::parquet::recorded_axis_column`] builds for a source.
+///
+/// The same `(String, String)` shape as [`Key`] and deliberately a distinct
+/// map: an axis is not a channel, is never served to a caller as samples,
+/// and never reaches a DTO.
+type AxisKey = (String, String);
+
+/// What one decode has claimed so later callers wait for it instead of
+/// repeating it (ruling R232.2).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Pending {
+    /// A channel decode, by its [`Key`].
+    Channel(Key),
+    /// A shared axis decode, by its [`AxisKey`].
+    Axis(AxisKey),
+}
+
+/// How long a waiter sleeps before re-checking whether the decode it is
+/// waiting on has landed.
+///
+/// Not a deadline — a waiter never gives up, because the thread that marked
+/// the key in flight always clears it (the mark is released by a `Drop`
+/// guard, on the error path and on unwind alike). The interval only bounds
+/// how long a missed notification could go unnoticed.
+const PENDING_POLL: Duration = Duration::from_secs(5);
+
 /// Everything the cache mutates, behind one lock.
 ///
 /// `order` is the LRU chain, coldest first: the key of every resident entry
@@ -120,6 +169,21 @@ type Key = (String, String);
 struct Inner {
     entries: HashMap<Key, Arc<ChannelSamples>>,
     order: Vec<Key>,
+    /// The shared timestamp axes (ruling R232.1), keyed apart from channels
+    /// so one entry serves every channel that borrows it and is charged to
+    /// `resident_bytes` exactly once.
+    axes: HashMap<AxisKey, Arc<AxisColumn>>,
+    /// Insertion order of `axes`, coldest first — the eviction order for
+    /// axes no resident channel still borrows.
+    axis_order: Vec<AxisKey>,
+    /// How many axis columns this cache has actually decoded, ever. The
+    /// observable that makes "one axis decode per (session, source)"
+    /// testable: six channels of one source must move it by two (the union
+    /// `t` and that source's companion), not by twelve.
+    axis_decodes: u64,
+    /// Decodes marked in flight, so a second caller for the same channel or
+    /// axis waits for the first rather than repeating it (ruling R232.2).
+    pending: HashSet<Pending>,
     resident_bytes: u64,
     budget_bytes: u64,
     /// Bytes promised to decodes that have started but not finished
@@ -137,6 +201,9 @@ struct Shared {
     /// Signalled whenever bytes are given back — a reservation dropped, or
     /// an entry evicted — so waiting decodes re-check the budget.
     released: Condvar,
+    /// Signalled whenever a decode marked in flight finishes, succeeds or
+    /// fails, so the callers that deduped onto it re-check (ruling R232.2).
+    decoded: Condvar,
     /// Where decode progress goes and how often, cloned out once per decode
     /// and never held across one.
     progress: Mutex<Progress>,
@@ -212,11 +279,16 @@ impl SessionCache {
                 inner: Mutex::new(Inner {
                     entries: HashMap::new(),
                     order: Vec::new(),
+                    axes: HashMap::new(),
+                    axis_order: Vec::new(),
+                    axis_decodes: 0,
+                    pending: HashSet::new(),
                     resident_bytes: 0,
                     budget_bytes,
                     in_flight_bytes: 0,
                 }),
                 released: Condvar::new(),
+                decoded: Condvar::new(),
                 progress: Mutex::new(Progress::default()),
             }),
         }
@@ -377,21 +449,221 @@ impl SessionCache {
     /// corrupt or unreadable `data.parquet` is [`IpcErrorKind::Io`].
     pub fn channel(&self, session_dir: &Path, session_id: &str, channel: &str) -> Result<Arc<ChannelSamples>, IpcError> {
         let key = (session_id.to_string(), channel.to_string());
-        if let Some(hit) = self.lock().touch(&key) {
-            return Ok(hit);
+        loop {
+            // Either this thread owns the decode, or another one finished it
+            // while this one waited (ruling R232.2) — in which case `claim`
+            // yields nothing to do and the entry is simply resident.
+            let in_flight = self.claim(Pending::Channel(key.clone()), |inner| inner.touch(&key));
+            if let Some(hit) = self.lock().touch(&key) {
+                return Ok(hit);
+            }
+            // No entry and no claim: the leader failed and left nothing
+            // behind. Go round again and lead the next attempt rather than
+            // inherit a failure this thread never saw.
+            let Some(_in_flight) = in_flight else { continue };
+
+            let needed = estimate_channel_bytes(session_dir, channel).map_err(|e| store_error(session_id, channel, 0, e))?;
+            let reservation = self.reserve(needed, &format!("decode channel '{channel}' of session '{session_id}'"))?;
+
+            let (decoded, _axis_claims) = self.decode_reporting_progress(session_dir, session_id, channel);
+            let fresh = decoded.map_err(|e| store_error(session_id, channel, needed, e))?;
+            let samples = Arc::new(fresh.samples);
+            {
+                // The channel goes in **before** the axes it decoded, and in
+                // the same lock scope: an axis is pinned by a resident
+                // channel that borrows it (`Inner::axis_is_borrowed`), so an
+                // axis admitted while its own channel is still missing would
+                // read as unborrowed and could be evicted immediately by the
+                // very `evict_to_budget` its insertion triggers — paid for
+                // and thrown away in the same breath.
+                let mut inner = self.lock();
+                inner.insert(key, samples.clone());
+                for (axis_key, axis) in fresh.axes {
+                    inner.axis_decodes += 1;
+                    inner.insert_axis(axis_key, axis);
+                }
+            }
+            // Only now give the reservation back: releasing it before the
+            // bytes are accounted as resident would let a waiter through on
+            // a budget this decode is still occupying.
+            drop(reservation);
+            return Ok(samples);
         }
+    }
 
-        let needed = estimate_channel_bytes(session_dir, channel).map_err(|e| store_error(session_id, channel, 0, e))?;
-        let reservation = self.reserve(needed, &format!("decode channel '{channel}' of session '{session_id}'"))?;
+    /// Several channels of one session at once, decoded **in parallel**
+    /// (ruling R232.2).
+    ///
+    /// This is what a cell bind, a report or a raster asks for: a set of
+    /// channels, most of them cold, all wanted before anything can be drawn.
+    /// Served one at a time they cost the sum of their decodes — the 44
+    /// seconds the R221 measurement recorded for one 516 MB session. Here
+    /// the misses fan out over [`decode_pool`]'s workers, each reserving
+    /// through the same byte semaphore [`Self::reserve`] hands out, so they
+    /// queue on memory rather than exhaust it.
+    ///
+    /// Returns one result per requested channel, **in the order asked** —
+    /// a per-channel failure is that channel's own `Err`, never the
+    /// request's, because one unknown name in a notebook must not cost the
+    /// other eight their samples. Resident channels are returned without
+    /// touching the pool at all.
+    pub fn channels(
+        &self,
+        session_dir: &Path,
+        session_id: &str,
+        channels: &[&str],
+    ) -> Vec<Result<Arc<ChannelSamples>, IpcError>> {
+        if channels.len() < 2 {
+            return channels.iter().map(|c| self.channel(session_dir, session_id, c)).collect();
+        }
+        match decode_pool() {
+            Some(pool) => pool.install(|| {
+                use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+                channels.par_iter().map(|c| self.channel(session_dir, session_id, c)).collect()
+            }),
+            // No pool on this machine (a thread-spawn failure) degrades to
+            // serial, exactly as the indexing job's does: decoding slowly is
+            // strictly better than not decoding at all.
+            None => channels.iter().map(|c| self.channel(session_dir, session_id, c)).collect(),
+        }
+    }
 
-        let decoded = self.decode_reporting_progress(session_dir, session_id, channel);
-        let samples = Arc::new(decoded.map_err(|e| store_error(session_id, channel, needed, e))?);
-        // Insert first, then give the reservation back: releasing it before
-        // the bytes are accounted as resident would let a waiter through on
-        // a budget this decode is still occupying.
-        self.lock().insert(key, samples.clone());
-        drop(reservation);
-        Ok(samples)
+    /// Decodes `channels` into residency for their own sake, discarding both
+    /// the samples and any failure (ruling R232.2's "requests wait, never
+    /// fail").
+    ///
+    /// The call a command makes when it knows up front which channels an
+    /// evaluation will ask for one at a time: they arrive together, in
+    /// parallel, and the lazy lookups that follow are all cache hits. A
+    /// name this session does not have is simply not decoded — a prefetch
+    /// reports nothing, because the lookup that really needs the channel
+    /// runs afterwards and reports it properly.
+    pub fn prefetch(&self, session_dir: &Path, session_id: &str, channels: &[&str]) {
+        let _ = self.channels(session_dir, session_id, channels);
+    }
+
+    /// Marks `what` as being decoded by this thread, or waits for the thread
+    /// that already is (ruling R232.2).
+    ///
+    /// `hit` is re-checked under the lock on every wake, so a waiter takes
+    /// the leader's result rather than repeating its work: `Ok(None)` means
+    /// "it is resident now, ask again". `Ok(Some(guard))` means this thread
+    /// owns the decode and must do it; dropping the guard clears the mark
+    /// and wakes everyone waiting, on the error path and on unwind alike.
+    ///
+    /// A leader that fails leaves nothing resident, so the first waiter to
+    /// wake becomes the next leader and tries once itself. That costs a
+    /// second attempt at a genuinely broken decode, and it is what keeps a
+    /// transient failure (a file being rewritten under the reader) from
+    /// being cached as a permanent one.
+    fn claim<T>(&self, what: Pending, hit: impl Fn(&mut Inner) -> Option<T>) -> Option<InFlight<'_>> {
+        let mut inner = self.lock();
+        loop {
+            if hit(&mut inner).is_some() {
+                return None;
+            }
+            if !inner.pending.contains(&what) {
+                inner.pending.insert(what.clone());
+                return Some(InFlight { cache: self, what });
+            }
+            let (guard, _) = self
+                .shared
+                .decoded
+                .wait_timeout(inner, PENDING_POLL)
+                .unwrap_or_else(|e| e.into_inner());
+            inner = guard;
+        }
+    }
+
+    /// One decode of `channel`, borrowing this session's shared timestamp
+    /// axes rather than decompressing them again (ruling R232.1).
+    ///
+    /// The union `t` column and the channel's `<source>_t_recorded_us`
+    /// companion are taken from the cache when resident. When they are not,
+    /// **this decode reads them in its own single pass** and hands them back
+    /// in [`FreshDecode::axes`] for the caller to admit --
+    /// `read_channel_sharing_axes` projects the axes alongside the value
+    /// column, so priming the cache costs no extra pass over the file.
+    ///
+    /// It hands them back rather than admitting them itself because an axis
+    /// is pinned by the resident channels that borrow it: an axis admitted
+    /// before its own channel exists would read as unborrowed for as long as
+    /// that gap lasted, and could be evicted by the very eviction pass its
+    /// own insertion triggers. [`SessionCache::channel`] closes the gap by
+    /// admitting the channel and its axes in one lock scope.
+    ///
+    /// A cold axis is claimed before the read (`t` first, then the recorded
+    /// companion -- one order for every caller, so two threads can never
+    /// each hold the axis the other is waiting for), and the claims are
+    /// returned alongside the samples so they outlive the admission rather
+    /// than releasing a waiter onto an axis that is not resident yet. A
+    /// thread that does not win the claim waits for the axis to land and
+    /// then reads only its own column. That is what makes a cold fan-out
+    /// worth doing: the first channel pays for the axes once, and the rest
+    /// decode in parallel against them.
+    ///
+    /// A synthesized `Time`/`Distance`, and any name this file does not
+    /// carry, falls through to the ordinary whole-decode read, which owns
+    /// the answer and the error message for both.
+    #[allow(clippy::type_complexity)]
+    fn decode_borrowing_axes(
+        &self,
+        session_dir: &Path,
+        session_id: &str,
+        channel: &str,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> (Result<FreshDecode, idl_rs::store::parquet::ParquetStoreError>, Vec<InFlight<'_>>) {
+        let index = match read_channel_index(session_dir) {
+            Ok(index) => index,
+            Err(e) => return (Err(e), Vec::new()),
+        };
+        let Some(info) = index.iter().find(|c| c.channel_id == channel) else {
+            let plain = read_channel_with_progress(session_dir, channel, on_progress)
+                .map(|samples| FreshDecode { samples, axes: Vec::new() });
+            return (plain, Vec::new());
+        };
+        let t_key: AxisKey = (session_id.to_string(), "t".to_string());
+        let recorded_key: AxisKey = (session_id.to_string(), recorded_axis_column(&info.source_kind));
+
+        // Claimed in this order by every caller, always: `t`, then the
+        // recorded companion. A second order would let two threads each
+        // wait on the axis the other holds.
+        let mut claims: Vec<InFlight<'_>> = Vec::new();
+        claims.extend(self.claim(Pending::Axis(t_key.clone()), |inner| inner.axis(&t_key)));
+        claims.extend(self.claim(Pending::Axis(recorded_key.clone()), |inner| inner.axis(&recorded_key)));
+        let (held_t, held_recorded) = {
+            let inner = self.lock();
+            (inner.axis(&t_key), inner.axis(&recorded_key))
+        };
+
+        let decoded = read_channel_sharing_axes(
+            session_dir,
+            channel,
+            BorrowedAxes { t: held_t.as_deref(), recorded: held_recorded.as_deref() },
+            on_progress,
+        );
+        let fresh = decoded.map(|decoded| {
+            let mut axes: Vec<(AxisKey, Arc<AxisColumn>)> = Vec::new();
+            if let Some(t) = decoded.t {
+                axes.push((t_key, Arc::new(t)));
+            }
+            if let Some(recorded) = decoded.recorded {
+                axes.push((recorded_key, Arc::new(recorded)));
+            }
+            FreshDecode { samples: decoded.samples, axes }
+        });
+        (fresh, claims)
+    }
+
+    /// How many axis columns this cache has decoded since it was built
+    /// (ruling R232.1's "count reads").
+    pub fn axis_decodes(&self) -> u64 {
+        self.lock().axis_decodes
+    }
+
+    /// Number of resident axis columns, across every session.
+    pub fn axes_len(&self) -> usize {
+        self.lock().axes.len()
     }
 
     /// One `read_channel`, reporting `decode_progress` to the installed sink
@@ -407,22 +679,24 @@ impl SessionCache {
     /// since a ring whose decode failed must stop, not spin.
     ///
     /// With no sink installed this is exactly `read_channel`.
+    #[allow(clippy::type_complexity)]
     fn decode_reporting_progress(
         &self,
         session_dir: &Path,
         session_id: &str,
         channel: &str,
-    ) -> Result<ChannelSamples, idl_rs::store::parquet::ParquetStoreError> {
+    ) -> (Result<FreshDecode, idl_rs::store::parquet::ParquetStoreError>, Vec<InFlight<'_>>) {
         let settings = self.progress();
         let Some(sink) = settings.sink else {
-            return read_channel_with_progress(session_dir, channel, &mut |_, _| {});
+            return self.decode_borrowing_axes(session_dir, session_id, channel, &mut |_, _| {});
         };
+
 
         let started = Instant::now();
         let mut last_sent: Option<Instant> = None;
         let mut last_counts = (0u64, 0u64);
 
-        let result = {
+        let (result, claims) = {
             let mut report = |done: usize, total: usize| {
                 last_counts = (done as u64, total as u64);
                 let now = Instant::now();
@@ -442,7 +716,7 @@ impl SessionCache {
                     finished: false,
                 });
             };
-            read_channel_with_progress(session_dir, channel, &mut report)
+            self.decode_borrowing_axes(session_dir, session_id, channel, &mut report)
         };
 
         if last_sent.is_some() {
@@ -454,7 +728,7 @@ impl SessionCache {
                 finished: true,
             });
         }
-        result
+        (result, claims)
     }
 
     /// Drops every resident channel of `session_id`.
@@ -496,6 +770,59 @@ pub fn install_progress_sink<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         let _ = handle.emit("decode_progress", event);
     });
     app.state::<SessionCache>().set_progress_sink(sink);
+}
+
+/// The pool several channels of one request decode on (ruling R232.2),
+/// built once for the process.
+///
+/// `None` when the pool would not build — a thread-spawn failure on an
+/// exhausted machine — in which case [`SessionCache::channels`] decodes
+/// serially instead, the same degradation the indexing job takes.
+///
+/// Its own pool, not rayon's global one, and the same width the indexing
+/// job uses (`physical cores − 1`, [`worker_count`]): decodes must not
+/// inherit another caller's width, and must not widen past what R208.1
+/// decided this machine can carry. Width is not what bounds memory — the
+/// byte semaphore is, and every worker here reserves through it.
+fn decode_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(worker_count().max(1)).build().ok())
+        .as_ref()
+}
+
+/// One channel's samples and the shared axes this decode had to read to
+/// produce them (ruling R232.1), on their way to being admitted together.
+///
+/// `axes` is empty on the common path -- a session whose axes are already
+/// resident -- and carries one or two entries on the decode that primed
+/// them.
+#[derive(Debug)]
+struct FreshDecode {
+    /// The channel, as the caller asked for it.
+    samples: ChannelSamples,
+    /// The axis entries this decode decoded, keyed ready for the cache.
+    axes: Vec<(AxisKey, Arc<AxisColumn>)>,
+}
+
+/// One thread's claim on a decode, clearing the mark and waking every
+/// waiter when it is dropped (ruling R232.2).
+///
+/// Held for exactly as long as the decode: taken before the estimate, given
+/// back when the entry is resident *or* the decode has failed. A `Drop`
+/// impl rather than an explicit release so an early `?` and an unwinding
+/// panic both free the mark — a leaked mark would park every later caller
+/// for that channel forever.
+#[derive(Debug)]
+struct InFlight<'a> {
+    cache: &'a SessionCache,
+    what: Pending,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.cache.lock().pending.remove(&self.what);
+        self.cache.shared.decoded.notify_all();
+    }
 }
 
 /// One decode's claim on the budget, released when it is dropped (ruling
@@ -624,6 +951,72 @@ impl Inner {
         self.evict_to_budget();
     }
 
+    /// The resident axis for `key`, or `None`. Axes have no LRU position of
+    /// their own — what keeps one alive is a channel that borrows it
+    /// ([`Self::axis_is_borrowed`]), not how recently it was touched.
+    fn axis(&self, key: &AxisKey) -> Option<Arc<AxisColumn>> {
+        self.axes.get(key).cloned()
+    }
+
+    /// Admits a decoded axis, charging its bytes to residency once.
+    ///
+    /// An axis larger than the whole budget is not retained, exactly as an
+    /// oversized channel is not: the decode that produced it already holds
+    /// its `Arc`, and admitting it would evict everything else to hold
+    /// something that still does not fit.
+    fn insert_axis(&mut self, key: AxisKey, axis: Arc<AxisColumn>) {
+        let bytes = axis.resident_bytes() as u64;
+        if bytes > self.budget_bytes || self.axes.contains_key(&key) {
+            return;
+        }
+        self.axes.insert(key.clone(), axis);
+        self.axis_order.push(key);
+        self.resident_bytes += bytes;
+        self.evict_to_budget();
+    }
+
+    /// `true` when some resident channel still reads through the axis
+    /// `key` names — the union `t` of that session, or a
+    /// `<source>_t_recorded_us` whose source kind that channel carries.
+    ///
+    /// …or when a decode that is using it right now still holds its own
+    /// `Arc` — the cache's own handle is the only one when nothing else
+    /// does, so `strong_count > 1` *is* "a decode is reading through this",
+    /// with no bookkeeping to keep in step.
+    ///
+    /// This is R232.1's pin: evicting an axis out from under a resident
+    /// channel would free nothing (the channel's `Arc` on it keeps the
+    /// memory) and would make the next channel of that source decode it
+    /// again, which is the exact cost the ruling exists to remove.
+    fn axis_is_borrowed(&self, key: &AxisKey) -> bool {
+        let (session_id, axis) = key;
+        let Some(resident) = self.axes.get(key) else {
+            return false;
+        };
+        if Arc::strong_count(resident) > 1 {
+            return true;
+        }
+        self.entries.iter().any(|((sid, _), samples)| {
+            sid == session_id && (axis == "t" || *axis == recorded_axis_column(&samples.source_kind))
+        })
+    }
+
+    /// Drops every axis of the sessions no resident channel names any more.
+    fn evict_unborrowed_axes(&mut self) {
+        let stale: Vec<AxisKey> = self.axis_order.iter().filter(|k| !self.axis_is_borrowed(k)).cloned().collect();
+        for key in stale {
+            self.drop_axis(&key);
+        }
+    }
+
+    /// Removes one axis entry and gives its bytes back.
+    fn drop_axis(&mut self, key: &AxisKey) {
+        if let Some(axis) = self.axes.remove(key) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(axis.resident_bytes() as u64);
+        }
+        self.axis_order.retain(|k| k != key);
+    }
+
     /// Drops coldest-first until `resident_bytes <= budget_bytes`.
     ///
     /// Evicting only stops the cache *counting* those bytes: a channel a
@@ -632,12 +1025,20 @@ impl Inner {
     /// shared, immutable data, and it is why the reservation half of
     /// [`SessionCache::reserve`] exists — the in-flight counter bounds what
     /// is actually being allocated right now, which this counter cannot.
+    /// Channels go first, coldest first; an axis is only ever dropped once
+    /// the last channel borrowing it has gone (ruling R232.1), so a source
+    /// whose channels are all resident keeps its axis however tight the
+    /// budget gets.
     fn evict_to_budget(&mut self) {
         while self.resident_bytes > self.budget_bytes && !self.order.is_empty() {
             let coldest = self.order.remove(0);
             if let Some(dropped) = self.entries.remove(&coldest) {
                 self.resident_bytes = self.resident_bytes.saturating_sub(dropped.resident_bytes() as u64);
             }
+            self.evict_unborrowed_axes();
+        }
+        if self.resident_bytes > self.budget_bytes {
+            self.evict_unborrowed_axes();
         }
     }
 
@@ -655,6 +1056,10 @@ impl Inner {
         });
         self.order.retain(|k| keep(k));
         self.resident_bytes = self.resident_bytes.saturating_sub(freed);
+        // A session whose channels are gone has no axis worth keeping —
+        // `data.parquet` is invalidated as a unit, so its axes are as stale
+        // as its channels (ruling R232.1 follows R203.2's rule here).
+        self.evict_unborrowed_axes();
     }
 }
 
@@ -753,9 +1158,11 @@ mod tests {
         // Act
         let samples = cache.channel(&dir, "s1", "A").unwrap();
 
-        // Assert — 100 f64 samples plus 100 i64 timestamps.
+        // Assert — 100 f64 samples plus 100 i64 timestamps, and the
+        // session's shared axes charged once alongside them (R232.1).
         assert_eq!(samples.len(), 100);
-        assert_eq!(cache.resident_bytes(), samples.resident_bytes() as u64);
+        let axes: u64 = cache.lock().axes.values().map(|a| a.resident_bytes() as u64).sum();
+        assert_eq!(cache.resident_bytes(), samples.resident_bytes() as u64 + axes);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -823,9 +1230,11 @@ mod tests {
         // Act
         cache.invalidate_session("s1");
 
-        // Assert
+        // Assert — only s2's channel survives, and only s2's axes with it.
         assert_eq!(cache.len(), 1);
-        assert_eq!(cache.resident_bytes(), kept.resident_bytes() as u64);
+        let axes: u64 = cache.lock().axes.values().map(|a| a.resident_bytes() as u64).sum();
+        assert_eq!(cache.resident_bytes(), kept.resident_bytes() as u64 + axes);
+        assert!(cache.lock().axes.keys().all(|(sid, _)| sid == "s2"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1078,6 +1487,301 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Seeds `session_id` with six `imu0` channels that record hardware
+    /// stamps and two `gps` channels that do not — the shape ruling R232.1
+    /// is about: many channels, few sources, one union axis.
+    fn seed_two_sources(root: &Path, session_id: &str, n: usize) {
+        let channel = |id: &str, source: &str, recorded: bool| Channel {
+            channel_id: id.to_string(),
+            t_us: (0..n).map(|i| i as i64 * 1000).collect(),
+            t_recorded_us: if recorded { Some((0..n).map(|i| i as i64 * 1000 + 7).collect()) } else { None },
+            nominal_rate_hz: 1000.0,
+            column: RawColumn::F64((0..n).map(|i| i as f64).collect()),
+            source_kind: source.to_string(),
+            unit: "m/s".to_string(),
+            gaps: Vec::new(),
+        };
+        let mut channels: Vec<Channel> = (0..6).map(|i| channel(&format!("IMU0_C{i}"), "imu0", true)).collect();
+        channels.push(channel("GPS_SpeedKmh", "gps", false));
+        channels.push(channel("GPS_Alt", "gps", false));
+        let session = Session {
+            session_id: session_id.to_string(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            timestamp_source: TimestampSource::SourceFile,
+            config_checksum: None,
+            source_format: SourceFormat::Fit,
+            blob_sha256: "a".repeat(64),
+            channels,
+        };
+        write_session_parquet(root, &session, "0.1.0").unwrap();
+    }
+
+    #[test]
+    fn channel_six_channels_of_one_source_decode_that_sources_axis_exactly_once() {
+        // Arrange
+        let root = temp_root();
+        seed_two_sources(&root, "s1", 64);
+        let dir = session_dir(&root, "s1");
+        let cache = SessionCache::with_budget(1 << 30);
+
+        // Act
+        for i in 0..6 {
+            cache.channel(&dir, "s1", &format!("IMU0_C{i}")).unwrap();
+        }
+
+        // Assert — ruling R232.1: the union `t` and `imu0_t_recorded_us`,
+        // twice in total, not twelve times.
+        assert_eq!(cache.axis_decodes(), 2);
+        assert_eq!(cache.axes_len(), 2);
+        assert_eq!(cache.len(), 6);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn channel_channels_of_a_second_source_reuse_the_union_axis_and_add_only_their_own() {
+        // Arrange
+        let root = temp_root();
+        seed_two_sources(&root, "s1", 64);
+        let dir = session_dir(&root, "s1");
+        let cache = SessionCache::with_budget(1 << 30);
+
+        // Act
+        cache.channel(&dir, "s1", "IMU0_C0").unwrap();
+        cache.channel(&dir, "s1", "GPS_SpeedKmh").unwrap();
+        cache.channel(&dir, "s1", "GPS_Alt").unwrap();
+
+        // Assert — three axis columns for eight channels: the union `t`
+        // once, and one recorded companion per source (the writer emits one
+        // for every source, C1 §3.2), never one per channel.
+        assert_eq!(cache.axis_decodes(), 3);
+        assert_eq!(cache.axes_len(), 3);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn channel_borrowing_a_shared_axis_returns_the_same_samples_as_decoding_it_alone() {
+        // Arrange — one cache warms the axes, a second decodes each channel
+        // on its own; the two must not disagree by one sample.
+        let root = temp_root();
+        seed_two_sources(&root, "s1", 64);
+        let dir = session_dir(&root, "s1");
+        let shared = SessionCache::with_budget(1 << 30);
+        shared.channel(&dir, "s1", "IMU0_C0").unwrap();
+
+        // Act
+        let borrowed = shared.channel(&dir, "s1", "IMU0_C3").unwrap();
+        let alone = SessionCache::with_budget(1 << 30).channel(&dir, "s1", "IMU0_C3").unwrap();
+
+        // Assert
+        assert_eq!(borrowed.t_us, alone.t_us);
+        assert_eq!(borrowed.t_recorded_us, alone.t_recorded_us);
+        assert_eq!(borrowed.materialize(), alone.materialize());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resident_bytes_counts_every_channel_plus_each_axis_exactly_once() {
+        // Arrange
+        let root = temp_root();
+        seed_two_sources(&root, "s1", 64);
+        let dir = session_dir(&root, "s1");
+        let cache = SessionCache::with_budget(1 << 30);
+
+        // Act
+        let decoded: Vec<Arc<ChannelSamples>> =
+            (0..6).map(|i| cache.channel(&dir, "s1", &format!("IMU0_C{i}")).unwrap()).collect();
+
+        // Assert — six channels plus two axes, each charged once (R232.1).
+        let channels: u64 = decoded.iter().map(|c| c.resident_bytes() as u64).sum();
+        let axes: u64 = cache.lock().axes.values().map(|a| a.resident_bytes() as u64).sum();
+        assert_eq!(cache.resident_bytes(), channels + axes);
+        assert!(axes > 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invalidate_session_drops_that_sessions_axes_alongside_its_channels() {
+        // Arrange
+        let root = temp_root();
+        seed_two_sources(&root, "s1", 64);
+        let dir = session_dir(&root, "s1");
+        let cache = SessionCache::with_budget(1 << 30);
+        cache.channel(&dir, "s1", "IMU0_C0").unwrap();
+        assert_eq!(cache.axes_len(), 2);
+
+        // Act
+        cache.invalidate_session("s1");
+
+        // Assert — `data.parquet` is invalidated as a unit, so its axes are
+        // as stale as its channels.
+        assert_eq!(cache.axes_len(), 0);
+        assert_eq!(cache.resident_bytes(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn evict_to_budget_never_drops_an_axis_a_resident_channel_still_borrows() {
+        // Arrange — a budget tight enough to force eviction of channels.
+        let root = temp_root();
+        seed_two_sources(&root, "s1", 64);
+        let dir = session_dir(&root, "s1");
+        let sized = SessionCache::with_budget(1 << 30);
+        let one = sized.channel(&dir, "s1", "IMU0_C0").unwrap().resident_bytes() as u64;
+        let estimate = with_estimate_margin(estimate_channel_bytes(&dir, "IMU0_C0").unwrap());
+        let cache = SessionCache::with_budget((one * 2).max(estimate));
+
+        // Act
+        for i in 0..6 {
+            cache.channel(&dir, "s1", &format!("IMU0_C{i}")).unwrap();
+        }
+
+        // Assert — channels were evicted, but every resident channel still
+        // has the axis it reads through (ruling R232.1's pin), so no later
+        // channel of this source re-decodes it.
+        assert!(cache.len() < 6);
+        assert!(cache.len() > 0);
+        assert_eq!(cache.axes_len(), 2);
+        assert_eq!(cache.axis_decodes(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn channels_a_cold_fan_out_under_a_budget_that_forces_eviction_still_decodes_each_axis_once() {
+        // Arrange — six channels of one source against a budget holding
+        // barely two of them, decoded in parallel. This is the shape that
+        // used to lose a freshly decoded axis: it was admitted before the
+        // channel that borrows it existed, so the eviction its own insertion
+        // triggered saw it as unborrowed and could drop it, and the next
+        // channel of the source paid for it again (ruling R232.1's pin).
+        let root = temp_root();
+        seed_two_sources(&root, "s1", 512);
+        let dir = session_dir(&root, "s1");
+        let sized = SessionCache::with_budget(1 << 30);
+        let one = sized.channel(&dir, "s1", "IMU0_C0").unwrap().resident_bytes() as u64;
+        let estimate = with_estimate_margin(estimate_channel_bytes(&dir, "IMU0_C0").unwrap());
+        let cache = SessionCache::with_budget((one * 2).max(estimate));
+        let names: Vec<String> = (0..6).map(|i| format!("IMU0_C{i}")).collect();
+        let wanted: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+
+        // Act
+        let got = cache.channels(&dir, "s1", &wanted);
+
+        // Assert — every channel served, eviction did its job, and the two
+        // axes were still read exactly once between all six workers.
+        assert!(got.iter().all(|r| r.is_ok()));
+        assert!(cache.len() < 6);
+        assert_eq!(cache.axis_decodes(), 2);
+        assert!(cache.resident_bytes() <= cache.budget_bytes());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn channels_a_batch_of_cold_channels_decodes_each_exactly_once_and_returns_them_in_order() {
+        // Arrange
+        let root = temp_root();
+        seed_two_sources(&root, "s1", 64);
+        let dir = session_dir(&root, "s1");
+        let cache = SessionCache::with_budget(1 << 30);
+        let names: Vec<String> = (0..6).map(|i| format!("IMU0_C{i}")).collect();
+        let wanted: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+
+        // Act
+        let got = cache.channels(&dir, "s1", &wanted);
+
+        // Assert — one entry per request, in order, and the axes still
+        // decoded twice between all six workers (rulings R232.1, R232.2).
+        assert_eq!(got.len(), 6);
+        assert!(got.iter().all(|r| r.is_ok()));
+        assert_eq!(cache.len(), 6);
+        assert_eq!(cache.axis_decodes(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn channels_one_unknown_name_fails_only_its_own_slot() {
+        // Arrange
+        let root = temp_root();
+        seed_two_sources(&root, "s1", 64);
+        let dir = session_dir(&root, "s1");
+        let cache = SessionCache::with_budget(1 << 30);
+
+        // Act
+        let got = cache.channels(&dir, "s1", &["IMU0_C0", "NopeChannel", "GPS_Alt"]);
+
+        // Assert — one unknown name in a notebook must not cost the others
+        // their samples.
+        assert!(got[0].is_ok());
+        assert_eq!(got[1].as_ref().unwrap_err().kind, IpcErrorKind::NotFound);
+        assert!(got[2].is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn channel_eight_threads_racing_for_one_cold_channel_decode_it_exactly_once() {
+        // Arrange — a recording sink with no delay, so every decode that
+        // actually runs leaves exactly one `finished` event behind.
+        let root = temp_root();
+        seed_two_sources(&root, "s1", 4096);
+        let dir = session_dir(&root, "s1");
+        let cache = SessionCache::with_budget(1 << 30);
+        let (sink, seen) = recording_sink();
+        cache.set_progress_sink_with_timings(sink, Duration::ZERO, Duration::ZERO);
+
+        // Act
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                let dir = dir.clone();
+                std::thread::spawn(move || cache.channel(&dir, "s1", "IMU0_C0").map(|s| s.len()))
+            })
+            .collect();
+        let lengths: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap().unwrap()).collect();
+
+        // Assert — one decode, many waiters (ruling R232.2).
+        let finished = seen.lock().unwrap().iter().filter(|e| e.finished && e.channel == "IMU0_C0").count();
+        assert_eq!(finished, 1);
+        assert_eq!(lengths, vec![4096; 8]);
+        assert_eq!(cache.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn decode_progress_a_decode_that_reads_its_axes_first_reports_monotonically_to_its_total() {
+        // Arrange — nothing resident, so this decode makes three passes:
+        // the union axis, the recorded companion, then its own column.
+        let root = temp_root();
+        seed_two_sources(&root, "s1", 4096);
+        let cache = SessionCache::with_budget(1 << 30);
+        let (sink, seen) = recording_sink();
+        cache.set_progress_sink_with_timings(sink, Duration::ZERO, Duration::ZERO);
+
+        // Act
+        cache.channel(&session_dir(&root, "s1"), "s1", "IMU0_C0").unwrap();
+
+        // Assert — ruling R232.3: one ring, advancing over real work, never
+        // restarting at a column boundary.
+        let events = seen.lock().unwrap().clone();
+        assert!(events.len() >= 2);
+        assert!(events.windows(2).all(|w| w[1].done_rows >= w[0].done_rows));
+        assert!(events.iter().all(|e| e.done_rows <= e.total_rows));
+        let last = events.last().unwrap();
+        assert!(last.finished);
+        assert_eq!(last.done_rows, last.total_rows);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn invalidate_all_drops_every_session() {
         // Arrange
@@ -1098,3 +1802,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+

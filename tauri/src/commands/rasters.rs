@@ -396,6 +396,10 @@ pub fn fetch_raster_via(
         "histogram2d" => {
             let p = parse_histogram2d_params(params)?;
             check_bins_match_pixels(&p, width, height)?;
+            // Both axes at once, on the decode pool (ruling R232.2): a
+            // histogram2d cannot draw a pixel until it has both, so paying
+            // for them back to back buys nothing.
+            cache.prefetch(&session_dir(data_dir, session_id), session_id, &[channel, p.y_channel.as_str()]);
             let x_ch = raster_channel(cache, data_dir, session_id, channel)?;
             let y_ch = raster_channel(cache, data_dir, session_id, &p.y_channel)?;
             let xs = windowed_samples(&x_ch, span);
@@ -478,6 +482,10 @@ pub fn fetch_raster_meta_via(
         "histogram2d" => {
             let p = parse_histogram2d_params(params)?;
             check_bins_match_pixels(&p, width, height)?;
+            // Both axes at once, on the decode pool (ruling R232.2): a
+            // histogram2d cannot draw a pixel until it has both, so paying
+            // for them back to back buys nothing.
+            cache.prefetch(&session_dir(data_dir, session_id), session_id, &[channel, p.y_channel.as_str()]);
             let x_ch = raster_channel(cache, data_dir, session_id, channel)?;
             let y_ch = raster_channel(cache, data_dir, session_id, &p.y_channel)?;
             let xs = windowed_samples(&x_ch, span);
@@ -942,11 +950,19 @@ mod tests {
     fn fetch_raster_via_a_window_narrows_the_spectrogram_to_that_span_not_the_whole_session() {
         // Arrange — the same channel, once session-wide and once over the
         // first half of the recording.
+        //
+        // `seed_session` records **128 samples at 64 Hz**, so the session
+        // spans 0 .. 127/64 s = 1_984_375 us, not 64 s. A half-session
+        // window is therefore ~1_000_000 us; the 32_000_000 us this test
+        // first asked for was sixteen times the whole recording, so the
+        // "windowed" request resolved to the entire session and the two
+        // domains were identical by construction. 1_000_000 us keeps 64
+        // samples, which is still four window_size=32 / hop_size=16 frames.
         let root = temp_root();
         seed_session(&root);
         let window = WindowDto {
             session_id: "s1".to_string(),
-            span: SpanDto::Range { t0_us: 0, t1_us: 32_000_000 },
+            span: SpanDto::Range { t0_us: 0, t1_us: 1_000_000 },
             colour: "--chart-1".to_string(),
         };
 

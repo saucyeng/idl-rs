@@ -2320,6 +2320,7 @@ dependencies = [
  "idl-rs",
  "idl-transport",
  "notify",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",
