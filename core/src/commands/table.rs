@@ -279,9 +279,10 @@ pub const VERBS_RULED: &[(&str, &str)] = &[
     ("wire", "R236"),
     ("synth", "R187"),
     // Not `R192`: that ruling adopted the calibration *design*, and said
-    // nothing about the CLI vocabulary. The verb itself was granted by the
-    // M6.3 task brief, which is the narrower and more honest citation.
-    ("calibrate", "M6.3 brief"),
+    // nothing about the CLI vocabulary. The verb was granted by the M6.3
+    // task brief and numbered R238 after the fact, so that the app's copy of
+    // this table (which accepts only numbered rulings) agrees with core.
+    ("calibrate", "R238"),
 ];
 
 /// Whether `verb` is in either vocabulary.
@@ -597,7 +598,7 @@ pub const COMMANDS: &[CommandRow] = &[
         )],
         core_fn: "calibration::rigid::calibrate",
         json_shape: Some("CalibrationReport"),
-        help: "Fit the rigid-body IMU calibration to a held-in-the-air session (ruling M6.3 brief)",
+        help: "Fit the rigid-body IMU calibration to a held-in-the-air session (ruling R238)",
         tier: Tier::Rare,
         status: Status::Current,
         data_dir: false,
@@ -993,14 +994,13 @@ mod tests {
 
     #[test]
     fn every_ruled_verb_names_the_ruling_that_added_it() {
-        // Arrange — a verb is granted either by a numbered ruling (`R229`) or
-        // by the task brief that commissioned it (`M6.3 brief`), which is how
-        // `calibrate` arrived. Anything else names nothing and is the thing
-        // this test exists to catch.
+        // Arrange — a verb is granted only by a numbered ruling (`R229`);
+        // the app's `cliTable.test.ts` enforces the same rule on the
+        // generated copy, so the two must agree. Anything else names
+        // nothing and is the thing this test exists to catch.
         let rows = VERBS_RULED;
         let names_a_source = |ruling: &str| {
             ruling.starts_with('R') && ruling[1..].starts_with(|c: char| c.is_ascii_digit())
-                || ruling.ends_with(" brief")
         };
 
         // Act
