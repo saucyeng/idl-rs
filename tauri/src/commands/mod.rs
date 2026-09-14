@@ -17,6 +17,7 @@ pub mod rasters;
 pub mod rebuild;
 pub mod gps;
 pub mod scatter;
+pub mod seams;
 pub mod sync;
 pub mod tiles;
 pub mod workbook;

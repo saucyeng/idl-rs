@@ -201,6 +201,30 @@ pub fn correct_burst_seams(stamps: &[i64], nominal_period_us: i64) -> SeamCorrec
     SeamCorrection { corrected_us: corrected, effective_period_us, warnings }
 }
 
+/// Burst-boundary spans on the **corrected** time axis (contract C1 §3.3,
+/// C3 §3.5 `fetch_seams`): one `(start_us, end_us)` pair per burst seam,
+/// `start_us` the corrected time of the last sample before the seam and
+/// `end_us` the corrected time of the first sample after it.
+///
+/// The correction itself leaves no sentinel in the corrected samples (C1
+/// §3.3 does not touch `gaps`), so a reader cannot tell where a burst
+/// boundary fell without re-detecting it — this function re-runs [step
+/// 1](detect_bursts) against the **verbatim recorded** stamps (never the
+/// corrected ones, whose within-burst spacing is now uniform and would hide
+/// the seam) and reports each boundary's corrected-axis extent.
+///
+/// `recorded_us` and `corrected_us` must be the same length and in the same
+/// sample order (`corrected_us` is normally `correct_burst_seams`'s own
+/// output run on `recorded_us`). Fewer than 2 samples: no boundary to find,
+/// returns empty.
+pub fn seam_spans(recorded_us: &[i64], corrected_us: &[i64], nominal_period_us: i64) -> Vec<(i64, i64)> {
+    if recorded_us.len() < 2 || recorded_us.len() != corrected_us.len() {
+        return Vec::new();
+    }
+    let bursts = detect_bursts(recorded_us, nominal_period_us);
+    bursts.windows(2).map(|w| (corrected_us[w[0].end], corrected_us[w[1].start])).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +370,45 @@ mod tests {
         // Assert — strictly increasing end to end, including the seam the
         // fallback exists to protect (8000 -> 8150, not 8000 -> 6725).
         assert!(result.corrected_us.windows(2).all(|w| w[1] > w[0]));
+    }
+
+    #[test]
+    fn seam_spans_worked_example_reports_one_span_per_burst_boundary_on_the_corrected_axis() {
+        // Arrange — same recorded stamps and correction as the C1 §3.3
+        // worked example (4 bursts of N=4 -> 3 seams).
+        let recorded = vec![
+            96250, 97500, 98750, 100000, //
+            101050, 102300, 103550, 104800, //
+            105850, 107100, 108350, 109600, //
+            110650, 111900, 113150, 114400,
+        ];
+        let corrected = correct_burst_seams(&recorded, 1250).corrected_us;
+
+        // Act
+        let spans = seam_spans(&recorded, &corrected, 1250);
+
+        // Assert — one span per seam, each bounded by the corrected times of
+        // the samples either side of the recorded-stamp discontinuity.
+        assert_eq!(spans, vec![(100000, 101200), (104800, 106000), (109600, 110800)]);
+    }
+
+    #[test]
+    fn seam_spans_clean_stream_no_bursts_detected_is_empty() {
+        // Arrange — every delta exactly nominal: one burst, no boundary.
+        let nominal = 1250i64;
+        let stamps: Vec<i64> = (0..10).map(|i| 100_000 + i * nominal).collect();
+
+        // Act
+        let spans = seam_spans(&stamps, &stamps, nominal);
+
+        // Assert
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn seam_spans_fewer_than_two_samples_is_empty() {
+        // Arrange / Act / Assert
+        assert!(seam_spans(&[], &[], 1250).is_empty());
+        assert!(seam_spans(&[42], &[42], 1250).is_empty());
     }
 }

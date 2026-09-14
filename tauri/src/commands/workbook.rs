@@ -19,7 +19,9 @@ use idl_rs::session::handle::{SessionHandle, SessionMetaInput};
 use idl_rs::store::atomic::{sha256_hex, write_atomic, AtomicWriteErrorKind};
 use idl_rs::table::{evaluate_table_multi, plan_rows, resolve_baseline_row, WindowLaps};
 use idl_rs::workbook::v3::front_matter::{parse_front_matter, render_front_matter, FrontMatter};
-use idl_rs::workbook::v3::{parse_workbook, render_prose_html, CellDoc, CellError, CellKindToken, WorkbookError};
+use idl_rs::workbook::v3::{
+    parse_workbook, render_prose_html, render_workbook, CellDoc, CellError, CellKindToken, WorkbookError,
+};
 
 use crate::error::{IpcError, IpcErrorKind};
 use crate::session_cache::SessionCache;
@@ -898,13 +900,24 @@ fn table_cell_value(
     Some(serde_json::json!({ "model": planned, "results": results }))
 }
 
+/// The `evaluated_with` front-matter key (C2 §1, ruling R237): a bare
+/// semver string, written by `save_workbook_via` alone, naming the engine
+/// build that produced the bytes on disk. Matches `app/src`'s
+/// `EVALUATED_WITH_KEY` (`engineVersionBanner.ts`) and `idl_rs::VERSION`
+/// (`fetchEngineVersion`/`commands::engine_version`) — the version banner
+/// compares this key's value against the *engine's* version, never an app
+/// build number, so this writes only that one string, not an `{app,
+/// engine}` mapping.
+const EVALUATED_WITH_KEY: &str = "evaluated_with";
+
 /// Transport-agnostic core of `save_workbook`. Order of operations (C4 §4):
 /// resolve the target, parse (an `Err` writes nothing), migrate any retired
-/// function name to its current spelling (R151 item 9), hash, register the
-/// expected hash **before** the write (step 3's load-bearing ordering), then
-/// `write_atomic`. `hash` and the written bytes are always the *migrated*
-/// markdown — a caller-supplied `based_on_hash` still refers to the file's
-/// previous on-disk bytes, never to this call's own input.
+/// function name to its current spelling (R151 item 9), stamp
+/// `evaluated_with`, hash, register the expected hash **before** the write
+/// (step 3's load-bearing ordering), then `write_atomic`. `hash` and the
+/// written bytes are always the *migrated, stamped* markdown — a
+/// caller-supplied `based_on_hash` still refers to the file's previous
+/// on-disk bytes, never to this call's own input.
 fn save_workbook_via(
     data_dir: &Path,
     hashes: &ExpectedHashSet,
@@ -930,6 +943,26 @@ fn save_workbook_via(
     // `version: 3`). `doc.id`/`doc.name` above are unaffected by a rename, so
     // the target-resolution step below still uses the original parse.
     let (markdown, migrations) = idl_rs::math::migrate_document(markdown);
+
+    // Step 1c (C2 §1, ruling R237): stamp `evaluated_with` with the engine
+    // build writing this file — an advisory front-matter key (R135, exactly
+    // like `graph`) nothing in the parser/evaluator ever reads. Every
+    // explicit save is "an explicit save" in decision 62's sense, so this
+    // is unconditional, not gated on whether an evaluation actually ran
+    // this session — the value is always the *current* engine, so a save
+    // right after opening an already-current workbook is a no-op write.
+    // Reparsed on the post-migration text so the stamped document reflects
+    // the exact bytes about to hit disk; migration never touches front
+    // matter, so this reparse cannot disagree with Step 1's own `doc`.
+    let markdown = {
+        let (mut post_doc, _) = parse_workbook(&markdown).map_err(|_| {
+            IpcError::new(IpcErrorKind::InvalidArgument, "workbook markdown front matter failed to parse")
+        })?;
+        post_doc
+            .front_matter_unknown
+            .insert(EVALUATED_WITH_KEY.to_string(), serde_yaml_ng::Value::String(idl_rs::VERSION.to_string()));
+        render_workbook(&post_doc)
+    };
     let markdown = markdown.as_str();
 
     // Step 2: resolve the target. `id` matches an existing workbook (path or
@@ -1862,6 +1895,70 @@ mod tests {
         assert_eq!(rows[0].file_name, "Fork tuning");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_workbook_via_stamps_evaluated_with_the_engine_version() {
+        // Arrange — no `evaluated_with` key in the authored markdown.
+        let root = temp_root();
+        let hashes = ExpectedHashSet::new();
+        let markdown = two_cell_markdown();
+        assert!(!markdown.contains("evaluated_with"));
+
+        // Act
+        save_workbook_via(&root, &hashes, WB_ID, &markdown, None).unwrap();
+
+        // Assert — the written file carries the key with the live engine's
+        // own version (matching `commands::engine_version`), and still
+        // parses.
+        let path = root.join("workbooks").join("Fork tuning.idl1wb");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains(&format!("evaluated_with: {}", idl_rs::VERSION)));
+        let (doc, _) = parse_workbook(&on_disk).unwrap();
+        assert_eq!(
+            doc.front_matter_unknown.get("evaluated_with"),
+            Some(&serde_yaml_ng::Value::String(idl_rs::VERSION.to_string()))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_workbook_via_overwrites_a_stale_evaluated_with_from_an_older_build() {
+        // Arrange — a file that already carries a different build's stamp
+        // (e.g. synced from a peer on an older engine).
+        let root = temp_root();
+        let hashes = ExpectedHashSet::new();
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Fork tuning\nversion: 3\nevaluated_with: 0.0.1-old\n---\n\n\
+             ```math id=aaaaaaaa\nx = 1\n```\n"
+        );
+
+        // Act
+        save_workbook_via(&root, &hashes, WB_ID, &markdown, None).unwrap();
+
+        // Assert
+        let path = root.join("workbooks").join("Fork tuning.idl1wb");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("0.0.1-old"));
+        assert!(on_disk.contains(&format!("evaluated_with: {}", idl_rs::VERSION)));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_workbook_an_old_file_with_no_evaluated_with_key_still_parses() {
+        // Arrange — a file predating ruling R237, no `evaluated_with` key at
+        // all (R135: an absent unrecognised key is simply absent, never an
+        // error).
+        let markdown = two_cell_markdown();
+
+        // Act
+        let (doc, structural) = parse_workbook(&markdown).unwrap();
+
+        // Assert
+        assert!(structural.is_empty());
+        assert_eq!(doc.front_matter_unknown.get("evaluated_with"), None);
     }
 
     #[test]

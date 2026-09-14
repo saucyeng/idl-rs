@@ -88,6 +88,7 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::gps::fetch_gps_trace_v2,
         commands::gps::fetch_gps_trace_meta,
         commands::tiles::fetch_tile,
+        commands::seams::fetch_seams,
         commands::import::list_importers,
         commands::import::import_file,
         commands::library::set_session_start,
