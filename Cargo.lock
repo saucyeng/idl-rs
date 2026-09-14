@@ -2323,6 +2323,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha2",
  "sysinfo",
  "tauri",
