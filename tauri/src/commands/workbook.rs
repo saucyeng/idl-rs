@@ -1654,11 +1654,26 @@ mod tests {
         // Assert — ledger R48: the file name comes from front matter `name`
         // ("Fork tuning", `two_cell_markdown`'s fixture), sanitised, never
         // from `id`.
-        assert_eq!(result.hash, sha256_hex(markdown.as_bytes()));
+        // `SaveResult.hash` is the hash of the bytes on disk, which since
+        // ruling R237 carry the `evaluated_with` stamp and so differ from
+        // the input markdown.
         let target = root.join("workbooks").join("Fork tuning.idl1wb");
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), markdown);
+        let on_disk = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(result.hash, sha256_hex(on_disk.as_bytes()));
+        assert_eq!(evaluated_with_of(&on_disk).as_deref(), Some(idl_rs::VERSION));
+        assert!(on_disk.contains("Fork tuning"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `evaluated_with` front-matter value of a rendered workbook, if
+    /// present — what the R237 stamp leaves on disk.
+    fn evaluated_with_of(markdown: &str) -> Option<String> {
+        let (doc, _) = parse_workbook(markdown).unwrap();
+        match doc.front_matter_unknown.get(EVALUATED_WITH_KEY) {
+            Some(serde_yaml_ng::Value::String(v)) => Some(v.clone()),
+            _ => None,
+        }
     }
 
     #[test]
@@ -1987,17 +2002,20 @@ mod tests {
         let h1 = save_workbook_via(&root, &hashes, WB_ID, &v1, None).unwrap().hash;
         let target = root.join("workbooks").join("Fork tuning.idl1wb");
         let v2 = format!("{v1}\n<!-- edited -->\n");
-        let h2 = sha256_hex(v2.as_bytes());
 
         // Act
         let result = save_workbook_via(&root, &hashes, WB_ID, &v2, Some(&h1)).unwrap();
 
-        // Assert — the expected-hash set already held h2 before the write
-        // happened (C4 §4 step 3): a self-write callback checking right now
-        // would see it.
+        // Assert — the expected-hash set already held the new on-disk hash
+        // before the write happened (C4 §4 step 3): a self-write callback
+        // checking right now would see it. The on-disk bytes are the input
+        // plus the R237 `evaluated_with` stamp, so hash the file, not `v2`.
+        let on_disk = std::fs::read_to_string(&target).unwrap();
+        let h2 = sha256_hex(on_disk.as_bytes());
         assert!(hashes.check_and_consume(&target, &h2));
         assert_eq!(result.hash, h2);
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), v2);
+        assert!(on_disk.contains("<!-- edited -->"));
+        assert_eq!(evaluated_with_of(&on_disk).as_deref(), Some(idl_rs::VERSION));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2083,9 +2101,11 @@ mod tests {
         // Act
         let result = save_workbook_via(&root, &hashes, WB_ID, &markdown, None).unwrap();
 
-        // Assert
+        // Assert — the hash is of the stamped bytes on disk (R237), so a
+        // migration-free save still differs from the input by that key.
         assert!(result.migrations.is_empty());
-        assert_eq!(result.hash, sha256_hex(markdown.as_bytes()));
+        let on_disk = std::fs::read_to_string(root.join("workbooks").join("Fork tuning.idl1wb")).unwrap();
+        assert_eq!(result.hash, sha256_hex(on_disk.as_bytes()));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2678,7 +2698,11 @@ version: 3
         // function `save_workbook_via` used for `SaveResult.hash`.
         let event = rx.recv_timeout(std::time::Duration::from_millis(1000)).expect("callback fired");
         assert_eq!(event.hash, save_result.hash);
-        assert_eq!(event.hash, sha256_hex(edited.as_bytes()));
+        // The bytes on disk are `edited` plus the R237 `evaluated_with`
+        // stamp; both hashes are of those bytes, not of `edited`.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(event.hash, sha256_hex(on_disk.as_bytes()));
+        assert!(on_disk.contains("x = 2"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
