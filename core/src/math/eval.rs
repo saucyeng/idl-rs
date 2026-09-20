@@ -522,8 +522,9 @@ pub(crate) fn elemwise(
         (Value::Channel(a), Value::Channel(b)) => {
             // Shape before rate: a `[lap]` value has no sample rate, so
             // combining one with a time series otherwise reports "different
-            // sample rates (0 Hz vs 100 Hz). Use resample()" — advice that
-            // cannot work, for a mismatch that is not about rates at all.
+            // sample rates (0 Hz vs 100 Hz). resample() will match rates
+            // first" — advice that cannot work yet, for a mismatch that is
+            // not about rates at all.
             let axis = require_same_shape(op_name, &a, &b)?;
             let t_us = combine_t_us(op_name, &a.t_us, &b.t_us)?;
             let mut out = Vec::with_capacity(a.samples.len());
@@ -583,15 +584,15 @@ fn require_same_shape(
 ) -> Result<ValueAxis, MathEvalError> {
     // Shape before rate: a `[lap]` value has no sample rate, so combining one
     // with a time series otherwise reports "different sample rates (0 Hz vs
-    // 100 Hz). Use resample()" — advice that cannot work, for a mismatch that
-    // is not about rates at all.
+    // 100 Hz). resample() will match rates first" — advice that cannot work
+    // yet, for a mismatch that is not about rates at all.
     let axis = combine_axis(op_name, a.axis, b.axis)?;
     if a.sample_rate_hz != b.sample_rate_hz {
         return Err(err(
             MathEvalErrorKind::Runtime,
             format!(
                 "Cannot \"{op_name}\" channels with different sample rates ({} Hz vs {} Hz). \
-                 Use resample() to match rates first.",
+                 resample() will match rates first (not yet implemented; arrives under R242).",
                 a.sample_rate_hz, b.sample_rate_hz
             ),
         ));
