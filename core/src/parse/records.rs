@@ -418,6 +418,12 @@ pub fn imu_index_of(name: &str) -> Option<usize> {
 /// copies of the first value; interior drops are linearly interpolated in raw
 /// `i16` space between the bracketing real samples; the tail is padded to
 /// `target_len` with held copies of the last value. Design §4.2.
+///
+/// Since ruling R241 the plan passes each IMU's **own** occupied length as
+/// `target_len`, so the tail branch is a no-op on the import path: a stream
+/// ends at its last recorded sample. The branch stays because the function is
+/// public and its contract ("pad to `target_len`") is what a caller asking for
+/// a longer grid would still get.
 pub fn rebuild_i16(
     raw: &[i16],
     gaps_received: &[(usize, usize)],
@@ -464,8 +470,10 @@ pub fn rebuild_i16(
 }
 
 /// Builds the grid-slot [`GapSpan`] list for one IMU from its leading pad, drop
-/// list, occupied length, and the session-wide `target_len`. Shared across the
-/// IMU's six axes. Design §4.2/§4.3.
+/// list, occupied length, and the grid length `target_len`. Shared across the
+/// IMU's six axes. Design §4.2/§4.3. With `target_len == occupied` — what the
+/// plan passes since ruling R241 — there is no trailing span, because there is
+/// no trailing pad to mark.
 pub fn build_spans(
     leading: usize,
     gaps_received: &[(usize, usize)],
@@ -492,10 +500,22 @@ pub fn build_spans(
 /// Drop-reconciliation plan for the three IMUs, derived from each IMU's
 /// **burst-seam-corrected** stamp sequence (contract C1 §3.3 — gap detection
 /// runs on the corrected grid, never the nominal one; C1 §3.3/§8 item 1,
-/// ruled). Anchors a single grid at the earliest corrected first-sample
-/// across every reconciled IMU (`t0`, absolute device-clock domain — the
-/// caller subtracts the session-wide origin uniformly afterward, the same
-/// way it already does for every non-IMU channel).
+/// ruled). Anchors each IMU's leading pad at the earliest corrected
+/// first-sample across every reconciled IMU (`t0`, absolute device-clock
+/// domain — the caller subtracts the session-wide origin uniformly afterward,
+/// the same way it already does for every non-IMU channel).
+///
+/// **The grid is shared at its start, not at its end (ruling R241).** Every
+/// IMU's slot 0 still sits at `t0`, so the three streams remain index-aligned
+/// from the front; but each ends at its own last recorded sample. The old
+/// session-wide length padded an IMU that stopped early out to the longest
+/// stream's, with a forward-extrapolated tail that pushed `duration_ms` and
+/// the union `t` axis past the end of the recording (up to ~52 s on a real
+/// session). The leading pad is kept: it is bounded by the spread of the
+/// IMUs' start instants — one FIFO drain, milliseconds — where the tail was
+/// bounded by nothing, and dropping it would also drop the front-of-stream
+/// index alignment C1 §3.3's reconciliation premise still rests on. Both
+/// pads are marked in `gaps` either way.
 pub struct ImuGridPlan {
     /// Per-IMU corrected period (µs): `effective_period_us` from seam
     /// correction, or `nominal_period_us` when unreconciled.
@@ -504,8 +524,13 @@ pub struct ImuGridPlan {
     leading: [usize; 3],
     /// Whether each IMU has ≥2 samples and is therefore reconciled.
     reconciled: [bool; 3],
-    /// Session-wide grid length — the max occupied length across reconciled IMUs.
-    target_len: usize,
+    /// Per-IMU grid length: that IMU's own occupied length — leading pad +
+    /// received samples + interior fills — and nothing beyond it (ruling
+    /// R241). There is no session-wide length: an IMU that stopped early
+    /// ends at its own last recorded sample rather than being padded out to
+    /// the longest stream's, which used to put up to ~52 s of synthesized
+    /// tail into `duration_ms` and the union `t` axis.
+    grid_len: [usize; 3],
     /// Per-IMU drop list `(received_index, missing)`, used by the rebuild.
     gaps_received: [Vec<(usize, usize)>; 3],
     /// Per-IMU grid-slot gap spans, shared across that IMU's six axes.
@@ -589,11 +614,14 @@ impl ImuGridPlan {
             occupied[i] = leading[i] + corrected[i].len() + total_missing;
         }
 
-        let target_len = occupied.iter().copied().max().unwrap_or(0);
+        // No session-wide `target_len` (R241): each IMU's grid is exactly its
+        // own occupied length, so `build_spans` never appends a trailing span
+        // and the rebuilds never pad past the last real sample.
+        let grid_len = occupied;
         let mut spans: [Vec<GapSpan>; 3] = Default::default();
         for i in 0..3 {
             if reconciled[i] {
-                spans[i] = build_spans(leading[i], &gaps_received[i], occupied[i], target_len);
+                spans[i] = build_spans(leading[i], &gaps_received[i], occupied[i], grid_len[i]);
             }
         }
 
@@ -601,11 +629,11 @@ impl ImuGridPlan {
             period_us,
             leading,
             reconciled,
-            target_len,
             gaps_received,
             spans,
             corrected,
             raw,
+            grid_len,
         }
     }
 
@@ -628,14 +656,14 @@ impl ImuGridPlan {
         match imu_index_of(name) {
             Some(i) if self.reconciled[i] => {
                 let t_us = slot_times_from_corrected(
-                    &self.corrected[i], &self.gaps_received[i], self.leading[i], self.target_len, self.period_us[i],
+                    &self.corrected[i], &self.gaps_received[i], self.leading[i], self.grid_len[i], self.period_us[i],
                 );
                 let t_recorded_us = rebuild_i64_grid_or_real(
-                    &self.raw[i], &self.gaps_received[i], self.leading[i], self.target_len, &t_us,
+                    &self.raw[i], &self.gaps_received[i], self.leading[i], self.grid_len[i], &t_us,
                 );
                 match column {
                     RawColumn::I16 { data, scale, offset } => {
-                        let rebuilt = rebuild_i16(&data, &self.gaps_received[i], self.leading[i], self.target_len);
+                        let rebuilt = rebuild_i16(&data, &self.gaps_received[i], self.leading[i], self.grid_len[i]);
                         (RawColumn::I16 { data: rebuilt, scale, offset }, t_us, t_recorded_us, self.spans[i].clone())
                     }
                     // IMU axes are always compact i16 on the parse path; pass any
@@ -661,9 +689,11 @@ impl ImuGridPlan {
 ///   the corrected stamps bracketing the drop, so `t_us` stays monotone across
 ///   the dropout and each fill sits between its neighbours;
 /// - the **leading** pad extrapolates backward from the first corrected stamp
-///   at `period_us`, and the **trailing** pad forward from the last one — there
-///   is no bracketing stamp on those edges, exactly as `rebuild_i16` has no
-///   bracketing value there.
+///   at `period_us`, and the **trailing** pad (when a caller asks for a grid
+///   longer than the stream — not the import path since ruling R241, where
+///   `target_len` is the stream's own occupied length) forward from the last
+///   one — there is no bracketing stamp on those edges, exactly as
+///   `rebuild_i16` has no bracketing value there.
 ///
 /// A final pass enforces C1 §3.5 invariant 1 (strictly increasing `t_us`): a
 /// slot that does not advance past its predecessor is clamped to
@@ -711,8 +741,9 @@ fn slot_times_from_corrected(
         out.push(corrected[k]);
     }
 
-    // Tail pad: forward extrapolation from the last corrected stamp out to the
-    // session-wide grid length.
+    // Tail pad: forward extrapolation from the last corrected stamp out to
+    // `target_len`. Dead on the import path since R241 (`target_len` is this
+    // stream's own length there); see this function's doc.
     if out.len() < target_len {
         let last = *corrected.last().unwrap_or(&first);
         let occupied = out.len();
@@ -1002,10 +1033,10 @@ mod tests {
     }
 
     #[test]
-    fn plan_makes_two_imus_with_different_drops_equal_length() {
+    fn plan_gives_each_imu_its_own_length_rather_than_padding_to_the_longest() {
         // Arrange — IMU0: 4 corrected stamps with a 2-sample gap between
         // received index 0 and 1 (occupied 6). IMU1: 5 received, no drops
-        // (occupied 5). target = 6.
+        // (occupied 5). Ruling R241: no shared target — 6 and 5.
         let corrected = [
             vec![0i64, 3000, 4000, 5000],
             vec![0i64, 1000, 2000, 3000, 4000],
@@ -1023,9 +1054,10 @@ mod tests {
             RawColumn::I16 { data: vec![1, 2, 3, 4, 5], scale: 1.0, offset: 0.0 },
         );
 
-        // Assert — both rebuilt to the shared grid length 6 (IMU1 tail-padded).
+        // Assert — each rebuilt to its own occupied length: IMU0's interior
+        // fills count, IMU1 gets no tail it never recorded.
         assert_eq!(c0.len(), 6);
-        assert_eq!(c1.len(), 6);
+        assert_eq!(c1.len(), 5);
     }
 
     #[test]
@@ -1320,6 +1352,36 @@ mod tests {
         // is the regression this test exists to hold shut.
         assert_eq!(seams, vec![(100000, 101200), (104800, 106000), (109600, 110800)]);
         assert_eq!(crate::session::seam_correction::seam_spans(&t_us, &t_us, 1250).len(), 15);
+    }
+
+    #[test]
+    fn an_imu_that_stops_early_ends_at_its_own_last_recorded_sample() {
+        // Arrange — ruling R241: IMU0 runs for 100 samples, IMU1 stops after
+        // 10. Both at 1000 µs, starting together.
+        let long: Vec<i64> = (0..100).map(|i| 1_000_000 + i * 1000).collect();
+        let short: Vec<i64> = (0..10).map(|i| 1_000_000 + i * 1000).collect();
+        let last_short = *short.last().unwrap();
+        let plan = plan_from([long, short, Vec::new()], [1000, 1000, 1000], 1000);
+
+        // Act
+        let (_c0, t0_us, _r0, spans0) = plan.reconcile(
+            "IMU0_AccelX",
+            RawColumn::I16 { data: vec![1; 100], scale: 1.0, offset: 0.0 },
+        );
+        let (c1, t1_us, _r1, spans1) = plan.reconcile(
+            "IMU1_AccelX",
+            RawColumn::I16 { data: vec![2; 10], scale: 1.0, offset: 0.0 },
+        );
+
+        // Assert — the short IMU has 10 slots, not 100, ends at its own last
+        // stamp, and carries no trailing gap span, because there is no
+        // synthesized tail to mark.
+        assert_eq!(t0_us.len(), 100);
+        assert_eq!(t1_us.len(), 10);
+        assert_eq!(c1.len(), 10);
+        assert_eq!(*t1_us.last().unwrap(), last_short);
+        assert!(spans0.is_empty());
+        assert!(spans1.is_empty(), "no pad means no span: {spans1:?}");
     }
 
     #[test]

@@ -941,6 +941,53 @@ mod tests {
     }
 
     #[test]
+    fn an_imu_that_stops_early_does_not_stretch_the_session_past_its_last_real_stamp() {
+        // Arrange — ruling R241. IMU0 records 12 samples at 1000 µs; IMU1
+        // stops after 4. Before R241, IMU1 was padded out to IMU0's length
+        // with a forward-extrapolated tail, and both the union `t` axis and
+        // `duration_ms` (a max over channels) reported time that was never
+        // recorded.
+        let registry = vec![
+            v3_registry_entry(0, 4, 1000, 1.0, 0.0, "IMU0_AccelX", "raw"),
+            v3_registry_entry(6, 4, 1000, 1.0, 0.0, "IMU1_AccelX", "raw"),
+        ];
+        let mut parts = vec![Header {
+            schema_version: 3,
+            imu_mask: 0x41,
+            imu_count: 2,
+            imu_sample_rate_hz: 1000,
+            ..Default::default()
+        }
+        .build(&registry)];
+        for k in 0..12 {
+            parts.push(frame(0x01, &imu_payload(0, 1_000_000 + k * 1000, &[0])));
+        }
+        for k in 0..4 {
+            parts.push(frame(0x01, &imu_payload(1, 1_000_000 + k * 1000, &[0])));
+        }
+        parts.push(session_end());
+
+        // Act
+        let r = parse_v3(&cat(&parts)).unwrap();
+        let long = find(&r, "IMU0_AccelX");
+        let short = find(&r, "IMU1_AccelX");
+
+        // Assert — the short stream is 4 samples ending at its own last
+        // recorded stamp (t0-relative 3000 µs), not 12 ending at 11000.
+        assert_eq!(short.len(), 4);
+        assert_eq!(long.len(), 12);
+        assert_eq!(*short.t_us.last().unwrap(), 3000);
+        assert!(short.gaps.is_empty(), "no synthesized tail to mark: {:?}", short.gaps);
+
+        // Assert — and neither the union axis (C1 §3.5 invariant 2, the
+        // sorted union of every channel's t_us) nor `duration_ms` (a max over
+        // channels) runs past the last stamp any source actually recorded.
+        let last_real = r.session.channels.iter().filter_map(|c| c.t_us.last().copied()).max();
+        assert_eq!(last_real, Some(11_000));
+        assert_eq!(r.session.channels.iter().map(|c| c.duration_ms()).max(), Some(11));
+    }
+
+    #[test]
     fn all_imu_channels_report_the_single_nominal_rate_despite_different_drops() {
         // Arrange — same two-IMU stream as the shared-spike test above (minus
         // the spike itself): IMU0 drops one, IMU1 drops none, each carrying 9
