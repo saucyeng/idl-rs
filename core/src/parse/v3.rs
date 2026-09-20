@@ -186,7 +186,13 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     // against each IMU's own corrected stamps and effective period — never
     // the nominal period, and never inline in the hot loop (that was the
     // phantom-drop mechanism C1's worked example demonstrates).
-    let plan = ImuGridPlan::build_from_corrected(corrected, effective_period_us, period_us);
+    // The raw stamps go into the plan beside the corrected ones: `t` is the
+    // corrected axis (C1 §3.1) and `_t_recorded_us` is the verbatim device
+    // stamp (C1 §3.2, ruling R240), so the two columns describe different
+    // things and `fetch_seams` has a pre-correction sequence to detect bursts
+    // in. `imu_recorded_ts` is moved here — nothing reads it afterwards.
+    let plan =
+        ImuGridPlan::build_from_corrected(corrected, imu_recorded_ts, effective_period_us, period_us);
     let t0_us = origin.min_us.unwrap_or(0);
     let mut channels = Vec::new();
     for (name, column) in acc.into_entries() {
@@ -1270,12 +1276,15 @@ mod tests {
         assert_relative_eq!(ch.nominal_rate_hz, 1e6 / 1200.0, epsilon = 1e-6);
         assert!(ch.t_us.windows(2).all(|w| w[1] - w[0] == 1200));
 
-        // t_recorded_us is present (correction actually diverged it from the
-        // nominal-grid formula the pre-Task-6 parser used) and, since this
-        // IMU has no drops, advances at the same 1200 µs corrected spacing
-        // as t_us.
-        let t_recorded = ch.t_recorded_us.as_ref().expect("burst correction should set t_recorded_us");
-        assert_eq!(t_recorded.len(), 16);
-        assert!(t_recorded.windows(2).all(|w| w[1] - w[0] == 1200));
+        // t_recorded_us holds the **raw** stamps the firmware wrote (ruling
+        // R240, C1 §3.2), t0-relative: 1250 µs inside each burst — the
+        // nominal cadence the FIFO walk-back uses — and 1050 µs across each
+        // seam. That is the sequence `seam_spans` detects bursts in, and it
+        // is not a copy of t_us.
+        let t_recorded = ch.t_recorded_us.as_ref().expect("an IMU channel carries recorded stamps");
+        let t0_us = raw_stamps[0];
+        let expected: Vec<i64> = raw_stamps.iter().map(|t| t - t0_us).collect();
+        assert_eq!(*t_recorded, expected);
+        assert_ne!(*t_recorded, ch.t_us);
     }
 }

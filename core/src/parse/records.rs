@@ -511,9 +511,18 @@ pub struct ImuGridPlan {
     /// Per-IMU grid-slot gap spans, shared across that IMU's six axes.
     spans: [Vec<GapSpan>; 3],
     /// The corrected (pre-grid, dense-but-ungapped) stamps this plan was
-    /// built from — kept so `reconcile` can place each kept sample's exact
-    /// corrected time at its slot's `t_recorded_us` entry.
+    /// built from — the source of each kept slot's `t_us`, and of the grid
+    /// itself.
     corrected: [Vec<i64>; 3],
+    /// The **raw, pre-correction** device stamps, index-aligned with
+    /// [`Self::corrected`] — the source of each kept slot's `t_recorded_us`
+    /// (contract C1 §3.2, ruling R240). Kept separately because §3.2's column
+    /// is verbatim by definition: once the two are the same array, the seam
+    /// detector `fetch_seams` runs has nothing left to detect against (C1
+    /// §3.3's step 1 reads recorded deltas, whose within-burst spacing the
+    /// correction deliberately flattens), and no column anywhere retains a
+    /// pre-correction stamp.
+    raw: [Vec<i64>; 3],
 }
 
 impl ImuGridPlan {
@@ -521,11 +530,15 @@ impl ImuGridPlan {
     /// stamp sequence (`seam_correction::correct_burst_seams(..).corrected_us`,
     /// or the raw stamps verbatim for an IMU with <2 samples — correction is
     /// a no-op there per the burst-correction module). `effective_period_us[i]`
-    /// is that same call's `effective_period_us`. `nominal_period_us` is the
-    /// fallback for an IMU with <2 samples (no correction ran, so no
-    /// effective period exists).
+    /// is that same call's `effective_period_us`. `raw[i]` is the same IMU's
+    /// **verbatim** recorded stamp sequence — the input correction ran on,
+    /// index-aligned with `corrected[i]` and the same length — which becomes
+    /// `t_recorded_us` (C1 §3.2, R240). `nominal_period_us` is the fallback
+    /// for an IMU with <2 samples (no correction ran, so no effective period
+    /// exists; `raw` and `corrected` are then the same values).
     pub fn build_from_corrected(
         corrected: [Vec<i64>; 3],
+        raw: [Vec<i64>; 3],
         effective_period_us: [i64; 3],
         nominal_period_us: i64,
     ) -> Self {
@@ -592,6 +605,7 @@ impl ImuGridPlan {
             gaps_received,
             spans,
             corrected,
+            raw,
         }
     }
 
@@ -603,7 +617,8 @@ impl ImuGridPlan {
     /// holds a real sample, and a neighbour-interpolated placeholder inside a
     /// gap ([`slot_times_from_corrected`], C1 §3.1/§3.5 invariant 4 — a
     /// sample's time is never `i / nominal_rate_hz`). `t_recorded_us` is
-    /// dense and equals the real corrected stamp at every kept slot, and is
+    /// dense and equals the **raw, pre-correction** device stamp at every kept
+    /// slot (C1 §3.2, ruling R240 — it is not a second copy of `t_us`), and is
     /// **unspecified at every slot inside `gaps`** (callers must consult
     /// `gaps`, never infer nullness from content — see this module's doc for
     /// the reasoning). Every non-IMU channel passes through with
@@ -616,7 +631,7 @@ impl ImuGridPlan {
                     &self.corrected[i], &self.gaps_received[i], self.leading[i], self.target_len, self.period_us[i],
                 );
                 let t_recorded_us = rebuild_i64_grid_or_real(
-                    &self.corrected[i], &self.gaps_received[i], self.leading[i], self.target_len, &t_us,
+                    &self.raw[i], &self.gaps_received[i], self.leading[i], self.target_len, &t_us,
                 );
                 match column {
                     RawColumn::I16 { data, scale, offset } => {
@@ -715,34 +730,40 @@ fn slot_times_from_corrected(
 }
 
 /// Builds a dense `t_recorded_us` array for one IMU's grid: at a slot that
-/// holds a real (non-synthesized) sample, its exact corrected timestamp; at
-/// every other slot (leading pad, interior fill, trailing pad — all covered
-/// by a `GapSpan`), the corresponding value from `slot_t_us` (a harmless,
-/// documented placeholder — see [`ImuGridPlan::reconcile`]'s doc). Mirrors
-/// `rebuild_i16`'s fill-pattern walk exactly, but placing real/placeholder
-/// timestamps rather than interpolating values.
+/// holds a real (non-synthesized) sample, that sample's **verbatim recorded**
+/// timestamp (`stamps` is the raw, pre-correction sequence — contract C1 §3.2,
+/// ruling R240); at every other slot (leading pad, interior fill, trailing pad
+/// — all covered by a `GapSpan`), the corresponding value from `slot_t_us` (a
+/// harmless, documented placeholder — see [`ImuGridPlan::reconcile`]'s doc; a
+/// synthesized slot has no recorded stamp to carry, and the gap list, not the
+/// content, is what says so). Mirrors `rebuild_i16`'s fill-pattern walk
+/// exactly, but placing real/placeholder timestamps rather than interpolating
+/// values.
+///
+/// `stamps` is indexed in the same received-sample space as `gaps_received`,
+/// which is why the raw and corrected arrays must stay index-aligned.
 fn rebuild_i64_grid_or_real(
-    corrected: &[i64],
+    stamps: &[i64],
     gaps_received: &[(usize, usize)],
     leading: usize,
     target_len: usize,
     slot_t_us: &[i64],
 ) -> Vec<i64> {
-    if corrected.is_empty() {
+    if stamps.is_empty() {
         return Vec::new();
     }
     // Real/placeholder is tracked per index (not by sentinel-value
-    // collision), so a real corrected timestamp of exactly `0` — never
+    // collision), so a real recorded timestamp of exactly `0` — never
     // physically possible for a device clock, but not worth relying on
     // implicitly — cannot be mistaken for a placeholder.
     let mut out: Vec<i64> = Vec::with_capacity(target_len);
     let mut is_real: Vec<bool> = Vec::with_capacity(target_len);
     out.resize(leading, 0);
     is_real.resize(leading, false);
-    out.push(corrected[0]);
+    out.push(stamps[0]);
     is_real.push(true);
     let mut gi = 0usize;
-    for k in 1..corrected.len() {
+    for k in 1..stamps.len() {
         let missing = if gi < gaps_received.len() && gaps_received[gi].0 == k {
             let m = gaps_received[gi].1;
             gi += 1;
@@ -754,7 +775,7 @@ fn rebuild_i64_grid_or_real(
             out.push(0);
             is_real.push(false);
         }
-        out.push(corrected[k]);
+        out.push(stamps[k]);
         is_real.push(true);
     }
     if out.len() < target_len {
@@ -934,6 +955,19 @@ mod tests {
         );
     }
 
+    /// A plan whose raw and corrected stamps are the same sequence — the
+    /// shape of an IMU the correction was a no-op on (C1 §3.3: a stream
+    /// already at its nominal period). Tests that care about the two columns
+    /// differing build the plan directly.
+    fn plan_from(
+        corrected: [Vec<i64>; 3],
+        effective_period_us: [i64; 3],
+        nominal_period_us: i64,
+    ) -> ImuGridPlan {
+        let raw = corrected.clone();
+        ImuGridPlan::build_from_corrected(corrected, raw, effective_period_us, nominal_period_us)
+    }
+
     #[test]
     fn build_spans_clean_imu_has_no_spans() {
         // Arrange / Act / Assert — leading 0, no drops, occupied == target.
@@ -945,7 +979,7 @@ mod tests {
         // Arrange — IMU0 corrected stamps: 0, 1000 (exact period), 3000 (a
         // 2000 µs jump → 1 sample missing before received index 2).
         let corrected = [vec![0i64, 1000, 3000], Vec::new(), Vec::new()];
-        let plan = ImuGridPlan::build_from_corrected(corrected, [1000, 1000, 1000], 1000);
+        let plan = plan_from(corrected, [1000, 1000, 1000], 1000);
 
         // Act — raw [0, 10, 30]; one fill (20) between 10 and 30.
         let (col, t_us, t_recorded_us, spans) = plan.reconcile(
@@ -977,7 +1011,7 @@ mod tests {
             vec![0i64, 1000, 2000, 3000, 4000],
             Vec::new(),
         ];
-        let plan = ImuGridPlan::build_from_corrected(corrected, [1000, 1000, 1000], 1000);
+        let plan = plan_from(corrected, [1000, 1000, 1000], 1000);
 
         // Act
         let (c0, _, _, _) = plan.reconcile(
@@ -998,7 +1032,7 @@ mod tests {
     fn plan_passes_through_non_imu_channels_unchanged() {
         // Arrange
         let corrected = [vec![0i64, 1000, 2000], Vec::new(), Vec::new()];
-        let plan = ImuGridPlan::build_from_corrected(corrected, [1000, 1000, 1000], 1000);
+        let plan = plan_from(corrected, [1000, 1000, 1000], 1000);
 
         // Act
         let (col, t_us, t_recorded_us, spans) =
@@ -1015,7 +1049,7 @@ mod tests {
     fn plan_leaves_under_two_sample_imu_unreconciled() {
         // Arrange — a single-sample IMU is not reconciled (design §6).
         let corrected = [vec![42i64], Vec::new(), Vec::new()];
-        let plan = ImuGridPlan::build_from_corrected(corrected, [1000, 1000, 1000], 1000);
+        let plan = plan_from(corrected, [1000, 1000, 1000], 1000);
 
         // Act
         let (col, t_us, t_recorded_us, spans) = plan.reconcile(
@@ -1103,7 +1137,7 @@ mod tests {
         let last_stamp = *stamps.last().unwrap();
         let first_stamp = stamps[0];
         let corrected = [stamps, Vec::new(), Vec::new()];
-        let plan = ImuGridPlan::build_from_corrected(corrected, [1250, 1250, 1250], 1250);
+        let plan = plan_from(corrected, [1250, 1250, 1250], 1250);
 
         // Act
         let (_col, t_us, t_recorded_us, spans) = plan.reconcile(
@@ -1138,7 +1172,7 @@ mod tests {
         // true periods so neither matches the reconciler's median.
         let stamps = drifting_stamps_with_dropout(500, 1180, 2_500_000, 500, 1230);
         let corrected = [stamps, Vec::new(), Vec::new()];
-        let plan = ImuGridPlan::build_from_corrected(corrected, [1250, 1250, 1250], 1250);
+        let plan = plan_from(corrected, [1250, 1250, 1250], 1250);
 
         // Act
         let (_col, t_us, _t_recorded_us, _spans) = plan.reconcile(
@@ -1157,7 +1191,7 @@ mod tests {
         // corrected stamp on both sides.
         let stamps = drifting_stamps_with_dropout(10, 1200, 100_000, 10, 1200);
         let corrected = [stamps, Vec::new(), Vec::new()];
-        let plan = ImuGridPlan::build_from_corrected(corrected, [1250, 1250, 1250], 1250);
+        let plan = plan_from(corrected, [1250, 1250, 1250], 1250);
 
         // Act
         let (_col, t_us, _t_recorded_us, spans) = plan.reconcile(
@@ -1179,6 +1213,115 @@ mod tests {
         }
     }
 
+    /// C1 §3.3's worked example as the two sequences an import really holds:
+    /// the raw stamps the firmware wrote (nominal 1250 µs walk-back inside
+    /// each burst, a 1050 µs step at each seam) and the corrected axis the
+    /// same data produces (a uniform 1200 µs).
+    fn worked_example_raw_and_corrected() -> (Vec<i64>, Vec<i64>) {
+        let raw = vec![
+            96250, 97500, 98750, 100000, //
+            101050, 102300, 103550, 104800, //
+            105850, 107100, 108350, 109600, //
+            110650, 111900, 113150, 114400,
+        ];
+        let corrected =
+            crate::session::seam_correction::correct_burst_seams(&raw, 1250).corrected_us;
+        (raw, corrected)
+    }
+
+    #[test]
+    fn reconcile_a_corrected_imu_puts_the_raw_stamp_in_t_recorded_us_and_the_corrected_one_in_t_us() {
+        // Arrange — ruling R240: the two columns must mean different things.
+        let (raw, corrected) = worked_example_raw_and_corrected();
+        let plan = ImuGridPlan::build_from_corrected(
+            [corrected.clone(), Vec::new(), Vec::new()],
+            [raw.clone(), Vec::new(), Vec::new()],
+            [1200, 1200, 1200],
+            1250,
+        );
+
+        // Act
+        let (_col, t_us, t_recorded_us, spans) = plan.reconcile(
+            "IMU0_AccelX",
+            RawColumn::I16 { data: vec![1; 16], scale: 1.0, offset: 0.0 },
+        );
+
+        // Assert — no drops here, so every slot is real: t_us is the
+        // corrected axis, t_recorded_us is the raw one, and they differ.
+        assert!(spans.is_empty());
+        assert_eq!(t_us, corrected);
+        assert_eq!(t_recorded_us, raw);
+        assert_ne!(t_us, t_recorded_us);
+    }
+
+    #[test]
+    fn reconcile_a_gap_slot_keeps_the_grid_time_in_t_recorded_us_because_nothing_was_recorded_there() {
+        // Arrange — one interior dropout: the raw stamps are the corrected
+        // ones offset by a constant, so a real slot is recognisable by its
+        // offset and a synthesized one by the absence of it.
+        let corrected = drifting_stamps_with_dropout(10, 1200, 100_000, 10, 1200);
+        let raw: Vec<i64> = corrected.iter().map(|t| t + 7).collect();
+        let plan = ImuGridPlan::build_from_corrected(
+            [corrected, Vec::new(), Vec::new()],
+            [raw, Vec::new(), Vec::new()],
+            [1200, 1200, 1200],
+            1200,
+        );
+
+        // Act
+        let (_col, t_us, t_recorded_us, spans) = plan.reconcile(
+            "IMU0_AccelX",
+            RawColumn::I16 { data: vec![7; 20], scale: 1.0, offset: 0.0 },
+        );
+
+        // Assert — inside every gap span, t_recorded_us repeats t_us (the
+        // documented placeholder); outside one, it is the raw stamp.
+        assert!(!spans.is_empty(), "the dropout should produce a gap span");
+        let mut in_gap = vec![false; t_us.len()];
+        for s in &spans {
+            for slot in s.start..s.start + s.len {
+                in_gap[slot] = true;
+            }
+        }
+        for slot in 0..t_us.len() {
+            if in_gap[slot] {
+                assert_eq!(t_recorded_us[slot], t_us[slot], "gap slot {slot}");
+            } else {
+                assert_eq!(t_recorded_us[slot], t_us[slot] + 7, "real slot {slot}");
+            }
+        }
+    }
+
+    #[test]
+    fn seam_spans_over_an_import_shaped_channel_finds_the_seams_the_correction_flattened() {
+        // Arrange — exactly what `fetch_seams_via` passes after an import:
+        // the channel's own `t_recorded_us` and `t_us`, straight out of
+        // `reconcile` (review finding 2's collateral note — the tauri tests
+        // hand-build a channel and so never exercised this shape).
+        let (raw, corrected) = worked_example_raw_and_corrected();
+        let plan = ImuGridPlan::build_from_corrected(
+            [corrected, Vec::new(), Vec::new()],
+            [raw, Vec::new(), Vec::new()],
+            [1200, 1200, 1200],
+            1250,
+        );
+        let (_col, t_us, t_recorded_us, _spans) = plan.reconcile(
+            "IMU0_AccelX",
+            RawColumn::I16 { data: vec![1; 16], scale: 1.0, offset: 0.0 },
+        );
+
+        // Act — nominal period, as the command derives it from the rate.
+        let seams = crate::session::seam_correction::seam_spans(&t_recorded_us, &t_us, 1250);
+
+        // Assert — the example's three burst boundaries, reported on the
+        // corrected axis. Fed the corrected array in both arguments (what
+        // the importer produced before R240) the same call reads every
+        // sample as its own burst — 15 spurious seams instead of 3 — which
+        // is the regression this test exists to hold shut.
+        assert_eq!(seams, vec![(100000, 101200), (104800, 106000), (109600, 110800)]);
+        assert_eq!(crate::session::seam_correction::seam_spans(&t_us, &t_us, 1250).len(), 15);
+    }
+
     #[test]
     fn imu_slot_time_gap_free_constant_rate_stream_is_the_uniform_grid() {
         // Arrange — the existing-behaviour regression: a stream whose
@@ -1186,7 +1329,7 @@ mod tests {
         // so recorded time and the old `t0 + slot × period` grid agree.
         let stamps: Vec<i64> = (0..50).map(|i| 500_000 + i * 1000).collect();
         let corrected = [stamps, Vec::new(), Vec::new()];
-        let plan = ImuGridPlan::build_from_corrected(corrected, [1000, 1000, 1000], 1000);
+        let plan = plan_from(corrected, [1000, 1000, 1000], 1000);
 
         // Act
         let (_col, t_us, _t_recorded_us, spans) = plan.reconcile(
