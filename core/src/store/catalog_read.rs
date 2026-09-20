@@ -666,8 +666,8 @@ mod tests {
 
     #[test]
     fn list_stale_sessions_a_row_stamped_with_an_older_importer_version_is_listed_as_strings() {
-        // Arrange — `write_full_session` always stamps `"0.1.0"`
-        // (`crate::parse::IDL0_IMPORTER_VERSION`'s current value); overwrite
+        // Arrange — `write_full_session` always stamps a fixed literal
+        // version; overwrite
         // it with an older string directly in the catalog, simulating a
         // session imported by a previous build.
         let root = temp_root();
