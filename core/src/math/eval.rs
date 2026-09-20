@@ -522,9 +522,9 @@ pub(crate) fn elemwise(
         (Value::Channel(a), Value::Channel(b)) => {
             // Shape before rate: a `[lap]` value has no sample rate, so
             // combining one with a time series otherwise reports "different
-            // sample rates (0 Hz vs 100 Hz). resample() will match rates
-            // first" — advice that cannot work yet, for a mismatch that is
-            // not about rates at all.
+            // sample rates (0 Hz vs 100 Hz). ... resample(x, onto)" — advice
+            // that cannot work for a `[lap]` operand (resample is `[t]`-only),
+            // for a mismatch that is not about rates at all.
             let axis = require_same_shape(op_name, &a, &b)?;
             let t_us = combine_t_us(op_name, &a.t_us, &b.t_us)?;
             let mut out = Vec::with_capacity(a.samples.len());
@@ -584,15 +584,16 @@ fn require_same_shape(
 ) -> Result<ValueAxis, MathEvalError> {
     // Shape before rate: a `[lap]` value has no sample rate, so combining one
     // with a time series otherwise reports "different sample rates (0 Hz vs
-    // 100 Hz). resample() will match rates first" — advice that cannot work
-    // yet, for a mismatch that is not about rates at all.
+    // 100 Hz). ... resample(x, onto)" — advice that cannot work for a `[lap]`
+    // operand (resample is `[t]`-only), for a mismatch that is not about rates
+    // at all.
     let axis = combine_axis(op_name, a.axis, b.axis)?;
     if a.sample_rate_hz != b.sample_rate_hz {
         return Err(err(
             MathEvalErrorKind::Runtime,
             format!(
                 "Cannot \"{op_name}\" channels with different sample rates ({} Hz vs {} Hz). \
-                 resample() will match rates first (not yet implemented; arrives under R242).",
+                 Put one on the other's time axis first: resample(x, onto).",
                 a.sample_rate_hz, b.sample_rate_hz
             ),
         ));
@@ -664,7 +665,8 @@ fn combine_t_us(op_name: &str, a: &Arc<[i64]>, b: &Arc<[i64]>) -> Result<Arc<[i6
         MathEvalErrorKind::Runtime,
         format!(
             "\"{op_name}\": channels carry different per-sample time axes \
-             ({} samples spanning {}..{} µs vs {} samples spanning {}..{} µs)",
+             ({} samples spanning {}..{} µs vs {} samples spanning {}..{} µs). \
+             Put one on the other's time axis first: resample(x, onto).",
             a.len(),
             a.first().copied().unwrap_or(0),
             a.last().copied().unwrap_or(0),
@@ -673,6 +675,122 @@ fn combine_t_us(op_name: &str, a: &Arc<[i64]>, b: &Arc<[i64]>) -> Result<Arc<[i6
             b.last().copied().unwrap_or(0),
         ),
     ))
+}
+
+/// `resample(x, onto)` (ruling R242): linear interpolation of channel `x` onto
+/// channel `onto`'s own per-sample time axis. The result carries `onto`'s axis
+/// (`t_us`), `onto`'s sample rate and `onto`'s length, so it pairs sample for
+/// sample with `onto` and with anything else already on that axis — which is
+/// the point: after C1 §3.1's corrected IMU stamps, two IMUs no longer share a
+/// time axis, and this is the explicit operation that brings them together
+/// (C2 §3.6.2 rule 4 — never an implicit resample).
+///
+/// **Extrapolation, never.** An `onto` time outside `[x.t_us.first(),
+/// x.t_us.last()]` yields `NaN`: `x` says nothing about when it was not
+/// recording, and a held edge value would read as a measurement. A `NaN` in
+/// `x` propagates through the interpolation to every output sample it brackets.
+///
+/// **Known limitation (gaps).** Samples of `onto` that fall inside a
+/// synthesized run of `x` (a `GapSpan` — a FIFO dropout the importer filled)
+/// are interpolated like any other, not masked to `NaN`. Gaps are not on the
+/// math path at all: [`LookupChannel`] and [`ChannelValue`] carry samples, rate
+/// and `t_us` and no gap metadata, and a gap slot holds the importer's
+/// interpolated fill rather than a sentinel. Masking them wants a decision
+/// about whether a gap reads as `NaN` for *every* builtin (`mean`, `rms`, …),
+/// which is a C2 §3.6 value-model change and not `resample`'s to make alone.
+///
+/// **Shape.** `[t]` only, on both arguments. A `[lap]` value's `t_us` holds
+/// ordinal lap numbers (see [`ChannelValue::t_us`]), and interpolating between
+/// lap 3 and lap 4 has no meaning — so a `[lap]` argument is the same typed
+/// shape error [`combine_axis`] gives, rather than a silent ordinal lerp. This
+/// is deliberately *not* the shape-polymorphism of `lap_time()` and friends:
+/// those produce one value per lap from lap-scoped data, whereas `resample`
+/// interpolates along a continuous coordinate, which only `[t]` is.
+fn resample_onto(x: &ChannelValue, onto: &ChannelValue) -> Result<Value, MathEvalError> {
+    if x.axis != ValueAxis::Time || onto.axis != ValueAxis::Time {
+        return Err(err(
+            MathEvalErrorKind::Type,
+            format!(
+                "\"resample(x, onto)\": both arguments must be [t] values (got [{}] and [{}]) — \
+                 there is nothing to interpolate along a [lap] axis.",
+                x.axis.symbol(),
+                onto.axis.symbol()
+            ),
+        ));
+    }
+    if x.t_us.is_empty() {
+        return Err(err(
+            MathEvalErrorKind::Runtime,
+            "\"resample(x, onto)\": x has no per-sample time axis, so there is no time to \
+             interpolate from. Reference a session channel (or something derived from one) \
+             rather than a scalar-, table- or closed-form-derived value."
+                .to_string(),
+        ));
+    }
+    if onto.t_us.is_empty() {
+        return Err(err(
+            MathEvalErrorKind::Runtime,
+            "\"resample(x, onto)\": onto has no per-sample time axis, so there are no times to \
+             resample onto. Reference a session channel — e.g. [Time], which runs at the \
+             session's base rate."
+                .to_string(),
+        ));
+    }
+    // Both invariants hold by construction everywhere a value is built
+    // (`samples.len() == t_us.len()` whenever `t_us` is non-empty), so a
+    // mismatch means a bug upstream — a typed error, never an index panic.
+    if x.samples.len() != x.t_us.len() || onto.samples.len() != onto.t_us.len() {
+        return Err(err(
+            MathEvalErrorKind::Runtime,
+            format!(
+                "\"resample(x, onto)\": a channel's samples and time axis disagree in length \
+                 (x: {} samples / {} times; onto: {} samples / {} times)",
+                x.samples.len(),
+                x.t_us.len(),
+                onto.samples.len(),
+                onto.t_us.len()
+            ),
+        ));
+    }
+
+    let src_t = x.t_us.as_ref();
+    let src_v = x.samples.as_ref();
+    let first = src_t[0];
+    let last = src_t[src_t.len() - 1];
+    let mut out = Vec::with_capacity(onto.t_us.len());
+    // Cursor into `x`, kept between targets: both axes are strictly increasing
+    // (C1 §3.5 invariant 1), so the walk is O(n + m). A target that steps back
+    // (a value assembled outside that invariant) falls back to a binary search
+    // rather than reading the wrong bracket.
+    let mut i = 0usize;
+    for &tt in onto.t_us.iter() {
+        if tt < first || tt > last {
+            out.push(f64::NAN);
+            continue;
+        }
+        if src_t[i] > tt {
+            i = src_t.partition_point(|&t| t <= tt).saturating_sub(1);
+        }
+        while i + 1 < src_t.len() && src_t[i + 1] <= tt {
+            i += 1;
+        }
+        if src_t[i] == tt || i + 1 >= src_t.len() {
+            out.push(src_v[i]);
+            continue;
+        }
+        let (t0, t1) = (src_t[i] as f64, src_t[i + 1] as f64);
+        let (v0, v1) = (src_v[i], src_v[i + 1]);
+        let w = (tt as f64 - t0) / (t1 - t0);
+        out.push(v0 + (v1 - v0) * w);
+    }
+
+    Ok(Value::Channel(ChannelValue {
+        samples: Arc::from(out),
+        sample_rate_hz: onto.sample_rate_hz,
+        channel_id: None,
+        t_us: onto.t_us.clone(),
+        axis: ValueAxis::Time,
+    }))
 }
 
 /// Applies `f` element-wise to a scalar or channel. Mirrors Dart `_mapValue`.
@@ -1663,7 +1781,30 @@ fn call_function(
             }
             Ok(channel(out, cond.sample_rate_hz, t_us))
         }
-        "spectrogram" | "envelope" | "correlate" | "convolve" | "resample" | "sosfilt" => {
+        // R242: the explicit, and only, way two channels recorded on different
+        // clocks come together. Never implicit — C2 §3.6.2 rule 4 ("never an
+        // implicit resample") is the contract this satisfies rather than
+        // weakens.
+        "resample" => {
+            require_arg_count(name, &args, 2)?;
+            if let Value::Scalar(n) = &args[1] {
+                // `resample(ch, num)` — the scipy-style target-sample-count
+                // form C2 §3.3 reserved until R242. Named explicitly so an
+                // author who wrote it gets the reason, not "expected channel".
+                return Err(err(
+                    MathEvalErrorKind::NotImplemented,
+                    format!(
+                        "resample(x, onto): the second argument is the channel whose time axis \
+                         to resample onto, not a sample count (got {n}). The count form \
+                         (`scipy.signal.resample`) is not implemented."
+                    ),
+                ));
+            }
+            let x = require_channel(&args[0], "resample(x, onto) — x")?;
+            let onto = require_channel(&args[1], "resample(x, onto) — onto")?;
+            resample_onto(&x, &onto)
+        }
+        "spectrogram" | "envelope" | "correlate" | "convolve" | "sosfilt" => {
             Err(err(MathEvalErrorKind::NotImplemented, format!("not yet implemented: {name}")))
         }
 
@@ -4365,5 +4506,183 @@ mod tests {
 
         // Assert — (86 + 88.5) / 2, not a window-narrowed subset.
         assert_eq!(out, 87.25);
+    }
+
+    // ---- resample(x, onto) (R242) ----
+
+    #[test]
+    fn resample_onto_another_axis_interpolates_linearly_and_takes_that_axis() {
+        // Arrange — x at 0/1000/2000 µs, onto at 500/1500 µs (inside x's span).
+        let lk = timed(&[
+            ("x", vec![0.0, 10.0, 30.0], 1000.0, vec![0, 1000, 2000]),
+            ("onto", vec![7.0, 7.0], 2000.0, vec![500, 1500]),
+        ]);
+
+        // Act
+        let v = eval_expr("resample([x], [onto])", &lk).unwrap();
+
+        // Assert — halfway between each bracketing pair, on onto's axis/rate.
+        match v {
+            Value::Channel(c) => {
+                assert_eq!(c.samples.as_ref(), &[5.0, 20.0]);
+                assert_eq!(c.t_us.as_ref(), &[500, 1500]);
+                assert_eq!(c.sample_rate_hz, 2000.0);
+                assert_eq!(c.axis, ValueAxis::Time);
+            }
+            other => panic!("expected a channel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resample_outside_the_source_span_is_nan_never_extrapolated() {
+        // Arrange — onto starts before x and ends after it.
+        let lk = timed(&[
+            ("x", vec![10.0, 20.0], 1000.0, vec![1000, 2000]),
+            ("onto", vec![0.0; 4], 1000.0, vec![0, 1000, 2000, 3000]),
+        ]);
+
+        // Act
+        let v = eval_expr("resample([x], [onto])", &lk).unwrap();
+
+        // Assert — the two interior times resolve; the two outside are NaN,
+        // not x's held edge values.
+        match v {
+            Value::Channel(c) => {
+                assert!(c.samples[0].is_nan(), "{}", c.samples[0]);
+                assert_eq!(c.samples[1], 10.0);
+                assert_eq!(c.samples[2], 20.0);
+                assert!(c.samples[3].is_nan(), "{}", c.samples[3]);
+            }
+            other => panic!("expected a channel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resample_onto_an_identical_axis_returns_the_source_samples_unchanged() {
+        // Arrange — the degenerate case a workbook hits when both channels
+        // really were sampled together.
+        let lk = timed(&[
+            ("x", vec![1.0, 2.0, 3.0], 1000.0, vec![0, 1000, 2000]),
+            ("onto", vec![9.0, 9.0, 9.0], 1000.0, vec![0, 1000, 2000]),
+        ]);
+
+        // Act
+        let v = eval_expr("resample([x], [onto])", &lk).unwrap();
+
+        // Assert
+        assert!(matches!(v, Value::Channel(c) if c.samples.as_ref() == [1.0, 2.0, 3.0]));
+    }
+
+    #[test]
+    fn resample_from_a_single_sample_source_resolves_only_that_exact_time() {
+        // Arrange — one sample is a zero-width span, not a constant.
+        let lk = timed(&[
+            ("x", vec![42.0], 1000.0, vec![1000]),
+            ("onto", vec![0.0; 3], 1000.0, vec![0, 1000, 2000]),
+        ]);
+
+        // Act — must not panic on the missing bracket.
+        let v = eval_expr("resample([x], [onto])", &lk).unwrap();
+
+        // Assert
+        match v {
+            Value::Channel(c) => {
+                assert!(c.samples[0].is_nan());
+                assert_eq!(c.samples[1], 42.0);
+                assert!(c.samples[2].is_nan());
+            }
+            other => panic!("expected a channel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resample_from_a_source_with_no_time_axis_is_a_typed_error() {
+        // Arrange — a closed-form value (sector_number(), a table column) has
+        // no recorded time to interpolate from.
+        let lk = timed(&[
+            ("x", vec![1.0, 2.0], 1000.0, vec![]),
+            ("onto", vec![0.0, 0.0], 1000.0, vec![0, 1000]),
+        ]);
+
+        // Act
+        let e = eval_expr("resample([x], [onto])", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(e.kind, MathEvalErrorKind::Runtime);
+        assert!(e.message.contains("x has no per-sample time axis"), "{}", e.message);
+    }
+
+    #[test]
+    fn resample_onto_a_target_with_no_time_axis_is_a_typed_error() {
+        // Arrange
+        let lk = timed(&[
+            ("x", vec![1.0, 2.0], 1000.0, vec![0, 1000]),
+            ("onto", vec![1.0, 2.0], 1000.0, vec![]),
+        ]);
+
+        // Act
+        let e = eval_expr("resample([x], [onto])", &lk).unwrap_err();
+
+        // Assert — names [Time], the channel that always has one.
+        assert_eq!(e.kind, MathEvalErrorKind::Runtime);
+        assert!(e.message.contains("onto has no per-sample time axis"), "{}", e.message);
+        assert!(e.message.contains("[Time]"), "{}", e.message);
+    }
+
+    #[test]
+    fn resample_with_a_sample_count_second_argument_says_that_form_is_not_implemented() {
+        // Arrange — `resample(ch, 4096)`, the scipy-style form C2 §3.3
+        // reserved before R242.
+        let lk = timed(&[("x", vec![1.0, 2.0], 1000.0, vec![0, 1000])]);
+
+        // Act
+        let e = eval_expr("resample([x], 4096)", &lk).unwrap_err();
+
+        // Assert — the reason, not "expected channel argument".
+        assert_eq!(e.kind, MathEvalErrorKind::NotImplemented);
+        assert!(e.message.contains("not a sample count"), "{}", e.message);
+    }
+
+    #[test]
+    fn resample_of_a_lap_shaped_value_is_a_typed_shape_error() {
+        // Arrange — a [lap] value's t_us holds lap numbers, not µs.
+        let ctx = two_lap_ctx();
+
+        // Act
+        let e = evaluate("resample(lap_time(), lap_time())", &NoChannels, &ctx).unwrap_err();
+
+        // Assert — never an ordinal lerp between lap 3 and lap 4.
+        assert_eq!(e.kind, MathEvalErrorKind::Type);
+        assert!(e.message.contains("[t] values"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_rate_mismatch_names_resample_as_the_way_out() {
+        // Arrange — finding 3: the error used to recommend an unimplemented
+        // function.
+        let lk = lookup(&[("a", vec![1.0, 2.0], 100.0), ("b", vec![1.0, 2.0], 50.0)]);
+
+        // Act
+        let e = eval_expr("[a] - [b]", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(e.kind, MathEvalErrorKind::Runtime);
+        assert!(e.message.contains("resample(x, onto)"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_time_axis_mismatch_names_resample_as_the_way_out() {
+        // Arrange — finding 5: two IMUs at the same rate on different clocks.
+        let lk = timed(&[
+            ("a", vec![1.0, 2.0], 1000.0, vec![0, 1000]),
+            ("b", vec![1.0, 2.0], 1000.0, vec![7, 1007]),
+        ]);
+
+        // Act
+        let e = eval_expr("[a] - [b]", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(e.kind, MathEvalErrorKind::Runtime);
+        assert!(e.message.contains("resample(x, onto)"), "{}", e.message);
     }
 }

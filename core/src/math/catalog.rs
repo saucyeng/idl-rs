@@ -608,13 +608,13 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
         MathBuiltin {
             name: "resample",
             arity: &[2],
-            status: N,
+            status: I,
             category: "Resampling",
-            signature: "resample(ch, num)",
+            signature: "resample(x, onto)",
             unit_rule: "SameAsArg(0)",
             shape: "[t]",
-            description: "Resamples a channel to `num` total samples, as `scipy.signal.resample`. `num` is a count, not a rate. Not implemented.",
-            example: "resample([Fork], 4096)",
+            description: "Linear interpolation of `x` onto the per-sample recorded times of `onto`; the result carries `onto`'s time axis, rate and length, so the two can then be combined. Times outside `x`'s span are `NaN` -- never extrapolated. The explicit way to combine two channels recorded on different clocks; nothing resamples implicitly.",
+            example: "resample([IMU2_AccelZ], [IMU1_AccelZ])",
         },
         MathBuiltin {
             name: "where",
@@ -976,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn implemented_and_not_implemented_counts_split_69_and_6() {
+    fn implemented_and_not_implemented_counts_split_70_and_5() {
         // Arrange
         let catalog = math_builtin_catalog();
 
@@ -988,9 +988,10 @@ mod tests {
 
         // Assert — was 63/6; the scipy-alignment lane's three net-new entries
         // and the lap-shaped trio (see the length test above) are all
-        // Implemented, so only that side of the split moves.
-        assert_eq!(not_implemented, 6);
-        assert_eq!(implemented, 69);
+        // Implemented, so only that side of the split moved (69/6). R242 then
+        // implements `resample`, moving one entry across: 70/5.
+        assert_eq!(not_implemented, 5);
+        assert_eq!(implemented, 70);
     }
 
     #[test]

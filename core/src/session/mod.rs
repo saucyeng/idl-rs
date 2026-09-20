@@ -178,10 +178,23 @@ pub struct Channel {
     /// Verbatim recorded time, **before** burst-seam correction (contract
     /// C1 §3.2's `<source>_t_recorded_us`), same length/units/origin as
     /// `t_us`. `None` when identical to `t_us` element-for-element by
-    /// construction (every non-IMU source, and any IMU channel session
-    /// with no burst correction applied yet) — avoids duplicating identical
-    /// data in RAM; `Some` only once §3.3 correction has actually moved a
-    /// value (Task 6). **This field is not explicit in C1 §2's struct
+    /// construction (every non-IMU source) — avoids duplicating identical
+    /// data in RAM.
+    ///
+    /// `Some` for every reconciled `.idl0` IMU channel, holding the **raw
+    /// device stamp** each kept slot's sample arrived with (ruling R240): not
+    /// the seam-corrected value, which is what `t_us` carries, and not a copy
+    /// of `t_us`. That distinction is what C1 §3.2's second column is for, and
+    /// what `seam_spans` (C3 §3.5 `fetch_seams`) detects bursts in — the
+    /// correction flattens within-burst spacing, so a corrected array hides
+    /// the very boundaries it is asked to find. At a **synthesized** slot
+    /// (leading pad, interior fill, trailing pad — every slot covered by
+    /// `gaps`) there is no recorded stamp, and the entry holds the slot's
+    /// `t_us` as a documented placeholder: consult `gaps`, never the content.
+    /// Not guaranteed sorted (C1 §3.5 invariant 3) — a burst source's recorded
+    /// stamps can regress slightly at a seam.
+    ///
+    /// **This field is not explicit in C1 §2's struct
     /// listing** — C1 §1 states the module layout implementing §2–§7 is
     /// L1's own call, and C1 §4.1 requires both `t` (corrected) and
     /// `_t_recorded_us` (verbatim) as separate, independently-readable
@@ -321,9 +334,9 @@ impl Channel {
     }
 
     /// The verbatim recorded time for this channel (contract C1 §3.2) —
-    /// `t_recorded_us` when correction actually diverged it, else `t_us`
-    /// itself (the two are identical by construction whenever
-    /// `t_recorded_us` is `None`).
+    /// `t_recorded_us` when the source has one of its own (every reconciled
+    /// IMU), else `t_us` itself (the two are identical by construction
+    /// whenever `t_recorded_us` is `None`).
     pub fn t_recorded_us_or_t_us(&self) -> &[i64] {
         self.t_recorded_us.as_deref().unwrap_or(&self.t_us)
     }
