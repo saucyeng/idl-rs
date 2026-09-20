@@ -26,6 +26,7 @@
 //! No I/O — the caller (`idl-rs docs workbook`) reads the curated files and
 //! writes the result.
 
+use crate::commands::table::JSON_SCHEMA_VERSION;
 use crate::math::{math_builtin_catalog, math_name_migrations, MathBuiltin, MathBuiltinStatus};
 
 /// One curated section to append after the generated half: the file's
@@ -200,7 +201,7 @@ pub fn workbook_catalog_json() -> serde_json::Value {
     entries.sort_by_key(|entry| entry.name);
 
     serde_json::json!({
-        "schema_version": 1,
+        "schema_version": JSON_SCHEMA_VERSION,
         "functions": entries.iter().map(|entry| serde_json::json!({
             "name": entry.name,
             "signature": entry.signature,
