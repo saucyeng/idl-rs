@@ -587,7 +587,14 @@ impl ImuGridPlan {
             reconciled[i] = true;
             period_us[i] = effective_period_us[i];
             let first = corrected[i][0];
-            leading[i] = (((first - t0v) as f64) / period_us[i] as f64).round().max(0.0) as usize;
+            // **Floor, not round** (ruling R248): the leading pad extrapolates
+            // backward from `first` at `period_us`, so its earliest slot sits
+            // at `first - leading × period`. Rounding *up* would put that slot
+            // before `t0` — the session origin — and C1 §3.5 invariant 1's
+            // `t_us >= 0` would fail on a synthesized slot. Flooring keeps
+            // every pad slot inside `[t0, first)` by construction, at the cost
+            // of at most one fewer pad slot than the nearest-integer count.
+            leading[i] = (((first - t0v) as f64) / period_us[i] as f64).floor().max(0.0) as usize;
 
             // Gap detection, once, against the corrected stamps and this
             // IMU's own effective period — same absolute-slot rule as the

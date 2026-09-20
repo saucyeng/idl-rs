@@ -191,9 +191,39 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     // stamp (C1 §3.2, ruling R240), so the two columns describe different
     // things and `fetch_seams` has a pre-correction sequence to detect bursts
     // in. `imu_recorded_ts` is moved here — nothing reads it afterwards.
+    // The IMU half of the session origin, taken **before** the plan consumes
+    // the arrays: the earliest corrected stamp of every IMU — including one
+    // with too few samples to reconcile, whose `corrected` is its raw stamps
+    // verbatim (correction is a no-op there). The plan's own grid anchor
+    // covers only *reconciled* IMUs, which is right for the grid and too
+    // narrow for the origin.
+    let imu_corrected_min = corrected.iter().filter_map(|c| c.first().copied()).min();
     let plan =
         ImuGridPlan::build_from_corrected(corrected, imu_recorded_ts, effective_period_us, period_us);
-    let t0_us = origin.min_us.unwrap_or(0);
+    // Session origin (contract C1 §3.1, ruling R248): the minimum **corrected**
+    // stamp across every source — the IMUs' via the plan's anchor, every other
+    // source's recorded stamps verbatim (for those, recorded *is* corrected,
+    // C1 §3.3). Not `origin.min_us`, which is the minimum *raw* stamp: burst
+    // correction re-spaces burst 0 backward at the measured period, so an IMU
+    // running slower than its configured ODR has a corrected first sample
+    // earlier than its raw one, and anchoring on the raw minimum left the first
+    // corrected samples at a negative `t` — a direct breach of §3.5 invariant 1
+    // (`t_us >= 0`), measured at about -1.3 ms on a real session.
+    let non_imu_min = gps_ts
+        .iter()
+        .copied()
+        .min()
+        .into_iter()
+        .chain(channel_ts_us.values().filter_map(|v| v.iter().copied().min()))
+        .min();
+    let t0_us = match (imu_corrected_min, non_imu_min) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        // No IMU and no other timestamped source: nothing to anchor on.
+        // `origin.min_us` is the last resort, as before.
+        (None, None) => origin.min_us.unwrap_or(0),
+    };
     let mut channels = Vec::new();
     for (name, column) in acc.into_entries() {
         if let Some(imu_idx) = imu_index_of(&name) {
@@ -255,7 +285,9 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     let mut timestamp_source = crate::session::TimestampSource::Header;
     if effective_start_ms == 0 {
         if let (Some(epoch), Some(dev)) = (gps_anchor.gps_epoch_ms, gps_anchor.device_ts_us) {
-            let first_sample_us = origin.min_us.unwrap_or(0);
+            // `t0_us`, not the raw minimum: C1 §3.1 defines this value as the
+            // wall clock at `t = 0`, and `t = 0` is the session origin (R248).
+            let first_sample_us = t0_us;
             effective_start_ms =
                 epoch - ((dev - first_sample_us) as f64 / 1000.0).round() as i64;
             timestamp_source = crate::session::TimestampSource::GpsBackfill;
@@ -941,6 +973,60 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_corrected_earlier_than_its_raw_stamp_still_anchors_the_session_at_zero() {
+        // Arrange — ruling R248. An IMU configured at 800 Hz (nominal 1250 µs)
+        // but genuinely running *slower*: true period 1300 µs, bursts of 4, so
+        // read instants are 5200 µs apart. The firmware walks each burst back
+        // at the nominal 1250, so burst 0's raw stamps start at
+        // 100_000 - 3×1250 = 96_250; correction re-spaces it at the measured
+        // 1300, putting the corrected first sample at 100_000 - 3×1300 =
+        // 96_100 — 150 µs EARLIER than any raw stamp in the file. Anchored on
+        // the raw minimum (the pre-R248 rule) that sample sat at t = -150.
+        let mut raw_stamps: Vec<i64> = Vec::new();
+        for burst in 0..4i64 {
+            let t_read = 100_000 + burst * 5200;
+            for i in 0..4i64 {
+                raw_stamps.push(t_read - (3 - i) * 1250);
+            }
+        }
+        let registry = vec![v3_registry_entry(0, 4, 800, 1.0, 0.0, "IMU0_AccelX", "raw")];
+        let mut parts = vec![Header {
+            schema_version: 3,
+            imu_mask: 0x01,
+            imu_sample_rate_hz: 800,
+            ..Default::default()
+        }
+        .build(&registry)];
+        for &ts in raw_stamps.iter() {
+            parts.push(frame(0x01, &imu_payload(0, ts, &[10])));
+        }
+        parts.push(session_end());
+
+        // Act
+        let r = parse_v3(&cat(&parts)).unwrap();
+        let ch = find(&r, "IMU0_AccelX");
+
+        // Assert — the correction really did move burst 0 before its raw
+        // stamp (otherwise this test proves nothing)…
+        let t_recorded = ch.t_recorded_us.as_ref().expect("an IMU channel carries recorded stamps");
+        assert!(t_recorded[0] > 0, "the raw stamp must sit after t=0 here: {}", t_recorded[0]);
+
+        // …and the session is anchored on that corrected sample: `t` starts at
+        // exactly 0 and no channel anywhere carries a negative time (C1 §3.5
+        // invariant 1).
+        assert_eq!(ch.t_us[0], 0);
+        for c in &r.session.channels {
+            assert!(
+                c.t_us.first().copied().unwrap_or(0) >= 0,
+                "{} starts at {:?}",
+                c.channel_id,
+                c.t_us.first()
+            );
+        }
+        assert_eq!(r.session.channels.iter().filter_map(|c| c.t_us.first().copied()).min(), Some(0));
+    }
+
+    #[test]
     fn an_imu_that_stops_early_does_not_stretch_the_session_past_its_last_real_stamp() {
         // Arrange — ruling R241. IMU0 records 12 samples at 1000 µs; IMU1
         // stops after 4. Before R241, IMU1 was padded out to IMU0's length
@@ -1324,14 +1410,22 @@ mod tests {
         assert!(ch.t_us.windows(2).all(|w| w[1] - w[0] == 1200));
 
         // t_recorded_us holds the **raw** stamps the firmware wrote (ruling
-        // R240, C1 §3.2), t0-relative: 1250 µs inside each burst — the
-        // nominal cadence the FIFO walk-back uses — and 1050 µs across each
-        // seam. That is the sequence `seam_spans` detects bursts in, and it
-        // is not a copy of t_us.
+        // R240, C1 §3.2), expressed against the session origin: 1250 µs inside
+        // each burst — the nominal cadence the FIFO walk-back uses — and
+        // 1050 µs across each seam. That is the sequence `seam_spans` detects
+        // bursts in, and it is not a copy of t_us.
+        //
+        // The origin is the earliest **corrected** stamp (96_400 here, R248),
+        // and this IMU runs faster than nominal, so correction moved burst 0
+        // *later* than its raw stamps: the first recorded value is
+        // 96_250 - 96_400 = -150. C1 §3.2 says so — `t >= 0` is an invariant
+        // of `t`, never of the verbatim recorded column.
         let t_recorded = ch.t_recorded_us.as_ref().expect("an IMU channel carries recorded stamps");
-        let t0_us = raw_stamps[0];
-        let expected: Vec<i64> = raw_stamps.iter().map(|t| t - t0_us).collect();
+        let origin_us = 96_400;
+        let expected: Vec<i64> = raw_stamps.iter().map(|t| t - origin_us).collect();
         assert_eq!(*t_recorded, expected);
+        assert_eq!(t_recorded[0], -150);
+        assert_eq!(ch.t_us[0], 0);
         assert_ne!(*t_recorded, ch.t_us);
     }
 }
