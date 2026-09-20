@@ -427,65 +427,84 @@ fn the_committed_fixture_truth_matches_the_regenerated_truth() {
 
 /// `[IMU1_AccelZ] - resample([IMU2_AccelZ], [IMU1_AccelZ])` over the committed
 /// three-IMU fixture, through the real parser and the real evaluator (R242).
-/// This is the product's core expression — one IMU against another — and after
-/// C1 §3.1's corrected stamps it is only expressible through `resample`.
+/// This is the product's core expression — one IMU against another — which on
+/// real hardware is only expressible through `resample`, because C1 §3.1's
+/// corrected stamps give each IMU its own time axis.
+///
+/// The generator stamps all three sensors from one simulated clock (C1 §9.4),
+/// so on *this* fixture the axes coincide and `resample` must be the identity:
+/// the resampled difference has to equal the direct one bit for bit. That is
+/// the strongest assertion this fixture can carry, and it pins the property
+/// the interpolation must have at its fixed point. The genuinely-differing-axis
+/// cases live in `math::eval`'s unit tests, where the axes can be chosen.
 #[test]
-fn one_imu_against_another_evaluates_through_resample_on_the_committed_fixture() {
-    // Arrange — the fixture, parsed the way an import would parse it.
+fn one_imu_against_another_through_resample_matches_the_direct_difference_on_the_fixture() {
+    // Arrange
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synth-3lap.idl0");
     let bytes = std::fs::read(path).expect("committed fixture is present");
     let session = parse_log(&bytes);
-    let onto_t_us = session
+    let t_us_of = |name: &str| {
+        session
+            .channels
+            .iter()
+            .find(|c| c.channel_id == name)
+            .unwrap_or_else(|| panic!("no channel {name}"))
+            .t_us
+            .clone()
+    };
+    let onto_t_us = t_us_of("IMU1_AccelZ");
+    let other_t_us = t_us_of("IMU2_AccelZ");
+    let handle = crate::session::handle::SessionHandle::from_session(session);
+    let ctx = crate::math::MathLapContext::empty();
+
+    // Act
+    let resampled =
+        crate::math::evaluate("[IMU1_AccelZ] - resample([IMU2_AccelZ], [IMU1_AccelZ])", &handle, &ctx)
+            .expect("the resampled difference evaluates");
+    let direct = crate::math::evaluate("[IMU1_AccelZ] - [IMU2_AccelZ]", &handle, &ctx)
+        .expect("the fixture's IMUs share one simulated clock, so this is defined too");
+
+    // Assert — the fixture's premise, then the identity it makes testable.
+    assert_eq!(onto_t_us, other_t_us, "the generator's sensors share one clock");
+    assert_eq!(resampled.t_us, onto_t_us);
+    assert_eq!(resampled.samples.len(), onto_t_us.len());
+    assert_eq!(resampled.samples, direct.samples);
+    assert!(resampled.samples.iter().all(|v| v.is_finite()), "no NaN inside the shared span");
+}
+
+/// Resampling onto an axis that starts later and ends earlier than the source
+/// keeps every sample it can and fabricates none — the real-data shape, using
+/// the fixture's GPS channel as a genuinely slower, shorter axis.
+#[test]
+fn resampling_an_imu_onto_the_fixtures_gps_axis_lands_on_the_gps_times() {
+    // Arrange
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synth-3lap.idl0");
+    let bytes = std::fs::read(path).expect("committed fixture is present");
+    let session = parse_log(&bytes);
+    let gps_t_us = session
         .channels
         .iter()
-        .find(|c| c.channel_id == "IMU1_AccelZ")
-        .expect("fixture has three IMUs")
+        .find(|c| c.channel_id == "GPS_SpeedKmh")
+        .expect("the fixture has GPS")
         .t_us
         .clone();
     let handle = crate::session::handle::SessionHandle::from_session(session);
 
-    // Act
+    // Act — an 800-ish Hz IMU channel onto a 5 Hz GPS axis.
     let out = crate::math::evaluate(
-        "[IMU1_AccelZ] - resample([IMU2_AccelZ], [IMU1_AccelZ])",
+        "resample([IMU0_AccelZ], [GPS_SpeedKmh])",
         &handle,
         &crate::math::MathLapContext::empty(),
     )
     .expect("the expression evaluates");
 
-    // Assert — the result sits on IMU1's own recorded axis, sample for
-    // sample, and is a real difference (finite) wherever IMU2 was recording.
-    assert_eq!(out.t_us, onto_t_us);
-    assert_eq!(out.samples.len(), onto_t_us.len());
+    // Assert — one sample per GPS fix, on the GPS times, and finite wherever
+    // the fix falls inside the IMU's recorded span (NaN outside it, never an
+    // extrapolated edge value).
+    assert_eq!(out.t_us, gps_t_us);
+    assert_eq!(out.samples.len(), gps_t_us.len());
     let finite = out.samples.iter().filter(|v| v.is_finite()).count();
-    assert!(
-        finite * 10 > out.samples.len() * 9,
-        "only {finite} of {} samples are finite",
-        out.samples.len()
-    );
-}
-
-/// The same pair without `resample`: a typed error naming the way out, never a
-/// silently misaligned difference (C2 §3.6.2 rule 4, review finding 5).
-#[test]
-fn one_imu_minus_another_without_a_resample_is_a_typed_error_on_the_fixture() {
-    // Arrange
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synth-3lap.idl0");
-    let bytes = std::fs::read(path).expect("committed fixture is present");
-    let handle = crate::session::handle::SessionHandle::from_session(parse_log(&bytes));
-
-    // Act
-    let result = crate::math::evaluate(
-        "[IMU1_AccelZ] - [IMU2_AccelZ]",
-        &handle,
-        &crate::math::MathLapContext::empty(),
-    );
-
-    // Assert — either the two IMUs genuinely share one axis (then the
-    // difference is honest and defined), or they do not and the error says
-    // what to write instead. Never an out-of-bounds read or a wrong pairing.
-    if let Err(e) = result {
-        assert!(e.message.contains("resample(x, onto)"), "{}", e.message);
-    }
+    assert!(finite > gps_t_us.len() / 2, "only {finite} of {} fixes resolved", gps_t_us.len());
 }
 
 #[test]
