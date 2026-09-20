@@ -600,7 +600,10 @@ mod tests {
                 gaps: Vec::new(),
             }],
         };
-        write_session_parquet(root, &session, "0.1.0").unwrap();
+        // The running version, not a literal: the staleness tests below turn
+        // on whether a row matches what this build would stamp, so a literal
+        // here makes them lie the moment the importer version is bumped.
+        write_session_parquet(root, &session, crate::parse::IDL0_IMPORTER_VERSION).unwrap();
     }
 
     #[test]
@@ -666,8 +669,8 @@ mod tests {
 
     #[test]
     fn list_stale_sessions_a_row_stamped_with_an_older_importer_version_is_listed_as_strings() {
-        // Arrange — `write_full_session` always stamps `"0.1.0"`
-        // (`crate::parse::IDL0_IMPORTER_VERSION`'s current value); overwrite
+        // Arrange — `write_full_session` stamps the running
+        // `IDL0_IMPORTER_VERSION`; overwrite
         // it with an older string directly in the catalog, simulating a
         // session imported by a previous build.
         let root = temp_root();

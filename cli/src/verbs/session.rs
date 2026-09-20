@@ -16,7 +16,7 @@ use idl_rs::commands::session_ops::{
 use idl_rs::store::catalog_read::{
     get_session, list_laps, list_sessions, LapSummary, SessionDetail, SessionSummary,
 };
-use idl_rs::store::import::import_file_path;
+use idl_rs::store::import::{import_file_path, import_idl0_path};
 use idl_rs::store::session_json::{set_session_start, SessionJson};
 use idl_rs::calibration::json::CalibrationJson;
 use idl_rs::calibration::rigid;
@@ -195,7 +195,17 @@ pub fn import(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
         ));
     }
 
-    let report = import_file_path(root, &extension, &file)?;
+    // `.idl0` is the device's own format and has no `Importer` trait entry —
+    // `import_file` covers the converted formats only and answers "no
+    // importer covers file extension" for it, while `--dry-run` above
+    // (rightly) said it would import. Routing is this verb's job (see
+    // `import_file`'s doc), and this is the same entry point the deprecated
+    // top-level `import` command uses.
+    let report = if extension == "idl0" {
+        import_idl0_path(root, &file)?
+    } else {
+        import_file_path(root, &extension, &file)?
+    };
 
     let outcome = format!("{:?}", report.outcome).to_lowercase();
     Ok(VerbOutput::new(
@@ -602,6 +612,49 @@ mod tests {
         let (_, m) = parsed.subcommand().unwrap();
         let (_, m) = m.subcommand().unwrap();
         m.clone()
+    }
+
+    /// A `session import` subcommand's own matches.
+    fn import_matches(argv: &[&str]) -> ArgMatches {
+        let tree = crate::verbs::augment(clap::Command::new("idl-rs"));
+        let mut full = vec!["idl-rs", "session", "import"];
+        full.extend_from_slice(argv);
+        let parsed = tree.try_get_matches_from(full).expect("argv parses");
+        let (_, m) = parsed.subcommand().unwrap();
+        let (_, m) = m.subcommand().unwrap();
+        m.clone()
+    }
+
+    #[test]
+    fn session_import_of_an_idl0_log_agrees_with_its_own_dry_run() {
+        // Arrange — P2-1: `--dry-run` answered "would import … as idl0" while
+        // the real path answered "no importer covers file extension idl0",
+        // because `.idl0` has no `Importer` trait entry and this verb did not
+        // route it to `import_idl0_path`.
+        let out = temp_dir().join("ride.idl0");
+        let root = temp_dir().join("library");
+        let dry = Ctx { json: false, dry_run: true, data_dir: Some(root.clone()) };
+        synth(
+            &Ctx { json: false, dry_run: false, data_dir: None },
+            &synth_matches(&["--out", out.to_str().unwrap(), "--laps", "1", "--lap-length-m", "200", "--rate-hz", "100"]),
+        )
+        .unwrap();
+        let m = import_matches(&[out.to_str().unwrap()]);
+        let real = Ctx { json: false, dry_run: false, data_dir: Some(root) };
+
+        // Act
+        let preview = import(&dry, &m).unwrap();
+        let done = match import(&real, &m) {
+            Ok(r) => r,
+            Err(e) => panic!("{}", e.message),
+        };
+
+        // Assert — the dry run promised an idl0 import and the real path
+        // delivered one, writing the session's `data.parquet`.
+        assert!(preview.text.contains("as idl0"), "{}", preview.text);
+        assert_eq!(done.data["written"], serde_json::json!(true));
+        let parquet = done.data["data_parquet"].as_str().unwrap();
+        assert!(std::path::Path::new(parquet).is_file(), "{parquet} was not written");
     }
 
     /// A `session calibrate` subcommand's own matches.

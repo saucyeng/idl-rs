@@ -27,7 +27,13 @@ use crate::session::{ParseError, ParseResult};
 /// argument); a mismatch against the currently-running build's value is one
 /// of the two triggers for C1 §4.3's regeneration rule (the other being
 /// [`crate::session::seam_correction::SEAM_CORRECTION_VERSION`]).
-pub const IDL0_IMPORTER_VERSION: &str = "0.1.0";
+/// `0.2.0` (2026-09-19): IMU `t_us` is each slot's recorded (burst-seam-
+/// corrected) time rather than a uniform `t0 + slot × effective_period_us`
+/// grid (C1 §3.1, §3.5 invariant 4). Every `.idl0` `data.parquet` written by
+/// an earlier build carries IMU times that drift from the hardware stamps, so
+/// `library stale` reports those sessions and `library rebuild` re-derives
+/// them.
+pub const IDL0_IMPORTER_VERSION: &str = "0.2.0";
 
 /// Validates the magic bytes (and schema byte) and dispatches to the v3 parser.
 ///

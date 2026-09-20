@@ -524,27 +524,7 @@ pub(crate) fn elemwise(
             // combining one with a time series otherwise reports "different
             // sample rates (0 Hz vs 100 Hz). Use resample()" — advice that
             // cannot work, for a mismatch that is not about rates at all.
-            let axis = combine_axis(op_name, a.axis, b.axis)?;
-            if a.sample_rate_hz != b.sample_rate_hz {
-                return Err(err(
-                    MathEvalErrorKind::Runtime,
-                    format!(
-                        "Cannot \"{op_name}\" channels with different sample rates ({} Hz vs {} Hz). \
-                         Use resample() to match rates first.",
-                        a.sample_rate_hz, b.sample_rate_hz
-                    ),
-                ));
-            }
-            if a.samples.len() != b.samples.len() {
-                return Err(err(
-                    MathEvalErrorKind::Runtime,
-                    format!(
-                        "\"{op_name}\": channel lengths differ ({} vs {})",
-                        a.samples.len(),
-                        b.samples.len()
-                    ),
-                ));
-            }
+            let axis = require_same_shape(op_name, &a, &b)?;
             let t_us = combine_t_us(op_name, &a.t_us, &b.t_us)?;
             let mut out = Vec::with_capacity(a.samples.len());
             for i in 0..a.samples.len() {
@@ -585,6 +565,48 @@ pub(crate) fn elemwise(
             format!("\"{op_name}\": unexpected value types ({}, {})", type_name(&l), type_name(&r)),
         )),
     }
+}
+
+/// Checks that two channel operands of `op_name` agree in shape well enough
+/// to be paired sample for sample: same axis ([`combine_axis`]), same sample
+/// rate (Hz), same length. Returns the shared axis.
+///
+/// Every builtin that pairs two channels positionally goes through here, so
+/// the author reads one wording for one mistake — arithmetic and `where`
+/// answer a mixed-rate pair with the same typed error, rather than one of
+/// them indexing the shorter operand out of bounds (P0-3,
+/// `docs/superpowers/specs/2026-09-19-idl1-first-real-workbook-gaps-DRAFT.md`).
+fn require_same_shape(
+    op_name: &str,
+    a: &ChannelValue,
+    b: &ChannelValue,
+) -> Result<ValueAxis, MathEvalError> {
+    // Shape before rate: a `[lap]` value has no sample rate, so combining one
+    // with a time series otherwise reports "different sample rates (0 Hz vs
+    // 100 Hz). Use resample()" — advice that cannot work, for a mismatch that
+    // is not about rates at all.
+    let axis = combine_axis(op_name, a.axis, b.axis)?;
+    if a.sample_rate_hz != b.sample_rate_hz {
+        return Err(err(
+            MathEvalErrorKind::Runtime,
+            format!(
+                "Cannot \"{op_name}\" channels with different sample rates ({} Hz vs {} Hz). \
+                 Use resample() to match rates first.",
+                a.sample_rate_hz, b.sample_rate_hz
+            ),
+        ));
+    }
+    if a.samples.len() != b.samples.len() {
+        return Err(err(
+            MathEvalErrorKind::Runtime,
+            format!(
+                "\"{op_name}\": channel lengths differ ({} vs {})",
+                a.samples.len(),
+                b.samples.len()
+            ),
+        ));
+    }
+    Ok(axis)
 }
 
 /// Resolves the axis of a channel×channel [`elemwise`] result (C2 §3.6.2
@@ -1613,6 +1635,16 @@ fn call_function(
             }
             let cond = require_channel(&args[0], "where(cond,t,f) — cond")?;
             let n = cond.samples.len();
+            // A channel branch is paired with `cond` sample for sample, so it
+            // must agree with it in shape, rate and length exactly as an
+            // arithmetic operand would — otherwise a 1 Hz branch under an
+            // 800 Hz condition read past its own end (P0-3). A scalar branch
+            // broadcasts and is not checked.
+            for branch in [&args[1], &args[2]] {
+                if let Value::Channel(b) = branch {
+                    require_same_shape("where(cond,t,f)", &cond, b)?;
+                }
+            }
             // L3-R33: cond's t_us no longer wins by default — it is folded via
             // combine_t_us against the t/f operands' own axes too (a scalar
             // operand contributes no axis, i.e. empty). Equal-or-empty passes
@@ -3040,6 +3072,38 @@ mod tests {
         // Assert
         assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
         assert!(err.message.contains("different per-sample time axes"), "{}", err.message);
+    }
+
+    #[test]
+    fn where_branch_at_a_different_sample_rate_is_the_typed_rate_error_not_an_index_panic() {
+        // Arrange — P0-3: an 800 Hz condition over a 1 Hz branch, the shape
+        // of `where(sector_number() == 3, [GPS_SpeedKmh], 0)`. Before this
+        // check the branch was indexed with the condition's index and
+        // answered "Sample index N out of bounds".
+        let lk = lookup(&[("fast", vec![1.0, 1.0, 0.0, 1.0], 800.0), ("slow", vec![7.0], 1.0)]);
+
+        // Act
+        let err = eval_expr("where([fast], [slow], 0)", &lk).unwrap_err();
+
+        // Assert — the same typed error the arithmetic operators give.
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("different sample rates"), "{}", err.message);
+        assert!(err.message.contains("800"), "{}", err.message);
+        assert!(!err.message.contains("out of bounds"), "{}", err.message);
+    }
+
+    #[test]
+    fn where_branch_at_the_same_rate_but_a_shorter_length_is_a_typed_length_error() {
+        // Arrange — same rate, fewer samples: the other way a branch could be
+        // read past its own end.
+        let lk = lookup(&[("cond", vec![1.0, 0.0, 1.0], 10.0), ("short", vec![5.0, 6.0], 10.0)]);
+
+        // Act
+        let err = eval_expr("where([cond], [short], 0)", &lk).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::math::MathEvalErrorKind::Runtime);
+        assert!(err.message.contains("channel lengths differ"), "{}", err.message);
     }
 
     #[test]

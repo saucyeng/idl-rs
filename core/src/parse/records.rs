@@ -500,8 +500,6 @@ pub struct ImuGridPlan {
     /// Per-IMU corrected period (µs): `effective_period_us` from seam
     /// correction, or `nominal_period_us` when unreconciled.
     period_us: [i64; 3],
-    /// Grid origin, absolute device-clock µs.
-    t0: i64,
     /// Leading pad length (slots) per IMU — `round((first - t0) / period)`.
     leading: [usize; 3],
     /// Whether each IMU has ≥2 samples and is therefore reconciled.
@@ -588,7 +586,6 @@ impl ImuGridPlan {
 
         ImuGridPlan {
             period_us,
-            t0: t0.unwrap_or(0),
             leading,
             reconciled,
             target_len,
@@ -601,20 +598,23 @@ impl ImuGridPlan {
     /// Reconciles one channel by name: rebuilds its value column onto the
     /// grid (unchanged fill logic — held-edge pads, linear interior fills),
     /// and returns `(column, t_us, t_recorded_us, gaps)` — `t_us` is the
-    /// pure uniform grid (absolute device-clock µs, same domain as `t0`);
-    /// `t_recorded_us` is dense and equals the real corrected stamp at every
-    /// kept slot, and is **unspecified at every slot inside `gaps`** (callers
-    /// must consult `gaps`, never infer nullness from content — see this
-    /// module's doc for the reasoning). Every non-IMU channel passes
-    /// through with `t_us`/`t_recorded_us` empty and an empty gap list (the
-    /// caller already has real `t_us` for those from its own recorded-time
-    /// bookkeeping).
+    /// **recorded** time of each slot (absolute device-clock µs, same domain
+    /// as `t0`): the slot's own burst-seam-corrected stamp wherever the slot
+    /// holds a real sample, and a neighbour-interpolated placeholder inside a
+    /// gap ([`slot_times_from_corrected`], C1 §3.1/§3.5 invariant 4 — a
+    /// sample's time is never `i / nominal_rate_hz`). `t_recorded_us` is
+    /// dense and equals the real corrected stamp at every kept slot, and is
+    /// **unspecified at every slot inside `gaps`** (callers must consult
+    /// `gaps`, never infer nullness from content — see this module's doc for
+    /// the reasoning). Every non-IMU channel passes through with
+    /// `t_us`/`t_recorded_us` empty and an empty gap list (the caller already
+    /// has real `t_us` for those from its own recorded-time bookkeeping).
     pub fn reconcile(&self, name: &str, column: RawColumn) -> (RawColumn, Vec<i64>, Vec<i64>, Vec<GapSpan>) {
         match imu_index_of(name) {
             Some(i) if self.reconciled[i] => {
-                let t_us: Vec<i64> = (0..self.target_len)
-                    .map(|slot| self.t0 + (slot as i64) * self.period_us[i])
-                    .collect();
+                let t_us = slot_times_from_corrected(
+                    &self.corrected[i], &self.gaps_received[i], self.leading[i], self.target_len, self.period_us[i],
+                );
                 let t_recorded_us = rebuild_i64_grid_or_real(
                     &self.corrected[i], &self.gaps_received[i], self.leading[i], self.target_len, &t_us,
                 );
@@ -633,10 +633,91 @@ impl ImuGridPlan {
     }
 }
 
+/// Builds one IMU's dense per-slot time axis (`t_us`, absolute device-clock
+/// µs) from its burst-seam-corrected stamps — contract C1 §3.1 ("`t_us[i] =
+/// corrected_timestamp_us[i] − t0_us`"; the caller subtracts the session-wide
+/// `t0_us`) and §3.5 invariant 4 ("`nominal_rate_hz` never derives a sample's
+/// time, anywhere"). Walks the same fill pattern as [`rebuild_i16`]:
+///
+/// - a slot holding a real sample takes that sample's corrected stamp
+///   verbatim, so a recorded cadence that drifts from the session median, and
+///   a multi-second FIFO dropout, both appear in `t_us` exactly as recorded;
+/// - an **interior** gap slot is linearly interpolated (rounded to µs) between
+///   the corrected stamps bracketing the drop, so `t_us` stays monotone across
+///   the dropout and each fill sits between its neighbours;
+/// - the **leading** pad extrapolates backward from the first corrected stamp
+///   at `period_us`, and the **trailing** pad forward from the last one — there
+///   is no bracketing stamp on those edges, exactly as `rebuild_i16` has no
+///   bracketing value there.
+///
+/// A final pass enforces C1 §3.5 invariant 1 (strictly increasing `t_us`): a
+/// slot that does not advance past its predecessor is clamped to
+/// `previous + 1 µs`. Burst-seam correction already guarantees strictly
+/// increasing corrected stamps, so this is a defence against a degenerate
+/// interpolation (a sub-slot-per-µs drop), never the normal path.
+///
+/// `period_us` is that IMU's corrected `effective_period_us` (µs).
+fn slot_times_from_corrected(
+    corrected: &[i64],
+    gaps_received: &[(usize, usize)],
+    leading: usize,
+    target_len: usize,
+    period_us: i64,
+) -> Vec<i64> {
+    if corrected.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<i64> = Vec::with_capacity(target_len);
+
+    // Leading pad: backward extrapolation from the first corrected stamp.
+    let first = corrected[0];
+    for slot in 0..leading {
+        out.push(first - ((leading - slot) as i64) * period_us);
+    }
+    out.push(first);
+
+    let mut gi = 0usize;
+    for k in 1..corrected.len() {
+        let missing = if gi < gaps_received.len() && gaps_received[gi].0 == k {
+            let m = gaps_received[gi].1;
+            gi += 1;
+            m
+        } else {
+            0
+        };
+        if missing >= 1 {
+            let t0 = corrected[k - 1] as f64;
+            let t1 = corrected[k] as f64;
+            let denom = (missing + 1) as f64;
+            for j in 1..=missing {
+                out.push((t0 + (t1 - t0) * (j as f64) / denom).round() as i64);
+            }
+        }
+        out.push(corrected[k]);
+    }
+
+    // Tail pad: forward extrapolation from the last corrected stamp out to the
+    // session-wide grid length.
+    if out.len() < target_len {
+        let last = *corrected.last().unwrap_or(&first);
+        let occupied = out.len();
+        for j in 1..=(target_len - occupied) {
+            out.push(last + (j as i64) * period_us);
+        }
+    }
+
+    for i in 1..out.len() {
+        if out[i] <= out[i - 1] {
+            out[i] = out[i - 1] + 1;
+        }
+    }
+    out
+}
+
 /// Builds a dense `t_recorded_us` array for one IMU's grid: at a slot that
 /// holds a real (non-synthesized) sample, its exact corrected timestamp; at
 /// every other slot (leading pad, interior fill, trailing pad — all covered
-/// by a `GapSpan`), the corresponding value from `grid_t_us` (a harmless,
+/// by a `GapSpan`), the corresponding value from `slot_t_us` (a harmless,
 /// documented placeholder — see [`ImuGridPlan::reconcile`]'s doc). Mirrors
 /// `rebuild_i16`'s fill-pattern walk exactly, but placing real/placeholder
 /// timestamps rather than interpolating values.
@@ -645,7 +726,7 @@ fn rebuild_i64_grid_or_real(
     gaps_received: &[(usize, usize)],
     leading: usize,
     target_len: usize,
-    grid_t_us: &[i64],
+    slot_t_us: &[i64],
 ) -> Vec<i64> {
     if corrected.is_empty() {
         return Vec::new();
@@ -681,8 +762,8 @@ fn rebuild_i64_grid_or_real(
         is_real.resize(target_len, false);
     }
     for (i, real) in is_real.iter().enumerate() {
-        if !*real && i < grid_t_us.len() {
-            out[i] = grid_t_us[i];
+        if !*real && i < slot_t_us.len() {
+            out[i] = slot_t_us[i];
         }
     }
     out
@@ -872,8 +953,12 @@ mod tests {
             RawColumn::I16 { data: vec![0, 10, 30], scale: 1.0, offset: 0.0 },
         );
 
-        // Assert — value fill unchanged; t_us is the pure uniform grid;
-        // t_recorded_us carries the real corrected stamp at every kept slot.
+        // Assert — value fill unchanged; t_us is the recorded time at every
+        // kept slot and the neighbour interpolation inside the gap (here
+        // identical to the old uniform grid, because this stream's recorded
+        // spacing *is* exactly the period — the existing-behaviour
+        // regression case); t_recorded_us carries the real corrected stamp
+        // at every kept slot.
         assert_eq!(col.materialize(), vec![0.0, 10.0, 20.0, 30.0]);
         assert_eq!(spans, vec![GapSpan { start: 2, len: 1 }]);
         assert_eq!(t_us, vec![0, 1000, 2000, 3000]);
@@ -980,6 +1065,138 @@ mod tests {
                 "{name}: t_us/column length mismatch"
             );
         }
+    }
+
+    /// One IMU's corrected stamps for the drift-and-dropout cases below:
+    /// `n_before` samples at `period_a` µs, then a `dropout_us` hole, then
+    /// `n_after` samples at `period_b` µs. Returns the corrected sequence
+    /// (absolute device-clock µs).
+    fn drifting_stamps_with_dropout(
+        n_before: usize,
+        period_a: i64,
+        dropout_us: i64,
+        n_after: usize,
+        period_b: i64,
+    ) -> Vec<i64> {
+        let mut out = Vec::with_capacity(n_before + n_after);
+        let mut t = 1_000_000i64;
+        for _ in 0..n_before {
+            out.push(t);
+            t += period_a;
+        }
+        t += dropout_us;
+        for _ in 0..n_after {
+            out.push(t);
+            t += period_b;
+        }
+        out
+    }
+
+    #[test]
+    fn imu_slot_time_drifting_period_with_a_dropout_tracks_the_recorded_stamps() {
+        // Arrange — 2000 samples whose true period (1200 µs) drifts from the
+        // session median the reconciler is handed (1250 µs), with a 3 s
+        // dropout in the middle. Under the old `t0 + slot × period` grid the
+        // end of this stream drifted ≈ 2000 × 50 µs = 100 ms away from the
+        // hardware stamps; the recorded-time rule must not.
+        let stamps = drifting_stamps_with_dropout(1000, 1200, 3_000_000, 1000, 1200);
+        let last_stamp = *stamps.last().unwrap();
+        let first_stamp = stamps[0];
+        let corrected = [stamps, Vec::new(), Vec::new()];
+        let plan = ImuGridPlan::build_from_corrected(corrected, [1250, 1250, 1250], 1250);
+
+        // Act
+        let (_col, t_us, t_recorded_us, spans) = plan.reconcile(
+            "IMU0_AccelX",
+            RawColumn::I16 { data: vec![7; 2000], scale: 1.0, offset: 0.0 },
+        );
+
+        // Assert — a single reconciled IMU anchors the grid on its own first
+        // stamp and sets the grid length, so slot 0 and the last slot are
+        // both real: each carries its recorded stamp, well inside one sample
+        // period of it. The 3 s dropout is present in `t_us` as a jump.
+        let last = t_us.len() - 1;
+        assert!(
+            (t_us[last] - t_recorded_us[last]).abs() < 1250,
+            "t drifted from the recorded stamp: {} vs {}",
+            t_us[last],
+            t_recorded_us[last]
+        );
+        assert_eq!(t_us[last], last_stamp);
+        assert_eq!(t_us[0], first_stamp);
+        let interior = spans
+            .iter()
+            .find(|s| s.start > 0 && s.start + s.len < t_us.len())
+            .expect("the dropout should be an interior gap span");
+        let jump = t_us[interior.start + interior.len] - t_us[interior.start - 1];
+        assert!(jump > 3_000_000, "the dropout should appear in t, got {jump} µs");
+    }
+
+    #[test]
+    fn imu_slot_time_drifting_period_with_a_dropout_is_strictly_increasing() {
+        // Arrange — same stream, with the two halves running at different
+        // true periods so neither matches the reconciler's median.
+        let stamps = drifting_stamps_with_dropout(500, 1180, 2_500_000, 500, 1230);
+        let corrected = [stamps, Vec::new(), Vec::new()];
+        let plan = ImuGridPlan::build_from_corrected(corrected, [1250, 1250, 1250], 1250);
+
+        // Act
+        let (_col, t_us, _t_recorded_us, _spans) = plan.reconcile(
+            "IMU0_AccelX",
+            RawColumn::I16 { data: vec![7; 1000], scale: 1.0, offset: 0.0 },
+        );
+
+        // Assert — C1 §3.5 invariant 1, per source.
+        assert!(t_us.len() >= 1000);
+        assert!(t_us.windows(2).all(|w| w[1] > w[0]), "t_us must be strictly increasing");
+    }
+
+    #[test]
+    fn imu_slot_time_pad_slots_lie_strictly_between_their_neighbours() {
+        // Arrange — one interior dropout, so every padded slot has a real
+        // corrected stamp on both sides.
+        let stamps = drifting_stamps_with_dropout(10, 1200, 100_000, 10, 1200);
+        let corrected = [stamps, Vec::new(), Vec::new()];
+        let plan = ImuGridPlan::build_from_corrected(corrected, [1250, 1250, 1250], 1250);
+
+        // Act
+        let (_col, t_us, _t_recorded_us, spans) = plan.reconcile(
+            "IMU0_AccelX",
+            RawColumn::I16 { data: vec![7; 20], scale: 1.0, offset: 0.0 },
+        );
+
+        // Assert — inside each interior span, every slot is strictly between
+        // the real stamps bracketing it.
+        let interior: Vec<&GapSpan> =
+            spans.iter().filter(|s| s.start > 0 && s.start + s.len < t_us.len()).collect();
+        assert!(!interior.is_empty(), "the dropout should produce an interior gap span");
+        for s in interior {
+            let before = t_us[s.start - 1];
+            let after = t_us[s.start + s.len];
+            for slot in s.start..s.start + s.len {
+                assert!(t_us[slot] > before && t_us[slot] < after, "pad slot {slot} is not between its neighbours");
+            }
+        }
+    }
+
+    #[test]
+    fn imu_slot_time_gap_free_constant_rate_stream_is_the_uniform_grid() {
+        // Arrange — the existing-behaviour regression: a stream whose
+        // recorded spacing is exactly the reconciler's period has no gaps,
+        // so recorded time and the old `t0 + slot × period` grid agree.
+        let stamps: Vec<i64> = (0..50).map(|i| 500_000 + i * 1000).collect();
+        let corrected = [stamps, Vec::new(), Vec::new()];
+        let plan = ImuGridPlan::build_from_corrected(corrected, [1000, 1000, 1000], 1000);
+
+        // Act
+        let (_col, t_us, _t_recorded_us, spans) = plan.reconcile(
+            "IMU0_AccelX",
+            RawColumn::I16 { data: vec![3; 50], scale: 1.0, offset: 0.0 },
+        );
+
+        // Assert
+        assert!(spans.is_empty());
+        assert_eq!(t_us, (0..50).map(|i| 500_000 + i * 1000).collect::<Vec<i64>>());
     }
 
     #[test]
