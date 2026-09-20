@@ -237,6 +237,50 @@ fn folder(m: &ArgMatches) -> Result<PathBuf, CliError> {
 #[cfg(test)]
 mod tests {
     use idl_rs::commands::table::rows_for;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn temp_dir() -> std::path::PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("idl-rs-cli-store-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn docs_workbook_json_writes_the_catalog_sorted_by_name() {
+        // Arrange
+        let out = temp_dir().join("functionCatalog.json");
+
+        // Act
+        super::docs_workbook_json(&out).unwrap();
+
+        // Assert
+        let text = std::fs::read_to_string(&out).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        let names: Vec<&str> =
+            parsed["functions"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        assert!(!text.contains('\r'));
+    }
+
+    #[test]
+    fn docs_workbook_json_run_twice_writes_identical_bytes() {
+        // Arrange
+        let out = temp_dir().join("functionCatalog.json");
+
+        // Act
+        super::docs_workbook_json(&out).unwrap();
+        let first = std::fs::read(&out).unwrap();
+        super::docs_workbook_json(&out).unwrap();
+        let second = std::fs::read(&out).unwrap();
+
+        // Assert — CI's gate is `git diff --exit-code` over exactly this.
+        assert_eq!(first, second);
+    }
 
     #[test]
     fn every_library_row_in_the_table_is_one_this_module_can_build() {
