@@ -752,11 +752,11 @@ fn function_unit_rule(name: &str, arg_count: usize) -> (FnUnitRule, Vec<FnUnitCh
         // rename cost zero migration.
         "envelope" => (SameAsArg(0), no_checks),
         "correlate" | "convolve" => (Product(same(0), same(1)), no_checks),
-        // `resample(ch, n)` — `n` is a target sample count (scipy's own
-        // parameterisation), not a rate (R146/R151 item 8): a count is
-        // `Dimensionless` and carries no unit check of its own, so this rule
-        // is unaffected by the rename — only the C2 §3.3 signature/prose
-        // changed, not the argument this rule reads.
+        // `resample(x, onto)` — `onto` contributes its *time axis*, never its
+        // values, so the result's unit is x's unit and `onto`'s unit is not
+        // checked against anything (R242; before it, the second argument was
+        // a scipy-style target sample count, and the rule was the same for
+        // the same reason — that argument does not enter the result).
         "resample" => (SameAsArg(0), no_checks),
         "where" => (AllMatch(vec![1, 2]), no_checks),
         "current_lap" => (Dimensionless, no_checks),
