@@ -4,7 +4,10 @@
 //! One action today, `docs workbook`, which renders
 //! `docs/WORKBOOK-REFERENCE.md` — the generated builtin catalog and
 //! retired-name table from [`idl_rs::docs`], followed by the curated
-//! Markdown files under `--src` in filename order.
+//! Markdown files under `--src` in filename order. `docs workbook --json`
+//! (ruling R249) bypasses this module entirely: `verbs/store.rs`'s `docs()`
+//! writes [`idl_rs::docs::workbook_catalog_json`] straight to `--out`
+//! instead, since that mode has no curated sections to splice in.
 //!
 //! CI runs this and then `git diff --exit-code`, so the output has to be
 //! byte-stable for a given engine and curated source set: the curated files

@@ -110,13 +110,19 @@ pub fn docs(row: &CommandRow, ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, C
         "workbook" => {
             let out = opt_path(m, "out")
                 .ok_or_else(|| CliError::usage("docs workbook needs --out"))?;
-            let src = opt_path(m, "src").unwrap_or_else(|| PathBuf::from("docs/reference-src"));
             if ctx.dry_run {
                 return Ok(VerbOutput::new(
                     format!("would write {}", out.display()),
                     json!({ "out": out.display().to_string(), "written": false }),
                 ));
             }
+            // `--json` (ruling R249): the builtin catalog as sorted JSON,
+            // rather than the Markdown reference — the same amended-flag
+            // shape `docs cli`'s own `--json` already uses, no new verb.
+            if ctx.json {
+                return docs_workbook_json(&out);
+            }
+            let src = opt_path(m, "src").unwrap_or_else(|| PathBuf::from("docs/reference-src"));
             // `docs_cmd::run` renders and exits; it is reused verbatim so the
             // byte-stability CI depends on has exactly one implementation.
             let code = docs_cmd::run(DocsAction::Workbook { out: out.clone(), src });
@@ -133,6 +139,30 @@ pub fn docs(row: &CommandRow, ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, C
             format!("`docs {other}` is in the command table but has no implementation"),
         )),
     }
+}
+
+/// `docs workbook --json` — the builtin catalog as sorted, stable JSON
+/// (ruling R249), written wholesale to `out`.
+///
+/// Byte-stable with `\n` line endings only, the same CI-diff-gate
+/// contract `docs_cmd::workbook`'s Markdown half and `cli`'s JSON half
+/// below both keep.
+fn docs_workbook_json(out: &std::path::Path) -> Result<VerbOutput, CliError> {
+    let mut body = serde_json::to_string_pretty(&idl_rs::docs::workbook_catalog_json())
+        .map_err(|e| CliError::new(ErrorKind::Internal, e.to_string()))?;
+    body.push('\n');
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CliError::io(format!("creating {}: {e}", parent.display())))?;
+        }
+    }
+    std::fs::write(out, body.as_bytes())
+        .map_err(|e| CliError::io(format!("writing {}: {e}", out.display())))?;
+    Ok(VerbOutput::new(
+        format!("wrote {}", out.display()),
+        json!({ "out": out.display().to_string(), "written": true }),
+    ))
 }
 
 /// `docs cli` — the command table as Markdown, or as JSON under `--json`.
