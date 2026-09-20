@@ -493,7 +493,7 @@ pub const COMMANDS: &[CommandRow] = &[
             help: "Log file to import (`.idl0`, `.fit`, `.gpx`, `.csv`)",
         }],
         flags: &[],
-        core_fn: "store::import::import_file_path",
+        core_fn: "store::import::import_idl0_path (.idl0) or import_file_path (.fit/.gpx/.csv)",
         json_shape: Some("ImportReport"),
         help: "Import one log file into the data directory",
         tier: Tier::Core,
