@@ -892,7 +892,7 @@ pub const COMMANDS: &[CommandRow] = &[
         ],
         core_fn: "docs::render_workbook_reference",
         json_shape: None,
-        help: "Regenerate the workbook reference from the engine's own catalogs",
+        help: "Regenerate the workbook reference from the engine's own catalogs, or its builtin catalog as JSON with --json (ruling R249)",
         tier: Tier::Rare,
         status: Status::Current,
         data_dir: false,

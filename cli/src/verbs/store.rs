@@ -110,13 +110,19 @@ pub fn docs(row: &CommandRow, ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, C
         "workbook" => {
             let out = opt_path(m, "out")
                 .ok_or_else(|| CliError::usage("docs workbook needs --out"))?;
-            let src = opt_path(m, "src").unwrap_or_else(|| PathBuf::from("docs/reference-src"));
             if ctx.dry_run {
                 return Ok(VerbOutput::new(
                     format!("would write {}", out.display()),
                     json!({ "out": out.display().to_string(), "written": false }),
                 ));
             }
+            // `--json` (ruling R249): the builtin catalog as sorted JSON,
+            // rather than the Markdown reference — the same amended-flag
+            // shape `docs cli`'s own `--json` already uses, no new verb.
+            if ctx.json {
+                return docs_workbook_json(&out);
+            }
+            let src = opt_path(m, "src").unwrap_or_else(|| PathBuf::from("docs/reference-src"));
             // `docs_cmd::run` renders and exits; it is reused verbatim so the
             // byte-stability CI depends on has exactly one implementation.
             let code = docs_cmd::run(DocsAction::Workbook { out: out.clone(), src });
@@ -133,6 +139,30 @@ pub fn docs(row: &CommandRow, ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, C
             format!("`docs {other}` is in the command table but has no implementation"),
         )),
     }
+}
+
+/// `docs workbook --json` — the builtin catalog as sorted, stable JSON
+/// (ruling R249), written wholesale to `out`.
+///
+/// Byte-stable with `\n` line endings only, the same CI-diff-gate
+/// contract `docs_cmd::workbook`'s Markdown half and `cli`'s JSON half
+/// below both keep.
+fn docs_workbook_json(out: &std::path::Path) -> Result<VerbOutput, CliError> {
+    let mut body = serde_json::to_string_pretty(&idl_rs::docs::workbook_catalog_json())
+        .map_err(|e| CliError::new(ErrorKind::Internal, e.to_string()))?;
+    body.push('\n');
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CliError::io(format!("creating {}: {e}", parent.display())))?;
+        }
+    }
+    std::fs::write(out, body.as_bytes())
+        .map_err(|e| CliError::io(format!("writing {}: {e}", out.display())))?;
+    Ok(VerbOutput::new(
+        format!("wrote {}", out.display()),
+        json!({ "out": out.display().to_string(), "written": true }),
+    ))
 }
 
 /// `docs cli` — the command table as Markdown, or as JSON under `--json`.
@@ -207,6 +237,50 @@ fn folder(m: &ArgMatches) -> Result<PathBuf, CliError> {
 #[cfg(test)]
 mod tests {
     use idl_rs::commands::table::rows_for;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn temp_dir() -> std::path::PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("idl-rs-cli-store-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn docs_workbook_json_writes_the_catalog_sorted_by_name() {
+        // Arrange
+        let out = temp_dir().join("functionCatalog.json");
+
+        // Act
+        super::docs_workbook_json(&out).unwrap();
+
+        // Assert
+        let text = std::fs::read_to_string(&out).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        let names: Vec<&str> =
+            parsed["functions"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        assert!(!text.contains('\r'));
+    }
+
+    #[test]
+    fn docs_workbook_json_run_twice_writes_identical_bytes() {
+        // Arrange
+        let out = temp_dir().join("functionCatalog.json");
+
+        // Act
+        super::docs_workbook_json(&out).unwrap();
+        let first = std::fs::read(&out).unwrap();
+        super::docs_workbook_json(&out).unwrap();
+        let second = std::fs::read(&out).unwrap();
+
+        // Assert — CI's gate is `git diff --exit-code` over exactly this.
+        assert_eq!(first, second);
+    }
 
     #[test]
     fn every_library_row_in_the_table_is_one_this_module_can_build() {

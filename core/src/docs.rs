@@ -26,7 +26,8 @@
 //! No I/O — the caller (`idl-rs docs workbook`) reads the curated files and
 //! writes the result.
 
-use crate::math::{math_builtin_catalog, math_name_migrations, MathBuiltinStatus};
+use crate::commands::table::JSON_SCHEMA_VERSION;
+use crate::math::{math_builtin_catalog, math_name_migrations, MathBuiltin, MathBuiltinStatus};
 
 /// One curated section to append after the generated half: the file's
 /// stem (used only for ordering by the caller) and its verbatim Markdown
@@ -184,6 +185,47 @@ fn render_retired_names(out: &mut String) {
     out.push('\n');
 }
 
+/// The builtin catalog as JSON (ruling R249): `idl-rs docs workbook --json`
+/// emits this, and `app/src/routes/pages/Notebook/model/functionCatalog.json`
+/// holds a checked-in copy — the same generated-and-diff-gated arrangement
+/// `idl-rs docs cli --json`/`app/src/shell/cliTable.json` already uses
+/// (ruling R230 item 2).
+///
+/// Sorted by name rather than the catalog's own first-appearance/category
+/// order [`render_builtins`] uses: this file has no headings to group
+/// entries under, and a name-sorted diff is the smallest one a future
+/// catalog entry produces. Deterministic and pure, the same guarantee
+/// [`render_workbook_reference`] gives.
+pub fn workbook_catalog_json() -> serde_json::Value {
+    let mut entries: Vec<&MathBuiltin> = math_builtin_catalog().iter().collect();
+    entries.sort_by_key(|entry| entry.name);
+
+    serde_json::json!({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "functions": entries.iter().map(|entry| serde_json::json!({
+            "name": entry.name,
+            "signature": entry.signature,
+            "category": entry.category,
+            "status": match entry.status {
+                MathBuiltinStatus::Implemented => "implemented",
+                MathBuiltinStatus::NotImplemented => "notImplemented",
+            },
+            "description": entry.description,
+            "units": builtin_units(entry.unit_rule),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// The literal unit a builtin's `unit_rule` names outright (`Fixed(x)` →
+/// `Some("x")`), or `None` when the rule instead describes a relationship to
+/// an argument's own unit (`SameAsArg`, `Product`, `Dimensionless`, …) —
+/// which is what "units if present" (ruling R249) means: most builtins have
+/// no unit of their own to report, only a rule for deriving one at eval
+/// time, and that rule is not a unit string.
+fn builtin_units(unit_rule: &str) -> Option<String> {
+    unit_rule.strip_prefix("Fixed(").and_then(|s| s.strip_suffix(')')).map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +335,60 @@ mod tests {
         // `[a-z0-9_]`, so the anchor is the name unchanged.
         assert_eq!(builtin_anchor("lap_delta_time"), "lap_delta_time");
         assert_eq!(builtin_anchor("welch"), "welch");
+    }
+
+    #[test]
+    fn workbook_catalog_json_called_twice_is_byte_identical() {
+        // Arrange / Act
+        let first = serde_json::to_string(&workbook_catalog_json()).unwrap();
+        let second = serde_json::to_string(&workbook_catalog_json()).unwrap();
+
+        // Assert — CI's gate is `git diff --exit-code` over the rendered
+        // file, same as `render_workbook_reference`.
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn workbook_catalog_json_has_one_entry_per_catalog_function_sorted_by_name() {
+        // Arrange
+        let json = workbook_catalog_json();
+
+        // Act
+        let functions = json["functions"].as_array().unwrap();
+        let names: Vec<&str> = functions.iter().map(|f| f["name"].as_str().unwrap()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+
+        // Assert
+        assert_eq!(functions.len(), math_builtin_catalog().len());
+        assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn workbook_catalog_json_a_not_implemented_builtin_is_marked_notimplemented() {
+        // Arrange
+        let json = workbook_catalog_json();
+
+        // Act
+        let functions = json["functions"].as_array().unwrap();
+        let spectrogram = functions.iter().find(|f| f["name"] == "spectrogram").unwrap();
+
+        // Assert
+        assert_eq!(spectrogram["status"], "notImplemented");
+    }
+
+    #[test]
+    fn builtin_units_a_fixed_rule_names_its_unit() {
+        // Arrange / Act / Assert
+        assert_eq!(builtin_units("Fixed(rad)"), Some("rad".to_string()));
+        assert_eq!(builtin_units("Fixed(mm/s)"), Some("mm/s".to_string()));
+    }
+
+    #[test]
+    fn builtin_units_a_relative_rule_has_no_unit_of_its_own() {
+        // Arrange / Act / Assert
+        assert_eq!(builtin_units("SameAsArg(0)"), None);
+        assert_eq!(builtin_units("Dimensionless"), None);
+        assert_eq!(builtin_units("SameAsArg(0) one-argument; AllMatch(0, 1) two-argument"), None);
     }
 }
