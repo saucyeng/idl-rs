@@ -9,6 +9,8 @@
 //! `idl-rs-tauri`; everything that decides lives here, behind one explicit
 //! transition table with a test per (state, input) pair.
 
+mod driver;
 mod machine;
 
 pub use machine::{Action, FailReason, Input, LinkConfig, LinkMachine, LinkState, Timer, Transition};
+pub use driver::{spawn_link, DirectBinder, LinkError, LinkHandle, NetworkBinder, OP_GATE};
