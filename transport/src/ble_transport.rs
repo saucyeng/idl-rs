@@ -257,9 +257,11 @@ impl BleTransport for BtleplugBle {
             .await
             .map_err(|e| ble_error(format!("listing known peripherals failed: {e}")))?;
         let mut found = None;
+        let mut name = String::new();
         for candidate in known {
             if let Ok(Some(props)) = candidate.properties().await {
                 if props.address == addr {
+                    name = props.local_name.unwrap_or_default();
                     found = Some(candidate);
                     break;
                 }
@@ -291,7 +293,7 @@ impl BleTransport for BtleplugBle {
 
         *self.peripheral.lock().await = Some(peripheral);
 
-        Ok(ConnectionInfo { device_id: device_id.to_string(), firmware_version, connected: true })
+        Ok(ConnectionInfo { device_id: device_id.to_string(), name, firmware_version, connected: true })
     }
 
     async fn disconnect(&mut self) -> Result<(), TransportError> {

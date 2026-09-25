@@ -16,6 +16,10 @@ pub enum TransportErrorKind {
     Config,
     /// LAN peer sync failure (pairing, manifest, blob transfer).
     Sync,
+    /// The OS refused a runtime permission the operation needs — Android's
+    /// Bluetooth/location grants (SPEC §14b.2). Not a failure of the device
+    /// or the link; the user can grant it in system settings.
+    PermissionDenied,
 }
 
 /// A transport failure: a kind the UI can route on plus a human-readable

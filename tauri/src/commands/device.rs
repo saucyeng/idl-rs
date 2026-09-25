@@ -1,9 +1,12 @@
 //! Device commands (C3 §3.8): `ble_scan`, `ble_connect`, `list_device_files`,
-//! `download_file`, `push_config` — wired to `idl-transport`'s desktop BLE/
-//! WiFi implementations (`BtleplugBle`/`ReqwestWifi`, L4, SPEC §14a).
+//! `download_file`, `push_config` — wired to the platform's BLE transport
+//! (`platform::PlatformBle`: `BtleplugBle` on desktop, the Kotlin-plugin-
+//! backed `AndroidBle` on Android, SPEC §14b.1) and an identity-checked
+//! `ReqwestWifi` (`platform::open_device_wifi`, SPEC §14b.3).
 //!
 //! Each `#[tauri::command]` is a thin wrapper: build the concrete transport
-//! (`BtleplugBle::new()`, `ReqwestWifi::new(DEVICE_BASE_URL)`), then call a
+//! (`PlatformBle::new()`, and `open_device_wifi` once the logger is in WiFi
+//! mode), then call a
 //! `_via`-suffixed helper generic over `BleTransport`/`WifiTransport`. The
 //! `_via` helpers are what this module's own tests exercise, against a
 //! hand-written stub — L4 ships no cross-crate-visible test double (its own
@@ -30,11 +33,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use idl_transport::ble_control::ControlCommand;
-use idl_transport::ble_transport::{BleTransport, BtleplugBle};
-use idl_transport::wifi_transport::{ReqwestWifi, WifiTransport, DEVICE_BASE_URL};
+use idl_transport::ble_transport::BleTransport;
+use idl_transport::wifi_transport::WifiTransport;
 use idl_transport::TransportError;
 
 use crate::error::{IpcError, IpcErrorKind};
+use crate::platform::{self, PlatformBle};
 use crate::state::{Connections, DataDir};
 
 /// One device found during a `ble_scan` (C3 §3.8).
@@ -65,13 +69,15 @@ impl From<idl_transport::DiscoveredDevice> for DeviceDiscovered {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConnectionInfo {
     pub device_id: String,
+    /// Advertised name (SPEC §14b.5): the SSID and the `/ping` identity key.
+    pub name: String,
     pub firmware_version: String,
     pub connected: bool,
 }
 
 impl From<idl_transport::ConnectionInfo> for ConnectionInfo {
     fn from(c: idl_transport::ConnectionInfo) -> Self {
-        Self { device_id: c.device_id, firmware_version: c.firmware_version, connected: c.connected }
+        Self { device_id: c.device_id, name: c.name, firmware_version: c.firmware_version, connected: c.connected }
     }
 }
 
@@ -318,6 +324,7 @@ async fn scan_via(
 ) -> Result<(), IpcError> {
     let mut rx = ble.scan(timeout).await.map_err(IpcError::from)?;
     while let Some(device) = rx.recv().await {
+        platform::remember_name(&device.device_id, &device.name);
         on_discovered(device.into());
     }
     Ok(())
@@ -328,6 +335,7 @@ async fn scan_via(
 /// `ConnectionInfo` is a snapshot, not a live handle.
 async fn connect_via(ble: &mut impl BleTransport, device_id: &str) -> Result<ConnectionInfo, IpcError> {
     let info = ble.connect(device_id).await.map_err(IpcError::from)?;
+    platform::remember_name(device_id, &info.name);
     let _ = ble.disconnect().await;
     Ok(info.into())
 }
@@ -336,7 +344,7 @@ async fn connect_via(ble: &mut impl BleTransport, device_id: &str) -> Result<Con
 /// this module's tests can exercise it against `StubBle` instead of a real
 /// `BtleplugBle` (this module's own doc comment on tests, and L4's own
 /// `StubBle` precedent). `state::Connections` is this type instantiated at
-/// `BtleplugBle`.
+/// `platform::PlatformBle`.
 pub(crate) type ConnectionMap<T> = StdMutex<HashMap<String, Arc<tokio::sync::Mutex<T>>>>;
 
 /// Transport-agnostic core of `connect_device`: connects `ble`, then inserts
@@ -361,6 +369,7 @@ async fn connect_device_via<T: BleTransport>(
     device_id: &str,
 ) -> Result<ConnectionInfo, IpcError> {
     let info = ble.connect(device_id).await.map_err(IpcError::from)?;
+    platform::remember_name(device_id, &info.name);
     let superseded = {
         let mut map = connections.lock().unwrap();
         map.insert(device_id.to_string(), Arc::new(tokio::sync::Mutex::new(ble)))
@@ -418,9 +427,17 @@ where
 }
 
 /// Transport-agnostic core of `list_device_files`: switches to WiFi mode,
-/// then lists files over HTTP.
-async fn list_files_via(ble: &impl BleTransport, wifi: &impl WifiTransport) -> Result<Vec<DeviceFile>, IpcError> {
+/// then opens the WiFi link (`open_wifi` — on Android the AP can only be
+/// requested once the logger is in WiFi mode, SPEC §14b.6 step 1) and lists
+/// files over HTTP.
+async fn list_files_via<W, G, GFut>(ble: &impl BleTransport, open_wifi: G) -> Result<Vec<DeviceFile>, IpcError>
+where
+    W: WifiTransport,
+    G: FnOnce() -> GFut,
+    GFut: std::future::Future<Output = Result<W, IpcError>>,
+{
     switch_to_wifi_mode(ble).await?;
+    let wifi = open_wifi().await?;
     let files = wifi.list_files().await.map_err(IpcError::from)?;
     Ok(files.into_iter().map(DeviceFile::from).collect())
 }
@@ -444,14 +461,20 @@ async fn list_files_via(ble: &impl BleTransport, wifi: &impl WifiTransport) -> R
 // to `main` as of this task) — once L1 lands, replace this hand-rolled
 // `data_dir.join(...)` split with a real call into that module's writer
 // instead of reimplementing C4 §2's path convention here.
-async fn download_via(
+async fn download_via<W, G, GFut>(
     ble: &impl BleTransport,
-    wifi: &impl WifiTransport,
+    open_wifi: G,
     file_name: &str,
     data_dir: &Path,
     mut on_progress: impl FnMut(u64, Option<u64>) + Send,
-) -> Result<DownloadResult, IpcError> {
+) -> Result<DownloadResult, IpcError>
+where
+    W: WifiTransport,
+    G: FnOnce() -> GFut,
+    GFut: std::future::Future<Output = Result<W, IpcError>>,
+{
     switch_to_wifi_mode(ble).await?;
+    let wifi = open_wifi().await?;
 
     let files = wifi.list_files().await.map_err(IpcError::from)?;
     let file_index = files
@@ -680,13 +703,28 @@ where
         .map_err(|e| IpcError::new(IpcErrorKind::Internal, format!("device returned non-UTF-8 config bytes: {e}")))
 }
 
+/// Connects `ble` to `device_id` and returns the logger's advertised name
+/// (the SSID and `/ping` identity, SPEC §14b.3), falling back to the name
+/// a scan saw when the platform's connect doesn't report one.
+async fn connected_name(ble: &mut PlatformBle, device_id: &str) -> Result<String, IpcError> {
+    let info = ble.connect(device_id).await.map_err(IpcError::from)?;
+    platform::remember_name(device_id, &info.name);
+    match platform::name_for(device_id) {
+        Ok(name) => Ok(name),
+        Err(e) => {
+            let _ = ble.disconnect().await;
+            Err(e)
+        }
+    }
+}
+
 /// Scans for `uuids::SERVICE` BLE devices for `timeout_ms`, streaming a
 /// `DeviceDiscovered` message per device found; resolves with no value when
 /// the scan window ends (C3 §3.8). Explicit user action on the Device tab —
 /// never a hot path (C3 §4).
 #[tauri::command]
 pub async fn ble_scan(timeout_ms: u32, progress: tauri::ipc::Channel<DeviceDiscovered>) -> Result<(), IpcError> {
-    let ble = BtleplugBle::new().await.map_err(IpcError::from)?;
+    let ble = PlatformBle::new().await.map_err(IpcError::from)?;
     scan_via(&ble, Duration::from_millis(timeout_ms as u64), |d| {
         let _ = progress.send(d);
     })
@@ -697,7 +735,7 @@ pub async fn ble_scan(timeout_ms: u32, progress: tauri::ipc::Channel<DeviceDisco
 /// and reads the initial firmware version (C3 §3.8).
 #[tauri::command]
 pub async fn ble_connect(device_id: String) -> Result<ConnectionInfo, IpcError> {
-    let mut ble = BtleplugBle::new().await.map_err(IpcError::from)?;
+    let mut ble = PlatformBle::new().await.map_err(IpcError::from)?;
     connect_via(&mut ble, &device_id).await
 }
 
@@ -711,7 +749,7 @@ pub async fn connect_device(
     connections: tauri::State<'_, Connections>,
     device_id: String,
 ) -> Result<ConnectionInfo, IpcError> {
-    let ble = BtleplugBle::new().await.map_err(IpcError::from)?;
+    let ble = PlatformBle::new().await.map_err(IpcError::from)?;
     connect_device_via(&connections.0, ble, &device_id).await
 }
 
@@ -733,17 +771,16 @@ pub async fn device_status(
     connections: tauri::State<'_, Connections>,
     device_id: String,
 ) -> Result<DeviceStatus, IpcError> {
-    device_status_via(&connections.0, &device_id, || async { BtleplugBle::new().await }).await
+    device_status_via(&connections.0, &device_id, || async { PlatformBle::new().await }).await
 }
 
 /// Lists files on `device_id`'s SD card, switching the device into WiFi
 /// mode first (C3 §3.8).
 #[tauri::command]
 pub async fn list_device_files(device_id: String) -> Result<Vec<DeviceFile>, IpcError> {
-    let mut ble = BtleplugBle::new().await.map_err(IpcError::from)?;
-    ble.connect(&device_id).await.map_err(IpcError::from)?;
-    let wifi = ReqwestWifi::new(DEVICE_BASE_URL);
-    let result = list_files_via(&ble, &wifi).await;
+    let mut ble = PlatformBle::new().await.map_err(IpcError::from)?;
+    let name = connected_name(&mut ble, &device_id).await?;
+    let result = list_files_via(&ble, || platform::open_device_wifi(&name)).await;
     let _ = ble.disconnect().await;
     result
 }
@@ -757,10 +794,9 @@ pub async fn download_file(
     progress: tauri::ipc::Channel<Progress>,
     data_dir: tauri::State<'_, DataDir>,
 ) -> Result<DownloadResult, IpcError> {
-    let mut ble = BtleplugBle::new().await.map_err(IpcError::from)?;
-    ble.connect(&device_id).await.map_err(IpcError::from)?;
-    let wifi = ReqwestWifi::new(DEVICE_BASE_URL);
-    let result = download_via(&ble, &wifi, &file_name, &data_dir.0, |done, total| {
+    let mut ble = PlatformBle::new().await.map_err(IpcError::from)?;
+    let name = connected_name(&mut ble, &device_id).await?;
+    let result = download_via(&ble, || platform::open_device_wifi(&name), &file_name, &data_dir.0, |done, total| {
         let _ = progress.send(Progress { done, total, phase: "download".to_string() });
     })
     .await;
@@ -772,7 +808,7 @@ pub async fn download_file(
 /// (C3 §3.8, SPEC §7.2).
 #[tauri::command]
 pub async fn push_config(device_id: String, config_json: String) -> Result<(), IpcError> {
-    let mut ble = BtleplugBle::new().await.map_err(IpcError::from)?;
+    let mut ble = PlatformBle::new().await.map_err(IpcError::from)?;
     ble.connect(&device_id).await.map_err(IpcError::from)?;
     let result = push_config_via(&ble, &config_json).await;
     let _ = ble.disconnect().await;
@@ -791,7 +827,11 @@ pub async fn device_control(
     device_id: String,
     command: String,
 ) -> Result<DeviceStatus, IpcError> {
-    device_control_str_via(&connections.0, &device_id, || async { BtleplugBle::new().await }, &command).await
+    let status = device_control_str_via(&connections.0, &device_id, || async { PlatformBle::new().await }, &command).await?;
+    if command == "wifi_off" {
+        platform::release_device_wifi().await;
+    }
+    Ok(status)
 }
 
 /// Reads `device_id`'s live `idl0_config.json` back over BLE (C3 §3.8),
@@ -803,7 +843,7 @@ pub async fn pull_config(
     connections: tauri::State<'_, Connections>,
     device_id: String,
 ) -> Result<String, IpcError> {
-    pull_config_via(&connections.0, &device_id, || async { BtleplugBle::new().await }).await
+    pull_config_via(&connections.0, &device_id, || async { PlatformBle::new().await }).await
 }
 
 /// One SPEC §5.2 registry row as sent over IPC (C3 §3.8). Field-for-field
@@ -1121,6 +1161,7 @@ pub(crate) mod tests {
         let mut ble = StubBle {
             connect_result: Ok(idl_transport::ConnectionInfo {
                 device_id: "AA:BB".to_string(),
+                name: "IDL0-A3F2".to_string(),
                 firmware_version: "1.5.0".to_string(),
                 connected: true,
             }),
@@ -1162,7 +1203,7 @@ pub(crate) mod tests {
     #[test]
     fn btleplug_ble_is_send_required_for_arc_mutex_managed_connection_state() {
         fn assert_send<T: Send>() {}
-        assert_send::<BtleplugBle>();
+        assert_send::<PlatformBle>();
     }
 
     #[tokio::test]
@@ -1172,6 +1213,7 @@ pub(crate) mod tests {
         let ble = StubBle {
             connect_result: Ok(idl_transport::ConnectionInfo {
                 device_id: "AA:BB".to_string(),
+                name: "IDL0-A3F2".to_string(),
                 firmware_version: "2.0.0".to_string(),
                 connected: true,
             }),
@@ -1195,6 +1237,7 @@ pub(crate) mod tests {
         let make_ble = || StubBle {
             connect_result: Ok(idl_transport::ConnectionInfo {
                 device_id: "AA:BB".to_string(),
+                name: "IDL0-A3F2".to_string(),
                 firmware_version: "1.0.0".to_string(),
                 connected: true,
             }),
@@ -1218,6 +1261,7 @@ pub(crate) mod tests {
         let make_ble = || StubBle {
             connect_result: Ok(idl_transport::ConnectionInfo {
                 device_id: "AA:BB".to_string(),
+                name: "IDL0-A3F2".to_string(),
                 firmware_version: "1.0.0".to_string(),
                 connected: true,
             }),
@@ -1305,6 +1349,7 @@ pub(crate) mod tests {
                 Ok(StubBle {
                     connect_result: Ok(idl_transport::ConnectionInfo {
                         device_id: "AA:BB".to_string(),
+                        name: "IDL0-A3F2".to_string(),
                         firmware_version: "1.0.0".to_string(),
                         connected: true,
                     }),
@@ -1451,7 +1496,7 @@ pub(crate) mod tests {
         };
 
         // Act
-        let files = list_files_via(&ble, &wifi).await.unwrap();
+        let files = list_files_via(&ble, || async { Ok(wifi) }).await.unwrap();
 
         // Assert
         assert_eq!(files.len(), 2);
@@ -1467,7 +1512,7 @@ pub(crate) mod tests {
         let wifi = StubWifi { list_files_result: Err(TransportError::new(TransportErrorKind::Wifi, "GET /files failed")), ..Default::default() };
 
         // Act
-        let err = list_files_via(&ble, &wifi).await.unwrap_err();
+        let err = list_files_via(&ble, || async { Ok(wifi) }).await.unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::Wifi);
@@ -1487,7 +1532,7 @@ pub(crate) mod tests {
         let mut progress_calls = Vec::new();
 
         // Act
-        let result = download_via(&ble, &wifi, "session_001.idl0", data_dir.path(), |done, total| progress_calls.push((done, total)))
+        let result = download_via(&ble, || async { Ok(wifi) }, "session_001.idl0", data_dir.path(), |done, total| progress_calls.push((done, total)))
             .await
             .unwrap();
 
@@ -1528,7 +1573,7 @@ pub(crate) mod tests {
         };
 
         // Act
-        let result = download_via(&ble, &wifi, "shard.idl0", data_dir.path(), |_, _| {}).await.unwrap();
+        let result = download_via(&ble, || async { Ok(wifi) }, "shard.idl0", data_dir.path(), |_, _| {}).await.unwrap();
 
         // Assert: lands at blobs/sha256/ab/<remaining 62 hex>, not blobs/sha256/<64 hex>.
         let expected_path = data_dir.path().join("blobs/sha256").join("ab").join(&expected_hash[2..]);
@@ -1549,8 +1594,8 @@ pub(crate) mod tests {
         };
 
         // Act
-        let first = download_via(&make_ble(), &make_wifi(), "a.idl0", data_dir.path(), |_, _| {}).await.unwrap();
-        let second = download_via(&make_ble(), &make_wifi(), "a.idl0", data_dir.path(), |_, _| {}).await.unwrap();
+        let first = download_via(&make_ble(), || async { Ok(make_wifi()) }, "a.idl0", data_dir.path(), |_, _| {}).await.unwrap();
+        let second = download_via(&make_ble(), || async { Ok(make_wifi()) }, "a.idl0", data_dir.path(), |_, _| {}).await.unwrap();
 
         // Assert
         assert_eq!(first.sha256, second.sha256);
@@ -1570,7 +1615,7 @@ pub(crate) mod tests {
         let wifi = StubWifi { list_files_result: Ok(vec![]), ..Default::default() };
 
         // Act
-        let err = download_via(&ble, &wifi, "missing.idl0", data_dir.path(), |_, _| {}).await.unwrap_err();
+        let err = download_via(&ble, || async { Ok(wifi) }, "missing.idl0", data_dir.path(), |_, _| {}).await.unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::NotFound);

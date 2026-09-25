@@ -20,7 +20,10 @@ pub mod error;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod inbox;
 pub mod memory;
+#[cfg(target_os = "android")]
+pub mod mobile;
 pub mod paths;
+pub mod platform;
 pub mod session_cache;
 pub mod session_source;
 pub mod state;

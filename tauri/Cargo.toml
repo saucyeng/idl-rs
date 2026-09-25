@@ -33,6 +33,11 @@ uuid = { version = "1", features = ["v4"] }
 # collectors, and their platform dependencies, out of the build.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
+# Android only (SPEC §14b.2): GATT payloads cross the Kotlin plugin boundary
+# as base64 strings.
+[target.'cfg(target_os = "android")'.dependencies]
+base64 = "0.22"
+
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["test-util"] }

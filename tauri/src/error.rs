@@ -139,6 +139,11 @@ pub enum IpcErrorKind {
     /// here: `inbox_status` on mobile (C3 §3.3, ruling R191 — the inbox is
     /// desktop only). `detail` carries `{ platform }`.
     UnsupportedPlatform,
+    /// SPEC §14b.5 (added 2026-09-25): the OS refused a runtime permission
+    /// the command needs (Android Bluetooth/location). The UI explains and
+    /// offers the system settings page, never a failure toast. `detail`
+    /// carries `{ permission: "ble" }`.
+    PermissionDenied,
     /// C3 §1 (added 2026-09-10, lead ruling R203): the command was refused
     /// **before** allocating, because the work would not fit the app's
     /// memory budget — a session too large to decode, a raster too large to
@@ -185,6 +190,13 @@ impl From<idl_transport::TransportError> for IpcError {
             idl_transport::TransportErrorKind::Wifi => IpcErrorKind::Wifi,
             idl_transport::TransportErrorKind::Config => IpcErrorKind::Config,
             idl_transport::TransportErrorKind::Sync => IpcErrorKind::Sync,
+            idl_transport::TransportErrorKind::PermissionDenied => {
+                return IpcError::with_detail(
+                    IpcErrorKind::PermissionDenied,
+                    e.message,
+                    serde_json::json!({ "permission": "ble" }),
+                );
+            }
         };
         IpcError::new(kind, e.message)
     }

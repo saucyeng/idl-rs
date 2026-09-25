@@ -2316,6 +2316,7 @@ dependencies = [
 name = "idl-rs-tauri"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "hex",
  "idl-rs",
  "idl-transport",

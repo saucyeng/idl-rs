@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use idl_transport::ble_control::ControlCommand;
-use idl_transport::ble_transport::{BleTransport, BtleplugBle};
+use idl_transport::ble_transport::BleTransport;
 use idl_transport::firmware_catalog::{self, FirmwareChannel, FirmwareRelease};
-use idl_transport::wifi_transport::{OtaPushErrorKind, ReqwestWifi, WifiTransport, DEVICE_BASE_URL};
+use idl_transport::wifi_transport::{OtaPushErrorKind, WifiTransport};
 use idl_transport::TransportError;
 
 use crate::commands::device::{switch_to_wifi_mode, ConnectionMap, Progress};
@@ -279,12 +279,12 @@ pub fn auto_confirm_armed(
 /// `BtleplugBle` in the map would have every other command reuse it. A new
 /// one is inserted when the reconnect succeeds.
 #[allow(clippy::too_many_arguments)]
-pub async fn push_firmware_via<T, F, Fut>(
+pub async fn push_firmware_via<T, F, Fut, W, G, GFut>(
     connections: &ConnectionMap<T>,
     device_id: &str,
     image: &LoadedImage,
     source_is_catalog: bool,
-    wifi: &impl WifiTransport,
+    open_wifi: G,
     new_ble: F,
     timings: &OtaTimings,
     on_state: &mut (dyn FnMut(OtaState) + Send),
@@ -294,6 +294,9 @@ where
     T: BleTransport,
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<T, TransportError>>,
+    W: WifiTransport,
+    G: FnOnce() -> GFut,
+    GFut: std::future::Future<Output = Result<W, IpcError>>,
 {
     let connected = connections.lock().unwrap().get(device_id).cloned().ok_or_else(|| {
         IpcError::new(IpcErrorKind::NotFound, "connect to the device first")
@@ -307,6 +310,9 @@ where
         check_preconditions(&status)?;
         switch_to_wifi_mode(&*ble).await?;
     }
+    // Opened only now: on Android the AP can be requested only once the
+    // logger is in WiFi mode (SPEC §14b.6 step 1).
+    let wifi = open_wifi().await?;
 
     let total_bytes = image.bytes.len() as u64;
     on_state(OtaState::Pushing { done_bytes: 0, total_bytes, pct: 0 });
@@ -514,7 +520,7 @@ pub async fn push_firmware<R: tauri::Runtime>(
 
     let result = async {
         let image = load_image(&app, &ota, &source, &firmware_repo, channel, &progress).await?;
-        let wifi = ReqwestWifi::new(DEVICE_BASE_URL);
+        let name = crate::platform::name_for(&device_id)?;
         let timings = OtaTimings::default();
         let mut on_state = |state: OtaState| publish_state(&app, &ota, state);
         let mut on_progress = |done: u64, total: u64, phase: &str| {
@@ -525,8 +531,8 @@ pub async fn push_firmware<R: tauri::Runtime>(
             &device_id,
             &image,
             source_is_catalog,
-            &wifi,
-            || async { BtleplugBle::new().await },
+            || crate::platform::open_device_wifi(&name),
+            || async { crate::platform::PlatformBle::new().await },
             &timings,
             &mut on_state,
             &mut on_progress,
@@ -601,6 +607,7 @@ mod tests {
         let ble = StubBle {
             connect_result: Ok(idl_transport::ConnectionInfo {
                 device_id: "dev-1".to_string(),
+                name: "IDL0-A3F2".to_string(),
                 firmware_version: firmware.unwrap_or("").to_string(),
                 connected: true,
             }),
@@ -716,7 +723,7 @@ mod tests {
             "dev-1",
             &image,
             true,
-            &wifi,
+            || async { Ok(wifi) },
             || async { Ok(ready_ble(None, true)) },
             &fast_timings(),
             &mut on_state,
@@ -827,7 +834,7 @@ mod tests {
             "dev-1",
             &image,
             true,
-            &wifi,
+            || async { Ok(wifi) },
             || async { Ok(ready_ble(Some("1.6.0"), true)) },
             &fast_timings(),
             &mut on_state,
@@ -864,7 +871,7 @@ mod tests {
             "dev-1",
             &image,
             false,
-            &wifi,
+            || async { Ok(wifi) },
             || async { Ok(ready_ble(Some("1.6.0"), true)) },
             &fast_timings(),
             &mut on_state,
@@ -895,7 +902,7 @@ mod tests {
             "dev-1",
             &image,
             true,
-            &wifi,
+            || async { Ok(wifi) },
             || async { Ok(ready_ble(Some("1.5.0"), false)) },
             &fast_timings(),
             &mut on_state,
@@ -927,7 +934,7 @@ mod tests {
             "dev-1",
             &image,
             true,
-            &wifi,
+            || async { Ok(wifi) },
             || async { Ok(ready_ble(Some("1.6.0"), false)) },
             &fast_timings(),
             &mut on_state,
@@ -967,7 +974,7 @@ mod tests {
             "dev-1",
             &image,
             true,
-            &wifi,
+            || async { Ok(wifi) },
             || async { Ok(ready_ble(Some("1.6.0"), true)) },
             &fast_timings(),
             &mut on_state,
@@ -996,7 +1003,7 @@ mod tests {
             "dev-1",
             &image,
             true,
-            &wifi,
+            || async { Ok(wifi) },
             || async { Ok(ready_ble(Some("1.6.0"), true)) },
             &fast_timings(),
             &mut on_state,
@@ -1032,7 +1039,7 @@ mod tests {
             "dev-1",
             &image,
             true,
-            &wifi,
+            || async { Ok(wifi) },
             || async { Ok(ready_ble(Some("1.6.0"), true)) },
             &fast_timings(),
             &mut on_state,
@@ -1063,7 +1070,7 @@ mod tests {
             "dev-1",
             &image,
             true,
-            &wifi,
+            || async { Ok(wifi) },
             || async {
                 Err::<StubBle, _>(TransportError::new(TransportErrorKind::Ble, "no adapter"))
             },

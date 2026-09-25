@@ -25,6 +25,10 @@ pub struct DiscoveredDevice {
 pub struct ConnectionInfo {
     /// Same identifier as the `DiscoveredDevice` passed to `connect`.
     pub device_id: String,
+    /// Advertised name, e.g. `"IDL0-A3F2"` (SPEC §3.6) — the WiFi AP's SSID
+    /// and the name `/ping` must report (SPEC §14b.3). Empty when the
+    /// platform did not report one.
+    pub name: String,
     /// From the first status read/notification's `Firmware:` line (SPEC §7.3).
     pub firmware_version: String,
     /// `true` once GATT setup (service/characteristic discovery, Status

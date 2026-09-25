@@ -30,6 +30,10 @@ fn wifi_error(message: impl Into<String>) -> TransportError {
 /// The device's fixed WiFi-mode IP (SPEC §6, AP mode, no router).
 pub const DEVICE_BASE_URL: &str = "http://192.168.4.1";
 
+/// The logger AP's WPA2 passphrase (SPEC §6). The same on every device today.
+// TODO(idl0): per-device password (SPEC §6, TODO #16).
+pub const DEVICE_AP_PASSWORD: &str = "datalogger123";
+
 /// Builds the `Range` request header for a resumed download starting at
 /// `resume_from_bytes` bytes into the file (SPEC §6.1 `/download`: "`Range:
 /// bytes=START[-END]` supported").
