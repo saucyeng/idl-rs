@@ -59,6 +59,12 @@ axum = "0.8.9"
 # in the M0 ecosystem report, no crate this task chose itself).
 mdns-sd = "0.21.1"
 
+
+# Android only: the firmware catalog's HTTPS trust store (see
+# `firmware_catalog::https_client`). Already in the lockfile via rustls.
+[target.'cfg(target_os = "android")'.dependencies]
+webpki-root-certs = "1"
+
 [dev-dependencies]
 serde_json = "1"
 # review-task9 fix: `mdns_sd::Receiver<T>` is `flume::Receiver<T>` (mdns-sd

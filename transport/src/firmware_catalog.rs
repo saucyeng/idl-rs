@@ -298,6 +298,26 @@ pub async fn fetch_releases(
     fetch_releases_from(&format!("https://api.github.com/repos/{repo}/releases"), repo, channel).await
 }
 
+/// The HTTPS client for GitHub. Android pins the trust store to the bundled
+/// Mozilla roots: reqwest's default platform verifier needs a JNI context
+/// this app never hands it, and panics on the first handshake without one
+/// (`rustls-platform-verifier` 0.7, "Expect rustls-platform-verifier to be
+/// initialized"). Every other platform keeps the OS trust store.
+fn https_client() -> Result<reqwest::Client, TransportError> {
+    #[cfg(target_os = "android")]
+    {
+        let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .filter_map(|der| reqwest::Certificate::from_der(der.as_ref()).ok());
+        reqwest::Client::builder()
+            .tls_certs_only(roots)
+            .build()
+            .map_err(|e| catalog_error(format!("building the HTTPS client failed: {e}")))
+    }
+    #[cfg(not(target_os = "android"))]
+    Ok(reqwest::Client::new())
+}
+
 /// [`fetch_releases`] with the API base spelled out, so this module's tests
 /// can point it at the local mock HTTP server instead of github.com.
 async fn fetch_releases_from(
@@ -308,7 +328,7 @@ async fn fetch_releases_from(
     if repo.trim().is_empty() {
         return Err(catalog_error("no firmware repository is configured"));
     }
-    let client = reqwest::Client::new();
+    let client = https_client()?;
     let response = client
         .get(url)
         .header(reqwest::header::USER_AGENT, CATALOG_USER_AGENT)
@@ -348,7 +368,7 @@ pub async fn download_image(
 ) -> Result<DownloadedImage, TransportError> {
     use futures::StreamExt;
 
-    let client = reqwest::Client::new();
+    let client = https_client()?;
     let response = client
         .get(&release.image_url)
         .header(reqwest::header::USER_AGENT, CATALOG_USER_AGENT)

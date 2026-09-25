@@ -2349,6 +2349,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+ "webpki-root-certs",
 ]
 
 [[package]]
