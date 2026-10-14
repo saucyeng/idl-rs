@@ -45,6 +45,10 @@ pub struct DeviceStatus {
     /// while the field is unreported by older firmware — SPEC §7.3 says this
     /// line is otherwise always present.
     pub battery_raw: Option<u32>,
+    /// Battery cell voltage, millivolts (`BatteryMv: N` line): the firmware's
+    /// calibrated reading after the divider (idl1-firmware F9). Preferred
+    /// over `battery_raw` when present. `None` when unreported.
+    pub battery_mv: Option<u32>,
     /// Free space on the mounted SD card, MiB (`SDFreeMiB: N` line).
     /// Present when `sd` is `Ok` or `Full`; `None` for `Error`/`Absent` or
     /// when unreported.
@@ -136,6 +140,7 @@ pub fn parse_status(text: &str) -> DeviceStatus {
             "hr_battery" => status.hr_battery_pct = value.trim_end_matches('%').parse().ok(),
             "loggingelapsed" => status.logging_elapsed_s = value.parse().ok(),
             "batteryraw" => status.battery_raw = value.parse().ok(),
+            "batterymv" => status.battery_mv = value.parse().ok(),
             "sdfreemib" => status.sd_free_mib = value.parse().ok(),
             "gpsfix" => status.gps_fix_quality = value.parse().ok(),
             "gpssats" => status.gps_sats = value.parse().ok(),
@@ -250,7 +255,7 @@ mod tests {
     #[test]
     fn parse_status_additive_fields_present_all_parse() {
         // Arrange
-        let text = "Logging: RUNNING\nLoggingElapsed: 305\nBatteryRaw: 2731\n\
+        let text = "Logging: RUNNING\nLoggingElapsed: 305\nBatteryRaw: 2731\nBatteryMv: 4012\n\
                     SD: OK\nSDFreeMiB: 14208\nGPS: FIX\nGPSFix: 1\nGPSSats: 7\n\
                     GPSHDOP: 90\nIMU0: OK\nIMU1: ERROR\nIMU2: OFF";
 
@@ -260,6 +265,7 @@ mod tests {
         // Assert
         assert_eq!(status.logging_elapsed_s, Some(305));
         assert_eq!(status.battery_raw, Some(2731));
+        assert_eq!(status.battery_mv, Some(4012));
         assert_eq!(status.sd_free_mib, Some(14208));
         assert_eq!(status.gps_fix_quality, Some(1));
         assert_eq!(status.gps_sats, Some(7));

@@ -196,6 +196,9 @@ pub struct DeviceStatus {
     /// deprecated on the wire; the app scales this raw count itself and
     /// prefers it whenever both are present.
     pub battery_raw: Option<u32>,
+    /// Battery cell voltage, millivolts (`BatteryMv` line). Preferred over
+    /// `battery_raw` and `battery_pct` when present.
+    pub battery_mv: Option<u32>,
     /// Free space on the mounted SD card, MiB. Present when `sd` is `Ok` or
     /// `Full`; `None` for `Error`/`Absent` or when unreported.
     pub sd_free_mib: Option<u32>,
@@ -231,6 +234,7 @@ impl From<idl_transport::ble_status::DeviceStatus> for DeviceStatus {
             hr_battery_pct: s.hr_battery_pct,
             logging_elapsed_s: s.logging_elapsed_s,
             battery_raw: s.battery_raw,
+            battery_mv: s.battery_mv,
             sd_free_mib: s.sd_free_mib,
             gps_fix_quality: s.gps_fix_quality,
             gps_sats: s.gps_sats,
@@ -1434,6 +1438,7 @@ pub(crate) mod tests {
             hr_battery_pct: Some(88),
             logging_elapsed_s: Some(305),
             battery_raw: Some(2731),
+            battery_mv: Some(4012),
             sd_free_mib: Some(14208),
             gps_fix_quality: Some(1),
             gps_sats: Some(7),
@@ -1459,6 +1464,7 @@ pub(crate) mod tests {
         assert_eq!(dto.hr_battery_pct, Some(88));
         assert_eq!(dto.logging_elapsed_s, Some(305));
         assert_eq!(dto.battery_raw, Some(2731));
+        assert_eq!(dto.battery_mv, Some(4012));
         assert_eq!(dto.sd_free_mib, Some(14208));
         assert_eq!(dto.gps_fix_quality, Some(1));
         assert_eq!(dto.gps_sats, Some(7));
