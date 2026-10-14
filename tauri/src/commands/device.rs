@@ -848,7 +848,7 @@ pub async fn pull_config(
 
 /// `list_recent_device_files`'s return (C3 §3.8): the logger's newest
 /// session files, read over BLE without WiFi (SPEC §7.2).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RecentDeviceFiles {
     /// Every file on the logger, listed or not.
     pub total: u32,
