@@ -36,7 +36,26 @@ pub struct ConnectionInfo {
     pub connected: bool,
 }
 
-/// One entry from `GET /files` (SPEC §6.1).
+/// The `CMD_FILES_READ_BEGIN` payload (SPEC §7.2): the logger's newest
+/// session files, newest first, read over BLE without WiFi.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct RecentFiles {
+    /// Every file in the logger's `/sessions/`, listed or not.
+    pub total: u32,
+    /// At most the ten newest files, newest first; same entries as `GET /files`.
+    pub files: Vec<DeviceFile>,
+}
+
+/// Parses a `CMD_FILES_READ_BEGIN` read-back (SPEC §7.2). Malformed JSON is
+/// a `TransportErrorKind::Ble` error: the bytes came over the BLE link.
+pub fn parse_recent_files(bytes: &[u8]) -> Result<RecentFiles, crate::TransportError> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        crate::TransportError::new(crate::TransportErrorKind::Ble, format!("recent-files read-back is not valid JSON: {e}"))
+    })
+}
+
+/// One entry from `GET /files` (SPEC §6.1) and from the BLE recent-files
+/// read-back (SPEC §7.2).
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct DeviceFile {
     /// File name on the device's SD card.
@@ -51,4 +70,35 @@ pub struct DeviceFile {
     /// (SPEC §6.1: "omitted only if the header is unreadable").
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_recent_files_payload_with_and_without_session_id_both_entries_kept() {
+        // Arrange
+        let bytes = br#"{"total":3,"files":[{"name":"b.idl0","size":10,"session_id":"ab"},{"name":"a.idl0","size":5}]}"#;
+
+        // Act
+        let recent = parse_recent_files(bytes).unwrap();
+
+        // Assert
+        assert_eq!(recent.total, 3);
+        assert_eq!(recent.files[0].session_id.as_deref(), Some("ab"));
+        assert_eq!(recent.files[1].size_bytes, 5);
+    }
+
+    #[test]
+    fn parse_recent_files_not_json_ble_error() {
+        // Arrange
+        let bytes = b"not json";
+
+        // Act
+        let err = parse_recent_files(bytes).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, crate::TransportErrorKind::Ble);
+    }
 }

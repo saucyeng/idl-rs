@@ -88,10 +88,25 @@ pub trait BleTransport {
     /// `read_config`, not folded into one call here.
     async fn push_config(&self, config_json: &[u8]) -> Result<(), TransportError>;
 
-    /// Reads the live config back via CMD_CONFIG_READ_BEGIN + the FF06 read
-    /// loop (SPEC §7.2, `ble_config::reassemble_config_reads`). Returns
-    /// `TransportErrorKind::Ble` if READ_BEGIN ACKs `0x81` (no config file).
-    async fn read_config(&self) -> Result<Vec<u8>, TransportError>;
+    /// Starts a read-back with `begin` (`ConfigReadBegin` or
+    /// `FilesReadBegin`) and drains the FF06 read loop until an empty read
+    /// (SPEC §7.2, `ble_config::reassemble_config_reads`). Returns
+    /// `TransportErrorKind::Ble` if `begin` is not ACKed `Success`.
+    async fn read_back(&self, begin: ControlCommand) -> Result<Vec<u8>, TransportError>;
+
+    /// Reads the live config back via CMD_CONFIG_READ_BEGIN (SPEC §7.2).
+    /// Returns `TransportErrorKind::Ble` if READ_BEGIN ACKs `0x81` (no
+    /// config file).
+    async fn read_config(&self) -> Result<Vec<u8>, TransportError> {
+        self.read_back(ControlCommand::ConfigReadBegin).await
+    }
+
+    /// Reads the logger's newest session files via CMD_FILES_READ_BEGIN
+    /// (SPEC §7.2), without switching it to WiFi.
+    async fn read_recent_files(&self) -> Result<crate::device::RecentFiles, TransportError> {
+        let bytes = self.read_back(ControlCommand::FilesReadBegin).await?;
+        crate::device::parse_recent_files(&bytes)
+    }
 }
 
 /// Builds a `TransportErrorKind::Ble` error with `message`.
@@ -399,8 +414,8 @@ impl BleTransport for BtleplugBle {
         self.send_command(ControlCommand::ConfigCommit).await
     }
 
-    async fn read_config(&self) -> Result<Vec<u8>, TransportError> {
-        self.send_command(ControlCommand::ConfigReadBegin).await?;
+    async fn read_back(&self, begin: ControlCommand) -> Result<Vec<u8>, TransportError> {
+        self.send_command(begin).await?;
 
         let peripheral = self.connected_peripheral().await?;
         let characteristic = characteristic_by_uuid(&peripheral, uuids::CONFIG_TX)?;
@@ -506,8 +521,8 @@ mod sequencing {
             Err(ble_error("StubBle::push_config is not exercised by this test"))
         }
 
-        async fn read_config(&self) -> Result<Vec<u8>, TransportError> {
-            Err(ble_error("StubBle::read_config is not exercised by this test"))
+        async fn read_back(&self, _begin: ControlCommand) -> Result<Vec<u8>, TransportError> {
+            Err(ble_error("StubBle::read_back is not exercised by this test"))
         }
     }
 

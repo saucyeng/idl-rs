@@ -289,8 +289,8 @@ impl BleTransport for AndroidBle {
         self.send_command(ControlCommand::ConfigCommit).await
     }
 
-    async fn read_config(&self) -> Result<Vec<u8>, TransportError> {
-        self.send_command(ControlCommand::ConfigReadBegin).await?;
+    async fn read_back(&self, begin: ControlCommand) -> Result<Vec<u8>, TransportError> {
+        self.send_command(begin).await?;
         let mut chunks = Vec::new();
         loop {
             if chunks.len() >= MAX_CONFIG_READS {

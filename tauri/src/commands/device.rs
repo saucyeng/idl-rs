@@ -846,6 +846,53 @@ pub async fn pull_config(
     pull_config_via(&connections.0, &device_id, || async { PlatformBle::new().await }).await
 }
 
+/// `list_recent_device_files`'s return (C3 §3.8): the logger's newest
+/// session files, read over BLE without WiFi (SPEC §7.2).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RecentDeviceFiles {
+    /// Every file on the logger, listed or not.
+    pub total: u32,
+    /// At most the ten newest, newest first.
+    pub files: Vec<DeviceFile>,
+}
+
+/// Transport-agnostic core of `list_recent_device_files`: the managed
+/// connection when one exists (same rule as `pull_config_via`), otherwise
+/// connect, read, disconnect.
+async fn list_recent_files_via<T, F, Fut>(
+    connections: &ConnectionMap<T>,
+    device_id: &str,
+    new_ble: F,
+) -> Result<RecentDeviceFiles, IpcError>
+where
+    T: BleTransport,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, TransportError>>,
+{
+    let managed = connections.lock().unwrap().get(device_id).cloned();
+    let recent = if let Some(ble) = managed {
+        ble.lock().await.read_recent_files().await.map_err(IpcError::from)?
+    } else {
+        let mut ble = new_ble().await.map_err(IpcError::from)?;
+        ble.connect(device_id).await.map_err(IpcError::from)?;
+        let result = ble.read_recent_files().await;
+        let _ = ble.disconnect().await;
+        result.map_err(IpcError::from)?
+    };
+    Ok(RecentDeviceFiles { total: recent.total, files: recent.files.into_iter().map(DeviceFile::from).collect() })
+}
+
+/// Lists the logger's ten newest session files over BLE, without switching
+/// it to WiFi (C3 §3.8, SPEC §7.2 `CMD_FILES_READ_BEGIN`). Firmware without
+/// the command fails with the `ble` kind; the app then lists over WiFi.
+#[tauri::command]
+pub async fn list_recent_device_files(
+    connections: tauri::State<'_, Connections>,
+    device_id: String,
+) -> Result<RecentDeviceFiles, IpcError> {
+    list_recent_files_via(&connections.0, &device_id, || async { PlatformBle::new().await }).await
+}
+
 /// One SPEC §5.2 registry row as sent over IPC (C3 §3.8). Field-for-field
 /// copy of `idl_rs::parse::registry_preview::RegistryPreviewRow`, with
 /// `data_type` as an owned `String` (JSON has no `&'static str`).
@@ -1029,7 +1076,8 @@ pub(crate) mod tests {
             self.push_config_result.clone()
         }
 
-        async fn read_config(&self) -> Result<Vec<u8>, TransportError> {
+        async fn read_back(&self, begin: ControlCommand) -> Result<Vec<u8>, TransportError> {
+            *self.last_command.lock().unwrap() = Some(begin);
             self.read_config_result.clone()
         }
     }
@@ -1829,6 +1877,55 @@ pub(crate) mod tests {
 
         // Assert
         assert_eq!(config, r#"{"config_version":1}"#);
+    }
+
+    #[tokio::test]
+    async fn list_recent_files_via_managed_link_sends_files_read_begin_and_maps_entries() {
+        // Arrange
+        let ble = Arc::new(tokio::sync::Mutex::new(StubBle {
+            read_config_result: Ok(
+                br#"{"total":12,"files":[{"name":"2026-10-14_15-02-11.idl0","size":4096,"session_id":"0123456789abcdef0123456789abcdef"},{"name":"tmp_99.idl0","size":7}]}"#
+                    .to_vec(),
+            ),
+            ..Default::default()
+        }));
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        connections.lock().unwrap().insert("AA:BB".to_string(), ble.clone());
+
+        // Act
+        let recent = list_recent_files_via(&connections, "AA:BB", || async {
+            Err(TransportError::new(TransportErrorKind::Ble, "unused"))
+        })
+        .await
+        .unwrap();
+
+        // Assert
+        assert_eq!(recent.total, 12);
+        assert_eq!(recent.files.len(), 2);
+        assert_eq!(recent.files[0].size_bytes, 4096);
+        assert_eq!(recent.files[1].session_id, None);
+        assert_eq!(*ble.lock().await.last_command.lock().unwrap(), Some(ControlCommand::FilesReadBegin));
+    }
+
+    #[tokio::test]
+    async fn list_recent_files_via_old_firmware_refusal_maps_to_ble() {
+        // Arrange
+        let ble = Arc::new(tokio::sync::Mutex::new(StubBle {
+            read_config_result: Err(TransportError::new(TransportErrorKind::Ble, "FilesReadBegin refused: 0x82")),
+            ..Default::default()
+        }));
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        connections.lock().unwrap().insert("AA:BB".to_string(), ble.clone());
+
+        // Act
+        let err = list_recent_files_via(&connections, "AA:BB", || async {
+            Err(TransportError::new(TransportErrorKind::Ble, "unused"))
+        })
+        .await
+        .unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::Ble);
     }
 
     #[tokio::test]

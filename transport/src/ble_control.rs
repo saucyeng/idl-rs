@@ -15,6 +15,9 @@ pub enum ControlCommand {
     ConfigBegin = 0x07,
     ConfigCommit = 0x08,
     ConfigReadBegin = 0x09,
+    /// Snapshots the ten newest session files into the FF06 read-back
+    /// buffer, so new sessions can be spotted without WiFi (SPEC §7.2).
+    FilesReadBegin = 0x0A,
 }
 
 impl ControlCommand {
@@ -78,6 +81,7 @@ mod tests {
             (ControlCommand::ConfigBegin, 0x07),
             (ControlCommand::ConfigCommit, 0x08),
             (ControlCommand::ConfigReadBegin, 0x09),
+            (ControlCommand::FilesReadBegin, 0x0A),
         ];
 
         // Act / Assert
