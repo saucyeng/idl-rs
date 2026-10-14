@@ -145,10 +145,27 @@ CREATE INDEX idx_lap_summary_channel ON lap_summary(channel_id);
 /// empty file call [`create_schema`] (internal) via [`rebuild_catalog`].
 pub fn open_catalog(path: &Path) -> Result<Connection, CatalogError> {
     let conn = Connection::open(path)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    // busy_timeout first: the journal_mode switch and the bootstrap below
+    // take locks, and a second connection opening the same fresh file must
+    // wait for them rather than fail with "database is locked".
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    // Switching a fresh file to WAL can return SQLITE_BUSY at once, without
+    // consulting the busy handler, while another connection is doing the
+    // same: retry it for up to ~2 s.
+    let mut attempts = 0;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy && attempts < 100 =>
+            {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => break other?,
+        }
+    }
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "busy_timeout", 5000)?;
     // A brand-new file (first launch on a fresh data root, ruling R200) has
     // no tables and `user_version` 0: bootstrap the schema here rather than
     // leaving every query to fail with "no such table" until someone runs a
@@ -156,26 +173,38 @@ pub fn open_catalog(path: &Path) -> Result<Connection, CatalogError> {
     // one, whatever its version, is left to the rebuild/migration paths.
     let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if user_version == 0 {
-        let tables: i64 =
-            conn.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))?;
-        if tables == 0 {
-            create_schema(&conn)?;
-        }
+        create_schema(&conn)?;
     }
     Ok(conn)
 }
 
-/// Creates the schema and sets `user_version` on a freshly-opened,
-/// empty database.
+/// Creates the schema and sets `user_version` on an empty database, inside
+/// one write transaction. Idempotent and race-safe: the app's first launch
+/// opens the catalog from several commands at once, and each used to see
+/// the empty file and run the DDL, so all but the first failed with "table
+/// blobs already exists" (Isaac's phone, 2026-10-14). `BEGIN IMMEDIATE`
+/// makes the others wait on the lock and then find the schema in place. A
+/// database that already has tables is left alone.
 fn create_schema(conn: &Connection) -> Result<(), CatalogError> {
-    // Idempotent: `open_catalog` may already have bootstrapped an empty file
-    // (R200), and callers that open-then-create must not fail on it.
-    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if user_version == CATALOG_SCHEMA_VERSION {
-        return Ok(());
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<(), CatalogError> {
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let tables: i64 =
+            conn.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))?;
+        if user_version != 0 || tables != 0 {
+            return Ok(());
+        }
+        conn.execute_batch(DDL)?;
+        conn.pragma_update(None, "user_version", CATALOG_SCHEMA_VERSION)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
     }
-    conn.execute_batch(DDL)?;
-    conn.pragma_update(None, "user_version", CATALOG_SCHEMA_VERSION)?;
     Ok(())
 }
 
@@ -2359,5 +2388,34 @@ mod tests {
         assert_eq!(user_version, CATALOG_SCHEMA_VERSION);
         let workbooks: i64 = conn.query_row("SELECT count(*) FROM workbooks", [], |r| r.get(0)).unwrap();
         assert_eq!(workbooks, 0);
+    }
+
+    #[test]
+    fn open_catalog_fresh_file_opened_concurrently_every_open_succeeds() {
+        // Arrange
+        let root = temp_root();
+        let path = root.join("catalog.sqlite");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+
+        // Act
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    open_catalog(&path).map(|_| ())
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Assert
+        assert!(results.iter().all(|r| r.is_ok()), "{results:?}");
+        let conn = open_catalog(&path).unwrap();
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(user_version, CATALOG_SCHEMA_VERSION);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
