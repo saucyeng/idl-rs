@@ -213,13 +213,14 @@ fn import_one(data_dir: &Path, file: &Path) -> Result<(), IpcError> {
                 format!("{} has no file extension to choose an importer from", file.display()),
             )
         })?;
-    if ext != "idl0" && idl_rs::import::importer_for_extension(&ext).is_none() {
+    let logger_file = ext == "idl0" || ext == "idl1";
+    if !logger_file && idl_rs::import::importer_for_extension(&ext).is_none() {
         return Err(IpcError::new(IpcErrorKind::InvalidArgument, format!("no importer covers '.{ext}' files")));
     }
 
     let bytes = std::fs::read(file)
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", file.display())))?;
-    if ext == "idl0" {
+    if logger_file {
         idl_rs::store::import::import_idl0(data_dir, &bytes)
     } else {
         idl_rs::store::import::import_file(data_dir, &ext, &bytes)

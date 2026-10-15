@@ -93,6 +93,11 @@ pub fn parse(bytes: &[u8]) -> Result<ParseResult, ParseError> {
 /// ([`v3::parse_v3`]'s own read order).
 const V3_SESSION_START_MS_OFFSET: usize = 4 + 1 + 16 + 6;
 
+/// Byte offset of the `.idl1` header's `session_start_utc_ms` (`.idl1` DRAFT
+/// spec §4.1): magic 4 + format_version 2 + header_len 4 + session_uuid 16 +
+/// device_id 6 + firmware_version 24.
+pub const IDL1_SESSION_START_MS_OFFSET: usize = 56;
+
 /// Reads the v3 header's `session start UTC ms` (UTC milliseconds since the
 /// Unix epoch, `0` = the firmware never had a clock) out of the *first bytes*
 /// of an `.idl0` file, without decoding a single record — the header peek C3
@@ -105,6 +110,11 @@ const V3_SESSION_START_MS_OFFSET: usize = 4 + 1 + 16 + 6;
 /// computes (C1 §3.1 `gps_backfill`): recovering that requires decoding GPS
 /// records, which a folder scan must not do.
 pub fn peek_session_start_ms(head: &[u8]) -> Option<i64> {
+    if head.len() >= IDL1_SESSION_START_MS_OFFSET + 8 && &head[0..4] == b"IDL1" {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&head[IDL1_SESSION_START_MS_OFFSET..IDL1_SESSION_START_MS_OFFSET + 8]);
+        return Some(i64::from_le_bytes(buf));
+    }
     if head.len() < V3_SESSION_START_MS_OFFSET + 8 {
         return None;
     }
@@ -196,6 +206,20 @@ mod dispatch_tests {
 
         // Assert
         assert_eq!(start, Some(0));
+    }
+
+    #[test]
+    fn peek_session_start_ms_an_idl1_header_returns_its_session_start() {
+        // Arrange
+        let mut b = crate::parse::idl1::tests::Builder::new();
+        b.session_start_ms = 1_760_123_456_789;
+        let buf = b.build();
+
+        // Act
+        let start = super::peek_session_start_ms(&buf);
+
+        // Assert
+        assert_eq!(start, Some(1_760_123_456_789));
     }
 
     #[test]

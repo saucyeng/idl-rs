@@ -154,11 +154,11 @@ fn scan_folder_inner(data_root: Option<&Path>, folder: &Path) -> Result<Vec<Scan
                 let already = bytes.as_ref().is_some_and(|b| blob_exists(root, &sha256_hex(b)));
                 (Some(already), bytes)
             }
-            None if importer_id.as_deref() == Some("idl0") => (None, read_head(&path)),
+            None if matches!(importer_id.as_deref(), Some("idl0") | Some("idl1")) => (None, read_head(&path)),
             None => (None, None),
         };
         let session_start_utc_ms = match (importer_id.as_deref(), head.as_ref()) {
-            (Some("idl0"), Some(b)) => peek_session_start_ms(b),
+            (Some("idl0") | Some("idl1"), Some(b)) => peek_session_start_ms(b),
             _ => None,
         };
 
@@ -196,8 +196,8 @@ fn read_head(path: &Path) -> Option<Vec<u8>> {
 /// does (`.idl0` is deliberately outside that table —
 /// [`crate::import::ImporterInfo`]).
 fn importer_id_for_extension(ext: &str) -> Option<String> {
-    if ext == "idl0" {
-        return Some("idl0".to_string());
+    if ext == "idl0" || ext == "idl1" {
+        return Some(ext.to_string());
     }
     importer_for_extension(ext).map(|i| i.source_format().as_str().to_string())
 }

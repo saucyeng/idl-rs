@@ -64,11 +64,10 @@ pub struct ImportOutcome {
 /// row `idl_rs::import::importers()` enumerates, with extensions
 /// dot-prefixed for the wire.
 fn list_importers_via() -> Vec<ImporterInfo> {
-    let mut out = vec![ImporterInfo {
-        id: "idl0".to_string(),
-        label: "IDL0 log".to_string(),
-        extensions: vec![".idl0".to_string()],
-    }];
+    let mut out = vec![
+        ImporterInfo { id: "idl0".to_string(), label: "IDL0 log".to_string(), extensions: vec![".idl0".to_string()] },
+        ImporterInfo { id: "idl1".to_string(), label: "IDL1 session".to_string(), extensions: vec![".idl1".to_string()] },
+    ];
     out.extend(idl_rs::import::importers().iter().map(ImporterInfo::from));
     out
 }
@@ -91,7 +90,7 @@ pub fn list_importers() -> Vec<ImporterInfo> {
 fn resolve_extension(path: &str, importer_id: Option<&str>) -> Result<String, IpcError> {
     match importer_id {
         Some(id) => {
-            if id == "idl0" || idl_rs::import::importers().iter().any(|i| i.id == id) {
+            if id == "idl0" || id == "idl1" || idl_rs::import::importers().iter().any(|i| i.id == id) {
                 Ok(id.to_string())
             } else {
                 Err(IpcError::new(IpcErrorKind::InvalidArgument, format!("unrecognised importer_id '{id}'")))
@@ -145,7 +144,9 @@ fn import_file_via(
     on_progress("decoding");
     // The path forms map the file rather than copying it onto the heap
     // (ruling R203.3).
-    let report = if ext == "idl0" {
+    // Logger files (`.idl0`, `.idl1`) share one entry point; the parser
+    // tells them apart by their magic bytes.
+    let report = if ext == "idl0" || ext == "idl1" {
         core_import::import_idl0_path(data_dir, Path::new(path))
     } else {
         core_import::import_file_path(data_dir, &ext, Path::new(path))
@@ -243,10 +244,12 @@ mod tests {
         let out = list_importers_via();
 
         // Assert
-        assert_eq!(out.len(), 1 + core_count);
+        assert_eq!(out.len(), 2 + core_count);
         let idl0 = out.iter().find(|i| i.id == "idl0").unwrap();
         assert_eq!(idl0.extensions, vec![".idl0".to_string()]);
-        for info in out.iter().filter(|i| i.id != "idl0") {
+        let idl1 = out.iter().find(|i| i.id == "idl1").unwrap();
+        assert_eq!(idl1.extensions, vec![".idl1".to_string()]);
+        for info in out.iter().filter(|i| i.id != "idl0" && i.id != "idl1") {
             for ext in &info.extensions {
                 assert!(ext.starts_with('.'), "extension {ext} was not dot-prefixed");
             }

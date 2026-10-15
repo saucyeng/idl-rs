@@ -243,7 +243,18 @@ pub struct ImportReport {
     pub derived_warning: Option<String>,
 }
 
-/// Imports one `.idl0` buffer into `data_root` (contract C4 §2 layout):
+/// The importer version for a logger file's parsed format: `.idl1` files
+/// carry [`crate::parse::IDL1_IMPORTER_VERSION`], `.idl0` (and anything else
+/// reaching the logger entry point) [`crate::parse::IDL0_IMPORTER_VERSION`].
+fn device_importer_version(format: crate::session::SourceFormat) -> &'static str {
+    match format {
+        crate::session::SourceFormat::Idl1 => crate::parse::IDL1_IMPORTER_VERSION,
+        _ => crate::parse::IDL0_IMPORTER_VERSION,
+    }
+}
+
+/// Imports one logger file, `.idl0` or `.idl1` (told apart by its magic
+/// bytes, [`crate::parse::parse`]), into `data_root` (contract C4 §2 layout):
 /// writes the raw bytes to the CAS blob store, parses them, synthesizes the
 /// base `Time`/`Distance` channels, decides via [`plan_import`] whether
 /// `data.parquet` needs writing/skipping/regenerating, and creates an empty
@@ -263,13 +274,8 @@ pub fn import_idl0(data_root: &Path, bytes: &[u8]) -> Result<ImportReport, Impor
     let truncation_warning = result.truncation_warning.map(|w| w.to_string());
     let import_warnings = result.import_warnings.iter().map(|w| w.message.clone()).collect();
 
-    let mut report = finish_import(
-        data_root,
-        result.session,
-        blob_sha256,
-        crate::parse::IDL0_IMPORTER_VERSION,
-        import_warnings,
-    )?;
+    let importer_version = device_importer_version(result.session.source_format);
+    let mut report = finish_import(data_root, result.session, blob_sha256, importer_version, import_warnings)?;
     report.truncation_warning = truncation_warning;
     Ok(report)
 }
@@ -570,7 +576,7 @@ pub fn reimport_session(data_root: &Path, session_id: &str) -> Result<ImportRepo
 
     let blob_bytes = blob::read_blob(data_root, &existing_meta.blob_sha256)?;
 
-    let mut session = if existing_meta.source_format == "idl0" {
+    let mut session = if existing_meta.source_format == "idl0" || existing_meta.source_format == "idl1" {
         let mut parsed = crate::parse::parse(&blob_bytes)?;
         crate::session::synthesis::synthesize_base_channels(&mut parsed.session);
         parsed.session
@@ -800,6 +806,28 @@ mod tests {
         assert!(!second.session_json_created);
         let sj_bytes_after = std::fs::read(&sj_path).unwrap();
         assert_eq!(sj_bytes_before, sj_bytes_after);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_idl0_an_idl1_file_imports_as_idl1_with_its_own_importer_version() {
+        // Arrange — the logger entry point takes both formats by magic.
+        let root = temp_root();
+        let mut b = crate::parse::idl1::tests::Builder::new();
+        b.imu_axes(0, 480);
+        b.imu_block(0, 0, 20_000, 920, &[[1; 6], [2; 6]], &[], &[(0, 0, 900)]);
+        b.imu_block(0, 0, 40_000, 1840, &[[3; 6], [4; 6]], &[], &[(0, 0, 1820)]);
+        b.end();
+        let bytes = b.build();
+
+        // Act
+        let report = import_idl0(&root, &bytes).unwrap();
+
+        // Assert
+        let meta = read_session_metadata(&report.data_parquet).unwrap();
+        assert_eq!(meta.source_format, "idl1");
+        assert_eq!(meta.importer_version, crate::parse::IDL1_IMPORTER_VERSION);
 
         let _ = std::fs::remove_dir_all(&root);
     }

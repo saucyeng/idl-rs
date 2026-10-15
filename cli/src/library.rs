@@ -568,7 +568,7 @@ pub fn fold_in(
 /// typed core error's `Display`, never a bare string built here.
 fn import_one(data_root: &Path, path: &Path, importer_id: &str) -> Result<(import::ImportReport, Vec<u8>), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    let report: Result<import::ImportReport, ImportError> = if importer_id == "idl0" {
+    let report: Result<import::ImportReport, ImportError> = if importer_id == "idl0" || importer_id == "idl1" {
         import::import_idl0(data_root, &bytes)
     } else {
         import::import_file(data_root, importer_id, &bytes)

@@ -201,7 +201,7 @@ pub fn import(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
     // (rightly) said it would import. Routing is this verb's job (see
     // `import_file`'s doc), and this is the same entry point the deprecated
     // top-level `import` command uses.
-    let report = if extension == "idl0" {
+    let report = if extension == "idl0" || extension == "idl1" {
         import_idl0_path(root, &file)?
     } else {
         import_file_path(root, &extension, &file)?
