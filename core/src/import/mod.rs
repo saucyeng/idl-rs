@@ -202,6 +202,9 @@ pub fn importer_for_id(importer_id: &str) -> Option<Box<dyn Importer>> {
 /// compares a catalogued session's stored version against this). `None` for
 /// any other id.
 pub fn current_importer_version(importer_id: &str) -> Option<&'static str> {
+    if importer_id == "idl1" {
+        return Some(crate::parse::IDL1_IMPORTER_VERSION);
+    }
     if importer_id == "idl0" {
         return Some(crate::parse::IDL0_IMPORTER_VERSION);
     }

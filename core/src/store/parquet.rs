@@ -598,6 +598,7 @@ fn metadata_from_builder(
 pub fn parse_source_format(token: &str) -> Result<SourceFormat, ParquetStoreError> {
     match token {
         "idl0" => Ok(SourceFormat::Idl0),
+        "idl1" => Ok(SourceFormat::Idl1),
         "fit" => Ok(SourceFormat::Fit),
         "gpx" => Ok(SourceFormat::Gpx),
         "csv" => Ok(SourceFormat::Csv),
@@ -715,7 +716,7 @@ fn session_shell(meta: SessionParquetMetadata) -> Result<Session, ParquetStoreEr
     // (`Idl0` -> `Header`, everything else -> `SourceFile`). Nothing today
     // reads this field off a parquet-round-tripped `Session`.
     let timestamp_source = match source_format {
-        SourceFormat::Idl0 => crate::session::TimestampSource::Header,
+        SourceFormat::Idl0 | SourceFormat::Idl1 => crate::session::TimestampSource::Header,
         _ => crate::session::TimestampSource::SourceFile,
     };
     Ok(Session {

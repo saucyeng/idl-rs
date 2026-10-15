@@ -104,6 +104,9 @@ pub struct GapSpan {
 pub enum SourceFormat {
     /// `.idl0` binary log from an IDL0 device.
     Idl0,
+    /// `.idl1` session file from an IDL1 device (`.idl1` DRAFT spec,
+    /// 2026-10-15).
+    Idl1,
     /// Garmin/Wahoo/etc. `.fit` activity file.
     Fit,
     /// Garmin Connect/Strava-style `.gpx` track.
@@ -122,6 +125,7 @@ impl SourceFormat {
     pub const fn as_str(&self) -> &'static str {
         match self {
             SourceFormat::Idl0 => "idl0",
+            SourceFormat::Idl1 => "idl1",
             SourceFormat::Fit => "fit",
             SourceFormat::Gpx => "gpx",
             SourceFormat::Csv => "csv",

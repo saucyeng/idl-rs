@@ -10,6 +10,8 @@
 //! an optional truncation warning. The retired v1 (`ESPL`) and v2 (`IDL0`
 //! schema 2) formats are no longer supported.
 
+pub mod idl1;
+pub mod idl1_timing;
 pub mod reader;
 pub mod records;
 pub mod registry_preview;
@@ -42,8 +44,15 @@ use crate::session::{ParseError, ParseResult};
 /// them.
 pub const IDL0_IMPORTER_VERSION: &str = "0.3.0";
 
-/// Validates the magic bytes (and schema byte) and dispatches to the v3 parser.
+/// The `.idl1` parser's own version (C1 §4.3), stamped into every
+/// `data.parquet` written for an `.idl1` source and bumped whenever its
+/// output or timing changes. `0.1.0` (2026-10-15): first version, chip-clock
+/// IMU timing (`.idl1` DRAFT spec §3).
+pub const IDL1_IMPORTER_VERSION: &str = "0.1.0";
+
+/// Validates the magic bytes (and schema byte) and dispatches to the parser.
 ///
+/// - `IDL1` → [`idl1::parse_idl1`] (IDL1 hardware's own format)
 /// - `IDL0` + schema 3 → [`v3::parse_v3`]
 ///
 /// Returns [`ParseError::InvalidMagicBytes`] for any other magic (including the
@@ -58,6 +67,9 @@ pub fn parse(bytes: &[u8]) -> Result<ParseResult, ParseError> {
         ));
     }
     let magic = String::from_utf8_lossy(&bytes[0..4]).into_owned();
+    if magic == "IDL1" {
+        return idl1::parse_idl1(bytes);
+    }
     if magic != "IDL0" {
         return Err(ParseError::InvalidMagicBytes(format!(
             "Not a valid IDL0 log — expected IDL0, got: {magic}"

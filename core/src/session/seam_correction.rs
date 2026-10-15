@@ -39,6 +39,13 @@ pub enum ImportWarningKind {
     /// A single burst's local-period fallback (the monotonicity guarantee's
     /// recompute) was `<= 0`; fell back to the nominal period for that burst.
     NonPositiveLocalPeriod,
+    /// An `.idl1` logger diagnostic: a LOGGER_EVENT or SESSION_SUMMARY record,
+    /// or FIFO-overrun flags on IMU blocks (`.idl1` DRAFT spec §4.3).
+    LoggerDiagnostic,
+    /// An `.idl1` IMU stream had too few chip timestamps to be timed by the
+    /// chip clock and was timed from read instants instead (`.idl1` DRAFT
+    /// spec §3).
+    TimingFallback,
 }
 
 /// A non-fatal import-time anomaly, surfaced rather than silently absorbed
