@@ -1,7 +1,8 @@
 //! The firmware release catalog: GitHub Releases of the repository named in
 //! Settings, as a list of installable firmware images (R198).
 //!
-//! This is the **only** call the app makes to the public internet, and it
+//! Besides the app's own update check (`app_release`), this is the only
+//! call the app makes to the public internet, and it
 //! runs only on "Check now" or on opening the Firmware section with the
 //! catalog enabled — never on a timer (R198). It lives in `idl-transport`
 //! rather than `idl-rs-tauri` for the reason CLAUDE.md §2 gives: bytes on
@@ -302,8 +303,9 @@ pub async fn fetch_releases(
 /// Mozilla roots: reqwest's default platform verifier needs a JNI context
 /// this app never hands it, and panics on the first handshake without one
 /// (`rustls-platform-verifier` 0.7, "Expect rustls-platform-verifier to be
-/// initialized"). Every other platform keeps the OS trust store.
-fn https_client() -> Result<reqwest::Client, TransportError> {
+/// initialized"). Every other platform keeps the OS trust store. Shared
+/// with `app_release`, the app's own update feed.
+pub(crate) fn https_client() -> Result<reqwest::Client, TransportError> {
     #[cfg(target_os = "android")]
     {
         let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS

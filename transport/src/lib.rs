@@ -9,6 +9,7 @@
 //! client. L11 adds LAN peer sync (`sync/`) beside it, starting with wire
 //! DTOs and pairing.
 
+pub mod app_release;
 pub mod ble_config;
 pub mod ble_control;
 pub mod ble_status;

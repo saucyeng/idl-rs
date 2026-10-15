@@ -45,6 +45,7 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::device::pull_config,
         commands::device::list_recent_device_files,
         commands::device::preview_channel_registry,
+        commands::app_update::check_app_update,
         commands::firmware::firmware_catalog,
         commands::firmware::push_firmware,
         commands::firmware::confirm_firmware,
