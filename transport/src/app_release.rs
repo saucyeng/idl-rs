@@ -2,19 +2,25 @@
 //! feed per release channel (docs/RELEASING.md, "Channels and in-app update
 //! checks").
 //!
-//! A build knows its channel from build time and is only ever offered a
-//! newer release *on that channel*:
+//! The check is against one channel — the build's own, or the one picked
+//! in Settings — and only ever offers a release from it:
 //!
-//! - **stable** — `vX.Y.Z` tags; compared by semver.
+//! - **stable** — `vX.Y.Z` tags.
 //! - **beta** — `vX.Y.Z-<pre>` tags, plus every stable release (a beta
-//!   tester is offered the stable release that follows their beta);
-//!   compared by semver.
+//!   tester is offered the stable release that follows their beta).
 //! - **nightly** — the one moving release `release.yml` replaces on every
-//!   push to `main` ([`NIGHTLY_TAG`]); compared by CI build number
-//!   (`github.run_number`, also the APK's `versionCode`). Its title
-//!   `idl1 alpha (build <n>, <sha7>)` is the wire format for the number.
+//!   push to `main` ([`NIGHTLY_TAG`]).
 //!
-//! Everything except the two `fetch` functions is pure and unit-tested.
+//! **Newer means a higher build number.** Every CI build's number is the
+//! workflow's `github.run_number`, which is also the APK's `versionCode`;
+//! Android refuses to install a lower `versionCode` over a higher one, so a
+//! build number is the one comparison that holds across channels. Release
+//! titles carry it as `(build <n>` (`idl1 nightly (build 20, abc1234)`,
+//! `idl1 v0.2.0 (build 31)`). A tagged release published before titles
+//! carried it, or a running build that does not know its own number, falls
+//! back to semver against the running version.
+//!
+//! Everything except the fetch is pure and unit-tested.
 
 use std::cmp::Ordering;
 
@@ -25,10 +31,10 @@ use crate::{TransportError, TransportErrorKind};
 pub const APP_REPO: &str = "saucyeng/idl1-app";
 
 /// The nightly channel's moving release tag.
-pub const NIGHTLY_TAG: &str = "alpha";
+pub const NIGHTLY_TAG: &str = "nightly";
 
-/// The nightly release's Android asset (`.github/scripts/alpha-rename.sh`).
-pub const NIGHTLY_APK_ASSET: &str = "idl1-app-alpha-arm64.apk";
+/// The nightly release's Android asset (`.github/scripts/nightly-rename.sh`).
+pub const NIGHTLY_APK_ASSET: &str = "idl1-app-nightly-arm64.apk";
 
 /// The Android asset a tagged release of `version` publishes (`release.yml`).
 pub fn tagged_apk_asset(version: &str) -> String {
@@ -44,7 +50,7 @@ fn release_error(message: impl Into<String>) -> TransportError {
     TransportError::new(TransportErrorKind::Wifi, message)
 }
 
-/// Which release channel a build belongs to, fixed when it is built.
+/// A release channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppChannel {
@@ -56,24 +62,26 @@ pub enum AppChannel {
     Nightly,
 }
 
-/// What the running build is, as the update check compares it.
+/// What to check for: the channel, and what the running build is.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CurrentBuild {
-    /// The channel it was built for.
+    /// The channel to check — the build's own unless Settings picked another.
     pub channel: AppChannel,
-    /// Its semver version (`tauri.conf.json`'s `version`).
+    /// The running build's semver version (`tauri.conf.json`'s `version`).
     pub version: String,
-    /// Its CI build number (`github.run_number`); 0 when unknown.
+    /// The running build's CI build number (`github.run_number`); 0 when unknown.
     pub build: u64,
 }
 
-/// A newer release on the build's channel.
+/// A newer release on the checked channel.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppUpdate {
-    /// The channel the release was found on (the build's own).
+    /// The channel the release was found on.
     pub channel: AppChannel,
-    /// What to call it: the semver version, or `"build <n>"` on nightly.
+    /// What to call it: `"build <n>"` on nightly, the semver version otherwise.
     pub label: String,
+    /// The release's build number, when its title carries one.
+    pub build: Option<u64>,
     /// The release body (markdown, as published).
     pub notes: String,
     /// Publication timestamp, verbatim from GitHub (RFC 3339); may be empty.
@@ -86,17 +94,12 @@ pub struct AppUpdate {
     pub apk_url: Option<String>,
 }
 
-/// Reads `(build, commit)` out of a nightly title of the form
-/// `idl1 alpha (build <n>, <sha7>)`. `None` for any other shape.
-pub fn parse_nightly_title(title: &str) -> Option<(u64, String)> {
+/// Reads the build number out of a release title containing `(build <n>`
+/// followed by `,` or `)`. `None` for any other shape.
+pub fn parse_build_number(title: &str) -> Option<u64> {
     let rest = &title[title.find("(build ")? + "(build ".len()..];
-    let (build, rest) = rest.split_once(',')?;
-    let build = build.trim().parse().ok()?;
-    let commit = rest.split_once(')')?.0.trim();
-    if commit.is_empty() {
-        return None;
-    }
-    Some((build, commit.to_string()))
+    let end = rest.find([',', ')'])?;
+    rest[..end].trim().parse().ok()
 }
 
 fn str_field<'a>(entry: &'a serde_json::Value, key: &str) -> &'a str {
@@ -118,20 +121,36 @@ fn parse_json(body: &str) -> Result<serde_json::Value, TransportError> {
     serde_json::from_str(body).map_err(|e| release_error(format!("the app's release feed returned malformed JSON: {e}")))
 }
 
+/// Whether a release is newer than `current`: by build number when both
+/// sides know theirs, else by semver (`None` when either side's version is
+/// not semver — then it is not offered).
+fn is_newer(build: Option<u64>, version: Option<&str>, current: &CurrentBuild) -> bool {
+    match build {
+        Some(build) if current.build > 0 => build > current.build,
+        _ => match (version.and_then(parse_semver), parse_semver(&current.version)) {
+            (Some(release), Some(running)) => compare_semver(&release, &running) == Ordering::Greater,
+            _ => false,
+        },
+    }
+}
+
 /// The nightly release from GitHub's `GET /releases/tags/<NIGHTLY_TAG>`
-/// body, if its build number is above `current.build`. A body that is not a
-/// release object, or whose title has no build number, is an error.
+/// body, if newer than `current`. A body that is not a release object, or
+/// whose title has no build number, is an error.
 pub fn nightly_update(body: &str, current: &CurrentBuild) -> Result<Option<AppUpdate>, TransportError> {
     let entry = parse_json(body)?;
     let title = str_field(&entry, "name");
-    let (build, _commit) = parse_nightly_title(title)
+    let build = parse_build_number(title)
         .ok_or_else(|| release_error(format!("the nightly release title {title:?} carries no build number")))?;
-    if build <= current.build {
+    // A nightly has no semver of its own; a running build that does not know
+    // its number is offered it.
+    if current.build > 0 && build <= current.build {
         return Ok(None);
     }
     Ok(Some(AppUpdate {
         channel: AppChannel::Nightly,
         label: format!("build {build}"),
+        build: Some(build),
         notes: str_field(&entry, "body").to_string(),
         published_at: str_field(&entry, "published_at").to_string(),
         page_url: str_field(&entry, "html_url").to_string(),
@@ -140,17 +159,13 @@ pub fn nightly_update(body: &str, current: &CurrentBuild) -> Result<Option<AppUp
 }
 
 /// The newest tagged release `current.channel` admits, from GitHub's
-/// `GET /releases` body, if its semver is above `current.version`. Drafts,
-/// non-semver tags (the nightly tag among them) and, on stable, prereleases
-/// are skipped. A `current.version` that is not semver is an error: there is
-/// nothing to compare against.
+/// `GET /releases` body, if newer than `current`. Drafts, non-semver tags
+/// (the nightly tag among them) and, on stable, prereleases are skipped.
 pub fn tagged_update(body: &str, current: &CurrentBuild) -> Result<Option<AppUpdate>, TransportError> {
     let parsed = parse_json(body)?;
     let entries = parsed
         .as_array()
         .ok_or_else(|| release_error("the app's release feed returned something other than a JSON array"))?;
-    let running = parse_semver(&current.version)
-        .ok_or_else(|| release_error(format!("this build's version {:?} is not semver", current.version)))?;
 
     let newest = entries
         .iter()
@@ -158,20 +173,22 @@ pub fn tagged_update(body: &str, current: &CurrentBuild) -> Result<Option<AppUpd
         .filter_map(|entry| Some((entry, parse_semver(str_field(entry, "tag_name"))?)))
         .filter(|(_, version)| current.channel != AppChannel::Stable || version.prerelease.is_empty())
         .max_by(|(_, a), (_, b)| compare_semver(a, b));
-    let Some((entry, version)) = newest else { return Ok(None) };
-    if compare_semver(&version, &running) != Ordering::Greater {
-        return Ok(None);
-    }
+    let Some((entry, _)) = newest else { return Ok(None) };
 
     let tag = str_field(entry, "tag_name");
-    let version_text = tag.strip_prefix('v').unwrap_or(tag);
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let build = parse_build_number(str_field(entry, "name"));
+    if !is_newer(build, Some(version), current) {
+        return Ok(None);
+    }
     Ok(Some(AppUpdate {
         channel: current.channel,
-        label: version_text.to_string(),
+        label: version.to_string(),
+        build,
         notes: str_field(entry, "body").to_string(),
         published_at: str_field(entry, "published_at").to_string(),
         page_url: str_field(entry, "html_url").to_string(),
-        apk_url: asset_url(entry, &tagged_apk_asset(version_text)),
+        apk_url: asset_url(entry, &tagged_apk_asset(version)),
     }))
 }
 
@@ -212,38 +229,39 @@ mod tests {
     pub(super) fn nightly_json(build: u64, with_apk: bool) -> String {
         let assets = if with_apk {
             serde_json::json!([
-                {"name": "idl1-app-alpha-arm64.apk.sha256", "browser_download_url": "https://example.invalid/apk.sha256"},
+                {"name": "idl1-app-nightly-arm64.apk.sha256", "browser_download_url": "https://example.invalid/apk.sha256"},
                 {"name": NIGHTLY_APK_ASSET, "browser_download_url": "https://example.invalid/nightly.apk"}
             ])
         } else {
             serde_json::json!([])
         };
         serde_json::json!({
-            "tag_name": "alpha", "name": format!("idl1 alpha (build {build}, 0123abc)"), "body": "Latest change",
+            "tag_name": "nightly", "name": format!("idl1 nightly (build {build}, 0123abc)"), "body": "Latest change",
             "prerelease": true, "published_at": "2026-10-15T09:00:00Z",
-            "html_url": "https://example.invalid/releases/alpha", "assets": assets
+            "html_url": "https://example.invalid/releases/nightly", "assets": assets
         })
         .to_string()
     }
 
-    /// Tagged releases: stable 0.2.0, beta 0.3.0-beta.1, a draft 0.4.0, the
-    /// nightly tag, and the older 0.1.0-alpha.4 prerelease.
+    /// Tagged releases: stable 0.2.0 (build 31), beta 0.3.0-beta.1 (build
+    /// 40), a draft 0.4.0, the nightly tag, and 0.1.0-alpha.4 from before
+    /// titles carried a build number.
     pub(super) fn tagged_json() -> String {
-        let release = |tag: &str, prerelease: bool, draft: bool| {
+        let release = |tag: &str, title: &str, prerelease: bool, draft: bool| {
             let version = tag.trim_start_matches('v');
             serde_json::json!({
-                "tag_name": tag, "name": format!("idl1 {tag}"), "body": format!("notes {tag}"),
+                "tag_name": tag, "name": title, "body": format!("notes {tag}"),
                 "draft": draft, "prerelease": prerelease, "published_at": "2026-10-15T09:00:00Z",
                 "html_url": format!("https://example.invalid/releases/{tag}"),
                 "assets": [{"name": tagged_apk_asset(version), "browser_download_url": format!("https://example.invalid/{tag}.apk")}]
             })
         };
         serde_json::json!([
-            release("alpha", true, false),
-            release("v0.4.0", false, true),
-            release("v0.3.0-beta.1", true, false),
-            release("v0.2.0", false, false),
-            release("v0.1.0-alpha.4", true, false),
+            release("nightly", "idl1 nightly (build 45, abc1234)", true, false),
+            release("v0.4.0", "idl1 v0.4.0 (build 50)", false, true),
+            release("v0.3.0-beta.1", "idl1 v0.3.0-beta.1 (build 40)", true, false),
+            release("v0.2.0", "idl1 v0.2.0 (build 31)", false, false),
+            release("v0.1.0-alpha.4", "idl1 v0.1.0-alpha.4", true, false),
         ])
         .to_string()
     }
@@ -253,25 +271,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_nightly_title_release_yml_title_returns_build_and_commit() {
+    fn parse_build_number_nightly_and_tagged_titles_return_the_number() {
         // Arrange
-        let title = "idl1 alpha (build 18, bdc3c54)";
+        let titles = ["idl1 nightly (build 18, bdc3c54)", "idl1 v0.2.0 (build 31)", "idl1 alpha (build 7, x)"];
 
         // Act
-        let parsed = parse_nightly_title(title);
+        let builds: Vec<Option<u64>> = titles.iter().map(|t| parse_build_number(t)).collect();
 
         // Assert
-        assert_eq!(parsed, Some((18, "bdc3c54".to_string())));
+        assert_eq!(builds, vec![Some(18), Some(31), Some(7)]);
     }
 
     #[test]
-    fn parse_nightly_title_other_shapes_return_none() {
+    fn parse_build_number_other_shapes_return_none() {
         // Arrange
-        let titles = ["idl1 v0.1.0", "idl1 alpha (build x, bdc3c54)", "idl1 alpha (build 18, )", "idl1 alpha (build 18"];
+        let titles = ["idl1 v0.1.0", "idl1 nightly (build x, bdc3c54)", "idl1 nightly (build 18"];
 
         // Act / Assert
         for title in titles {
-            assert_eq!(parse_nightly_title(title), None, "{title}");
+            assert_eq!(parse_build_number(title), None, "{title}");
         }
     }
 
@@ -285,8 +303,9 @@ mod tests {
 
         // Assert
         assert_eq!(update.label, "build 19");
+        assert_eq!(update.build, Some(19));
         assert_eq!(update.apk_url.as_deref(), Some("https://example.invalid/nightly.apk"));
-        assert_eq!(update.page_url, "https://example.invalid/releases/alpha");
+        assert_eq!(update.page_url, "https://example.invalid/releases/nightly");
         assert_eq!(update.notes, "Latest change");
     }
 
@@ -337,10 +356,11 @@ mod tests {
         let body = tagged_json();
 
         // Act
-        let update = tagged_update(&body, &current(AppChannel::Stable, "0.1.0", 0)).unwrap().unwrap();
+        let update = tagged_update(&body, &current(AppChannel::Stable, "0.1.0", 20)).unwrap().unwrap();
 
         // Assert
         assert_eq!(update.label, "0.2.0");
+        assert_eq!(update.build, Some(31));
         assert_eq!(update.channel, AppChannel::Stable);
         assert_eq!(update.apk_url.as_deref(), Some("https://example.invalid/v0.2.0.apk"));
     }
@@ -351,7 +371,7 @@ mod tests {
         let body = tagged_json();
 
         // Act
-        let update = tagged_update(&body, &current(AppChannel::Beta, "0.2.0", 0)).unwrap().unwrap();
+        let update = tagged_update(&body, &current(AppChannel::Beta, "0.2.0", 31)).unwrap().unwrap();
 
         // Assert
         assert_eq!(update.label, "0.3.0-beta.1");
@@ -359,29 +379,41 @@ mod tests {
     }
 
     #[test]
-    fn tagged_update_beta_ahead_of_every_stable_is_offered_nothing_older() {
-        // Arrange
+    fn tagged_update_nightly_build_switched_to_stable_is_offered_nothing_it_cannot_install() {
+        // Arrange — a nightly at build 35 with Settings set to stable: v0.2.0
+        // is build 31, and Android refuses the lower versionCode.
         let body = tagged_json();
 
         // Act
-        let stable_up_to_date = tagged_update(&body, &current(AppChannel::Stable, "0.2.0", 0)).unwrap();
-        let beta_up_to_date = tagged_update(&body, &current(AppChannel::Beta, "0.3.0-beta.1", 0)).unwrap();
+        let update = tagged_update(&body, &current(AppChannel::Stable, "0.1.0", 35)).unwrap();
 
         // Assert
-        assert_eq!(stable_up_to_date, None);
-        assert_eq!(beta_up_to_date, None);
+        assert_eq!(update, None);
     }
 
     #[test]
-    fn tagged_update_non_semver_running_version_is_a_typed_error() {
+    fn tagged_update_unknown_build_number_falls_back_to_semver() {
         // Arrange
         let body = tagged_json();
 
         // Act
-        let err = tagged_update(&body, &current(AppChannel::Stable, "dev", 0)).unwrap_err();
+        let older_version = tagged_update(&body, &current(AppChannel::Stable, "0.1.0", 0)).unwrap();
+        let same_version = tagged_update(&body, &current(AppChannel::Stable, "0.2.0", 0)).unwrap();
 
         // Assert
-        assert_eq!(err.kind, TransportErrorKind::Wifi);
+        assert_eq!(older_version.map(|u| u.label), Some("0.2.0".to_string()));
+        assert_eq!(same_version, None);
+    }
+
+    #[test]
+    fn is_newer_untitled_release_compares_semver_even_when_the_build_is_known() {
+        // Arrange
+        let running = current(AppChannel::Beta, "0.1.0-alpha.3", 18);
+
+        // Act / Assert
+        assert!(is_newer(None, Some("0.1.0-alpha.4"), &running));
+        assert!(!is_newer(None, Some("0.1.0-alpha.2"), &running));
+        assert!(!is_newer(None, Some("nightly"), &running));
     }
 }
 
@@ -396,7 +428,7 @@ mod integration {
     async fn check_app_update_at_routes_each_channel_to_its_feed() {
         // Arrange
         let (addr, _server) = spawn_mock_server(|path, _headers, _request_body| {
-            let body = if path.ends_with("/tags/alpha") { super::tests::nightly_json(30, true) } else { super::tests::tagged_json() };
+            let body = if path.ends_with("/tags/nightly") { super::tests::nightly_json(30, true) } else { super::tests::tagged_json() };
             (200, "OK", vec![("Content-Type".to_string(), "application/json".to_string())], body.into_bytes())
         })
         .await;
