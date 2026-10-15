@@ -809,12 +809,49 @@ pub async fn download_file(
 }
 
 /// Validates `config_json` locally, then pushes it to `device_id` over BLE
-/// (C3 §3.8, SPEC §7.2).
+/// (C3 §3.8, SPEC §7.2). Uses the managed connection when there is one; the
+/// logger restarts to apply the config, so that link is dropped afterwards
+/// and the app reconnects (2026-10-15).
 #[tauri::command]
-pub async fn push_config(device_id: String, config_json: String) -> Result<(), IpcError> {
-    let mut ble = PlatformBle::new().await.map_err(IpcError::from)?;
-    ble.connect(&device_id).await.map_err(IpcError::from)?;
-    let result = push_config_via(&ble, &config_json).await;
+pub async fn push_config(
+    connections: tauri::State<'_, Connections>,
+    device_id: String,
+    config_json: String,
+) -> Result<(), IpcError> {
+    push_config_managed_via(&connections.0, &device_id, &config_json, || async { PlatformBle::new().await }).await
+}
+
+/// Transport-agnostic core of `push_config`. With a managed connection the
+/// push goes over it, never a second connection: on Android a second link to
+/// the same logger, disconnected afterwards, tore down the managed one too
+/// (Isaac, 2026-10-15: "trying to send the config makes the connection
+/// drop"). A successful push restarts the logger (SPEC §7.2), so the entry
+/// is then removed rather than left as a dead link for other commands to
+/// reuse, the same as `push_firmware_via` after an OTA. Without a managed
+/// connection: connect, push, disconnect.
+async fn push_config_managed_via<T, F, Fut>(
+    connections: &ConnectionMap<T>,
+    device_id: &str,
+    config_json: &str,
+    new_ble: F,
+) -> Result<(), IpcError>
+where
+    T: BleTransport,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, TransportError>>,
+{
+    let managed = connections.lock().unwrap().get(device_id).cloned();
+    if let Some(ble) = managed {
+        push_config_via(&*ble.lock().await, config_json).await?;
+        let entry = connections.lock().unwrap().remove(device_id);
+        if let Some(ble) = entry {
+            let _ = ble.lock().await.disconnect().await;
+        }
+        return Ok(());
+    }
+    let mut ble = new_ble().await.map_err(IpcError::from)?;
+    ble.connect(device_id).await.map_err(IpcError::from)?;
+    let result = push_config_via(&ble, config_json).await;
     let _ = ble.disconnect().await;
     result
 }
@@ -1714,6 +1751,52 @@ pub(crate) mod tests {
 
         // Assert
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn push_config_managed_via_managed_connection_pushes_over_it_then_drops_it() {
+        // Arrange
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        let ble = Arc::new(tokio::sync::Mutex::new(StubBle { push_config_result: Ok(()), ..Default::default() }));
+        let connect_calls = ble.lock().await.connect_calls.clone();
+        let disconnect_calls = ble.lock().await.disconnect_calls.clone();
+        connections.lock().unwrap().insert("AA:BB".to_string(), ble);
+        let new_ble_called = Arc::new(AtomicUsize::new(0));
+        let counter = new_ble_called.clone();
+
+        // Act
+        let result = push_config_managed_via(&connections, "AA:BB", r#"{"config_version":1}"#, || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Ok(StubBle::default()) }
+        })
+        .await;
+
+        // Assert
+        assert!(result.is_ok());
+        assert_eq!(new_ble_called.load(Ordering::SeqCst), 0, "no second connection");
+        assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(disconnect_calls.load(Ordering::SeqCst), 1);
+        assert!(connections.lock().unwrap().get("AA:BB").is_none(), "the restarting logger's link is dropped");
+    }
+
+    #[tokio::test]
+    async fn push_config_managed_via_rejected_push_keeps_the_managed_connection() {
+        // Arrange
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        let ble = Arc::new(tokio::sync::Mutex::new(StubBle {
+            push_config_result: Err(TransportError::new(TransportErrorKind::Config, "device rejected config")),
+            ..Default::default()
+        }));
+        connections.lock().unwrap().insert("AA:BB".to_string(), ble);
+
+        // Act
+        let err = push_config_managed_via(&connections, "AA:BB", r#"{"config_version":1}"#, || async { Ok(StubBle::default()) })
+            .await
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::Config);
+        assert!(connections.lock().unwrap().get("AA:BB").is_some());
     }
 
     #[tokio::test]
