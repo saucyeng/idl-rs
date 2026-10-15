@@ -314,6 +314,8 @@ pub fn parse_idl1(bytes: &[u8]) -> Result<ParseResult, ParseError> {
         channels.push(Channel { channel_id: name, t_us, t_recorded_us: None, nominal_rate_hz: rate, column, source_kind, unit, gaps: Vec::new() });
     }
 
+    merge_high_g(&mut channels);
+
     // Start time: the header's, else back-filled from the first GPS fix
     // (as `.idl0` §5.6).
     let (timestamp_utc_ms, timestamp_source) = match (session_start_ms, gps_anchor.gps_epoch_ms, gps_anchor.device_ts_us) {
@@ -338,6 +340,99 @@ pub fn parse_idl1(bytes: &[u8]) -> Result<ParseResult, ParseError> {
         truncation_warning: truncation,
         import_warnings: warnings,
     })
+}
+
+/// Low-g readings at or above this fraction of full scale count as
+/// saturated, and the merge takes the high-g reading there (Isaac,
+/// 2026-10-15: "95% seems right").
+const LOW_G_SATURATION: f64 = 0.95;
+
+/// Merges each IMU accel axis's low-g and high-g streams at import (Isaac,
+/// 2026-10-14/15; `.idl1` DRAFT spec §4.5). For every axis with both:
+///
+/// - the merged channel takes the low-g name (`IMU1_AccelX`), so workbooks
+///   and charts keep working, and runs on whichever stream has the higher
+///   rate, with that stream's times and gaps;
+/// - at each of those times it takes the low-g reading, unless a low-g
+///   sample around that moment is at or above [`LOW_G_SATURATION`] of the
+///   low-g full scale, where it takes the high-g reading instead; the
+///   other stream is read by linear interpolation;
+/// - high-g is taken as linear and scaled by its registry scale, with no
+///   per-session calibration (Isaac: "assume it's scaled correctly and
+///   linear... we can play with this after the fact");
+/// - the raw streams stay, the low-g one renamed `IMU1_LgAccelX` and the
+///   high-g one as recorded (`IMU1_HgAccelX`), so the merge can be checked.
+fn merge_high_g(channels: &mut Vec<Channel>) {
+    for imu in 0..3 {
+        for axis in ["X", "Y", "Z"] {
+            let low_name = format!("IMU{imu}_Accel{axis}");
+            let high_name = format!("IMU{imu}_HgAccel{axis}");
+            let (Some(li), Some(hi)) = (
+                channels.iter().position(|c| c.channel_id == low_name),
+                channels.iter().position(|c| c.channel_id == high_name),
+            ) else {
+                continue;
+            };
+            let full_scale = match channels[li].column {
+                RawColumn::I16 { scale, .. } => scale.abs() * 32768.0,
+                _ => continue,
+            };
+            let merged = {
+                let (low, high) = (&channels[li], &channels[hi]);
+                let (low_v, high_v) = (low.materialize(), high.materialize());
+                let grid = if high.nominal_rate_hz > low.nominal_rate_hz { high } else { low };
+                let threshold = LOW_G_SATURATION * full_scale;
+                let data: Vec<f32> = grid
+                    .t_us
+                    .iter()
+                    .map(|&t| {
+                        let (lv, saturated) = sample_at(&low.t_us, &low_v, t, threshold);
+                        if saturated {
+                            sample_at(&high.t_us, &high_v, t, f64::INFINITY).0 as f32
+                        } else {
+                            lv as f32
+                        }
+                    })
+                    .collect();
+                Channel {
+                    channel_id: low_name.clone(),
+                    t_us: grid.t_us.clone(),
+                    t_recorded_us: None,
+                    nominal_rate_hz: grid.nominal_rate_hz,
+                    column: RawColumn::F32 { data, scale: 1.0, offset: 0.0 },
+                    source_kind: grid.source_kind.clone(),
+                    unit: "g".to_string(),
+                    gaps: grid.gaps.clone(),
+                }
+            };
+            channels[li].channel_id = format!("IMU{imu}_LgAccel{axis}");
+            channels.push(merged);
+        }
+    }
+}
+
+/// `values` (on times `t_us`, sorted) at time `t`, by linear interpolation
+/// between the two samples around it (the nearest one past either end),
+/// and whether either of those samples is at or above `threshold` in
+/// magnitude.
+fn sample_at(t_us: &[i64], values: &[f64], t: i64, threshold: f64) -> (f64, bool) {
+    if t_us.is_empty() || values.is_empty() {
+        return (0.0, false);
+    }
+    let n = t_us.len().min(values.len());
+    let i = t_us[..n].partition_point(|&x| x < t);
+    if i == 0 {
+        return (values[0], values[0].abs() >= threshold);
+    }
+    if i >= n {
+        return (values[n - 1], values[n - 1].abs() >= threshold);
+    }
+    let (t0, t1, v0, v1) = (t_us[i - 1], t_us[i], values[i - 1], values[i]);
+    let saturated = v0.abs() >= threshold || v1.abs() >= threshold;
+    if t1 == t0 {
+        return (v1, saturated);
+    }
+    (v0 + (v1 - v0) * (t - t0) as f64 / (t1 - t0) as f64, saturated)
 }
 
 /// GPS channel units, as `.idl0` (C1 §4.1), plus HDOP (unitless).
@@ -628,6 +723,14 @@ pub(crate) mod tests {
             self
         }
 
+        /// The three high-g axes of IMU `imu` at `rate_hz`, ±64 g.
+        pub(crate) fn hg_axes(&mut self, imu: u8, rate_hz: u32) -> &mut Self {
+            for (a, n) in ["X", "Y", "Z"].iter().enumerate() {
+                self.channel(18 + imu as u16 * 3 + a as u16, 4, KIND_IMU_AXIS, imu, a as u8, PATH_HIGH_G, rate_hz, 0.001952, &format!("IMU{imu}_HgAccel{n}"), "g");
+            }
+            self
+        }
+
         fn record(&mut self, kind: u8, payload: &[u8]) -> &mut Self {
             self.records.push(kind);
             self.records.extend((payload.len() as u16).to_le_bytes());
@@ -748,6 +851,76 @@ pub(crate) mod tests {
             read_us += 20_000;
         }
         let _ = emitted;
+    }
+
+    /// One second of IMU `imu` with low-g at 480 Hz and high-g at 960 Hz.
+    /// The true acceleration on every axis is 5 g, except 30 g from 0.4 s to
+    /// 0.5 s: the low-g stream (±16 g) clips there, the high-g (±64 g)
+    /// doesn't.
+    fn imu_stream_with_hg(b: &mut Builder, imu: u8) {
+        let tick_us = 21.75_f64;
+        let period_us = 1e6 / 480.0;
+        let accel = |t_us: f64| if (400_000.0..500_000.0).contains(&t_us) { 30.0 } else { 5.0 };
+        let low_raw = |g: f64| (g / 0.000488).round().clamp(-32768.0, 32767.0) as i16;
+        let high_raw = |g: f64| (g / 0.001952).round() as i16;
+        let mut k = 0usize;
+        let mut read_us = 20_000i64;
+        while k < 480 {
+            let (mut samples, mut hg, mut ts) = (Vec::new(), Vec::new(), Vec::new());
+            while k < 480 && (k as f64 * period_us) < read_us as f64 {
+                let t = k as f64 * period_us;
+                if k % 32 == 0 {
+                    ts.push((samples.len() as u16, hg.len() as u16, (t / tick_us).round() as u32));
+                }
+                let g = accel(t);
+                samples.push([low_raw(g), low_raw(g), low_raw(g), 0, 0, 0]);
+                hg.push([high_raw(g); 3]);
+                hg.push([high_raw(accel(t + period_us / 2.0)); 3]);
+                k += 1;
+            }
+            b.imu_block(imu, 0, read_us + 300, (read_us as f64 / tick_us).round() as u32, &samples, &hg, &ts);
+            read_us += 20_000;
+        }
+    }
+
+    #[test]
+    fn parse_idl1_high_g_merges_into_the_accel_channel_where_low_g_saturates() {
+        // Arrange
+        let mut b = Builder::new();
+        b.imu_axes(1, 480).hg_axes(1, 960);
+        imu_stream_with_hg(&mut b, 1);
+        b.end();
+
+        // Act
+        let r = parse_idl1(&b.build()).unwrap();
+
+        // Assert — the merged channel runs at the high-g rate, reads ~5 g
+        // outside the clipped stretch and ~30 g inside it.
+        let merged = find(&r, "IMU1_AccelX");
+        assert_eq!(merged.t_us.len(), 960);
+        assert_eq!(merged.unit, "g");
+        let v = merged.materialize();
+        let at = |t_us: i64| v[merged.t_us.iter().position(|&t| t >= t_us).unwrap()];
+        assert!((at(200_000) - 5.0).abs() < 0.01, "quiet: {}", at(200_000));
+        assert!((at(450_000) - 30.0).abs() < 0.05, "clipped stretch: {}", at(450_000));
+        // Raw streams kept for checking the merge.
+        assert!(find(&r, "IMU1_LgAccelX").materialize().iter().any(|&g| g > 15.0));
+        assert_eq!(find(&r, "IMU1_HgAccelX").t_us.len(), 960);
+        // Gyro is untouched.
+        assert!(r.session.channels.iter().any(|c| c.channel_id == "IMU1_GyroX"));
+    }
+
+    #[test]
+    fn sample_at_interpolates_and_flags_saturated_neighbours() {
+        // Arrange
+        let t = [0i64, 10, 20];
+        let v = [0.0, 10.0, 16.0];
+
+        // Act / Assert
+        assert_eq!(sample_at(&t, &v, 5, 15.0), (5.0, false));
+        assert_eq!(sample_at(&t, &v, 15, 15.0), (13.0, true));
+        assert_eq!(sample_at(&t, &v, 30, 15.0), (16.0, true));
+        assert_eq!(sample_at(&t, &v, -5, 15.0), (0.0, false));
     }
 
     fn find<'a>(r: &'a ParseResult, name: &str) -> &'a Channel {
