@@ -11,14 +11,18 @@
 //! - **nightly** — the one moving release `release.yml` replaces on every
 //!   push to `main` ([`NIGHTLY_TAG`]).
 //!
-//! **Newer means a higher build number.** Every CI build's number is the
-//! workflow's `github.run_number`, which is also the APK's `versionCode`;
-//! Android refuses to install a lower `versionCode` over a higher one, so a
-//! build number is the one comparison that holds across channels. Release
-//! titles carry it as `(build <n>` (`idl1 nightly (build 20, abc1234)`,
-//! `idl1 v0.2.0 (build 31)`). A tagged release published before titles
-//! carried it, or a running build that does not know its own number, falls
-//! back to semver against the running version.
+//! **When a release is offered.** Checking a channel *other* than the one
+//! the running build was made for is a switch, and a switch is always
+//! offered: the channel's latest release, whatever its version (Isaac,
+//! 2026-10-15: "switch back to beta or stable at any time"). Android only
+//! installs an APK whose `versionCode` (the CI build number,
+//! `github.run_number`) is at least the installed one's, so `release.yml`
+//! rebuilds the latest beta and stable APKs on every push to `main`, and all
+//! three channels carry the newest build number. On the build's own
+//! channel, nightly is newer by build number and beta/stable by semver: a
+//! rebuilt beta has a new build number but the same code, so it is not an
+//! update. Release titles carry the number as `(build <n>`
+//! (`idl1 nightly (build 20, abc1234)`, `idl1 v0.2.0 (build 31)`).
 //!
 //! Everything except the fetch is pure and unit-tested.
 
@@ -67,6 +71,9 @@ pub enum AppChannel {
 pub struct CurrentBuild {
     /// The channel to check — the build's own unless Settings picked another.
     pub channel: AppChannel,
+    /// The channel the running build was made for. Differs from `channel`
+    /// when the check is a switch.
+    pub build_channel: AppChannel,
     /// The running build's semver version (`tauri.conf.json`'s `version`).
     pub version: String,
     /// The running build's CI build number (`github.run_number`); 0 when unknown.
@@ -82,6 +89,8 @@ pub struct AppUpdate {
     pub label: String,
     /// The release's build number, when its title carries one.
     pub build: Option<u64>,
+    /// True when this is a channel switch rather than an update.
+    pub switch: bool,
     /// The release body (markdown, as published).
     pub notes: String,
     /// Publication timestamp, verbatim from GitHub (RFC 3339); may be empty.
@@ -121,36 +130,34 @@ fn parse_json(body: &str) -> Result<serde_json::Value, TransportError> {
     serde_json::from_str(body).map_err(|e| release_error(format!("the app's release feed returned malformed JSON: {e}")))
 }
 
-/// Whether a release is newer than `current`: by build number when both
-/// sides know theirs, else by semver (`None` when either side's version is
-/// not semver — then it is not offered).
-fn is_newer(build: Option<u64>, version: Option<&str>, current: &CurrentBuild) -> bool {
-    match build {
-        Some(build) if current.build > 0 => build > current.build,
-        _ => match (version.and_then(parse_semver), parse_semver(&current.version)) {
-            (Some(release), Some(running)) => compare_semver(&release, &running) == Ordering::Greater,
-            _ => false,
-        },
+/// Whether a tagged release of `version` is newer than the running build,
+/// by semver. Not offered when either side is not semver.
+fn is_newer_version(version: &str, current: &CurrentBuild) -> bool {
+    match (parse_semver(version), parse_semver(&current.version)) {
+        (Some(release), Some(running)) => compare_semver(&release, &running) == Ordering::Greater,
+        _ => false,
     }
 }
 
 /// The nightly release from GitHub's `GET /releases/tags/<NIGHTLY_TAG>`
-/// body, if newer than `current`. A body that is not a release object, or
-/// whose title has no build number, is an error.
+/// body: always on a switch, else when its build number is higher. A body
+/// that is not a release object, or whose title has no build number, is an
+/// error.
 pub fn nightly_update(body: &str, current: &CurrentBuild) -> Result<Option<AppUpdate>, TransportError> {
     let entry = parse_json(body)?;
     let title = str_field(&entry, "name");
     let build = parse_build_number(title)
         .ok_or_else(|| release_error(format!("the nightly release title {title:?} carries no build number")))?;
-    // A nightly has no semver of its own; a running build that does not know
-    // its number is offered it.
-    if current.build > 0 && build <= current.build {
+    let switch = current.build_channel != AppChannel::Nightly;
+    // A running nightly that does not know its own number is offered it.
+    if !switch && current.build > 0 && build <= current.build {
         return Ok(None);
     }
     Ok(Some(AppUpdate {
         channel: AppChannel::Nightly,
         label: format!("build {build}"),
         build: Some(build),
+        switch,
         notes: str_field(&entry, "body").to_string(),
         published_at: str_field(&entry, "published_at").to_string(),
         page_url: str_field(&entry, "html_url").to_string(),
@@ -159,8 +166,9 @@ pub fn nightly_update(body: &str, current: &CurrentBuild) -> Result<Option<AppUp
 }
 
 /// The newest tagged release `current.channel` admits, from GitHub's
-/// `GET /releases` body, if newer than `current`. Drafts, non-semver tags
-/// (the nightly tag among them) and, on stable, prereleases are skipped.
+/// `GET /releases` body: always on a switch, else when its semver is higher.
+/// Drafts, non-semver tags (the nightly tag among them) and, on stable,
+/// prereleases are skipped.
 pub fn tagged_update(body: &str, current: &CurrentBuild) -> Result<Option<AppUpdate>, TransportError> {
     let parsed = parse_json(body)?;
     let entries = parsed
@@ -178,13 +186,15 @@ pub fn tagged_update(body: &str, current: &CurrentBuild) -> Result<Option<AppUpd
     let tag = str_field(entry, "tag_name");
     let version = tag.strip_prefix('v').unwrap_or(tag);
     let build = parse_build_number(str_field(entry, "name"));
-    if !is_newer(build, Some(version), current) {
+    let switch = current.build_channel != current.channel;
+    if !switch && !is_newer_version(version, current) {
         return Ok(None);
     }
     Ok(Some(AppUpdate {
         channel: current.channel,
         label: version.to_string(),
         build,
+        switch,
         notes: str_field(entry, "body").to_string(),
         published_at: str_field(entry, "published_at").to_string(),
         page_url: str_field(entry, "html_url").to_string(),
@@ -266,8 +276,14 @@ mod tests {
         .to_string()
     }
 
+    /// A running build on `channel`, checking its own channel.
     fn current(channel: AppChannel, version: &str, build: u64) -> CurrentBuild {
-        CurrentBuild { channel, version: version.to_string(), build }
+        CurrentBuild { channel, build_channel: channel, version: version.to_string(), build }
+    }
+
+    /// A running `from` build checking `to`: a switch.
+    fn switching(from: AppChannel, to: AppChannel, version: &str, build: u64) -> CurrentBuild {
+        CurrentBuild { channel: to, build_channel: from, version: version.to_string(), build }
     }
 
     #[test]
@@ -379,41 +395,72 @@ mod tests {
     }
 
     #[test]
-    fn tagged_update_nightly_build_switched_to_stable_is_offered_nothing_it_cannot_install() {
-        // Arrange — a nightly at build 35 with Settings set to stable: v0.2.0
-        // is build 31, and Android refuses the lower versionCode.
+    fn tagged_update_same_channel_same_version_rebuilt_is_not_an_update() {
+        // Arrange: the beta APK is rebuilt on every push with a new build
+        // number, but its code is unchanged.
         let body = tagged_json();
 
         // Act
-        let update = tagged_update(&body, &current(AppChannel::Stable, "0.1.0", 35)).unwrap();
+        let rebuilt_beta = tagged_update(&body, &current(AppChannel::Beta, "0.3.0-beta.1", 20)).unwrap();
+        let rebuilt_stable = tagged_update(&body, &current(AppChannel::Stable, "0.2.0", 20)).unwrap();
+
+        // Assert
+        assert_eq!(rebuilt_beta, None);
+        assert_eq!(rebuilt_stable, None);
+    }
+
+    #[test]
+    fn tagged_update_switching_from_nightly_offers_the_latest_even_when_older() {
+        // Arrange: a nightly well ahead of every tag switches back.
+        let body = tagged_json();
+        let to_beta = switching(AppChannel::Nightly, AppChannel::Beta, "0.4.0", 60);
+        let to_stable = switching(AppChannel::Nightly, AppChannel::Stable, "0.4.0", 60);
+
+        // Act
+        let beta = tagged_update(&body, &to_beta).unwrap().unwrap();
+        let stable = tagged_update(&body, &to_stable).unwrap().unwrap();
+
+        // Assert
+        assert!(beta.switch);
+        assert_eq!(beta.label, "0.3.0-beta.1");
+        assert!(stable.switch);
+        assert_eq!(stable.label, "0.2.0");
+    }
+
+    #[test]
+    fn tagged_update_switch_to_a_channel_with_no_release_is_nothing() {
+        // Arrange
+        let body = serde_json::json!([]).to_string();
+
+        // Act
+        let update = tagged_update(&body, &switching(AppChannel::Nightly, AppChannel::Stable, "0.1.0", 20)).unwrap();
 
         // Assert
         assert_eq!(update, None);
     }
 
     #[test]
-    fn tagged_update_unknown_build_number_falls_back_to_semver() {
+    fn nightly_update_switching_from_beta_always_offers_it() {
         // Arrange
-        let body = tagged_json();
+        let body = nightly_json(18, true);
 
         // Act
-        let older_version = tagged_update(&body, &current(AppChannel::Stable, "0.1.0", 0)).unwrap();
-        let same_version = tagged_update(&body, &current(AppChannel::Stable, "0.2.0", 0)).unwrap();
+        let update = nightly_update(&body, &switching(AppChannel::Beta, AppChannel::Nightly, "0.2.0", 25)).unwrap().unwrap();
 
         // Assert
-        assert_eq!(older_version.map(|u| u.label), Some("0.2.0".to_string()));
-        assert_eq!(same_version, None);
+        assert!(update.switch);
+        assert_eq!(update.label, "build 18");
     }
 
     #[test]
-    fn is_newer_untitled_release_compares_semver_even_when_the_build_is_known() {
+    fn is_newer_version_compares_semver_and_refuses_non_semver() {
         // Arrange
         let running = current(AppChannel::Beta, "0.1.0-alpha.3", 18);
 
         // Act / Assert
-        assert!(is_newer(None, Some("0.1.0-alpha.4"), &running));
-        assert!(!is_newer(None, Some("0.1.0-alpha.2"), &running));
-        assert!(!is_newer(None, Some("nightly"), &running));
+        assert!(is_newer_version("0.1.0-alpha.4", &running));
+        assert!(!is_newer_version("0.1.0-alpha.2", &running));
+        assert!(!is_newer_version("nightly", &running));
     }
 }
 
@@ -433,8 +480,8 @@ mod integration {
         })
         .await;
         let base = format!("http://{addr}/releases");
-        let nightly = CurrentBuild { channel: AppChannel::Nightly, version: "0.1.0".to_string(), build: 18 };
-        let stable = CurrentBuild { channel: AppChannel::Stable, version: "0.1.0".to_string(), build: 18 };
+        let nightly = CurrentBuild { channel: AppChannel::Nightly, build_channel: AppChannel::Nightly, version: "0.1.0".to_string(), build: 18 };
+        let stable = CurrentBuild { channel: AppChannel::Stable, build_channel: AppChannel::Stable, version: "0.1.0".to_string(), build: 18 };
 
         // Act
         let nightly_update = check_app_update_at(&base, &nightly).await.unwrap().unwrap();
@@ -450,7 +497,7 @@ mod integration {
         // Arrange
         let (addr, _server) =
             spawn_mock_server(|_path, _headers, _request_body| (404, "Not Found", Vec::new(), Vec::new())).await;
-        let nightly = CurrentBuild { channel: AppChannel::Nightly, version: "0.1.0".to_string(), build: 18 };
+        let nightly = CurrentBuild { channel: AppChannel::Nightly, build_channel: AppChannel::Nightly, version: "0.1.0".to_string(), build: 18 };
 
         // Act
         let err = check_app_update_at(&format!("http://{addr}/releases"), &nightly).await.unwrap_err();
