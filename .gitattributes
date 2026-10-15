@@ -4,3 +4,5 @@
 # on Windows and nowhere else, which is the worst kind of failure to debug.
 core/tests/fixtures/*.idl0 binary
 core/tests/fixtures/*.truth.json text eol=lf
+*.idl1 binary
+*.idl0 binary

@@ -910,6 +910,47 @@ pub(crate) mod tests {
         assert!(r.session.channels.iter().any(|c| c.channel_id == "IMU1_GyroX"));
     }
 
+    /// Written by the firmware's own encoders (idl1-firmware
+    /// `test/gen_idl1_golden.c`), so the parser and the firmware can't drift
+    /// apart unnoticed. Regenerate with that program after an encoder change.
+    const FIRMWARE_GOLDEN: &[u8] = include_bytes!("testdata/firmware_golden.idl1");
+
+    #[test]
+    fn parse_idl1_firmware_golden_file_reads_back_what_the_firmware_wrote() {
+        // Act
+        let r = parse_idl1(FIRMWARE_GOLDEN).unwrap();
+
+        // Assert — identity and start time.
+        assert_eq!(r.session.session_id, "101112131415161718191a1b1c1d1e1f");
+        assert_eq!(r.session.device_id.as_deref(), Some("b0b1b2b3b4b5"));
+        assert_eq!(r.session.config_checksum.as_deref(), Some("12345678"));
+        assert_eq!(r.session.timestamp_source, TimestampSource::GpsBackfill);
+        assert!(r.truncation_warning.is_none());
+        assert!(!r.import_warnings.iter().any(|w| w.kind == ImportWarningKind::TimingFallback), "{:?}", r.import_warnings);
+        assert!(r.import_warnings.iter().any(|w| w.message.contains("FIFO overrun")));
+        assert!(r.import_warnings.iter().any(|w| w.message.contains("session summary")));
+
+        // Low-g: 2 s at 480 Hz, chip-timed, value k at sample k.
+        let lg = find(&r, "IMU1_LgAccelX");
+        assert_eq!(lg.t_us.len(), 960);
+        assert!(lg.gaps.is_empty());
+        assert!((lg.nominal_rate_hz - 480.0).abs() < 0.5, "rate {}", lg.nominal_rate_hz);
+        let spacing = (lg.t_us[959] - lg.t_us[0]) as f64 / 959.0;
+        assert!((spacing - 1e6 / 480.0).abs() < 0.5, "spacing {spacing}");
+        assert!((lg.materialize()[500] - 500.0 * 0.000488).abs() < 1e-6);
+
+        // High-g: 1920 samples, value 2k + h; the merged channel runs on it.
+        let hg = find(&r, "IMU1_HgAccelX");
+        assert_eq!(hg.t_us.len(), 1920);
+        assert_eq!(hg.source_kind, "imu1_hg");
+        assert_eq!(find(&r, "IMU1_AccelX").t_us.len(), 1920);
+
+        // Slow channels and GPS keep their own times and values.
+        assert_eq!(find(&r, "HR_BPM").materialize(), vec![142.0]);
+        assert_eq!(find(&r, "WheelFront").materialize(), vec![3.0]);
+        assert!((find(&r, "GPS_Hdop").materialize()[0] - 0.85).abs() < 1e-12);
+    }
+
     #[test]
     fn sample_at_interpolates_and_flags_saturated_neighbours() {
         // Arrange
