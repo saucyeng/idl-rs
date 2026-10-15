@@ -14,14 +14,12 @@
 //! **When a release is offered.** Checking a channel *other* than the one
 //! the running build was made for is a switch, and a switch is always
 //! offered: the channel's latest release, whatever its version (Isaac,
-//! 2026-10-15: "switch back to beta or stable at any time"). Android only
-//! installs an APK whose `versionCode` (the CI build number,
-//! `github.run_number`) is at least the installed one's, so `release.yml`
-//! rebuilds the latest beta and stable APKs on every push to `main`, and all
-//! three channels carry the newest build number. On the build's own
-//! channel, nightly is newer by build number and beta/stable by semver: a
-//! rebuilt beta has a new build number but the same code, so it is not an
-//! update. Release titles carry the number as `(build <n>`
+//! 2026-10-15: "switch back to beta or stable at any time"). That installs
+//! because every APK carries the same `versionCode` (`release.yml`'s
+//! `ANDROID_VERSION_CODE`), and Android accepts an equal one. On the build's
+//! own channel, nightly is newer by the CI build number and beta/stable by
+//! semver. The build number is only a label, which release titles carry
+//! as `(build <n>`
 //! (`idl1 nightly (build 20, abc1234)`, `idl1 v0.2.0 (build 31)`).
 //!
 //! Everything except the fetch is pure and unit-tested.
