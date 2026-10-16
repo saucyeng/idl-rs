@@ -1078,6 +1078,23 @@ pub fn save_session_metadata(
     save_session_metadata_via(&data_dir.0, &session_id, metadata)
 }
 
+/// C3 §3.2 `ride_summary(session_id)` (added 2026-10-16): the ride form's
+/// totals — average and max heart rate, GPS distance — worked out in core
+/// (`session::summary`). Reads the session's channels, so `async`.
+#[tauri::command(async)]
+pub fn ride_summary(
+    session_id: String,
+    data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, crate::session_cache::SessionCache>,
+) -> Result<idl_rs::session::summary::RideSummary, IpcError> {
+    let (handle, source) = crate::session_source::load_lazy_session_handle(&data_dir.0, &session_id, &cache)?;
+    let summary = idl_rs::session::summary::ride_summary(&handle);
+    if let Some(err) = source.take_first_error() {
+        return Err(err);
+    }
+    Ok(summary)
+}
+
 /// C3 §3.2 `delete_session(session_id, delete_blob)`.
 #[tauri::command(async)]
 pub fn delete_session(

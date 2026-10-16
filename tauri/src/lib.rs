@@ -63,6 +63,7 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::catalog::save_track,
         commands::catalog::delete_track,
         commands::catalog::save_session_metadata,
+        commands::catalog::ride_summary,
         commands::bikelog::list_bikes,
         commands::bikelog::bike_for_name,
         commands::bikelog::save_bike,

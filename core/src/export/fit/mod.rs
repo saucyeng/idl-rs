@@ -125,7 +125,7 @@ fn speed_stored(kmh: f64) -> u16 {
 
 /// Great-circle distance in metres between two physical decimal-degree
 /// coordinates.
-fn haversine_m(lat1_deg: f64, lon1_deg: f64, lat2_deg: f64, lon2_deg: f64) -> f64 {
+pub(crate) fn haversine_m(lat1_deg: f64, lon1_deg: f64, lat2_deg: f64, lon2_deg: f64) -> f64 {
     const R: f64 = 6_371_000.0; // Earth radius, metres
     let to_rad = |deg: f64| deg.to_radians();
     let (la1, lo1, la2, lo2) =

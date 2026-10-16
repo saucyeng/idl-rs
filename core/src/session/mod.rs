@@ -11,6 +11,7 @@ pub mod filename;
 pub mod handle;
 pub mod samples;
 pub mod seam_correction;
+pub mod summary;
 pub mod synthesis;
 pub mod time_map;
 
