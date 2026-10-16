@@ -354,7 +354,12 @@ impl WifiTransport for ReqwestWifi {
 
         let status = response.status();
         if !status.is_success() {
-            return Err(wifi_error(format!("GET /download returned status {status}")));
+            // The firmware's error body names the step ("fopen failed",
+            // "no such file"): keep it, bounded, so a report says why.
+            let body = response.text().await.unwrap_or_default();
+            let reason: String = body.trim().chars().take(120).collect();
+            let detail = if reason.is_empty() { String::new() } else { format!(": {reason}") };
+            return Err(wifi_error(format!("GET /download returned status {status}{detail}")));
         }
 
         // A 206 echoes exactly what range the server actually served — the
