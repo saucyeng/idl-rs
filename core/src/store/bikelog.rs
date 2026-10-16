@@ -1,7 +1,10 @@
 //! The bike log and setup sheet (spec `2026-10-16-idl1-bike-log-DRAFT.md`).
 //!
 //! Each bike has a log: one file per entry under
-//! `<data>/bikelog/<bike_id>/<entry_id>.json`, plus the bike itself at
+//! `<data>/bikelog/<bike_id>/`, named `note-<entry_id>.json` or
+//! `sheet-<entry_id>.json` so the kind shows in the folder listing and the
+//! confirmed sheets can be read without opening every note (Isaac,
+//! 2026-10-16), plus the bike itself at
 //! `<data>/bikes/<bike_id>.json`. An entry is a **note** (text, optionally
 //! exact field changes) or a confirmed **sheet** (every value). An entry
 //! keeps every version of itself, so two devices' copies merge as a union
@@ -260,9 +263,19 @@ pub fn bike_path(data_root: &Path, bike_id: &str) -> PathBuf {
     data_root.join("bikes").join(format!("{bike_id}.json"))
 }
 
-/// `<data>/bikelog/<bike_id>/<entry_id>.json`.
-pub fn entry_path(data_root: &Path, bike_id: &str, entry_id: &str) -> PathBuf {
-    data_root.join("bikelog").join(bike_id).join(format!("{entry_id}.json"))
+impl EntryKind {
+    /// The file-name prefix for this kind: `note-` or `sheet-`.
+    pub fn file_prefix(self) -> &'static str {
+        match self {
+            EntryKind::Note => "note-",
+            EntryKind::Sheet => "sheet-",
+        }
+    }
+}
+
+/// `<data>/bikelog/<bike_id>/<kind>-<entry_id>.json`.
+pub fn entry_path(data_root: &Path, bike_id: &str, kind: EntryKind, entry_id: &str) -> PathBuf {
+    data_root.join("bikelog").join(bike_id).join(format!("{}{entry_id}.json", kind.file_prefix()))
 }
 
 /// Writes `bytes` to `target` atomically (C4 §4).
@@ -294,7 +307,7 @@ pub fn save_bike(data_root: &Path, bike: &Bike) -> Result<Bike, BikeLogError> {
 pub fn save_entry(data_root: &Path, entry: &Entry) -> Result<Entry, BikeLogError> {
     check_id(&entry.bike_id)?;
     check_id(&entry.entry_id)?;
-    let target = entry_path(data_root, &entry.bike_id, &entry.entry_id);
+    let target = entry_path(data_root, &entry.bike_id, entry.kind, &entry.entry_id);
     let merged = match std::fs::read(&target).ok().and_then(|b| serde_json::from_slice::<Entry>(&b).ok()) {
         Some(on_disk) => on_disk.merge(entry),
         None => entry.merge(&Entry { versions: Vec::new(), ..entry.clone() }),
@@ -321,14 +334,16 @@ pub struct LogLoad {
     pub skipped: Vec<(PathBuf, String)>,
 }
 
-/// Reads every `*.json` in `dir` as `T`; a bad file is skipped, never fatal.
-fn load_dir<T: for<'de> Deserialize<'de>>(dir: &Path) -> (Vec<T>, Vec<(PathBuf, String)>) {
+/// Reads every `<prefix>*.json` in `dir` as `T`; a bad file is skipped,
+/// never fatal.
+fn load_dir<T: for<'de> Deserialize<'de>>(dir: &Path, prefix: &str) -> (Vec<T>, Vec<(PathBuf, String)>) {
     let Ok(read) = std::fs::read_dir(dir) else { return (Vec::new(), Vec::new()) };
     let mut ok = Vec::new();
     let mut skipped = Vec::new();
     for item in read.flatten() {
         let path = item.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with(prefix) || path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
         match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice::<T>(&b).map_err(|e| e.to_string())) {
@@ -341,17 +356,27 @@ fn load_dir<T: for<'de> Deserialize<'de>>(dir: &Path) -> (Vec<T>, Vec<(PathBuf, 
 
 /// Loads every bike.
 pub fn load_bikes(data_root: &Path) -> BikesLoad {
-    let (mut bikes, skipped) = load_dir::<Bike>(&data_root.join("bikes"));
+    let (mut bikes, skipped) = load_dir::<Bike>(&data_root.join("bikes"), "");
     bikes.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.bike_id.cmp(&b.bike_id)));
     BikesLoad { bikes, skipped }
 }
 
-/// Loads `bike_id`'s log. An unknown bike has an empty log.
+/// Loads `bike_id`'s log, notes and sheets. An unknown bike has an empty log.
 pub fn load_log(data_root: &Path, bike_id: &str) -> LogLoad {
+    load_log_files(data_root, bike_id, "")
+}
+
+/// Loads only `bike_id`'s confirmed sheets (`sheet-*.json`), without
+/// opening a single note.
+pub fn load_sheets(data_root: &Path, bike_id: &str) -> LogLoad {
+    load_log_files(data_root, bike_id, EntryKind::Sheet.file_prefix())
+}
+
+fn load_log_files(data_root: &Path, bike_id: &str, prefix: &str) -> LogLoad {
     if check_id(bike_id).is_err() {
         return LogLoad { entries: Vec::new(), skipped: Vec::new() };
     }
-    let (mut entries, skipped) = load_dir::<Entry>(&data_root.join("bikelog").join(bike_id));
+    let (mut entries, skipped) = load_dir::<Entry>(&data_root.join("bikelog").join(bike_id), prefix);
     entries.sort_by(|a, b| a.entry_id.cmp(&b.entry_id));
     LogLoad { entries, skipped }
 }
@@ -552,6 +577,27 @@ mod tests {
         // Assert
         assert_eq!(b.kind, BikeLogErrorKind::InvalidId);
         assert_eq!(e.kind, BikeLogErrorKind::InvalidId);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_entry_names_the_file_by_kind_and_load_sheets_reads_only_sheets() {
+        // Arrange
+        let root = temp_root();
+        let n = note("01A", 10, &[]);
+        let s = sheet("01B", 20, &[("fork.lsc", json!(10))]);
+
+        // Act
+        save_entry(&root, &n).unwrap();
+        save_entry(&root, &s).unwrap();
+        let sheets = load_sheets(&root, "gt");
+        let all = load_log(&root, "gt");
+
+        // Assert
+        assert!(root.join("bikelog/gt/note-01A.json").is_file());
+        assert!(root.join("bikelog/gt/sheet-01B.json").is_file());
+        assert_eq!(sheets.entries.iter().map(|e| e.entry_id.as_str()).collect::<Vec<_>>(), vec!["01B"]);
+        assert_eq!(all.entries.len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 
