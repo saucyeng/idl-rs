@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod app_update;
+pub mod bikelog;
 pub mod catalog;
 pub mod cursor;
 pub mod device;
