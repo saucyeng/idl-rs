@@ -169,6 +169,9 @@ fn pct_of(done_bytes: u64, total_bytes: u64) -> u8 {
 /// Maps a `POST /ota` failure onto the IPC error shape, keeping the device's
 /// own body text as structured `detail` so the UI can quote the firmware
 /// rather than paraphrase it (R198).
+/// The longest one post-update reconnect attempt may take.
+const RECONNECT_ATTEMPT_LIMIT: Duration = Duration::from_secs(15);
+
 fn ota_push_ipc_error(e: idl_transport::wifi_transport::OtaPushError) -> IpcError {
     let kind = match e.kind {
         // The device answered and refused: not a transport failure. `Wifi`
@@ -353,11 +356,15 @@ where
     for attempt in 1..=max_attempts {
         on_state(OtaState::Reconnecting { attempt, max_attempts });
         if let Ok(mut ble) = new_ble().await {
-            if ble.connect(device_id).await.is_ok() {
+            // Bounded: on Android a connect to a logger that is not
+            // advertising yet could hang the whole update on attempt 1,
+            // with no way out of the screen (2026-10-16).
+            let connected = tokio::time::timeout(RECONNECT_ATTEMPT_LIMIT, ble.connect(device_id)).await;
+            if matches!(connected, Ok(Ok(_))) {
                 reconnected = Some(ble);
                 break;
             }
-            let _ = ble.disconnect().await;
+            let _ = tokio::time::timeout(RECONNECT_ATTEMPT_LIMIT, ble.disconnect()).await;
         }
         if attempt < max_attempts {
             tokio::time::sleep(timings.reconnect_interval).await;
