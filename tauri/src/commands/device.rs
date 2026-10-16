@@ -492,7 +492,7 @@ where
     GFut: std::future::Future<Output = Result<W, IpcError>>,
 {
     switch_to_wifi_mode(ble).await?;
-    download_over_wifi(open_wifi, device_id, file_name, data_dir, on_progress).await
+    download_over_wifi(open_wifi, device_id, file_name, None, data_dir, on_progress).await
 }
 
 /// Where `device_id`'s `file` downloads to before it is complete:
@@ -517,6 +517,7 @@ async fn download_over_wifi<W, G, GFut>(
     open_wifi: G,
     device_id: &str,
     file_name: &str,
+    known_size: Option<u64>,
     data_dir: &Path,
     mut on_progress: impl FnMut(u64, Option<u64>) + Send,
 ) -> Result<DownloadResult, IpcError>
@@ -527,12 +528,20 @@ where
 {
     let wifi = open_wifi().await?;
 
-    let files = wifi.list_files().await.map_err(IpcError::from)?;
-    let file_index = files
-        .iter()
-        .position(|f| f.name == file_name)
-        .ok_or_else(|| IpcError::new(IpcErrorKind::NotFound, format!("{file_name} not found on device")))?;
-    let file = &files[file_index];
+    // With the size already known (the Bluetooth file list carries it), the
+    // WiFi file list is skipped: on a card with many sessions the logger
+    // could fail to build it (500) and every download failed (2026-10-16).
+    let file = match known_size {
+        Some(size_bytes) => idl_transport::DeviceFile { name: file_name.to_string(), size_bytes, session_id: None },
+        None => wifi
+            .list_files()
+            .await
+            .map_err(IpcError::from)?
+            .into_iter()
+            .find(|f| f.name == file_name)
+            .ok_or_else(|| IpcError::new(IpcErrorKind::NotFound, format!("{file_name} not found on device")))?,
+    };
+    let file = &file;
 
     let tmp_dir = data_dir.join("tmp");
     std::fs::create_dir_all(&tmp_dir)
@@ -874,6 +883,7 @@ pub async fn download_file(
     connections: tauri::State<'_, Connections>,
     device_id: String,
     file_name: String,
+    size_bytes: Option<u64>,
     progress: tauri::ipc::Channel<Progress>,
     data_dir: tauri::State<'_, DataDir>,
 ) -> Result<DownloadResult, IpcError> {
@@ -881,7 +891,7 @@ pub async fn download_file(
         let _ = progress.send(Progress { done, total, phase: "download".to_string() });
     };
     if let Some(name) = wifi_mode_over_managed(&connections.0, &device_id).await? {
-        return download_over_wifi(|| platform::open_device_wifi(&name), &device_id, &file_name, &data_dir.0, send).await;
+        return download_over_wifi(|| platform::open_device_wifi(&name), &device_id, &file_name, size_bytes, &data_dir.0, send).await;
     }
     let mut ble = PlatformBle::new().await.map_err(IpcError::from)?;
     let name = connected_name(&mut ble, &device_id).await?;
@@ -1844,6 +1854,24 @@ pub(crate) mod tests {
         // Assert
         assert_eq!(err.kind, IpcErrorKind::Wifi);
         assert!(part.exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_over_wifi_with_a_known_size_never_asks_for_the_file_list() {
+        // Arrange — the stub's file list fails, as the logger's did.
+        let data_dir = tempfile::tempdir().unwrap();
+        let content = b"ride bytes".to_vec();
+        let wifi = StubWifi {
+            list_files_result: Err(TransportError::new(TransportErrorKind::Wifi, "GET /files returned 500")),
+            download_bytes: Ok(content.clone()),
+            ..StubWifi::default()
+        };
+
+        // Act
+        let result = download_over_wifi(|| async { Ok(wifi) }, "dev", "s.idl1", Some(content.len() as u64), data_dir.path(), |_, _| {}).await.unwrap();
+
+        // Assert
+        assert_eq!(std::fs::read(&result.path).unwrap(), content);
     }
 
     #[test]
