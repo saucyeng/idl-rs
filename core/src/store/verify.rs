@@ -217,6 +217,10 @@ fn matches_layout(rel: &Path) -> bool {
         ["bikes", name] => name.ends_with(".json"),
         ["profiles"] => true,
         ["profiles", name] => name.ends_with(".idl0p"),
+        // The agent's orientation file and its engine to-do list
+        // (analysis-agent DRAFT §3).
+        ["AGENTS.md"] => true,
+        ["agent-gaps.md"] => true,
         ["catalog.sqlite"] => true,
         ["catalog.sqlite-wal"] => true,
         ["catalog.sqlite-shm"] => true,

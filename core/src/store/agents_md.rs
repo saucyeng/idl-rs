@@ -26,8 +26,8 @@ pub const AGENTS_MD_FILENAME: &str = "AGENTS.md";
 pub enum AgentsMdOutcome {
     /// The file did not exist and was written.
     Created,
-    /// The file existed but carried a different (or no) version marker,
-    /// and was rewritten.
+    /// The file existed but its text differed from this build's, and was
+    /// rewritten.
     Rewritten,
     /// The file was already current; nothing was written.
     Unchanged,
@@ -66,8 +66,10 @@ pub fn agents_md_path(data_root: &Path) -> PathBuf {
     data_root.join(AGENTS_MD_FILENAME)
 }
 
-/// Writes `<data>/AGENTS.md` if it is absent or was written by a different
-/// app version; otherwise leaves it untouched.
+/// Writes `<data>/AGENTS.md` if it is absent or its text differs from what
+/// this build renders; otherwise leaves it untouched. Compared by content,
+/// not by the version marker (2026-10-16): every nightly carries the same
+/// app version, and the primer changes between nightlies.
 ///
 /// `app_version` is the running app's version string (Tauri's
 /// `package_info().version`), used only in the marker and the file's own
@@ -79,7 +81,7 @@ pub fn ensure_agents_md(data_root: &Path, app_version: &str) -> Result<AgentsMdO
     let existing = std::fs::read_to_string(&path).ok();
     let outcome = match existing {
         None => AgentsMdOutcome::Created,
-        Some(ref current) if current.starts_with(&marker(app_version)) => return Ok(AgentsMdOutcome::Unchanged),
+        Some(ref current) if *current == wanted => return Ok(AgentsMdOutcome::Unchanged),
         Some(_) => AgentsMdOutcome::Rewritten,
     };
 
@@ -112,7 +114,8 @@ not keep notes in it.
 | `sessions/` | One folder per session: `session.json` (C1 metadata) and `data.parquet`. | `data.parquet` is derived — a pure function of (blob, importer version). Never edit it; re-import instead. |
 | `workbooks/` | `.idl1wb` files: Markdown with fenced `math`, `table`, `js` and prose cells. | **The truth, and the thing to edit.** A workbook is a file; the app is a live viewer of it. |
 | `tracks/` | Track artifacts (circuit geometry, sectors). | Edit through the app. |
-| `profiles/` | Bike profiles (`.idl0p`) — device configuration documents. | Edit through the app. |
+| `profiles/` | Logger profiles (`.idl0p`) — device configuration documents. | Edit through the app. |
+| `bikes/` | One file per bike: its name, setup-sheet fields and whole bike log (notes and confirmed setup sheets, oldest first, every edit kept). | Add entries (see "Analysing a ride"); never delete or rewrite an entry's history. |
 | `derived/` | Content-addressed derived artifacts. | Disposable; regenerated on demand. |
 | `catalog.sqlite` | The index over everything above. | **Disposable.** Delete it and `idl-rs library rebuild` reconstructs it. It is an index, never a source, and it is never synced. |
 | `inbox/` | Drop a log file here and the app imports it. | A queue, not storage. |
@@ -133,21 +136,89 @@ not keep notes in it.
 
 ## The CLI
 
-The engine ships as `idl-rs`. Every structured command takes `--format json`
-and answers with a JSON envelope; `--help` on any subcommand is authoritative.
+The engine ships as `idl-rs`, grammar `idl-rs <noun> <verb>`. Every command
+takes `--json` (typed JSON out, typed errors on stderr) and `--data-dir`
+(this folder; or set `IDL1_DATA_DIR`). `--help` on any command is
+authoritative; the full table is `docs/CLI-REFERENCE.md` in the source repo.
 
 ```
-idl-rs info <file.idl0>                     # session metadata: ids, start time, checksum
-idl-rs channels <file.idl0>                 # every channel: rate, sample count, synthesized flag
-idl-rs export <file.idl0> -o out.csv        # channels to CSV (long/tidy) or JSON
-idl-rs import <file.idl0> --data <data>     # import a log into this library
-idl-rs library scan --data <data>           # find log files not yet imported
-idl-rs library fold-in <dir> --data <data>  # import a whole folder of logs
-idl-rs library stale --data <data>          # sessions whose data.parquet predates the importer
-idl-rs library rebuild --data <data>        # re-derive data.parquet for stale sessions
-idl-rs library index --data <data>          # rebuild the lap/track index
-idl-rs docs workbook --out REFERENCE.md     # regenerate the workbook reference
+idl-rs session list [--venue V --since MS --until MS]   # rides, newest first
+idl-rs session show <id>                                # metadata, notes, channels, laps, bike_log
+idl-rs session laps <id>                                # lap times
+idl-rs workbook new <file>                              # start a workbook
+idl-rs workbook check <file>                            # parse errors before running
+idl-rs workbook eval <file> --session <id>              # run every cell against a ride
+idl-rs workbook data <file> <cell> --session <id>       # one cell's series or table
+idl-rs track list                                       # known tracks
+idl-rs session import <file>                            # import one log into this library
+idl-rs library scan <folder>                            # find logs not yet imported
+idl-rs library fold-in <folder>                         # import a whole folder of logs
+idl-rs library stale                                    # rides whose data.parquet predates the importer
+idl-rs library rebuild                                  # re-derive data.parquet for stale rides
+idl-rs library index                                    # rebuild the lap/track index
 ```
+
+## Analysing a ride
+
+You are the rider's ride engineer, not an oracle. Read the ride's notes,
+work out which questions the data can answer, measure them, and say what
+you found, how sure you are, and when the data can't tell. The design is
+`docs/superpowers/specs/2026-10-16-idl1-analysis-agent-DRAFT.md` in the
+source repo.
+
+**What a ride gives you** (`idl-rs session show <id> --json`):
+
+- `short_comment` is the ride's title and `long_comment` its notes: how it
+  went, the conditions, how the rider felt, and any setup change, in the
+  rider's own words (often dictated).
+- `bike_id` and `bike_log`: the bike, the bike-log entries this ride took
+  (`entry_ids`) and the setup sheet it started with (`setup_sheet.values`,
+  by dotted key such as `fork.lsc`; clicks counted from fully closed).
+- Laps, with UTC start and end times.
+
+**The sensors.** `IMU0` is on the frame (sprung mass), `IMU1` on the fork
+lower (front unsprung), `IMU2` on the swingarm (rear unsprung, absent on a
+hardtail). Each has `AccelX/Y/Z` (g) and `GyroX/Y/Z` (dps); on newer
+hardware `IMU1_AccelX` is low-g merged with high-g, the raw paths being
+`IMU1_LgAccelX` and `IMU1_HgAccelX`. Low-g clips at its configured range
+(usually 16 g). GPS is `GPS_*` (`GPS_SpeedKmh`, `GPS_Latitude`, ...); heart
+rate is `HR_BPM`, and `HR_RR` holds the strap's beat-to-beat intervals.
+Check a ride's own channel list and rates rather than assuming.
+
+**History.** Compare against earlier rides on the same bike and rides on
+other bikes at the same track (`session list --venue`), and read their
+notes and earlier conclusions.
+
+**How to work.**
+
+1. Turn each note into a question with a measurement and a comparison:
+   "bled the fork after lap 2" means: did the front soften, measured as
+   fork travel and fork-to-frame acceleration, laps 1–2 against 3 onward.
+2. Measure with workbook cells and `workbook eval`. Python is allowed on
+   this machine, but each time you use it because the engine can't do
+   something, add a line to `agent-gaps.md` in this folder: what you needed
+   and why. That file is the engine's to-do list.
+3. Report each answer as an estimate, the lap-to-lap spread, and a verdict:
+   a real change, within the noise, or not measurable with this data (and
+   what would measure it).
+4. Write the report as a workbook in `workbooks/`, prose around cells, so
+   every number comes from a cell the rider can open.
+
+**Honesty rules.** Compare every difference with lap-to-lap variation and
+call one smaller than the noise what it is. State every guessed quantity
+as a guess and how to correct it. "Not measurable, here's why" is a full
+answer. No number without the cell that produced it.
+
+**Keeping the setup sheet up to date.** When a ride's notes mention a setup
+change, add it to that bike's log in `bikes/<bike_id>.json`, after the last
+entry: a note whose `text` quotes the rider's words and whose `changes`
+holds the new absolute values (`"+1 LSC fork"` from 10 clicks out is
+`"fork.lsc": 9`: `+` closes one click). Give it a new `entry_id` and
+`version_id` (letters and digits, sortable by time), `at_ms` when it
+happened (a lap's start when the note names a lap), `updated_at_ms` now and
+`device: "agent"`. Never change or delete an existing entry: to correct
+one, add a version naming it in `parents`. The rider sees and can undo
+everything you add.
 
 ## Writing a workbook
 
@@ -234,6 +305,31 @@ mod tests {
     }
 
     #[test]
+    fn ensure_agents_md_same_version_but_older_text_rewrites_the_file() {
+        // Arrange — a nightly at the same version wrote an older primer.
+        let root = temp_root();
+        std::fs::write(agents_md_path(&root), format!("{}\nolder primer\n", marker("0.1.0"))).unwrap();
+
+        // Act
+        let outcome = ensure_agents_md(&root, "0.1.0").unwrap();
+
+        // Assert
+        assert_eq!(outcome, AgentsMdOutcome::Rewritten);
+        assert_eq!(std::fs::read_to_string(agents_md_path(&root)).unwrap(), render_agents_md("0.1.0"));
+    }
+
+    #[test]
+    fn render_agents_md_carries_the_analysis_primer() {
+        // Arrange / Act
+        let text = render_agents_md("0.1.0");
+
+        // Assert
+        for needle in ["## Analysing a ride", "agent-gaps.md", "`device: \"agent\"`", "IMU1` on the fork", "within the noise"] {
+            assert!(text.contains(needle), "primer lacks {needle}");
+        }
+    }
+
+    #[test]
     fn render_agents_md_names_every_never_touch_rule() {
         // Arrange / Act
         let text = render_agents_md("0.1.0");
@@ -251,7 +347,7 @@ mod tests {
         let text = render_agents_md("0.1.0");
 
         // Assert
-        for verb in ["idl-rs import ", "library fold-in", "library scan", "library stale", "library rebuild", "library index"] {
+        for verb in ["session import ", "library fold-in", "library scan", "library stale", "library rebuild", "library index"] {
             assert!(text.contains(verb), "{verb} has no example in AGENTS.md");
         }
     }
