@@ -35,6 +35,11 @@ pub struct Watchers(pub Mutex<HashMap<String, crate::watcher::WorkbookWatcher>>)
 /// connect-act-disconnect (C3 §3.8).
 pub struct Connections(pub Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::platform::PlatformBle>>>>);
 
+/// Running `download_files` batches by device id, each with the signal
+/// `cancel_wifi_transfer` fires (C3 §3.8, 2026-10-16).
+#[derive(Default)]
+pub struct WifiTransfers(pub Mutex<HashMap<String, Arc<tokio::sync::Notify>>>);
+
 /// The library-wide lap/track index job (rulings R207, R208 item 1): at
 /// most one run at a time, its live progress, and the flag that stops it.
 ///

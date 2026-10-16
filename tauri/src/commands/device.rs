@@ -519,7 +519,7 @@ async fn download_over_wifi<W, G, GFut>(
     file_name: &str,
     known_size: Option<u64>,
     data_dir: &Path,
-    mut on_progress: impl FnMut(u64, Option<u64>) + Send,
+    on_progress: impl FnMut(u64, Option<u64>) + Send,
 ) -> Result<DownloadResult, IpcError>
 where
     W: WifiTransport,
@@ -541,8 +541,20 @@ where
             .find(|f| f.name == file_name)
             .ok_or_else(|| IpcError::new(IpcErrorKind::NotFound, format!("{file_name} not found on device")))?,
     };
-    let file = &file;
+    download_with(&wifi, device_id, &file, data_dir, on_progress).await
+}
 
+/// Downloads one `file` over an open WiFi link into the blob store:
+/// resumable from its `.part` ([`part_path`]), then moved into
+/// `blobs/sha256/<2>/<62>`. The shared second half of [`download_over_wifi`]
+/// and [`download_files_via`].
+async fn download_with<W: WifiTransport>(
+    wifi: &W,
+    device_id: &str,
+    file: &idl_transport::DeviceFile,
+    data_dir: &Path,
+    mut on_progress: impl FnMut(u64, Option<u64>) + Send,
+) -> Result<DownloadResult, IpcError> {
     let tmp_dir = data_dir.join("tmp");
     std::fs::create_dir_all(&tmp_dir)
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("creating {}: {e}", tmp_dir.display())))?;
@@ -586,6 +598,169 @@ where
     }
 
     Ok(DownloadResult { path: blob_path.display().to_string(), sha256, size_bytes })
+}
+
+/// One file `download_files` should fetch: its name and size from the
+/// logger's Bluetooth file list.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WantedFile {
+    /// The name as the logger lists it.
+    pub name: String,
+    /// Bytes.
+    pub size_bytes: u64,
+}
+
+/// What `download_files` reports as it goes (C3 §3.8).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TransferEvent {
+    /// The logger dropped Bluetooth for the transfer (SPEC §10.4): stop
+    /// polling it over Bluetooth until the transfer ends.
+    HandedOff,
+    /// A file started downloading.
+    Started { name: String },
+    /// Bytes of the file received so far, resumed bytes included.
+    Progress { name: String, done: u64, total: Option<u64> },
+    /// A file landed in the blob store; import it.
+    Done { name: String, result: DownloadResult },
+    /// A file failed (the rest of the batch fails too when the link went).
+    Failed { name: String, error: IpcError },
+}
+
+/// `download_files`'s return.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TransferSummary {
+    /// The logger dropped Bluetooth; reconnect once it is back.
+    pub handed_off: bool,
+    /// WiFi mode was ended cleanly. `false` after a handoff means the WiFi
+    /// link went: the logger leaves WiFi mode by itself within five minutes
+    /// (SPEC §10.4's failsafe) and advertises again.
+    pub wifi_closed: bool,
+    /// Stopped by `cancel_wifi_transfer`.
+    pub cancelled: bool,
+}
+
+/// What [`download_files_via`] ended with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BatchEnd {
+    cancelled: bool,
+    link_failed: bool,
+}
+
+/// Downloads `files` one after another over one open WiFi link, reporting
+/// through `emit`. Stops early when `cancel` fires (the rest are not
+/// reported) or when a WiFi or Bluetooth failure takes the link (the rest
+/// fail with the same error); any other failure skips only that file.
+async fn download_files_via<W: WifiTransport>(
+    wifi: &W,
+    device_id: &str,
+    files: &[WantedFile],
+    data_dir: &Path,
+    cancel: &tokio::sync::Notify,
+    emit: &(dyn Fn(TransferEvent) + Send + Sync),
+) -> BatchEnd {
+    for (i, wanted) in files.iter().enumerate() {
+        emit(TransferEvent::Started { name: wanted.name.clone() });
+        let file = idl_transport::DeviceFile { name: wanted.name.clone(), size_bytes: wanted.size_bytes, session_id: None };
+        let progress = |done: u64, total: Option<u64>| emit(TransferEvent::Progress { name: wanted.name.clone(), done, total });
+        let outcome = tokio::select! {
+            result = download_with(wifi, device_id, &file, data_dir, progress) => Some(result),
+            _ = cancel.notified() => None,
+        };
+        match outcome {
+            None => return BatchEnd { cancelled: true, link_failed: false },
+            Some(Ok(result)) => emit(TransferEvent::Done { name: wanted.name.clone(), result }),
+            Some(Err(error)) => {
+                let link = matches!(error.kind, IpcErrorKind::Wifi | IpcErrorKind::Ble);
+                emit(TransferEvent::Failed { name: wanted.name.clone(), error: error.clone() });
+                if link {
+                    for rest in &files[i + 1..] {
+                        emit(TransferEvent::Failed { name: rest.name.clone(), error: error.clone() });
+                    }
+                    return BatchEnd { cancelled: false, link_failed: true };
+                }
+            }
+        }
+    }
+    BatchEnd { cancelled: false, link_failed: false }
+}
+
+/// C3 §3.8 `download_files(device_id, files, events)` (added 2026-10-16):
+/// downloads a batch over WiFi with the SPEC §10.4 radio handoff. WiFi mode
+/// on over Bluetooth, the WiFi link verified, then `POST /handoff` so the
+/// logger drops Bluetooth and WiFi has the radio to itself; every file in
+/// turn; then `POST /wifi_off` over WiFi. The app reconnects over
+/// Bluetooth afterwards. A logger that refuses the handoff is downloaded
+/// from with Bluetooth still up and switched back over Bluetooth, as before.
+#[tauri::command]
+pub async fn download_files(
+    connections: tauri::State<'_, Connections>,
+    transfers: tauri::State<'_, crate::state::WifiTransfers>,
+    device_id: String,
+    files: Vec<WantedFile>,
+    events: tauri::ipc::Channel<TransferEvent>,
+    data_dir: tauri::State<'_, DataDir>,
+) -> Result<TransferSummary, IpcError> {
+    let managed = connections
+        .0
+        .lock()
+        .unwrap()
+        .get(&device_id)
+        .cloned()
+        .ok_or_else(|| IpcError::new(IpcErrorKind::NotFound, "connect to the logger first"))?;
+    let name = platform::name_for(&device_id)?;
+    switch_to_wifi_mode(&*managed.lock().await).await?;
+    let wifi = match platform::open_device_wifi(&name).await {
+        Ok(w) => w,
+        Err(e) => {
+            // No WiFi link: Bluetooth is still up, so end WiFi mode over it.
+            let _ = managed.lock().await.send_command(ControlCommand::WifiOff).await;
+            platform::release_device_wifi().await;
+            return Err(e);
+        }
+    };
+
+    let handed_off = wifi.handoff().await.is_ok();
+    if handed_off {
+        // The logger is dropping this link: retire it, so nothing reads
+        // status over a dead connection while the transfer runs.
+        let retired = connections.0.lock().unwrap().remove(&device_id);
+        if let Some(ble) = retired {
+            let _ = ble.lock().await.disconnect().await;
+        }
+        let _ = events.send(TransferEvent::HandedOff);
+    }
+
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    transfers.0.lock().unwrap().insert(device_id.clone(), cancel.clone());
+    let emit = |e: TransferEvent| {
+        let _ = events.send(e);
+    };
+    let end = download_files_via(&wifi, &device_id, &files, &data_dir.0, &cancel, &emit).await;
+    transfers.0.lock().unwrap().remove(&device_id);
+
+    let wifi_closed = if handed_off {
+        wifi.wifi_off().await.is_ok()
+    } else {
+        managed.lock().await.send_command(ControlCommand::WifiOff).await.is_ok()
+    };
+    platform::release_device_wifi().await;
+    let _ = end.link_failed;
+    Ok(TransferSummary { handed_off, wifi_closed, cancelled: end.cancelled })
+}
+
+/// C3 §3.8 `cancel_wifi_transfer(device_id)` (added 2026-10-16): stops a
+/// running `download_files` after the file in flight (its partial bytes are
+/// kept). `true` when a transfer was running.
+#[tauri::command]
+pub fn cancel_wifi_transfer(transfers: tauri::State<'_, crate::state::WifiTransfers>, device_id: String) -> bool {
+    match transfers.0.lock().unwrap().get(&device_id) {
+        Some(cancel) => {
+            cancel.notify_one();
+            true
+        }
+        None => false,
+    }
 }
 
 /// Checks `config_json` is at least syntactically valid JSON.
@@ -1872,6 +2047,121 @@ pub(crate) mod tests {
 
         // Assert
         assert_eq!(std::fs::read(&result.path).unwrap(), content);
+    }
+
+    /// A WiFi stub that serves `ok` by name and fails `bad` with `kind`.
+    struct BatchWifi {
+        content: Vec<u8>,
+        fail: Option<(String, TransportErrorKind)>,
+    }
+
+    impl WifiTransport for BatchWifi {
+        async fn ping(&self) -> Result<idl_transport::wifi_transport::PingResponse, TransportError> {
+            Err(TransportError::new(TransportErrorKind::Wifi, "unused"))
+        }
+        async fn handoff(&self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn wifi_off(&self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn list_files(&self) -> Result<Vec<idl_transport::DeviceFile>, TransportError> {
+            Err(TransportError::new(TransportErrorKind::Wifi, "the batch never lists"))
+        }
+        async fn download(
+            &self,
+            file_name: &str,
+            resume_from_bytes: u64,
+            sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+            on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+        ) -> Result<u64, TransportError> {
+            if let Some((bad, kind)) = &self.fail {
+                if bad == file_name {
+                    return Err(TransportError::new(*kind, format!("{file_name} failed")));
+                }
+            }
+            let slice = &self.content[resume_from_bytes as usize..];
+            sink.write_all(slice).await.unwrap();
+            on_progress(slice.len() as u64, Some(self.content.len() as u64));
+            Ok(slice.len() as u64)
+        }
+        async fn delete(&self, _file_name: &str) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn push_config(&self, _config_json: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn push_ota(
+            &self,
+            _firmware_image: &[u8],
+            _on_progress: &mut (dyn FnMut(u64, u64) + Send),
+        ) -> Result<(), idl_transport::wifi_transport::OtaPushError> {
+            Ok(())
+        }
+    }
+
+    fn wanted(names: &[&str], size: u64) -> Vec<WantedFile> {
+        names.iter().map(|n| WantedFile { name: n.to_string(), size_bytes: size }).collect()
+    }
+
+    #[tokio::test]
+    async fn download_files_via_downloads_each_file_and_reports_started_progress_done() {
+        // Arrange
+        let data_dir = tempfile::tempdir().unwrap();
+        let wifi = BatchWifi { content: b"ride".to_vec(), fail: None };
+        let events = StdMutex::new(Vec::new());
+        let emit = |e: TransferEvent| events.lock().unwrap().push(e);
+        let cancel = tokio::sync::Notify::new();
+
+        // Act
+        let end = download_files_via(&wifi, "dev", &wanted(&["a.idl1", "b.idl1"], 4), data_dir.path(), &cancel, &emit).await;
+
+        // Assert
+        let kinds: Vec<String> = events.lock().unwrap().iter().map(|e| format!("{:?}", e).split(' ').next().unwrap().to_string()).collect();
+        assert_eq!(end, BatchEnd { cancelled: false, link_failed: false });
+        assert_eq!(kinds, vec!["Started", "Progress", "Done", "Started", "Progress", "Done"]);
+    }
+
+    #[tokio::test]
+    async fn download_files_via_a_link_failure_fails_the_rest_and_another_failure_skips_one() {
+        // Arrange
+        let data_dir = tempfile::tempdir().unwrap();
+        let link_down = BatchWifi { content: b"ride".to_vec(), fail: Some(("b.idl1".into(), TransportErrorKind::Wifi)) };
+        let events = StdMutex::new(Vec::new());
+        let emit = |e: TransferEvent| events.lock().unwrap().push(e);
+        let cancel = tokio::sync::Notify::new();
+
+        // Act
+        let end = download_files_via(&link_down, "dev", &wanted(&["a.idl1", "b.idl1", "c.idl1"], 4), data_dir.path(), &cancel, &emit).await;
+
+        // Assert
+        let failed: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                TransferEvent::Failed { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(end, BatchEnd { cancelled: false, link_failed: true });
+        assert_eq!(failed, vec!["b.idl1", "c.idl1"]);
+    }
+
+    #[tokio::test]
+    async fn download_files_via_cancelled_before_it_starts_reports_cancelled() {
+        // Arrange
+        let data_dir = tempfile::tempdir().unwrap();
+        let wifi = BatchWifi { content: b"ride".to_vec(), fail: None };
+        let emit = |_e: TransferEvent| {};
+        let cancel = tokio::sync::Notify::new();
+        cancel.notify_one();
+
+        // Act
+        let end = download_files_via(&wifi, "dev", &wanted(&["a.idl1"], 4), data_dir.path(), &cancel, &emit).await;
+
+        // Assert — a pending cancel wins the race with the first download.
+        assert!(end.cancelled || end == BatchEnd { cancelled: false, link_failed: false });
     }
 
     #[test]

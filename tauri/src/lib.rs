@@ -52,6 +52,8 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::firmware::ota_state,
         commands::device::list_device_files,
         commands::device::download_file,
+        commands::device::download_files,
+        commands::device::cancel_wifi_transfer,
         commands::device::push_config,
         commands::catalog::list_sessions,
         commands::catalog::get_session,
