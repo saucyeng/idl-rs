@@ -150,6 +150,9 @@ idl-rs workbook check <file>                            # parse errors before ru
 idl-rs workbook eval <file> --session <id>              # run every cell against a ride
 idl-rs workbook data <file> <cell> --session <id>       # one cell's series or table
 idl-rs track list                                       # known tracks
+idl-rs bike list                                        # bikes
+idl-rs bike show <bike_id> [--at MS]                    # a bike's log and setup sheet then
+idl-rs bike note <bike_id> --text T --change k=v        # add a setup change to its log
 idl-rs session import <file>                            # import one log into this library
 idl-rs library scan <folder>                            # find logs not yet imported
 idl-rs library fold-in <folder>                         # import a whole folder of logs
@@ -210,15 +213,20 @@ as a guess and how to correct it. "Not measurable, here's why" is a full
 answer. No number without the cell that produced it.
 
 **Keeping the setup sheet up to date.** When a ride's notes mention a setup
-change, add it to that bike's log in `bikes/<bike_id>.json`, after the last
-entry: a note whose `text` quotes the rider's words and whose `changes`
-holds the new absolute values (`"+1 LSC fork"` from 10 clicks out is
-`"fork.lsc": 9`: `+` closes one click). Give it a new `entry_id` and
-`version_id` (letters and digits, sortable by time), `at_ms` when it
-happened (a lap's start when the note names a lap), `updated_at_ms` now and
-`device: "agent"`. Never change or delete an existing entry: to correct
-one, add a version naming it in `parents`. The rider sees and can undo
-everything you add.
+change, add it to that bike's log with `idl-rs bike note`, never by editing
+`bikes/<bike_id>.json` yourself:
+
+```
+idl-rs bike show gt-force                              # the sheet now: fork.lsc = 10
+idl-rs bike note gt-force --text "+1 LSC fork" --change fork.lsc=9 --at <lap start ms> --device agent
+```
+
+`--text` quotes the rider's words; each `--change` is the new absolute
+value (`+` closes one click, counted from fully closed, so "+1 LSC" from 10
+is 9); `--at` is when it happened (the start of the lap the note names, or
+the ride's start); `--device agent` marks it as yours. Use `--dry-run`
+first if unsure. Never delete or rewrite an existing entry. The rider sees
+and can undo everything you add.
 
 ## Writing a workbook
 
@@ -324,7 +332,7 @@ mod tests {
         let text = render_agents_md("0.1.0");
 
         // Assert
-        for needle in ["## Analysing a ride", "agent-gaps.md", "`device: \"agent\"`", "IMU1` on the fork", "within the noise"] {
+        for needle in ["## Analysing a ride", "agent-gaps.md", "--device agent", "IMU1` on the fork", "within the noise"] {
             assert!(text.contains(needle), "primer lacks {needle}");
         }
     }

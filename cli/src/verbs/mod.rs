@@ -24,6 +24,7 @@
 //! - `--dry-run` on every writer.
 //! - Exit `0` on success, `1` on a failed operation, `2` on a usage error.
 
+mod bike;
 mod catalog;
 mod session;
 mod store;
@@ -217,6 +218,9 @@ pub fn dispatch(noun: &str, matches: &ArgMatches) -> Option<ExitCode> {
         ("workbook", "export") => workbook::export(&ctx, m),
         ("track", "list") => catalog::track_list(&ctx, m),
         ("track", "detect") => catalog::track_detect(&ctx, m),
+        ("bike", "list") => bike::list(&ctx, m),
+        ("bike", "show") => bike::show(&ctx, m),
+        ("bike", "note") => bike::note(&ctx, m),
         ("catalog", "verify") => catalog::verify(&ctx, m),
         ("catalog", "rebuild") => catalog::rebuild(&ctx, m),
         ("library", _) => return Some(store::library(row, &ctx, m)),

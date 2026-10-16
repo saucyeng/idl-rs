@@ -319,6 +319,67 @@ pub fn entries_for_session(entries: &[Entry], after_ms: Option<i64>, until_ms: i
     picked.into_iter().map(|(_, id)| id.to_string()).collect()
 }
 
+/// A new id that sorts by creation time: `now_ms` in base 36, zero-padded
+/// to nine characters, then six random lowercase letters and digits. Only
+/// letters and digits, so it is a safe id ([`is_valid_id`]); the app makes
+/// its ids the same way.
+pub fn new_id(now_ms: i64) -> String {
+    const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut n = now_ms.max(0) as u64;
+    let mut head = Vec::new();
+    while n > 0 {
+        head.push(ALPHABET[(n % 36) as usize]);
+        n /= 36;
+    }
+    while head.len() < 9 {
+        head.push(b'0');
+    }
+    head.reverse();
+    let random = uuid::Uuid::new_v4();
+    let tail = random.as_bytes()[..6].iter().map(|b| ALPHABET[(*b as usize) % 36]);
+    String::from_utf8(head.into_iter().chain(tail).collect()).expect("ascii")
+}
+
+/// A new note for `bike_id`: its text, the values it sets, when it
+/// happened and who wrote it. Not saved: hand it to [`save_entry`].
+pub fn new_note(bike_id: &str, text: &str, changes: BTreeMap<String, serde_json::Value>, at_ms: i64, device: &str, now_ms: i64) -> Entry {
+    Entry {
+        entry_id: new_id(now_ms),
+        bike_id: bike_id.to_string(),
+        kind: EntryKind::Note,
+        versions: vec![EntryVersion {
+            version_id: new_id(now_ms),
+            parents: Vec::new(),
+            at_ms,
+            updated_at_ms: now_ms,
+            device: device.to_string(),
+            text: text.trim().to_string(),
+            changes,
+            sheet: BTreeMap::new(),
+            deleted: false,
+        }],
+    }
+}
+
+/// Parses one `key=value` setup change: the value is a number when it
+/// reads as one, else text. `None` without an `=` or with an empty key.
+pub fn parse_change(spec: &str) -> Option<(String, serde_json::Value)> {
+    let (key, value) = spec.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let value = value.trim();
+    let parsed = value.parse::<f64>().ok().and_then(serde_json::Number::from_f64).map(|n| {
+        if n.as_f64().is_some_and(|f| f.fract() == 0.0 && f.abs() < 9e15) {
+            serde_json::Value::from(n.as_f64().unwrap() as i64)
+        } else {
+            serde_json::Value::Number(n)
+        }
+    });
+    Some((key.to_string(), parsed.unwrap_or_else(|| serde_json::Value::String(value.to_string()))))
+}
+
 /// The bike named `name` (trimmed, case ignored), creating it when there
 /// is none. A new bike's id is the name in lowercase letters, digits and
 /// `-` ("GT Force" is `gt-force`), with `-2`, `-3`… added if taken.
@@ -801,6 +862,56 @@ mod tests {
         assert!(log.entries.is_empty());
         assert_eq!(log.skipped.len(), 1);
         assert_eq!(bikes.skipped.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_id_sorts_by_time_and_is_a_valid_id() {
+        // Arrange
+        let early = new_id(1_000);
+        let late = new_id(1_760_000_000_000);
+
+        // Act
+        let mut sorted = vec![late.clone(), early.clone()];
+        sorted.sort();
+
+        // Assert
+        assert_eq!(sorted, vec![early.clone(), late.clone()]);
+        assert_eq!(late.len(), 15);
+        assert!(is_valid_id(&late) && is_valid_id(&early));
+    }
+
+    #[test]
+    fn parse_change_numbers_text_and_bad_specs() {
+        // Arrange
+        let specs = ["fork.lsc=9", "rear_tyre.psi = 26.5", "frame.flip_chip=Long", "nokey", "=5"];
+
+        // Act
+        let parsed: Vec<Option<(String, serde_json::Value)>> = specs.iter().map(|s| parse_change(s)).collect();
+
+        // Assert
+        assert_eq!(parsed[0], Some(("fork.lsc".to_string(), json!(9))));
+        assert_eq!(parsed[1], Some(("rear_tyre.psi".to_string(), json!(26.5))));
+        assert_eq!(parsed[2], Some(("frame.flip_chip".to_string(), json!("Long"))));
+        assert_eq!(parsed[3], None);
+        assert_eq!(parsed[4], None);
+    }
+
+    #[test]
+    fn new_note_saved_changes_the_running_sheet() {
+        // Arrange
+        let root = temp_root();
+        save_bike(&root, &gt()).unwrap();
+        save_entry(&root, &sheet("s1", 10, &[("fork.lsc", json!(10))])).unwrap();
+        let changes = [("fork.lsc".to_string(), json!(9))].into_iter().collect();
+
+        // Act
+        let saved = save_entry(&root, &new_note("gt", "+1 LSC fork", changes, 20, "agent", 30)).unwrap();
+        let log = load_log(&root, "gt");
+
+        // Assert
+        assert_eq!(saved.versions[0].device, "agent");
+        assert_eq!(running_sheet(&log.entries, 100).values["fork.lsc"], json!(9));
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -256,7 +256,7 @@ pub const JSON_SCHEMA_VERSION: u32 = 1;
 
 /// R230's closed noun vocabulary.
 pub const NOUNS: &[&str] =
-    &["session", "workbook", "track", "catalog", "library", "device", "docs"];
+    &["session", "workbook", "track", "bike", "catalog", "library", "device", "docs"];
 
 /// R230's closed verb vocabulary, verbatim.
 pub const VERBS: &[&str] = &[
@@ -283,6 +283,10 @@ pub const VERBS_RULED: &[(&str, &str)] = &[
     // task brief and numbered R238 after the fact, so that the app's copy of
     // this table (which accepts only numbered rulings) agrees with core.
     ("calibrate", "R238"),
+    // The bike log's `bike note` (Isaac, 2026-10-16): the analysis agent
+    // adds setup changes through the engine's merge, not by hand-editing
+    // `bikes/<id>.json`. The same ruling added the noun `bike`.
+    ("note", "R251"),
 ];
 
 /// Whether `verb` is in either vocabulary.
@@ -333,6 +337,15 @@ pub fn rows_for(noun: &str) -> Vec<&'static CommandRow> {
 
 /// The motions `session synth` can generate (`synth::Protocol`).
 const SYNTH_PROTOCOLS: &[&str] = &["loop", "calibration"];
+
+const BIKE_ID_ARG: Arg = Arg {
+    name: "bike_id",
+    kind: ValueKind::Text,
+    required: true,
+    repeatable: false,
+    choices: &[],
+    help: "Bike id, as `bike list` prints it",
+};
 
 const SESSION_ID_ARG: Arg = Arg {
     name: "id",
@@ -752,6 +765,58 @@ pub const COMMANDS: &[CommandRow] = &[
         data_dir: true,
         writer: true,
     },
+    // --- bike (R251) -------------------------------------------------------
+    CommandRow {
+        noun: "bike",
+        verb: "list",
+        args: &[],
+        flags: &[],
+        core_fn: "store::bikelog::load_bikes",
+        json_shape: Some("Bike[]"),
+        help: "List the bikes in the library",
+        tier: Tier::Occasional,
+        status: Status::Current,
+        data_dir: true,
+        writer: false,
+    },
+    CommandRow {
+        noun: "bike",
+        verb: "show",
+        args: &[BIKE_ID_ARG],
+        flags: &[Flag::value("at", ValueKind::Integer, "Work the setup sheet out as of this Unix epoch millisecond; default now")],
+        core_fn: "store::bikelog::running_sheet",
+        json_shape: Some("BikeShow"),
+        help: "Show a bike's log and its setup sheet",
+        tier: Tier::Occasional,
+        status: Status::Current,
+        data_dir: true,
+        writer: false,
+    },
+    CommandRow {
+        noun: "bike",
+        verb: "note",
+        args: &[BIKE_ID_ARG],
+        flags: &[
+            Flag::value("text", ValueKind::Text, "The note, in the rider's words"),
+            Flag {
+                long: "change",
+                kind: Some(ValueKind::Text),
+                repeatable: true,
+                choices: &[],
+                default: None,
+                help: "A changed setup value as `key=value`, e.g. `fork.lsc=9`; repeat for several",
+            },
+            Flag::value("at", ValueKind::Integer, "When it happened, Unix epoch milliseconds; default now"),
+            Flag::value("device", ValueKind::Text, "Who wrote it, e.g. `agent`; default `cli`"),
+        ],
+        core_fn: "store::bikelog::save_entry",
+        json_shape: Some("Entry"),
+        help: "Add a note to a bike's log; its changes update the setup sheet",
+        tier: Tier::Occasional,
+        status: Status::Current,
+        data_dir: true,
+        writer: true,
+    },
     // --- catalog ----------------------------------------------------------
     CommandRow {
         noun: "catalog",
@@ -969,7 +1034,7 @@ mod tests {
         // Arrange
         let expected = [
             "set-start", "set-meta", "cells", "data", "detect", "laps", "stale", "workbook", "cli", "wire",
-            "synth", "calibrate",
+            "synth", "calibrate", "note",
         ];
 
         // Act
@@ -1184,7 +1249,7 @@ mod tests {
         // Assert — `device` is in R230's vocabulary for the transport lane;
         // no row claims it yet, and that is not a failure.
         assert!(!has_device);
-        assert_eq!(in_use, ["session", "workbook", "track", "catalog", "library", "docs"]);
+        assert_eq!(in_use, ["session", "workbook", "track", "bike", "catalog", "library", "docs"]);
     }
 
     #[test]
