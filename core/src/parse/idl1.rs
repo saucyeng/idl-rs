@@ -199,6 +199,7 @@ pub fn parse_idl1(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     let mut gps_ts: Vec<i64> = Vec::new();
     let mut gps_anchor = GpsAnchor::default();
     let mut warnings: Vec<ImportWarning> = Vec::new();
+    let mut events: Vec<LoggerEvents> = Vec::new();
     let mut truncation: Option<ParseError> = None;
     let mut ended = false;
 
@@ -223,7 +224,7 @@ pub fn parse_idl1(bytes: &[u8]) -> Result<ParseResult, ParseError> {
                 acc.push("GPS_Hdop", hdop_x100 as f64 * 0.01);
             }
             REC_CHANNEL_SAMPLE => read_channel_sample(&mut r, len, &registry, &mut acc, &mut channel_slot, &mut channel_ts)?,
-            REC_LOGGER_EVENT => warnings.extend(read_logger_event(&mut r, len)?),
+            REC_LOGGER_EVENT => read_logger_event(&mut r, len, &mut events)?,
             REC_SESSION_SUMMARY => warnings.extend(read_session_summary(&mut r, len)?),
             _ => {}
         }
@@ -232,6 +233,8 @@ pub fn parse_idl1(bytes: &[u8]) -> Result<ParseResult, ParseError> {
             r.skip(len - consumed, "record remainder")?;
         }
     }
+
+    warnings.extend(events.iter().map(LoggerEvents::warning));
 
     // Each IMU's sample times on the ESP32 clock.
     let mut timed: Vec<(usize, bool, Vec<f64>, Vec<Option<usize>>, Vec<GapSpan>, f64)> = Vec::new();
@@ -631,20 +634,65 @@ fn event_name(code: u8) -> &'static str {
     }
 }
 
+/// Every LOGGER_EVENT of one (code, source), folded into one import
+/// warning: the logger repeats an ongoing problem once a second, and a
+/// warning per record would bury the import.
+struct LoggerEvents {
+    /// Event code (spec §4.3).
+    code: u8,
+    /// Event source (IMU index, or 0 for the logger itself).
+    source: u16,
+    /// LOGGER_EVENT records seen.
+    records: u32,
+    /// Sum of the records' counts: occurrences on the logger.
+    total: u64,
+    /// Device time of the first record, µs.
+    first_us: i64,
+    /// Device time of the last record, µs.
+    last_us: i64,
+}
+
+impl LoggerEvents {
+    /// The warning for this group.
+    fn warning(&self) -> ImportWarning {
+        let name = event_name(self.code);
+        let message = if self.records == 1 {
+            format!("logger: {name} (source {}) ×{} at device time {:.3} s", self.source, self.total, self.first_us as f64 / 1e6)
+        } else {
+            format!(
+                "logger: {name} (source {}) ×{} in {} reports, device time {:.3} s to {:.3} s",
+                self.source,
+                self.total,
+                self.records,
+                self.first_us as f64 / 1e6,
+                self.last_us as f64 / 1e6
+            )
+        };
+        ImportWarning { kind: ImportWarningKind::LoggerDiagnostic, message }
+    }
+}
+
 /// Reads one LOGGER_EVENT (spec §4.3: code u8, source u16, count u32,
-/// timestamp_us i64) as an import warning.
-fn read_logger_event(r: &mut ByteReader, len: usize) -> Result<Option<ImportWarning>, ParseError> {
+/// timestamp_us i64) into its (code, source) group, kept in order of first
+/// appearance.
+fn read_logger_event(r: &mut ByteReader, len: usize, events: &mut Vec<LoggerEvents>) -> Result<(), ParseError> {
     if len < 15 {
-        return Ok(None);
+        return Ok(());
     }
     let code = r.u8("event code")?;
     let source = r.u16("event source")?;
     let count = r.u32("event count")?;
     let ts = r.i64("event timestamp_us")?;
-    Ok(Some(ImportWarning {
-        kind: ImportWarningKind::LoggerDiagnostic,
-        message: format!("logger: {} (source {source}) ×{count} at device time {:.3} s", event_name(code), ts as f64 / 1e6),
-    }))
+    match events.iter_mut().find(|e| e.code == code && e.source == source) {
+        Some(e) => {
+            e.records += 1;
+            e.total += count as u64;
+            e.first_us = e.first_us.min(ts);
+            e.last_us = e.last_us.max(ts);
+        }
+        None => events.push(LoggerEvents { code, source, records: 1, total: count as u64, first_us: ts, last_us: ts }),
+    }
+    Ok(())
 }
 
 /// Reads SESSION_SUMMARY (spec §4.3: n_imu u8; per IMU overruns u32,
@@ -1047,6 +1095,26 @@ pub(crate) mod tests {
 
         // Assert
         assert!(r.import_warnings.iter().any(|w| w.kind == ImportWarningKind::LoggerDiagnostic && w.message.contains("writer buffer full") && w.message.contains("×3")));
+    }
+
+    #[test]
+    fn parse_idl1_repeated_logger_events_fold_into_one_warning_per_code_and_source() {
+        // Arrange
+        let mut b = Builder::new();
+        for s in 0..600i64 {
+            b.logger_event(1, 1, 2, 1_000_000 + s * 1_000_000);
+        }
+        b.logger_event(1, 2, 5, 3_000_000);
+        b.end();
+
+        // Act
+        let r = parse_idl1(&b.build()).unwrap();
+
+        // Assert
+        let overruns: Vec<&str> = r.import_warnings.iter().filter(|w| w.message.contains("FIFO overrun")).map(|w| w.message.as_str()).collect();
+        assert_eq!(overruns.len(), 2);
+        assert!(overruns[0].contains("(source 1) ×1200 in 600 reports, device time 1.000 s to 600.000 s"), "{}", overruns[0]);
+        assert!(overruns[1].contains("(source 2) ×5 at device time 3.000 s"), "{}", overruns[1]);
     }
 
     #[test]
