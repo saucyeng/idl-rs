@@ -230,6 +230,10 @@ pub struct SessionDetail {
     pub overlay_lap_key: Option<OverlayLapKey>,
     pub starred_lap_number: Option<u32>,
     pub track_visits_library_hash: Option<String>,
+    /// The bike this session was ridden on; `""` = not attached (C3 §3.11).
+    pub bike_id: String,
+    /// What the session took from its bike's log (C1 §6, C3 §3.11).
+    pub bike_log: Option<idl_rs::store::bikelog::SessionBikeLog>,
 }
 
 impl From<catalog_read::SessionDetail> for SessionDetail {
@@ -260,6 +264,8 @@ impl From<catalog_read::SessionDetail> for SessionDetail {
             overlay_lap_key: d.overlay_lap_key.map(OverlayLapKey::from),
             starred_lap_number: d.starred_lap_number,
             track_visits_library_hash: d.track_visits_library_hash,
+            bike_id: d.bike_id,
+            bike_log: d.bike_log,
         }
     }
 }

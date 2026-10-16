@@ -108,6 +108,12 @@ pub struct SessionDetail {
     pub starred_lap_number: Option<u32>,
     /// Opaque, do not parse (C1 §6).
     pub track_visits_library_hash: Option<String>,
+    /// The bike this session was ridden on (C1 §6, bike-log spec §4); `""`
+    /// = not attached.
+    pub bike_id: String,
+    /// What the session took from its bike's log: the entries and the
+    /// setup sheet at its start (C1 §6).
+    pub bike_log: Option<crate::store::bikelog::SessionBikeLog>,
 }
 
 /// Mirrors C1 §6 `session.json`'s `laps[]` object field for field — the
@@ -423,6 +429,8 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
         overlay_lap_key: doc.overlay_lap_key,
         starred_lap_number: doc.starred_lap_number,
         track_visits_library_hash: doc.track_visits_library_hash,
+        bike_id: doc.bike_id,
+        bike_log: doc.bike_log,
     })
 }
 
