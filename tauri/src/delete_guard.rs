@@ -58,9 +58,9 @@ mod tests {
         // Workbook merge install: removes the *old*-named `.idl1wb` only when
         // a peer's `workbook_id` wins the rename (C4 §6).
         ("core/src/store/sync/apply.rs", "install_workbook"),
-        // `download_over_wifi`: removes/renames only its `tmp/download-*.part`
+        // `download_with`: removes/renames only its `tmp/download-*.part`
         // file on its way into `blobs/`.
-        ("tauri/src/commands/device.rs", "download_over_wifi"),
+        ("tauri/src/commands/device.rs", "download_with"),
         // Resumable download `.part` files under `tmp/`, dropped on a cap
         // breach and again once the bytes are complete (R102).
         ("transport/src/sync/client.rs", "download_item_with_cap"),
