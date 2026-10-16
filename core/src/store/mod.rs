@@ -9,6 +9,7 @@
 /// touches the library (ruling R222 item 4).
 pub mod agents_md;
 pub mod atomic;
+pub mod bikelog;
 pub mod blob;
 pub mod catalog;
 pub mod catalog_read;

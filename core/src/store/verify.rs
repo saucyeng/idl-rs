@@ -212,6 +212,12 @@ fn matches_layout(rel: &Path) -> bool {
         ["workbooks", name] => name.ends_with(".idl1wb"),
         ["tracks"] => true,
         ["tracks", name] => name.ends_with(".idl0t"),
+        // The bike log (bike-log DRAFT spec §4, 2026-10-16).
+        ["bikes"] => true,
+        ["bikes", name] => name.ends_with(".json"),
+        ["bikelog"] => true,
+        ["bikelog", _bike] => true,
+        ["bikelog", _bike, name] => name.ends_with(".json"),
         ["profiles"] => true,
         ["profiles", name] => name.ends_with(".idl0p"),
         ["catalog.sqlite"] => true,
