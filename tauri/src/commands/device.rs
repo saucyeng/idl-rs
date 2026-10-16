@@ -28,7 +28,7 @@
 //! this module's connect-act-disconnect idiom.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -441,6 +441,17 @@ where
     GFut: std::future::Future<Output = Result<W, IpcError>>,
 {
     switch_to_wifi_mode(ble).await?;
+    list_over_wifi(open_wifi).await
+}
+
+/// The WiFi half of [`list_files_via`], for a caller that has already put the
+/// logger in WiFi mode (and let go of its BLE link).
+async fn list_over_wifi<W, G, GFut>(open_wifi: G) -> Result<Vec<DeviceFile>, IpcError>
+where
+    W: WifiTransport,
+    G: FnOnce() -> GFut,
+    GFut: std::future::Future<Output = Result<W, IpcError>>,
+{
     let wifi = open_wifi().await?;
     let files = wifi.list_files().await.map_err(IpcError::from)?;
     Ok(files.into_iter().map(DeviceFile::from).collect())
@@ -449,7 +460,8 @@ where
 /// Transport-agnostic core of `download_file`: switches to WiFi mode,
 /// resolves `file_name` to the device's `file_index` (WiFi's `/download`
 /// endpoint is index-addressed, not name-addressed — SPEC §6.1), streams
-/// into a temp file under `<data>/tmp/`, then moves it into the
+/// into a resumable `.part` file under `<data>/tmp/` (see [`part_path`]: an
+/// interrupted download picks up where it stopped, via `Range`), then moves it into the
 /// content-addressed blob store at `<data>/blobs/sha256/<2 hex>/<62 hex>`
 /// (C4 §2's fixed sharded path convention — the first 2 lowercase hex chars
 /// of the digest as a subdirectory, the remaining 62 as the filename, *not*
@@ -468,6 +480,41 @@ where
 async fn download_via<W, G, GFut>(
     ble: &impl BleTransport,
     open_wifi: G,
+    device_id: &str,
+    file_name: &str,
+    data_dir: &Path,
+    on_progress: impl FnMut(u64, Option<u64>) + Send,
+) -> Result<DownloadResult, IpcError>
+where
+    W: WifiTransport,
+    G: FnOnce() -> GFut,
+    GFut: std::future::Future<Output = Result<W, IpcError>>,
+{
+    switch_to_wifi_mode(ble).await?;
+    download_over_wifi(open_wifi, device_id, file_name, data_dir, on_progress).await
+}
+
+/// Where `device_id`'s `file` downloads to before it is complete:
+/// `<data>/tmp/download-<device>-<file>-<size>.part`, the session id
+/// standing in for the file name when the logger reports one. Keyed by size
+/// too, so a reused file name with different content can't resume onto old
+/// bytes. Unsafe filename characters become `_`.
+fn part_path(tmp_dir: &Path, device_id: &str, file: &idl_transport::DeviceFile) -> PathBuf {
+    let clean = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect::<String>();
+    let id = file.session_id.as_deref().unwrap_or(&file.name);
+    tmp_dir.join(format!("download-{}-{}-{}.part", clean(device_id), clean(id), file.size_bytes))
+}
+
+/// The WiFi half of [`download_via`], for a caller that has already put the
+/// logger in WiFi mode (and let go of its BLE link). Resumes from the
+/// file's `.part` when one is there: a part no longer than the file is
+/// continued with a `Range` request (or used as is when complete); a longer
+/// one is stale and restarted. A failed download leaves its part for next
+/// time. `on_progress` counts bytes of the whole file, resumed bytes
+/// included.
+async fn download_over_wifi<W, G, GFut>(
+    open_wifi: G,
+    device_id: &str,
     file_name: &str,
     data_dir: &Path,
     mut on_progress: impl FnMut(u64, Option<u64>) + Send,
@@ -477,36 +524,42 @@ where
     G: FnOnce() -> GFut,
     GFut: std::future::Future<Output = Result<W, IpcError>>,
 {
-    switch_to_wifi_mode(ble).await?;
     let wifi = open_wifi().await?;
 
     let files = wifi.list_files().await.map_err(IpcError::from)?;
     let file_index = files
         .iter()
         .position(|f| f.name == file_name)
-        .ok_or_else(|| IpcError::new(IpcErrorKind::NotFound, format!("{file_name} not found on device")))?
-        as u32;
+        .ok_or_else(|| IpcError::new(IpcErrorKind::NotFound, format!("{file_name} not found on device")))?;
+    let file = &files[file_index];
 
     let tmp_dir = data_dir.join("tmp");
     std::fs::create_dir_all(&tmp_dir)
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("creating {}: {e}", tmp_dir.display())))?;
-    let tmp_path = tmp_dir.join(uuid::Uuid::new_v4().to_string());
-    let mut tmp_file = tokio::fs::File::create(&tmp_path)
-        .await
-        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("creating {}: {e}", tmp_path.display())))?;
+    let tmp_path = part_path(&tmp_dir, device_id, file);
+    let have = std::fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0);
+    let resume_from = if have <= file.size_bytes { have } else { 0 };
 
-    let size_bytes = wifi
-        .download(file_index, 0, &mut tmp_file, &mut on_progress)
-        .await
-        .map_err(IpcError::from)?;
-    tmp_file
-        .sync_all()
-        .await
-        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("fsync {}: {e}", tmp_path.display())))?;
-    drop(tmp_file);
+    if resume_from < file.size_bytes || file.size_bytes == 0 {
+        let mut tmp_file = if resume_from == 0 {
+            tokio::fs::File::create(&tmp_path).await
+        } else {
+            tokio::fs::OpenOptions::new().append(true).open(&tmp_path).await
+        }
+        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("opening {}: {e}", tmp_path.display())))?;
+        let mut progress = |done: u64, total: Option<u64>| on_progress(resume_from + done, total);
+        let written = wifi.download(file_index as u32, resume_from, &mut tmp_file, &mut progress).await;
+        // Whatever arrived stays on disk for the next attempt, error or not.
+        let synced = tmp_file.sync_all().await;
+        written.map_err(IpcError::from)?;
+        synced.map_err(|e| IpcError::new(IpcErrorKind::Io, format!("fsync {}: {e}", tmp_path.display())))?;
+    } else {
+        on_progress(file.size_bytes, Some(file.size_bytes));
+    }
 
     let bytes = std::fs::read(&tmp_path)
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading back {}: {e}", tmp_path.display())))?;
+    let size_bytes = bytes.len() as u64;
     let sha256 = sha256_hex(&bytes);
 
     // C4 §2's fixed sharded convention: first 2 hex chars as a
@@ -778,10 +831,34 @@ pub async fn device_status(
     device_status_via(&connections.0, &device_id, || async { PlatformBle::new().await }).await
 }
 
+/// With a managed connection for `device_id`, switches the logger to WiFi
+/// mode over it and returns the logger's name for joining its AP; `None`
+/// without one, so the caller falls back to its own connect-act-disconnect
+/// link. The managed link is held only for the switch, so status reads go on
+/// during a long download, and is never disconnected: on Android a second
+/// link to the same logger, once disconnected, also tore down the managed
+/// one (the 2026-10-15 config-push drop).
+async fn wifi_mode_over_managed<T: BleTransport>(
+    connections: &ConnectionMap<T>,
+    device_id: &str,
+) -> Result<Option<String>, IpcError> {
+    let managed = connections.lock().unwrap().get(device_id).cloned();
+    let Some(ble) = managed else { return Ok(None) };
+    let name = platform::name_for(device_id)?;
+    switch_to_wifi_mode(&*ble.lock().await).await?;
+    Ok(Some(name))
+}
+
 /// Lists files on `device_id`'s SD card, switching the device into WiFi
-/// mode first (C3 §3.8).
+/// mode first (C3 §3.8). Uses the managed connection when there is one.
 #[tauri::command]
-pub async fn list_device_files(device_id: String) -> Result<Vec<DeviceFile>, IpcError> {
+pub async fn list_device_files(
+    connections: tauri::State<'_, Connections>,
+    device_id: String,
+) -> Result<Vec<DeviceFile>, IpcError> {
+    if let Some(name) = wifi_mode_over_managed(&connections.0, &device_id).await? {
+        return list_over_wifi(|| platform::open_device_wifi(&name)).await;
+    }
     let mut ble = PlatformBle::new().await.map_err(IpcError::from)?;
     let name = connected_name(&mut ble, &device_id).await?;
     let result = list_files_via(&ble, || platform::open_device_wifi(&name)).await;
@@ -793,17 +870,21 @@ pub async fn list_device_files(device_id: String) -> Result<Vec<DeviceFile>, Ipc
 /// store, streaming `Progress` (bytes done/total) as it goes (C3 §3.8).
 #[tauri::command]
 pub async fn download_file(
+    connections: tauri::State<'_, Connections>,
     device_id: String,
     file_name: String,
     progress: tauri::ipc::Channel<Progress>,
     data_dir: tauri::State<'_, DataDir>,
 ) -> Result<DownloadResult, IpcError> {
+    let send = |done, total| {
+        let _ = progress.send(Progress { done, total, phase: "download".to_string() });
+    };
+    if let Some(name) = wifi_mode_over_managed(&connections.0, &device_id).await? {
+        return download_over_wifi(|| platform::open_device_wifi(&name), &device_id, &file_name, &data_dir.0, send).await;
+    }
     let mut ble = PlatformBle::new().await.map_err(IpcError::from)?;
     let name = connected_name(&mut ble, &device_id).await?;
-    let result = download_via(&ble, || platform::open_device_wifi(&name), &file_name, &data_dir.0, |done, total| {
-        let _ = progress.send(Progress { done, total, phase: "download".to_string() });
-    })
-    .await;
+    let result = download_via(&ble, || platform::open_device_wifi(&name), &device_id, &file_name, &data_dir.0, send).await;
     let _ = ble.disconnect().await;
     result
 }
@@ -1623,7 +1704,7 @@ pub(crate) mod tests {
         let mut progress_calls = Vec::new();
 
         // Act
-        let result = download_via(&ble, || async { Ok(wifi) }, "session_001.idl0", data_dir.path(), |done, total| progress_calls.push((done, total)))
+        let result = download_via(&ble, || async { Ok(wifi) }, "dev", "session_001.idl0", data_dir.path(), |done, total| progress_calls.push((done, total)))
             .await
             .unwrap();
 
@@ -1664,7 +1745,7 @@ pub(crate) mod tests {
         };
 
         // Act
-        let result = download_via(&ble, || async { Ok(wifi) }, "shard.idl0", data_dir.path(), |_, _| {}).await.unwrap();
+        let result = download_via(&ble, || async { Ok(wifi) }, "dev", "shard.idl0", data_dir.path(), |_, _| {}).await.unwrap();
 
         // Assert: lands at blobs/sha256/ab/<remaining 62 hex>, not blobs/sha256/<64 hex>.
         let expected_path = data_dir.path().join("blobs/sha256").join("ab").join(&expected_hash[2..]);
@@ -1685,8 +1766,8 @@ pub(crate) mod tests {
         };
 
         // Act
-        let first = download_via(&make_ble(), || async { Ok(make_wifi()) }, "a.idl0", data_dir.path(), |_, _| {}).await.unwrap();
-        let second = download_via(&make_ble(), || async { Ok(make_wifi()) }, "a.idl0", data_dir.path(), |_, _| {}).await.unwrap();
+        let first = download_via(&make_ble(), || async { Ok(make_wifi()) }, "dev", "a.idl0", data_dir.path(), |_, _| {}).await.unwrap();
+        let second = download_via(&make_ble(), || async { Ok(make_wifi()) }, "dev", "a.idl0", data_dir.path(), |_, _| {}).await.unwrap();
 
         // Assert
         assert_eq!(first.sha256, second.sha256);
@@ -1699,6 +1780,87 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn download_via_with_a_part_left_from_an_interrupted_download_resumes_from_it() {
+        // Arrange — the first 6 bytes arrived last time.
+        let data_dir = tempfile::tempdir().unwrap();
+        let content = b"0123456789ABCDEF".to_vec();
+        let entry = idl_transport::DeviceFile { name: "s.idl1".to_string(), size_bytes: content.len() as u64, session_id: None };
+        let tmp = data_dir.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(part_path(&tmp, "dev", &entry), &content[..6]).unwrap();
+        let ble = StubBle { wifi_on_reads: StdMutex::new(VecDeque::from([Some(true)])), ..Default::default() };
+        let wifi = StubWifi { list_files_result: Ok(vec![entry]), download_bytes: Ok(content.clone()), ..StubWifi::default() };
+        let mut progress_calls = Vec::new();
+
+        // Act
+        let result = download_via(&ble, || async { Ok(wifi) }, "dev", "s.idl1", data_dir.path(), |done, total| progress_calls.push((done, total)))
+            .await
+            .unwrap();
+
+        // Assert — the stub serves only bytes 6.. on a resume, so a whole
+        // blob proves the part was continued, not restarted.
+        assert_eq!(std::fs::read(&result.path).unwrap(), content);
+        assert_eq!(result.size_bytes, content.len() as u64);
+        assert_eq!(progress_calls, vec![(16, Some(16))]);
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_via_part_longer_than_the_file_is_stale_and_restarted() {
+        // Arrange
+        let data_dir = tempfile::tempdir().unwrap();
+        let content = b"fresh".to_vec();
+        let entry = idl_transport::DeviceFile { name: "s.idl1".to_string(), size_bytes: content.len() as u64, session_id: None };
+        let tmp = data_dir.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(part_path(&tmp, "dev", &entry), b"stale and too long").unwrap();
+        let ble = StubBle { wifi_on_reads: StdMutex::new(VecDeque::from([Some(true)])), ..Default::default() };
+        let wifi = StubWifi { list_files_result: Ok(vec![entry]), download_bytes: Ok(content.clone()), ..StubWifi::default() };
+
+        // Act
+        let result = download_via(&ble, || async { Ok(wifi) }, "dev", "s.idl1", data_dir.path(), |_, _| {}).await.unwrap();
+
+        // Assert
+        assert_eq!(std::fs::read(&result.path).unwrap(), content);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_via_failed_download_keeps_its_part_for_the_next_attempt() {
+        // Arrange
+        let data_dir = tempfile::tempdir().unwrap();
+        let entry = idl_transport::DeviceFile { name: "s.idl1".to_string(), size_bytes: 10, session_id: None };
+        let part = part_path(&data_dir.path().join("tmp"), "dev", &entry);
+        let ble = StubBle { wifi_on_reads: StdMutex::new(VecDeque::from([Some(true)])), ..Default::default() };
+        let wifi = StubWifi {
+            list_files_result: Ok(vec![entry]),
+            download_bytes: Err(TransportError::new(TransportErrorKind::Wifi, "link dropped")),
+            ..StubWifi::default()
+        };
+
+        // Act
+        let err = download_via(&ble, || async { Ok(wifi) }, "dev", "s.idl1", data_dir.path(), |_, _| {}).await.unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::Wifi);
+        assert!(part.exists());
+    }
+
+    #[test]
+    fn part_path_names_device_session_and_size_with_unsafe_characters_replaced() {
+        // Arrange
+        let named = idl_transport::DeviceFile { name: "a b/c.idl1".to_string(), size_bytes: 7, session_id: None };
+        let with_id = idl_transport::DeviceFile { name: "x.idl1".to_string(), size_bytes: 9, session_id: Some("abc123".to_string()) };
+
+        // Act
+        let p1 = part_path(Path::new("t"), "AA:BB", &named);
+        let p2 = part_path(Path::new("t"), "AA:BB", &with_id);
+
+        // Assert
+        assert_eq!(p1, Path::new("t").join("download-AA_BB-a_b_c.idl1-7.part"));
+        assert_eq!(p2, Path::new("t").join("download-AA_BB-abc123-9.part"));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn download_via_unknown_file_name_errors_not_found_before_any_write() {
         // Arrange
         let data_dir = tempfile::tempdir().unwrap();
@@ -1706,7 +1868,7 @@ pub(crate) mod tests {
         let wifi = StubWifi { list_files_result: Ok(vec![]), ..Default::default() };
 
         // Act
-        let err = download_via(&ble, || async { Ok(wifi) }, "missing.idl0", data_dir.path(), |_, _| {}).await.unwrap_err();
+        let err = download_via(&ble, || async { Ok(wifi) }, "dev", "missing.idl0", data_dir.path(), |_, _| {}).await.unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::NotFound);
