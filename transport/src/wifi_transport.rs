@@ -343,7 +343,7 @@ impl WifiTransport for ReqwestWifi {
         on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
     ) -> Result<u64, TransportError> {
         let url = file_url(&self.base_url, "download", file_name)?;
-        let mut request = self.client.get(&url);
+        let mut request = self.client.get(url);
         if resume_from_bytes > 0 {
             request = request.header(reqwest::header::RANGE, range_header(resume_from_bytes));
         }
