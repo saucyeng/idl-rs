@@ -126,6 +126,8 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::sync::sync_now,
         commands::sync::pair_peer,
         commands::sync::start_pairing,
+        commands::sync::pairing_link,
+        commands::sync::pair_with_link,
         commands::sync::unpair_peer,
         commands::sync::set_sync_device_name,
     ]

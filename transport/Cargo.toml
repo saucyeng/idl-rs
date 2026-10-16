@@ -58,6 +58,9 @@ axum = "0.8.9"
 # Task 9: `_idl1._tcp` mDNS advertise/browse (PLAN §3, PLAN §8 Q2 — pinned
 # in the M0 ecosystem report, no crate this task chose itself).
 mdns-sd = "0.21.1"
+# The QR pairing link lists this machine's LAN addresses (sync::pairing_link);
+# already in the lock as mdns-sd's own dependency, named here directly.
+if-addrs = "0.15"
 
 
 # Android only: the firmware catalog's HTTPS trust store (see

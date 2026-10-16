@@ -234,6 +234,93 @@ pub async fn start_pairing(state: tauri::State<'_, SyncState>) -> Result<Pairing
     Ok(start_pairing_via(&state.pairing, now_ms()))
 }
 
+/// `pairing_link`'s return: the QR code's text, and the code it carries
+/// for typing by hand.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PairingLinkDto {
+    /// `idl1://pair?…` (`idl_transport::sync::pairing_link`).
+    pub link: String,
+    /// Six decimal digits.
+    pub code: String,
+    /// Epoch milliseconds after which the code no longer redeems.
+    pub expires_at_ms: i64,
+    /// The addresses the link carries, `ip:port`, for showing beside it.
+    pub addrs: Vec<String>,
+}
+
+/// C3 §3.9 `pairing_link()` (added 2026-10-16): starts a pairing offer, as
+/// `start_pairing` does, and returns it as a link for a QR code carrying
+/// this device's id, name and LAN addresses.
+#[tauri::command]
+pub async fn pairing_link(state: tauri::State<'_, SyncState>) -> Result<PairingLinkDto, IpcError> {
+    let offer = start_pairing_via(&state.pairing, now_ms());
+    let addrs = idl_transport::sync::lan_addrs(state.server.local_addr().port());
+    if addrs.is_empty() {
+        return Err(IpcError::new(IpcErrorKind::Sync, "this computer has no LAN address: connect it to the same network as the phone"));
+    }
+    let link = idl_transport::sync::PairingLink {
+        peer_id: state.peer_id.clone(),
+        name: state.name.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        code: offer.code.clone(),
+        addrs: addrs.clone(),
+    };
+    Ok(PairingLinkDto {
+        link: idl_transport::sync::build_link(&link),
+        code: offer.code,
+        expires_at_ms: offer.expires_at_ms,
+        addrs: addrs.iter().map(|a| a.to_string()).collect(),
+    })
+}
+
+/// How long one address in a pairing link gets to answer `POST /pair`.
+const LINK_PAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// C3 §3.9 `pair_with_link(link)` (added 2026-10-16): pairs using a QR
+/// pairing link, trying each address it carries in turn. On success the
+/// peer is stored as `pair_peer` stores it, and its address is remembered
+/// as if discovered, so `sync_now` reaches it even when mDNS can't see it.
+#[tauri::command]
+pub async fn pair_with_link(link: String, state: tauri::State<'_, SyncState>) -> Result<PeerStatusDto, IpcError> {
+    let parsed = idl_transport::sync::parse_link(&link).map_err(IpcError::from)?;
+    let request = PairRequest {
+        code: parsed.code.clone(),
+        peer_id: state.peer_id.clone(),
+        name: state.name.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        protocol_version: idl_transport::sync::PROTOCOL_VERSION,
+    };
+    let mut last_error = IpcError::new(IpcErrorKind::Sync, "no address in the pairing link answered");
+    for addr in &parsed.addrs {
+        match tokio::time::timeout(LINK_PAIR_TIMEOUT, idl_transport::sync::pair_with_peer(*addr, &request)).await {
+            Ok(Ok(response)) => {
+                let peer = Peer {
+                    peer_id: response.peer_id,
+                    name: response.name,
+                    token: response.token,
+                    protocol_version: response.protocol_version,
+                    paired_at_ms: now_ms(),
+                };
+                {
+                    let mut peers = state.peers.lock().unwrap_or_else(|e| e.into_inner());
+                    peers.retain(|p| p.peer_id != peer.peer_id);
+                    peers.push(peer.clone());
+                    idl_transport::sync::save_peers(&state.peers_path, &peers).map_err(IpcError::from)?;
+                }
+                let mut discovered = state.discovered.lock().unwrap_or_else(|e| e.into_inner());
+                discovered.entry(peer.peer_id.clone()).or_insert_with(|| DiscoveredPeer {
+                    peer_id: peer.peer_id.clone(),
+                    name: peer.name.clone(),
+                    protocol_version: peer.protocol_version,
+                    addr: *addr,
+                });
+                return Ok(peer_status_dto(&peer, &discovered));
+            }
+            Ok(Err(e)) => last_error = IpcError::from(e),
+            Err(_) => last_error = IpcError::new(IpcErrorKind::Sync, format!("{addr} did not answer within {} s", LINK_PAIR_TIMEOUT.as_secs())),
+        }
+    }
+    Err(last_error)
+}
+
 /// Transport-agnostic core of `unpair_peer`: drops `peer_id` from `peers`
 /// and persists the shortened list to `peers_path`. An unknown `peer_id`
 /// is `not_found` — nothing is written.

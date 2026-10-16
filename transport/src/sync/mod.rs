@@ -9,6 +9,7 @@ pub mod identity;
 #[cfg(test)]
 mod loopback_tests;
 pub mod pairing;
+pub mod pairing_link;
 pub mod range;
 pub mod server;
 pub mod wire;
@@ -16,6 +17,7 @@ pub mod wire;
 pub use client::{pair_with_peer, sync_with_peer, SyncProgress, SyncRunResult};
 pub use discovery::{advertise, browse, build_txt, parse_txt, Advertisement, DiscoveredPeer, SERVICE_TYPE};
 pub use identity::{Identity, DEFAULT_NAME};
+pub use pairing_link::{build_link, lan_addrs, parse_link, PairingLink};
 pub use pairing::{check_protocol_version, load_peers, save_peers, PairingState, MAX_ATTEMPTS, PAIRING_TTL_MS};
 pub use range::{parse_range, RangeError, RangeErrorKind};
 pub use server::{SyncServer, SyncServerConfig};
