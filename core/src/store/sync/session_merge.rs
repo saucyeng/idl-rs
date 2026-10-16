@@ -75,6 +75,10 @@ pub fn merge_session_json(
     peer_updated_at_ms: i64,
 ) -> SessionJson {
     let local_newer = local_updated_at_ms >= peer_updated_at_ms;
+    // The bike and what it took from the log move together: mixing one
+    // side's bike with the other's entries would be wrong.
+    let (bike_id, bike_log) =
+        merge_field((local.bike_id.clone(), local.bike_log.clone()), (peer.bike_id.clone(), peer.bike_log.clone()), local_newer);
 
     SessionJson {
         schema_version: local.schema_version,
@@ -106,6 +110,8 @@ pub fn merge_session_json(
         timestamp_utc_ms: merge_field(local.timestamp_utc_ms, peer.timestamp_utc_ms, local_newer),
         timestamp_source: merge_field(local.timestamp_source, peer.timestamp_source, local_newer),
         lap_detector_version: local.lap_detector_version.clone(),
+        bike_id,
+        bike_log,
     }
 }
 

@@ -159,16 +159,39 @@ impl Entry {
 }
 
 /// The running setup sheet at one moment (spec §2).
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct RunningSheet {
     /// The confirmed sheet it starts from, or `None` before the first one.
+    #[serde(default)]
     pub baseline: Option<String>,
     /// Every value: the baseline's, with later notes' changes applied.
+    #[serde(default)]
     pub values: BTreeMap<String, serde_json::Value>,
     /// Notes since the baseline, in time order: their changes are applied,
     /// and those without changes are the sheet's "changed since baseline"
     /// list.
+    #[serde(default)]
     pub since: Vec<String>,
+}
+
+/// What a session took from its bike's log, stored in its `session.json`
+/// (spec §4, §6).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SessionBikeLog {
+    /// The entries attached, in time order.
+    #[serde(default)]
+    pub entry_ids: Vec<String>,
+    /// The window entries were taken from: after `after_ms` (the bike's
+    /// previous session's `until_ms`; `None` for its first) up to and
+    /// including `until_ms` (this session's end), UTC ms.
+    #[serde(default)]
+    pub after_ms: Option<i64>,
+    /// See [`SessionBikeLog::after_ms`].
+    pub until_ms: i64,
+    /// The running sheet at the session's start: R190's per-session
+    /// snapshot.
+    #[serde(default)]
+    pub setup_sheet: RunningSheet,
 }
 
 /// The running sheet at `at_ms`: the newest live confirmed sheet at or
@@ -212,6 +235,83 @@ pub fn entries_for_session(entries: &[Entry], after_ms: Option<i64>, until_ms: i
         .collect();
     picked.sort();
     picked.into_iter().map(|(_, id)| id.to_string()).collect()
+}
+
+/// The bike named `name` (trimmed, case ignored), creating it when there
+/// is none. A new bike's id is the name in lowercase letters, digits and
+/// `-` ("GT Force" is `gt-force`), with `-2`, `-3`… added if taken.
+pub fn bike_for_name(data_root: &Path, name: &str, now_ms: i64) -> Result<Bike, BikeLogError> {
+    let wanted = name.trim();
+    let load = load_bikes(data_root);
+    if let Some(b) = load.bikes.iter().find(|b| b.name.trim().eq_ignore_ascii_case(wanted)) {
+        return Ok(b.clone());
+    }
+    let mut slug = String::new();
+    for c in wanted.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_end_matches('-').to_string();
+    let base = if slug.is_empty() { "bike".to_string() } else { slug };
+    let taken = |id: &str| load.bikes.iter().any(|b| b.bike_id == id) || bike_path(data_root, id).exists();
+    let mut bike_id = base.clone();
+    let mut n = 2;
+    while taken(&bike_id) {
+        bike_id = format!("{base}-{n}");
+        n += 1;
+    }
+    save_bike(data_root, &Bike { bike_id, name: wanted.to_string(), name_updated_at_ms: now_ms, fields: Vec::new(), fields_updated_at_ms: 0 })
+}
+
+/// Records that `session_id` was ridden on `bike_id` (spec §6): sets its
+/// `session.json`'s `bike_id`, `bike` (the bike's name) and `bike_log` —
+/// every live entry after the bike's previous session (the latest other
+/// session of this bike whose window ends at or before `start_ms`) up to
+/// `end_ms`, and the running sheet at `start_ms`. Running it again gives
+/// the same result for an unchanged log, so the ride form can re-run it
+/// after changing the bike.
+pub fn attach_session(data_root: &Path, session_id: &str, bike_id: &str, start_ms: i64, end_ms: i64) -> Result<crate::store::session_json::SessionJson, BikeLogError> {
+    use crate::store::session_json::{parse_session_json, write_session_json};
+    let io = |message: String| BikeLogError { kind: BikeLogErrorKind::Io, message };
+    check_id(bike_id)?;
+    let bike: Bike = std::fs::read(bike_path(data_root, bike_id))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or_else(|| BikeLogError { kind: BikeLogErrorKind::InvalidId, message: format!("no bike {bike_id:?}") })?;
+
+    let mut after_ms: Option<i64> = None;
+    for dir in std::fs::read_dir(data_root.join("sessions")).into_iter().flatten().flatten() {
+        if dir.file_name().to_str() == Some(session_id) {
+            continue;
+        }
+        let Some(doc) = std::fs::read(dir.path().join("session.json")).ok().and_then(|b| parse_session_json(&b).ok()) else { continue };
+        if doc.bike_id != bike_id {
+            continue;
+        }
+        if let Some(prev) = doc.bike_log.filter(|l| l.until_ms <= start_ms) {
+            after_ms = Some(after_ms.map_or(prev.until_ms, |a| a.max(prev.until_ms)));
+        }
+    }
+
+    let entries = load_log(data_root, bike_id).entries;
+    let attached = SessionBikeLog {
+        entry_ids: entries_for_session(&entries, after_ms, end_ms),
+        after_ms,
+        until_ms: end_ms,
+        setup_sheet: running_sheet(&entries, start_ms),
+    };
+
+    let target = data_root.join("sessions").join(session_id).join("session.json");
+    let raw = std::fs::read(&target).map_err(|e| io(format!("reading {}: {e}", target.display())))?;
+    let mut doc = parse_session_json(&raw).map_err(|e| io(e.message))?;
+    doc.bike_id = bike_id.to_string();
+    doc.bike = bike.name.clone();
+    doc.bike_log = Some(attached);
+    write_session_json(data_root, session_id, &doc, Some(&sha256_hex(&raw))).map_err(|e| io(e.message))?;
+    Ok(doc)
 }
 
 /// Discriminant for [`BikeLogError`].
@@ -639,6 +739,61 @@ mod tests {
         for bad in ["gt", "gt/other-01", "../x/note-01", "gt/note-", "gt/note-a/b", "gt/note-a.b"] {
             assert_eq!(parse_log_key(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn bike_for_name_finds_by_name_ignoring_case_and_creates_a_new_one_with_a_free_slug() {
+        // Arrange
+        let root = temp_root();
+        save_bike(&root, &Bike { bike_id: "gt-force".into(), name: "GT Force".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 0 }).unwrap();
+
+        // Act
+        let found = bike_for_name(&root, "  gt force ", 5).unwrap();
+        let other = bike_for_name(&root, "GT-Force!", 5).unwrap();
+        let blank = bike_for_name(&root, "  ", 5).unwrap();
+
+        // Assert
+        assert_eq!(found.bike_id, "gt-force");
+        assert_eq!(other.bike_id, "gt-force-2");
+        assert_eq!(other.name, "GT-Force!");
+        assert_eq!(blank.bike_id, "bike");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn attach_session_takes_entries_since_the_previous_session_and_the_sheet_at_start() {
+        // Arrange
+        use crate::store::session_json::{empty_session_json, read_session_json, write_session_json};
+        let root = temp_root();
+        save_bike(&root, &Bike { bike_id: "gt".into(), name: "GT".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 0 }).unwrap();
+        for e in [
+            sheet("s1", 50, &[("fork.lsc", json!(10))]),
+            note("n1", 150, &[("fork.lsc", json!(9))]),
+            note("n2", 350, &[]),
+            note("during", 450, &[("fork.lsc", json!(8))]),
+            note("later", 900, &[]),
+        ] {
+            save_entry(&root, &e).unwrap();
+        }
+        for id in ["ride1", "ride2"] {
+            std::fs::create_dir_all(root.join("sessions").join(id)).unwrap();
+            write_session_json(&root, id, &empty_session_json(id), None).unwrap();
+        }
+
+        // Act
+        attach_session(&root, "ride1", "gt", 100, 200).unwrap();
+        let doc = attach_session(&root, "ride2", "gt", 400, 500).unwrap();
+
+        // Assert
+        let log = doc.bike_log.unwrap();
+        assert_eq!(doc.bike, "GT");
+        assert_eq!(log.after_ms, Some(200));
+        assert_eq!(log.entry_ids, vec!["n2", "during"]);
+        assert_eq!(log.setup_sheet.values["fork.lsc"], json!(9));
+        let ride1 = read_session_json(&root.join("sessions/ride1/session.json")).unwrap().bike_log.unwrap();
+        assert_eq!(ride1.entry_ids, vec!["s1", "n1"]);
+        assert_eq!(ride1.after_ms, None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

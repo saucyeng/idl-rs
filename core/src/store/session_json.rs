@@ -116,6 +116,15 @@ pub struct SessionJson {
     /// stale, triggering a re-index on next import or an explicit rescan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lap_detector_version: Option<String>,
+    /// The bike this session was ridden on, a `bikes/<id>.json` id
+    /// (bike-log spec §4). Additive, added 2026-10-16; `""` = not set.
+    /// [`SessionJson::bike`] stays the display name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bike_id: String,
+    /// What this session took from its bike's log (bike-log spec §6).
+    /// Additive, added 2026-10-16.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bike_log: Option<crate::store::bikelog::SessionBikeLog>,
 }
 
 impl VersionedConfig for SessionJson {
@@ -337,6 +346,8 @@ pub fn empty_session_json(session_id: impl Into<String>) -> SessionJson {
         timestamp_utc_ms: None,
         timestamp_source: None,
         lap_detector_version: None,
+        bike_id: String::new(),
+        bike_log: None,
     }
 }
 
