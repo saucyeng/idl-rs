@@ -313,6 +313,15 @@ where
     // Opened only now: on Android the AP can be requested only once the
     // logger is in WiFi mode (SPEC §14b.6 step 1).
     let wifi = open_wifi().await?;
+    // SPEC §10.4 radio handoff: the logger drops its Bluetooth link so WiFi
+    // owns the shared radio for the push. Without it a connected phone took
+    // up to half the radio time and a 1.6 MB push took ~3 minutes
+    // (2026-10-16). Best effort: a logger that refuses still takes the push,
+    // slowly. The device reboots after the push and the link is rebuilt
+    // below either way.
+    if let Err(e) = wifi.handoff().await {
+        eprintln!("push_firmware: /handoff refused ({e}); pushing with BLE still up");
+    }
 
     let total_bytes = image.bytes.len() as u64;
     on_state(OtaState::Pushing { done_bytes: 0, total_bytes, pct: 0 });
