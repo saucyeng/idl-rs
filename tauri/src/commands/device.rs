@@ -458,8 +458,9 @@ where
 }
 
 /// Transport-agnostic core of `download_file`: switches to WiFi mode,
-/// resolves `file_name` to the device's `file_index` (WiFi's `/download`
-/// endpoint is index-addressed, not name-addressed — SPEC §6.1), streams
+/// finds `file_name` in the device's `/files` list (for its size and
+/// session id) and downloads it by name (`/download?file=<name>`, SPEC
+/// §6.1 as clarified 2026-10-16), streams
 /// into a resumable `.part` file under `<data>/tmp/` (see [`part_path`]: an
 /// interrupted download picks up where it stopped, via `Range`), then moves it into the
 /// content-addressed blob store at `<data>/blobs/sha256/<2 hex>/<62 hex>`
@@ -548,7 +549,7 @@ where
         }
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("opening {}: {e}", tmp_path.display())))?;
         let mut progress = |done: u64, total: Option<u64>| on_progress(resume_from + done, total);
-        let written = wifi.download(file_index as u32, resume_from, &mut tmp_file, &mut progress).await;
+        let written = wifi.download(&file.name, resume_from, &mut tmp_file, &mut progress).await;
         // Whatever arrived stays on disk for the next attempt, error or not.
         let synced = tmp_file.sync_all().await;
         written.map_err(IpcError::from)?;
@@ -1244,7 +1245,7 @@ pub(crate) mod tests {
 
         async fn download(
             &self,
-            _file_index: u32,
+            _file_name: &str,
             resume_from_bytes: u64,
             sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
             on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
@@ -1258,7 +1259,7 @@ pub(crate) mod tests {
             Ok(slice.len() as u64)
         }
 
-        async fn delete(&self, _file_index: u32) -> Result<(), TransportError> {
+        async fn delete(&self, _file_name: &str) -> Result<(), TransportError> {
             Err(TransportError::new(TransportErrorKind::Wifi, "StubWifi::delete not exercised"))
         }
 

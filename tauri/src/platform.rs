@@ -156,14 +156,14 @@ mod tests {
         }
         async fn download(
             &self,
-            _file_index: u32,
+            _file_name: &str,
             _resume_from_bytes: u64,
             _sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
             _on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
         ) -> Result<u64, TransportError> {
             Err(unused())
         }
-        async fn delete(&self, _file_index: u32) -> Result<(), TransportError> {
+        async fn delete(&self, _file_name: &str) -> Result<(), TransportError> {
             Err(unused())
         }
         async fn push_config(&self, _config_json: &[u8]) -> Result<(), TransportError> {

@@ -199,7 +199,10 @@ pub trait WifiTransport {
     /// `GET /files` (SPEC §6.1).
     async fn list_files(&self) -> Result<Vec<DeviceFile>, TransportError>;
 
-    /// `GET /download?file=N`, resumable via `Range` (SPEC §6.1). Streams
+    /// `GET /download?file=<name>`, resumable via `Range` (SPEC §6.1): the
+    /// file's name as `/files` lists it, which is what the firmware looks
+    /// up (2026-10-16: the app sent the list position, and the logger
+    /// answered 404 to every download). Streams
     /// into `sink` starting at `resume_from_bytes` bytes (`0` for a fresh
     /// download); calls `on_progress(done_bytes, total_bytes)` as chunks
     /// arrive. Returns the total bytes written this call (not including
@@ -209,14 +212,14 @@ pub trait WifiTransport {
     /// `Channel<Progress>`.
     async fn download(
         &self,
-        file_index: u32,
+        file_name: &str,
         resume_from_bytes: u64,
         sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
         on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
     ) -> Result<u64, TransportError>;
 
-    /// `GET /delete?file=N` (SPEC §6.1).
-    async fn delete(&self, file_index: u32) -> Result<(), TransportError>;
+    /// `GET /delete?file=<name>` (SPEC §6.1), the name as `/files` lists it.
+    async fn delete(&self, file_name: &str) -> Result<(), TransportError>;
 
     /// `POST /config` (SPEC §6.1) — the WiFi fallback path; BLE
     /// (`BleTransport::push_config`) is primary (SPEC §7.2). Same opaque
@@ -264,6 +267,13 @@ impl ReqwestWifi {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self { client: reqwest::Client::new(), base_url: base_url.into() }
     }
+}
+
+/// `<base>/<route>?file=<name>`, the name percent-encoded.
+fn file_url(base_url: &str, route: &str, file_name: &str) -> Result<reqwest::Url, TransportError> {
+    let mut url = reqwest::Url::parse(&format!("{base_url}/{route}")).map_err(|e| wifi_error(format!("bad device URL {base_url}: {e}")))?;
+    url.query_pairs_mut().append_pair("file", file_name);
+    Ok(url)
 }
 
 impl WifiTransport for ReqwestWifi {
@@ -327,12 +337,12 @@ impl WifiTransport for ReqwestWifi {
     /// harder to tell apart than they need to be.
     async fn download(
         &self,
-        file_index: u32,
+        file_name: &str,
         resume_from_bytes: u64,
         sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
         on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
     ) -> Result<u64, TransportError> {
-        let url = format!("{}/download?file={file_index}", self.base_url);
+        let url = file_url(&self.base_url, "download", file_name)?;
         let mut request = self.client.get(&url);
         if resume_from_bytes > 0 {
             request = request.header(reqwest::header::RANGE, range_header(resume_from_bytes));
@@ -384,9 +394,9 @@ impl WifiTransport for ReqwestWifi {
         Ok(done_bytes)
     }
 
-    async fn delete(&self, file_index: u32) -> Result<(), TransportError> {
+    async fn delete(&self, file_name: &str) -> Result<(), TransportError> {
         self.client
-            .get(format!("{}/delete?file={file_index}", self.base_url))
+            .get(file_url(&self.base_url, "delete", file_name)?)
             .send()
             .await
             .map_err(|e| wifi_error(format!("GET /delete failed: {e}")))?
@@ -784,7 +794,7 @@ pub(crate) mod integration {
         const CONTENT: &[u8] = b"0123456789ABCDEFGHIJ"; // 20 bytes
 
         let (addr, _server) = spawn_mock_server(|path, headers, _body| {
-            assert!(path.starts_with("/download?file="));
+            assert_eq!(path.split('?').nth(1), Some("file=2026-10-16_14-05-12.idl1"));
             let range_value = headers
                 .iter()
                 .find(|(key, _)| key == "range")
@@ -818,7 +828,7 @@ pub(crate) mod integration {
         let mut on_full_progress =
             |done_bytes: u64, total_bytes: Option<u64>| full_progress.push((done_bytes, total_bytes));
         let full_bytes_written = wifi
-            .download(0, 0, &mut full_sink, &mut on_full_progress)
+            .download("2026-10-16_14-05-12.idl1", 0, &mut full_sink, &mut on_full_progress)
             .await
             .unwrap();
 
@@ -826,7 +836,7 @@ pub(crate) mod integration {
         let mut resumed_sink = Vec::new();
         let mut on_resumed_progress = |_: u64, _: Option<u64>| {};
         let resumed_bytes_written = wifi
-            .download(0, 10, &mut resumed_sink, &mut on_resumed_progress)
+            .download("2026-10-16_14-05-12.idl1", 10, &mut resumed_sink, &mut on_resumed_progress)
             .await
             .unwrap();
 

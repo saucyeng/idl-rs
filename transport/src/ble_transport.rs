@@ -576,7 +576,7 @@ mod sequencing {
         let mut sink = Vec::new();
         let mut on_progress = |_: u64, _: Option<u64>| {};
         let bytes_written =
-            wifi.download(0, 0, &mut sink, &mut on_progress).await.unwrap();
+            wifi.download(&files[0].name, 0, &mut sink, &mut on_progress).await.unwrap();
 
         // Assert
         assert_eq!(files.len(), 1);
