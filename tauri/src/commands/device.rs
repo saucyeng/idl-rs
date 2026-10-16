@@ -640,6 +640,10 @@ pub struct TransferSummary {
     pub cancelled: bool,
 }
 
+/// How long a download may go without a byte before it counts as a dead
+/// WiFi link.
+const STALL_LIMIT: Duration = Duration::from_secs(20);
+
 /// What [`download_files_via`] ended with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BatchEnd {
@@ -662,9 +666,26 @@ async fn download_files_via<W: WifiTransport>(
     for (i, wanted) in files.iter().enumerate() {
         emit(TransferEvent::Started { name: wanted.name.clone() });
         let file = idl_transport::DeviceFile { name: wanted.name.clone(), size_bytes: wanted.size_bytes, session_id: None };
-        let progress = |done: u64, total: Option<u64>| emit(TransferEvent::Progress { name: wanted.name.clone(), done, total });
+        // A stalled stream (no bytes for STALL_LIMIT) fails as a WiFi
+        // failure rather than hanging the batch with WiFi mode stuck on.
+        let last_bytes = std::sync::atomic::AtomicU64::new(0);
+        let started = tokio::time::Instant::now();
+        let progress = |done: u64, total: Option<u64>| {
+            last_bytes.store(started.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+            emit(TransferEvent::Progress { name: wanted.name.clone(), done, total });
+        };
+        let stalled = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let quiet_ms = started.elapsed().as_millis() as u64 - last_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                if quiet_ms > STALL_LIMIT.as_millis() as u64 {
+                    break;
+                }
+            }
+        };
         let outcome = tokio::select! {
             result = download_with(wifi, device_id, &file, data_dir, progress) => Some(result),
+            _ = stalled => Some(Err(IpcError::new(IpcErrorKind::Wifi, format!("no data from the logger for {} s", STALL_LIMIT.as_secs())))),
             _ = cancel.notified() => None,
         };
         match outcome {
@@ -720,19 +741,27 @@ pub async fn download_files(
         }
     };
 
-    let handed_off = wifi.handoff().await.is_ok();
-    if handed_off {
-        // The logger is dropping this link: retire it, so nothing reads
-        // status over a dead connection while the transfer runs.
-        let retired = connections.0.lock().unwrap().remove(&device_id);
-        if let Some(ble) = retired {
-            let _ = ble.lock().await.disconnect().await;
-        }
-        let _ = events.send(TransferEvent::HandedOff);
-    }
-
     let cancel = Arc::new(tokio::sync::Notify::new());
     transfers.0.lock().unwrap().insert(device_id.clone(), cancel.clone());
+
+    let handed_off = wifi.handoff().await.is_ok();
+    if handed_off {
+        // Tell the screen first, so it stops reading status over Bluetooth.
+        let _ = events.send(TransferEvent::HandedOff);
+        // The logger is dropping this link: retire it, and close our end in
+        // the background. Waiting for that close here hung the whole
+        // transfer behind a status read still holding the dead link
+        // (2026-10-16).
+        let retired = connections.0.lock().unwrap().remove(&device_id);
+        if let Some(ble) = retired {
+            tauri::async_runtime::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(10), async move {
+                    let _ = ble.lock().await.disconnect().await;
+                })
+                .await;
+            });
+        }
+    }
     let emit = |e: TransferEvent| {
         let _ = events.send(e);
     };
@@ -2162,6 +2191,64 @@ pub(crate) mod tests {
 
         // Assert — a pending cancel wins the race with the first download.
         assert!(end.cancelled || end == BatchEnd { cancelled: false, link_failed: false });
+    }
+
+    /// WiFi that accepts the request and then never sends a byte.
+    struct SilentWifi;
+
+    impl WifiTransport for SilentWifi {
+        async fn ping(&self) -> Result<idl_transport::wifi_transport::PingResponse, TransportError> {
+            Err(TransportError::new(TransportErrorKind::Wifi, "unused"))
+        }
+        async fn handoff(&self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn wifi_off(&self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn list_files(&self) -> Result<Vec<idl_transport::DeviceFile>, TransportError> {
+            Ok(Vec::new())
+        }
+        async fn download(
+            &self,
+            _file_name: &str,
+            _resume_from_bytes: u64,
+            _sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+            _on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
+        ) -> Result<u64, TransportError> {
+            std::future::pending::<()>().await;
+            Ok(0)
+        }
+        async fn delete(&self, _file_name: &str) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn push_config(&self, _config_json: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn push_ota(
+            &self,
+            _firmware_image: &[u8],
+            _on_progress: &mut (dyn FnMut(u64, u64) + Send),
+        ) -> Result<(), idl_transport::wifi_transport::OtaPushError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_files_via_a_stream_that_goes_silent_fails_as_a_link_failure() {
+        // Arrange
+        let data_dir = tempfile::tempdir().unwrap();
+        let events = StdMutex::new(Vec::new());
+        let emit = |e: TransferEvent| events.lock().unwrap().push(e);
+        let cancel = tokio::sync::Notify::new();
+
+        // Act — paused time runs the 20 s watchdog instantly.
+        let end = download_files_via(&SilentWifi, "dev", &wanted(&["a.idl1", "b.idl1"], 4), data_dir.path(), &cancel, &emit).await;
+
+        // Assert
+        let failed = events.lock().unwrap().iter().filter(|e| matches!(e, TransferEvent::Failed { .. })).count();
+        assert_eq!(end, BatchEnd { cancelled: false, link_failed: true });
+        assert_eq!(failed, 2);
     }
 
     #[test]
