@@ -120,23 +120,12 @@ pub struct ProfileEntry {
     pub updated_at_ms: i64,
 }
 
-/// One `bikes/<id>.json` manifest entry (bike-log spec §4). Two copies
-/// that differ are merged by the receiver, part by part.
+/// One `bikes/<id>.json` manifest entry: a bike and its whole log
+/// (bike-log spec §4). Two copies that differ are merged by the receiver:
+/// the bike part by part, the log as a union of entries and versions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BikeEntry {
     pub bike_id: String,
-    pub sha256: String,
-    /// File size in bytes.
-    pub size_bytes: u64,
-}
-
-/// One `bikelog/<bike_id>/<kind>-<entry_id>.json` manifest entry (bike-log
-/// spec §4). Two copies that differ are merged by the receiver as a union
-/// of versions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BikeLogFileEntry {
-    /// `<bike_id>/<kind>-<entry_id>` (`bikelog::log_key`).
-    pub key: String,
     pub sha256: String,
     /// File size in bytes.
     pub size_bytes: u64,
@@ -174,10 +163,6 @@ pub struct Manifest {
     /// as empty.
     #[serde(default)]
     pub bikes: Vec<BikeEntry>,
-    /// Added 2026-10-16; absent from an older peer's manifest, which reads
-    /// as empty.
-    #[serde(default)]
-    pub bike_log: Vec<BikeLogFileEntry>,
 }
 
 /// Discriminant for [`SyncError`].
@@ -252,11 +237,7 @@ pub fn build_manifest(data_root: &Path, now_ms: i64) -> Result<(Manifest, Vec<Sk
     bikes.sort_by(|a, b| a.bike_id.cmp(&b.bike_id));
     skipped.extend(bike_skipped);
 
-    let (mut bike_log, log_skipped) = collect_bike_log(data_root);
-    bike_log.sort_by(|a, b| a.key.cmp(&b.key));
-    skipped.extend(log_skipped);
-
-    let manifest = Manifest { schema_version: 1, generated_at_ms: now_ms, blobs, sessions, workbooks, tracks, profiles, bikes, bike_log };
+    let manifest = Manifest { schema_version: 1, generated_at_ms: now_ms, blobs, sessions, workbooks, tracks, profiles, bikes };
     Ok((manifest, skipped))
 }
 
@@ -532,7 +513,7 @@ fn collect_profiles(data_root: &Path) -> (Vec<ProfileEntry>, Vec<SkippedEntry>) 
 /// `bikes/*.json`: a file whose name isn't a valid id, that doesn't parse,
 /// or whose `bike_id` differs from its name is skipped.
 fn collect_bikes(data_root: &Path) -> (Vec<BikeEntry>, Vec<SkippedEntry>) {
-    use crate::store::bikelog::{is_valid_id, Bike};
+    use crate::store::bikelog::{is_valid_id, BikeFile};
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     let Ok(entries) = std::fs::read_dir(data_root.join("bikes")) else { return (out, skipped) };
@@ -547,51 +528,12 @@ fn collect_bikes(data_root: &Path) -> (Vec<BikeEntry>, Vec<SkippedEntry>) {
             skipped.push(skip("could not read file"));
             continue;
         };
-        match serde_json::from_slice::<Bike>(&bytes) {
+        match BikeFile::from_slice(&bytes).map(|f| f.bike) {
             Ok(bike) if bike.bike_id == stem && is_valid_id(&stem) => {
                 out.push(BikeEntry { bike_id: stem, sha256: sha256_hex(&bytes), size_bytes: bytes.len() as u64 })
             }
             Ok(_) => skipped.push(skip("file name does not match the bike's own id")),
             Err(_) => skipped.push(skip("could not parse")),
-        }
-    }
-    (out, skipped)
-}
-
-/// `bikelog/<bike_id>/<kind>-<entry_id>.json`: a file whose path isn't a
-/// valid log key, that doesn't parse, or whose content disagrees with its
-/// path (bike, kind or id) is skipped.
-fn collect_bike_log(data_root: &Path) -> (Vec<BikeLogFileEntry>, Vec<SkippedEntry>) {
-    use crate::store::bikelog::{parse_log_key, Entry};
-    let mut out = Vec::new();
-    let mut skipped = Vec::new();
-    let Ok(bikes) = std::fs::read_dir(data_root.join("bikelog")) else { return (out, skipped) };
-    for bike in bikes.flatten() {
-        let Ok(files) = std::fs::read_dir(bike.path()) else { continue };
-        let bike_id = bike.file_name().to_string_lossy().to_string();
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            let key = format!("{bike_id}/{stem}");
-            let skip = |reason: &str| SkippedEntry { path: relative_path_str(data_root, &path), reason: format!("bike log: {reason}") };
-            let Some((b, kind, id)) = parse_log_key(&key) else {
-                skipped.push(skip("file name is not <note|sheet>-<id>.json under a valid bike id"));
-                continue;
-            };
-            let Ok(bytes) = std::fs::read(&path) else {
-                skipped.push(skip("could not read file"));
-                continue;
-            };
-            match serde_json::from_slice::<Entry>(&bytes) {
-                Ok(e) if e.bike_id == b && e.kind == kind && e.entry_id == id => {
-                    out.push(BikeLogFileEntry { key: key.clone(), sha256: sha256_hex(&bytes), size_bytes: bytes.len() as u64 })
-                }
-                Ok(_) => skipped.push(skip("content does not match its file name")),
-                Err(_) => skipped.push(skip("could not parse")),
-            }
         }
     }
     (out, skipped)
@@ -1018,7 +960,6 @@ mod tests {
             tracks: vec![TrackEntry { track_id: "t-1".to_string(), sha256: "f".repeat(64), size_bytes: 900, updated_at_ms: 1_756_857_600_000 }],
             profiles: vec![ProfileEntry { profile_id: "p-1".to_string(), sha256: "0".repeat(64), size_bytes: 640, updated_at_ms: 1_756_857_600_000 }],
             bikes: vec![BikeEntry { bike_id: "gt".to_string(), sha256: "1".repeat(64), size_bytes: 80 }],
-            bike_log: vec![BikeLogFileEntry { key: "gt/note-01".to_string(), sha256: "2".repeat(64), size_bytes: 300 }],
         };
 
         // Act
@@ -1031,7 +972,7 @@ mod tests {
         assert_eq!(json["sessions"][0]["data_parquet"]["seam_correction_version"], "v1");
         assert_eq!(json["profiles"][0]["profile_id"], "p-1");
         assert_eq!(json["workbooks"][0]["workbook_id"], "wb-1");
-        assert_eq!(json["bike_log"][0]["key"], "gt/note-01");
+        assert_eq!(json["bikes"][0]["bike_id"], "gt");
     }
 
     #[test]
@@ -1043,38 +984,24 @@ mod tests {
         let m: Manifest = serde_json::from_str(older).unwrap();
 
         // Assert
-        assert!(m.bikes.is_empty() && m.bike_log.is_empty());
+        assert!(m.bikes.is_empty());
     }
 
     #[test]
-    fn build_manifest_lists_bikes_and_log_files_and_skips_ones_that_disagree_with_their_name() {
+    fn build_manifest_lists_bike_files_and_skips_one_whose_id_disagrees_with_its_name() {
         // Arrange
-        use crate::store::bikelog::{save_bike, save_entry, Bike, Entry, EntryKind, EntryVersion};
+        use crate::store::bikelog::{save_bike, Bike};
         let root = std::env::temp_dir().join(format!("idl-rs-manifest-bike-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         save_bike(&root, &Bike { bike_id: "gt".into(), name: "GT".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 1 }).unwrap();
-        let v = EntryVersion {
-            version_id: "v1".into(),
-            parents: Vec::new(),
-            at_ms: 1,
-            updated_at_ms: 1,
-            device: String::new(),
-            text: "fork service".into(),
-            changes: Vec::new(),
-            sheet: Default::default(),
-            deleted: false,
-        };
-        save_entry(&root, &Entry { entry_id: "01".into(), bike_id: "gt".into(), kind: EntryKind::Note, versions: vec![v] }).unwrap();
-        let note = std::fs::read(root.join("bikelog/gt/note-01.json")).unwrap();
-        std::fs::write(root.join("bikelog/gt/sheet-01.json"), &note).unwrap();
+        std::fs::copy(root.join("bikes/gt.json"), root.join("bikes/other.json")).unwrap();
 
         // Act
         let (m, skipped) = build_manifest(&root, 0).unwrap();
 
         // Assert
         assert_eq!(m.bikes.iter().map(|b| b.bike_id.as_str()).collect::<Vec<_>>(), vec!["gt"]);
-        assert_eq!(m.bike_log.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), vec!["gt/note-01"]);
-        assert!(skipped.iter().any(|s| s.path == "bikelog/gt/sheet-01.json"));
+        assert!(skipped.iter().any(|s| s.path == "bikes/other.json"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

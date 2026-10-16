@@ -160,7 +160,6 @@ fn build_router(state: ServerState) -> Router {
         .route("/idl1/v1/track/{id}", get(handle_track_get).put(handle_track_put))
         .route("/idl1/v1/profile/{id}", get(handle_profile_get).put(handle_profile_put))
         .route("/idl1/v1/bike/{id}", get(handle_bike_get).put(handle_bike_put))
-        .route("/idl1/v1/bikelog/{bike}/{file}", get(handle_bike_log_get).put(handle_bike_log_put))
         .fallback(handle_not_found)
         // `route_layer`, not `layer`: auth wraps only the named routes, so an
         // unmatched path still falls through to the plain `404` fallback
@@ -595,27 +594,6 @@ async fn handle_bike_put(State(state): State<ServerState>, AxumPath(id): AxumPat
         Err(r) => return r,
     };
     let item = SyncItem { class: SyncClass::Bike, key: id, session_id: None, size_bytes: bytes.len() as u64 };
-    install_response(&state.data_root, &item, &bytes, &state.name, &InstallContext::default())
-}
-
-async fn handle_bike_log_get(State(state): State<ServerState>, AxumPath((bike, file)): AxumPath<(String, String)>, headers: HeaderMap) -> Response {
-    let key = format!("{bike}/{file}");
-    let Some((bike_id, kind, entry_id)) = idl_rs::store::bikelog::parse_log_key(&key) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    serve_file(&idl_rs::store::bikelog::entry_path(&state.data_root, bike_id, kind, entry_id), &headers)
-}
-
-async fn handle_bike_log_put(State(state): State<ServerState>, AxumPath((bike, file)): AxumPath<(String, String)>, request: Request) -> Response {
-    let key = format!("{bike}/{file}");
-    if idl_rs::store::bikelog::parse_log_key(&key).is_none() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let bytes = match read_body(request.into_body(), MAX_DOCUMENT_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(r) => return r,
-    };
-    let item = SyncItem { class: SyncClass::BikeLog, key, session_id: None, size_bytes: bytes.len() as u64 };
     install_response(&state.data_root, &item, &bytes, &state.name, &InstallContext::default())
 }
 

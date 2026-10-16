@@ -1,15 +1,14 @@
 //! The bike log and setup sheet (spec `2026-10-16-idl1-bike-log-DRAFT.md`).
 //!
-//! Each bike has a log: one file per entry under
-//! `<data>/bikelog/<bike_id>/`, named `note-<entry_id>.json` or
-//! `sheet-<entry_id>.json` so the kind shows in the folder listing and the
-//! confirmed sheets can be read without opening every note (Isaac,
-//! 2026-10-16), plus the bike itself at
-//! `<data>/bikes/<bike_id>.json`. An entry is a **note** (text, optionally
-//! exact field changes) or a confirmed **sheet** (every value). An entry
-//! keeps every version of itself, so two devices' copies merge as a union
-//! of versions and no edit is lost (§4). The running setup sheet is never
-//! stored: [`running_sheet`] works it out from the log.
+//! One file per bike, `<data>/bikes/<bike_id>.json`, holds the bike (its
+//! name and sheet fields) and its whole log, oldest entry first: the one
+//! readable history of that bike (Isaac, 2026-10-16). An entry is a
+//! **note** (text, plus only the values it changed) or a confirmed
+//! **sheet** (every value). Each entry keeps every version of itself: the
+//! current one sits at the top of the entry, older wording in its
+//! `history`, so two devices' copies merge as a union of entries and, within
+//! an entry, of versions; no edit is lost (§4). The full setup at any moment
+//! is never stored: [`running_sheet`] works it out from the log.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -23,7 +22,7 @@ use crate::store::atomic::{sha256_hex, write_atomic_with_retry, AtomicWriteError
 /// two parts merge separately, each by its own `*_updated_at_ms`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Bike {
-    /// Stable id, also the file and log-folder name.
+    /// Stable id, also the file name.
     pub bike_id: String,
     /// Display name, e.g. "GT Force".
     #[serde(default)]
@@ -32,7 +31,7 @@ pub struct Bike {
     #[serde(default)]
     pub name_updated_at_ms: i64,
     /// The sheet fields this bike has (dotted keys, e.g. `"fork.lsc"`), in
-    /// display order. A field not listed doesn't apply to this bike.
+    /// display order. Empty means every field.
     #[serde(default)]
     pub fields: Vec<String>,
     /// When `fields` last changed, UTC ms.
@@ -67,15 +66,6 @@ pub enum EntryKind {
     Sheet,
 }
 
-/// One exact field change carried by a note, e.g. fork LSC to 12 clicks.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FieldChange {
-    /// Dotted sheet key, e.g. `"fork.lsc"`.
-    pub field: String,
-    /// The new absolute value (clicks from fully closed, psi, mm, text…).
-    pub value: serde_json::Value,
-}
-
 /// One version of an entry. Versions are never edited or removed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EntryVersion {
@@ -83,7 +73,7 @@ pub struct EntryVersion {
     pub version_id: String,
     /// The version(s) this one was edited from: none for the first, two for
     /// a merge of a conflict.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parents: Vec<String>,
     /// When the noted thing happened, UTC ms (editable).
     pub at_ms: i64,
@@ -95,21 +85,22 @@ pub struct EntryVersion {
     /// The note's text (a sheet may carry a comment here).
     #[serde(default)]
     pub text: String,
-    /// A note's exact field changes, in order.
-    #[serde(default)]
-    pub changes: Vec<FieldChange>,
+    /// A note's changes: only the values it set, by dotted key (clicks from
+    /// fully closed, psi, mm, text…).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub changes: BTreeMap<String, serde_json::Value>,
     /// A sheet's values, by dotted key. Empty for a note.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sheet: BTreeMap<String, serde_json::Value>,
     /// This version deletes the entry.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deleted: bool,
 }
 
 /// One log entry: its identity and every version of it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
-    /// Unique id, also the file name; sorts by creation time when it is a ULID.
+    /// Unique id; sorts by creation time.
     pub entry_id: String,
     /// The bike whose log holds it.
     pub bike_id: String,
@@ -154,6 +145,97 @@ impl Entry {
         let have: HashSet<String> = out.versions.iter().map(|v| v.version_id.clone()).collect();
         out.versions.extend(other.versions.iter().filter(|v| !have.contains(&v.version_id)).cloned());
         out.versions.sort_by(|a, b| (a.updated_at_ms, &a.version_id).cmp(&(b.updated_at_ms, &b.version_id)));
+        out
+    }
+}
+
+/// One bike's file: the bike and its log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BikeFile {
+    /// The bike's name and fields.
+    pub bike: Bike,
+    /// Every entry, deleted ones included, oldest first (by current `at_ms`,
+    /// then id).
+    pub entries: Vec<Entry>,
+}
+
+/// An entry as written in the file: the current version's fields at the
+/// top, older versions in `history`.
+#[derive(Serialize, Deserialize)]
+struct StoredEntry {
+    entry_id: String,
+    kind: EntryKind,
+    #[serde(flatten)]
+    current: EntryVersion,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    history: Vec<EntryVersion>,
+}
+
+/// The file's shape: the bike's fields, then `entries`.
+#[derive(Serialize, Deserialize)]
+struct StoredBikeFile {
+    #[serde(flatten)]
+    bike: Bike,
+    #[serde(default)]
+    entries: Vec<StoredEntry>,
+}
+
+impl BikeFile {
+    /// A new bike with an empty log.
+    pub fn new(bike: Bike) -> BikeFile {
+        BikeFile { bike, entries: Vec::new() }
+    }
+
+    /// Parses a bike file.
+    pub fn from_slice(bytes: &[u8]) -> Result<BikeFile, BikeLogError> {
+        let stored: StoredBikeFile =
+            serde_json::from_slice(bytes).map_err(|e| BikeLogError { kind: BikeLogErrorKind::Parse, message: e.to_string() })?;
+        let bike_id = stored.bike.bike_id.clone();
+        let mut file = BikeFile { bike: stored.bike, entries: Vec::new() };
+        for s in stored.entries {
+            let mut versions = s.history;
+            versions.push(s.current);
+            let entry = Entry { entry_id: s.entry_id, bike_id: bike_id.clone(), kind: s.kind, versions };
+            file.upsert(&entry);
+        }
+        Ok(file)
+    }
+
+    /// The file's bytes: pretty JSON, entries oldest first, each with its
+    /// current version at the top and older ones in `history`.
+    pub fn to_vec(&self) -> Result<Vec<u8>, BikeLogError> {
+        let entries = self
+            .entries
+            .iter()
+            .filter_map(|e| {
+                let current = e.current()?.clone();
+                let history = e.versions.iter().filter(|v| v.version_id != current.version_id).cloned().collect();
+                Some(StoredEntry { entry_id: e.entry_id.clone(), kind: e.kind, current, history })
+            })
+            .collect();
+        serde_json::to_vec_pretty(&StoredBikeFile { bike: self.bike.clone(), entries })
+            .map_err(|e| BikeLogError { kind: BikeLogErrorKind::Encode, message: e.to_string() })
+    }
+
+    /// Adds `entry`, or merges it into the entry with the same id, keeping
+    /// the log in order.
+    pub fn upsert(&mut self, entry: &Entry) {
+        let entry = Entry { bike_id: self.bike.bike_id.clone(), ..entry.clone() };
+        match self.entries.iter_mut().find(|e| e.entry_id == entry.entry_id) {
+            Some(e) => *e = e.merge(&entry),
+            None => self.entries.push(entry.merge(&Entry { versions: Vec::new(), ..entry.clone() })),
+        }
+        self.entries.sort_by_key(|e| (e.current().map_or(i64::MIN, |v| v.at_ms), e.entry_id.clone()));
+    }
+
+    /// Merges two copies of the same bike's file: the bike part by part,
+    /// the log as a union of entries and versions. Symmetric, so two devices
+    /// converge once each has merged the other's copy.
+    pub fn merge(&self, other: &BikeFile) -> BikeFile {
+        let mut out = BikeFile { bike: self.bike.merge(&other.bike), entries: self.entries.clone() };
+        for e in &other.entries {
+            out.upsert(e);
+        }
         out
     }
 }
@@ -215,8 +297,8 @@ pub fn running_sheet(entries: &[Entry], at_ms: i64) -> RunningSheet {
         if e.kind != EntryKind::Note {
             continue;
         }
-        for c in &v.changes {
-            out.values.insert(c.field.clone(), c.value.clone());
+        for (field, value) in &v.changes {
+            out.values.insert(field.clone(), value.clone());
         }
         out.since.push(e.entry_id.clone());
     }
@@ -276,11 +358,7 @@ pub fn bike_for_name(data_root: &Path, name: &str, now_ms: i64) -> Result<Bike, 
 pub fn attach_session(data_root: &Path, session_id: &str, bike_id: &str, start_ms: i64, end_ms: i64) -> Result<crate::store::session_json::SessionJson, BikeLogError> {
     use crate::store::session_json::{parse_session_json, write_session_json};
     let io = |message: String| BikeLogError { kind: BikeLogErrorKind::Io, message };
-    check_id(bike_id)?;
-    let bike: Bike = std::fs::read(bike_path(data_root, bike_id))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .ok_or_else(|| BikeLogError { kind: BikeLogErrorKind::InvalidId, message: format!("no bike {bike_id:?}") })?;
+    let file = read_bike_file(data_root, bike_id)?;
 
     let mut after_ms: Option<i64> = None;
     for dir in std::fs::read_dir(data_root.join("sessions")).into_iter().flatten().flatten() {
@@ -296,19 +374,18 @@ pub fn attach_session(data_root: &Path, session_id: &str, bike_id: &str, start_m
         }
     }
 
-    let entries = load_log(data_root, bike_id).entries;
     let attached = SessionBikeLog {
-        entry_ids: entries_for_session(&entries, after_ms, end_ms),
+        entry_ids: entries_for_session(&file.entries, after_ms, end_ms),
         after_ms,
         until_ms: end_ms,
-        setup_sheet: running_sheet(&entries, start_ms),
+        setup_sheet: running_sheet(&file.entries, start_ms),
     };
 
     let target = data_root.join("sessions").join(session_id).join("session.json");
     let raw = std::fs::read(&target).map_err(|e| io(format!("reading {}: {e}", target.display())))?;
     let mut doc = parse_session_json(&raw).map_err(|e| io(e.message))?;
     doc.bike_id = bike_id.to_string();
-    doc.bike = bike.name.clone();
+    doc.bike = file.bike.name.clone();
     doc.bike_log = Some(attached);
     write_session_json(data_root, session_id, &doc, Some(&sha256_hex(&raw))).map_err(|e| io(e.message))?;
     Ok(doc)
@@ -321,7 +398,9 @@ pub enum BikeLogErrorKind {
     Io,
     /// The record did not encode to JSON.
     Encode,
-    /// An id would not make a safe file name.
+    /// A bike file did not parse.
+    Parse,
+    /// An id would not make a safe file name, or names no bike.
     InvalidId,
 }
 
@@ -348,8 +427,8 @@ impl From<AtomicWriteError> for BikeLogError {
     }
 }
 
-/// An id is used as a file or folder name: ASCII letters, digits, `-` and
-/// `_` only, and not empty.
+/// An id is used as a file name: ASCII letters, digits, `-` and `_` only,
+/// and not empty.
 fn check_id(id: &str) -> Result<(), BikeLogError> {
     if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         Ok(())
@@ -363,80 +442,55 @@ pub fn is_valid_id(id: &str) -> bool {
     check_id(id).is_ok()
 }
 
-/// The sync key of a log entry file: `<bike_id>/<kind>-<entry_id>`, its
-/// path under `bikelog/` without `.json`.
-pub fn log_key(bike_id: &str, kind: EntryKind, entry_id: &str) -> String {
-    format!("{bike_id}/{}{entry_id}", kind.file_prefix())
-}
-
-/// Splits a sync key from [`log_key`] into `(bike_id, kind, entry_id)`;
-/// `None` for anything else, including unsafe ids.
-pub fn parse_log_key(key: &str) -> Option<(&str, EntryKind, &str)> {
-    let (bike_id, stem) = key.split_once('/')?;
-    let (kind, entry_id) = if let Some(id) = stem.strip_prefix(EntryKind::Note.file_prefix()) {
-        (EntryKind::Note, id)
-    } else {
-        (EntryKind::Sheet, stem.strip_prefix(EntryKind::Sheet.file_prefix())?)
-    };
-    (is_valid_id(bike_id) && is_valid_id(entry_id)).then_some((bike_id, kind, entry_id))
-}
-
 /// `<data>/bikes/<bike_id>.json`.
 pub fn bike_path(data_root: &Path, bike_id: &str) -> PathBuf {
     data_root.join("bikes").join(format!("{bike_id}.json"))
 }
 
-impl EntryKind {
-    /// The file-name prefix for this kind: `note-` or `sheet-`.
-    pub fn file_prefix(self) -> &'static str {
-        match self {
-            EntryKind::Note => "note-",
-            EntryKind::Sheet => "sheet-",
-        }
+/// Reads `bike_id`'s file. A missing bike is `InvalidId`.
+pub fn read_bike_file(data_root: &Path, bike_id: &str) -> Result<BikeFile, BikeLogError> {
+    check_id(bike_id)?;
+    let path = bike_path(data_root, bike_id);
+    let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => BikeLogError { kind: BikeLogErrorKind::InvalidId, message: format!("no bike {bike_id:?}") },
+        _ => BikeLogError { kind: BikeLogErrorKind::Io, message: format!("reading {}: {e}", path.display()) },
+    })?;
+    BikeFile::from_slice(&bytes)
+}
+
+/// Writes `file` merged with the copy on disk, if any, so nothing written
+/// elsewhere in the meantime is lost. Returns what was written.
+pub fn save_bike_file(data_root: &Path, file: &BikeFile) -> Result<BikeFile, BikeLogError> {
+    check_id(&file.bike.bike_id)?;
+    for e in &file.entries {
+        check_id(&e.entry_id)?;
     }
+    let target = bike_path(data_root, &file.bike.bike_id);
+    let on_disk = std::fs::read(&target).ok();
+    let merged = match on_disk.as_deref().map(BikeFile::from_slice) {
+        Some(Ok(existing)) => existing.merge(file),
+        _ => file.merge(&BikeFile::new(file.bike.clone())),
+    };
+    let bytes = merged.to_vec()?;
+    let based_on = on_disk.as_deref().map(sha256_hex);
+    write_atomic_with_retry(data_root, &target, &bytes, based_on.as_deref(), |_current| bytes.clone())?;
+    Ok(merged)
 }
 
-/// `<data>/bikelog/<bike_id>/<kind>-<entry_id>.json`.
-pub fn entry_path(data_root: &Path, bike_id: &str, kind: EntryKind, entry_id: &str) -> PathBuf {
-    data_root.join("bikelog").join(bike_id).join(format!("{}{entry_id}.json", kind.file_prefix()))
-}
-
-/// Writes `bytes` to `target` atomically (C4 §4).
-fn write(data_root: &Path, target: &Path, bytes: Vec<u8>) -> Result<(), BikeLogError> {
-    let based_on = std::fs::read(target).ok().map(|b| sha256_hex(&b));
-    write_atomic_with_retry(data_root, target, &bytes, based_on.as_deref(), |_current| bytes.clone())?;
-    Ok(())
-}
-
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, BikeLogError> {
-    serde_json::to_vec_pretty(value).map_err(|e| BikeLogError { kind: BikeLogErrorKind::Encode, message: e.to_string() })
-}
-
-/// Saves `bike`, merged with the copy already on disk (so a stale writer
-/// can't undo a newer rename).
+/// Saves `bike`'s name and fields (merged part by part with the copy on
+/// disk, so a stale writer can't undo a newer rename), keeping its log.
 pub fn save_bike(data_root: &Path, bike: &Bike) -> Result<Bike, BikeLogError> {
-    check_id(&bike.bike_id)?;
-    let target = bike_path(data_root, &bike.bike_id);
-    let merged = match std::fs::read(&target).ok().and_then(|b| serde_json::from_slice::<Bike>(&b).ok()) {
-        Some(on_disk) => on_disk.merge(bike),
-        None => bike.clone(),
-    };
-    write(data_root, &target, encode(&merged)?)?;
-    Ok(merged)
+    Ok(save_bike_file(data_root, &BikeFile::new(bike.clone()))?.bike)
 }
 
-/// Saves `entry`, merged with the copy already on disk, so a version
-/// written elsewhere in the meantime is kept. Returns what was written.
+/// Saves `entry` (new, or new versions of one) into its bike's log, merged
+/// with what is there. The bike must exist. Returns the merged entry.
 pub fn save_entry(data_root: &Path, entry: &Entry) -> Result<Entry, BikeLogError> {
-    check_id(&entry.bike_id)?;
-    check_id(&entry.entry_id)?;
-    let target = entry_path(data_root, &entry.bike_id, entry.kind, &entry.entry_id);
-    let merged = match std::fs::read(&target).ok().and_then(|b| serde_json::from_slice::<Entry>(&b).ok()) {
-        Some(on_disk) => on_disk.merge(entry),
-        None => entry.merge(&Entry { versions: Vec::new(), ..entry.clone() }),
-    };
-    write(data_root, &target, encode(&merged)?)?;
-    Ok(merged)
+    let mut file = read_bike_file(data_root, &entry.bike_id)?;
+    file.entries.clear();
+    file.upsert(entry);
+    let merged = save_bike_file(data_root, &file)?;
+    Ok(merged.entries.into_iter().find(|e| e.entry_id == entry.entry_id).expect("just saved"))
 }
 
 /// Every bike, plus the files that didn't parse.
@@ -448,60 +502,41 @@ pub struct BikesLoad {
     pub skipped: Vec<(PathBuf, String)>,
 }
 
-/// One bike's log, plus the files that didn't parse.
+/// One bike's log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogLoad {
-    /// Parsed entries, deleted ones included, sorted by entry id.
+    /// Every entry, deleted ones included, oldest first.
     pub entries: Vec<Entry>,
-    /// `(path, reason)` for each file that didn't parse.
+    /// `(path, reason)` when the bike's file didn't parse.
     pub skipped: Vec<(PathBuf, String)>,
 }
 
-/// Reads every `<prefix>*.json` in `dir` as `T`; a bad file is skipped,
-/// never fatal.
-fn load_dir<T: for<'de> Deserialize<'de>>(dir: &Path, prefix: &str) -> (Vec<T>, Vec<(PathBuf, String)>) {
-    let Ok(read) = std::fs::read_dir(dir) else { return (Vec::new(), Vec::new()) };
-    let mut ok = Vec::new();
+/// Loads every bike's name and fields.
+pub fn load_bikes(data_root: &Path) -> BikesLoad {
+    let mut bikes = Vec::new();
     let mut skipped = Vec::new();
-    for item in read.flatten() {
+    for item in std::fs::read_dir(data_root.join("bikes")).into_iter().flatten().flatten() {
         let path = item.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !name.starts_with(prefix) || path.extension().and_then(|e| e.to_str()) != Some("json") {
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice::<T>(&b).map_err(|e| e.to_string())) {
-            Ok(v) => ok.push(v),
+        match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| BikeFile::from_slice(&b).map_err(|e| e.message)) {
+            Ok(f) => bikes.push(f.bike),
             Err(e) => skipped.push((path, e)),
         }
     }
-    (ok, skipped)
-}
-
-/// Loads every bike.
-pub fn load_bikes(data_root: &Path) -> BikesLoad {
-    let (mut bikes, skipped) = load_dir::<Bike>(&data_root.join("bikes"), "");
     bikes.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.bike_id.cmp(&b.bike_id)));
     BikesLoad { bikes, skipped }
 }
 
-/// Loads `bike_id`'s log, notes and sheets. An unknown bike has an empty log.
+/// Loads `bike_id`'s log. An unknown bike has an empty log; a file that
+/// doesn't parse is reported in `skipped`.
 pub fn load_log(data_root: &Path, bike_id: &str) -> LogLoad {
-    load_log_files(data_root, bike_id, "")
-}
-
-/// Loads only `bike_id`'s confirmed sheets (`sheet-*.json`), without
-/// opening a single note.
-pub fn load_sheets(data_root: &Path, bike_id: &str) -> LogLoad {
-    load_log_files(data_root, bike_id, EntryKind::Sheet.file_prefix())
-}
-
-fn load_log_files(data_root: &Path, bike_id: &str, prefix: &str) -> LogLoad {
-    if check_id(bike_id).is_err() {
-        return LogLoad { entries: Vec::new(), skipped: Vec::new() };
+    match read_bike_file(data_root, bike_id) {
+        Ok(f) => LogLoad { entries: f.entries, skipped: Vec::new() },
+        Err(e) if e.kind == BikeLogErrorKind::Parse => LogLoad { entries: Vec::new(), skipped: vec![(bike_path(data_root, bike_id), e.message)] },
+        Err(_) => LogLoad { entries: Vec::new(), skipped: Vec::new() },
     }
-    let (mut entries, skipped) = load_dir::<Entry>(&data_root.join("bikelog").join(bike_id), prefix);
-    entries.sort_by(|a, b| a.entry_id.cmp(&b.entry_id));
-    LogLoad { entries, skipped }
 }
 
 #[cfg(test)]
@@ -515,6 +550,10 @@ mod tests {
         dir
     }
 
+    fn gt() -> Bike {
+        Bike { bike_id: "gt".into(), name: "GT".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 0 }
+    }
+
     fn version(id: &str, parents: &[&str], at_ms: i64, updated_at_ms: i64, text: &str) -> EntryVersion {
         EntryVersion {
             version_id: id.to_string(),
@@ -523,7 +562,7 @@ mod tests {
             updated_at_ms,
             device: "phone".to_string(),
             text: text.to_string(),
-            changes: Vec::new(),
+            changes: BTreeMap::new(),
             sheet: BTreeMap::new(),
             deleted: false,
         }
@@ -531,7 +570,7 @@ mod tests {
 
     fn note(id: &str, at_ms: i64, changes: &[(&str, serde_json::Value)]) -> Entry {
         let mut v = version(&format!("{id}-v1"), &[], at_ms, at_ms, id);
-        v.changes = changes.iter().map(|(f, val)| FieldChange { field: f.to_string(), value: val.clone() }).collect();
+        v.changes = changes.iter().map(|(f, val)| (f.to_string(), val.clone())).collect();
         Entry { entry_id: id.to_string(), bike_id: "gt".to_string(), kind: EntryKind::Note, versions: vec![v] }
     }
 
@@ -539,6 +578,14 @@ mod tests {
         let mut v = version(&format!("{id}-v1"), &[], at_ms, at_ms, "");
         v.sheet = values.iter().map(|(f, val)| (f.to_string(), val.clone())).collect();
         Entry { entry_id: id.to_string(), bike_id: "gt".to_string(), kind: EntryKind::Sheet, versions: vec![v] }
+    }
+
+    fn deleted(mut e: Entry, at: i64) -> Entry {
+        let parent = e.versions[0].version_id.clone();
+        let mut d = version(&format!("{parent}-del"), &[&parent], e.versions[0].at_ms, at, "");
+        d.deleted = true;
+        e.versions.push(d);
+        e
     }
 
     #[test]
@@ -581,15 +628,58 @@ mod tests {
     fn entry_delete_is_a_version_and_survives_a_merge_with_an_older_copy() {
         // Arrange
         let old = note("e", 10, &[]);
-        let mut del = version("v2", &["e-v1"], 10, 20, "");
-        del.deleted = true;
-        let deleted = Entry { versions: vec![old.versions[0].clone(), del], ..old.clone() };
+        let gone = deleted(old.clone(), 20);
 
         // Act
-        let merged = old.merge(&deleted);
+        let merged = old.merge(&gone);
 
         // Assert
         assert!(merged.is_deleted());
+    }
+
+    #[test]
+    fn bike_file_round_trips_with_current_on_top_and_older_versions_in_history() {
+        // Arrange
+        let mut file = BikeFile::new(gt());
+        let mut edited = note("n1", 20, &[("rear_tyre.psi", json!(26))]);
+        edited.versions.push(version("n1-v2", &["n1-v1"], 20, 30, "rear 26 psi"));
+        file.upsert(&edited);
+        file.upsert(&sheet("s1", 10, &[("fork.lsc", json!(10))]));
+
+        // Act
+        let bytes = file.to_vec().unwrap();
+        let back = BikeFile::from_slice(&bytes).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Assert
+        assert_eq!(back, file);
+        assert_eq!(json["bike_id"], "gt");
+        assert_eq!(json["entries"][0]["entry_id"], "s1");
+        assert_eq!(json["entries"][1]["text"], "rear 26 psi");
+        assert_eq!(json["entries"][1]["history"][0]["text"], "n1");
+        assert!(json["entries"][0].get("history").is_none());
+    }
+
+    #[test]
+    fn bike_file_merge_is_a_union_of_entries_and_versions_from_both_sides() {
+        // Arrange
+        let mut phone = BikeFile::new(gt());
+        phone.upsert(&note("a", 10, &[]));
+        phone.upsert(&note("shared", 20, &[]));
+        let mut desk = BikeFile::new(Bike { name: "GT Force".into(), name_updated_at_ms: 5, ..gt() });
+        desk.upsert(&note("b", 15, &[]));
+        let mut shared = note("shared", 20, &[]);
+        shared.versions.push(version("shared-v2", &["shared-v1"], 20, 40, "edited on desk"));
+        desk.upsert(&shared);
+
+        // Act
+        let merged = phone.merge(&desk);
+
+        // Assert
+        assert_eq!(merged.entries.iter().map(|e| e.entry_id.as_str()).collect::<Vec<_>>(), vec!["a", "b", "shared"]);
+        assert_eq!(merged.entries[2].current().unwrap().text, "edited on desk");
+        assert_eq!(merged.bike.name, "GT Force");
+        assert_eq!(merged, desk.merge(&phone));
     }
 
     #[test]
@@ -618,11 +708,7 @@ mod tests {
     #[test]
     fn running_sheet_a_newer_sheet_replaces_the_baseline_and_deleted_entries_count_for_nothing() {
         // Arrange
-        let mut gone = sheet("s2", 200, &[("fork.lsc", json!(99))]);
-        let mut del = version("s2-v2", &["s2-v1"], 200, 210, "");
-        del.deleted = true;
-        gone.versions.push(del);
-        let entries = vec![sheet("s1", 100, &[("fork.lsc", json!(10))]), gone, sheet("s3", 150, &[("fork.lsc", json!(8))])];
+        let entries = vec![sheet("s1", 100, &[("fork.lsc", json!(10))]), deleted(sheet("s2", 200, &[("fork.lsc", json!(99))]), 210), sheet("s3", 150, &[("fork.lsc", json!(8))])];
 
         // Act
         let s = running_sheet(&entries, 400);
@@ -635,11 +721,7 @@ mod tests {
     #[test]
     fn entries_for_session_takes_live_entries_since_the_previous_session() {
         // Arrange
-        let mut gone = note("gone", 150, &[]);
-        let mut del = version("gone-v2", &["gone-v1"], 150, 160, "");
-        del.deleted = true;
-        gone.versions.push(del);
-        let entries = vec![note("before", 100, &[]), note("b", 300, &[]), note("a", 200, &[]), gone, note("after", 600, &[]), note("edge", 500, &[])];
+        let entries = vec![note("before", 100, &[]), note("b", 300, &[]), note("a", 200, &[]), deleted(note("gone", 150, &[]), 160), note("after", 600, &[]), note("edge", 500, &[])];
 
         // Act
         let picked = entries_for_session(&entries, Some(100), 500);
@@ -665,80 +747,61 @@ mod tests {
     }
 
     #[test]
-    fn save_entry_merges_with_the_copy_on_disk_and_load_log_reads_it_back() {
+    fn save_entry_adds_to_the_bikes_one_file_and_merges_new_versions() {
         // Arrange
         let root = temp_root();
+        save_bike(&root, &gt()).unwrap();
         let first = note("e1", 10, &[]);
         let edit = Entry { versions: vec![version("e1-v2", &["e1-v1"], 10, 20, "edited")], ..first.clone() };
-        std::fs::create_dir_all(root.join("bikelog/gt")).unwrap();
-        std::fs::write(root.join("bikelog/gt/bad.json"), b"nope").unwrap();
 
         // Act
         save_entry(&root, &first).unwrap();
-        save_entry(&root, &edit).unwrap();
+        let merged = save_entry(&root, &edit).unwrap();
+        save_bike(&root, &Bike { name: "GT Force".into(), name_updated_at_ms: 50, ..gt() }).unwrap();
         let log = load_log(&root, "gt");
 
         // Assert
+        assert_eq!(merged.versions.len(), 2);
         assert_eq!(log.entries.len(), 1);
-        assert_eq!(log.entries[0].versions.len(), 2);
         assert_eq!(log.entries[0].current().unwrap().text, "edited");
+        assert_eq!(load_bikes(&root).bikes[0].name, "GT Force");
+        assert_eq!(std::fs::read_dir(root.join("bikes")).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_entry_for_an_unknown_bike_or_with_an_unsafe_id_is_invalid_id() {
+        // Arrange
+        let root = temp_root();
+        save_bike(&root, &gt()).unwrap();
+        let unknown = Entry { bike_id: "nope".into(), ..note("e", 1, &[]) };
+        let unsafe_id = Entry { entry_id: "a/b".into(), ..note("e", 1, &[]) };
+        let bad_bike = Bike { bike_id: "../x".into(), ..gt() };
+
+        // Act
+        let errors = [save_entry(&root, &unknown).unwrap_err().kind, save_entry(&root, &unsafe_id).unwrap_err().kind, save_bike(&root, &bad_bike).unwrap_err().kind];
+
+        // Assert
+        assert_eq!(errors, [BikeLogErrorKind::InvalidId; 3]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_log_reports_a_bike_file_that_does_not_parse() {
+        // Arrange
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("bikes")).unwrap();
+        std::fs::write(root.join("bikes/gt.json"), b"nope").unwrap();
+
+        // Act
+        let log = load_log(&root, "gt");
+        let bikes = load_bikes(&root);
+
+        // Assert
+        assert!(log.entries.is_empty());
         assert_eq!(log.skipped.len(), 1);
+        assert_eq!(bikes.skipped.len(), 1);
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn save_bike_and_entry_refuse_ids_that_are_not_safe_file_names() {
-        // Arrange
-        let root = temp_root();
-        let bike = Bike { bike_id: "../x".into(), name: String::new(), name_updated_at_ms: 0, fields: Vec::new(), fields_updated_at_ms: 0 };
-        let entry = Entry { entry_id: "a/b".into(), ..note("e", 1, &[]) };
-
-        // Act
-        let b = save_bike(&root, &bike).unwrap_err();
-        let e = save_entry(&root, &entry).unwrap_err();
-
-        // Assert
-        assert_eq!(b.kind, BikeLogErrorKind::InvalidId);
-        assert_eq!(e.kind, BikeLogErrorKind::InvalidId);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn save_entry_names_the_file_by_kind_and_load_sheets_reads_only_sheets() {
-        // Arrange
-        let root = temp_root();
-        let n = note("01A", 10, &[]);
-        let s = sheet("01B", 20, &[("fork.lsc", json!(10))]);
-
-        // Act
-        save_entry(&root, &n).unwrap();
-        save_entry(&root, &s).unwrap();
-        let sheets = load_sheets(&root, "gt");
-        let all = load_log(&root, "gt");
-
-        // Assert
-        assert!(root.join("bikelog/gt/note-01A.json").is_file());
-        assert!(root.join("bikelog/gt/sheet-01B.json").is_file());
-        assert_eq!(sheets.entries.iter().map(|e| e.entry_id.as_str()).collect::<Vec<_>>(), vec!["01B"]);
-        assert_eq!(all.entries.len(), 2);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn parse_log_key_round_trips_log_key_and_refuses_anything_else() {
-        // Arrange
-        let key = log_key("gt-force", EntryKind::Sheet, "01ABC");
-
-        // Act
-        let parsed = parse_log_key(&key);
-
-        // Assert
-        assert_eq!(key, "gt-force/sheet-01ABC");
-        assert_eq!(parsed, Some(("gt-force", EntryKind::Sheet, "01ABC")));
-        assert_eq!(parse_log_key("gt/note-01"), Some(("gt", EntryKind::Note, "01")));
-        for bad in ["gt", "gt/other-01", "../x/note-01", "gt/note-", "gt/note-a/b", "gt/note-a.b"] {
-            assert_eq!(parse_log_key(bad), None, "{bad}");
-        }
     }
 
     #[test]
@@ -765,7 +828,7 @@ mod tests {
         // Arrange
         use crate::store::session_json::{empty_session_json, read_session_json, write_session_json};
         let root = temp_root();
-        save_bike(&root, &Bike { bike_id: "gt".into(), name: "GT".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 0 }).unwrap();
+        save_bike(&root, &gt()).unwrap();
         for e in [
             sheet("s1", 50, &[("fork.lsc", json!(10))]),
             note("n1", 150, &[("fork.lsc", json!(9))]),
@@ -793,21 +856,6 @@ mod tests {
         let ride1 = read_session_json(&root.join("sessions/ride1/session.json")).unwrap().bike_log.unwrap();
         assert_eq!(ride1.entry_ids, vec!["s1", "n1"]);
         assert_eq!(ride1.after_ms, None);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn save_bike_then_load_bikes_round_trips() {
-        // Arrange
-        let root = temp_root();
-        let bike = Bike { bike_id: "gt-force".into(), name: "GT Force".into(), name_updated_at_ms: 1, fields: vec!["fork.lsc".into()], fields_updated_at_ms: 1 };
-
-        // Act
-        save_bike(&root, &bike).unwrap();
-        let load = load_bikes(&root);
-
-        // Assert
-        assert_eq!(load.bikes, vec![bike]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

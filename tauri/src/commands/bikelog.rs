@@ -16,6 +16,7 @@ impl From<BikeLogError> for IpcError {
         let kind = match e.kind {
             BikeLogErrorKind::Io => IpcErrorKind::Io,
             BikeLogErrorKind::Encode => IpcErrorKind::Internal,
+            BikeLogErrorKind::Parse => IpcErrorKind::Io,
             BikeLogErrorKind::InvalidId => IpcErrorKind::InvalidArgument,
         };
         IpcError::new(kind, e.message)
@@ -139,7 +140,7 @@ mod tests {
             updated_at_ms,
             device: "phone".to_string(),
             text: text.to_string(),
-            changes: Vec::new(),
+            changes: Default::default(),
             sheet: Default::default(),
             deleted: false,
         }
@@ -156,6 +157,7 @@ mod tests {
             kind: EntryKind::Note,
             versions: vec![version("v1", &[], 1, "a"), version("p", &["v1"], 2, "phone"), version("d", &["v1"], 3, "desk")],
         };
+        bikelog::save_bike(&root, &bikelog::Bike { bike_id: "gt".into(), name: "GT".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 0 }).unwrap();
         bikelog::save_entry(&root, &entry).unwrap();
 
         // Act

@@ -48,11 +48,9 @@ pub enum SyncClass {
     Workbook,
     Track,
     Profile,
-    /// `bikes/<id>.json`; `key` is the bike id. Merged by the receiver.
+    /// `bikes/<id>.json`, a bike and its whole log; `key` is the bike id.
+    /// Merged by the receiver.
     Bike,
-    /// `bikelog/<bike>/<kind>-<id>.json`; `key` is `<bike>/<kind>-<id>`.
-    /// Merged by the receiver as a union of versions.
-    BikeLog,
 }
 
 /// Why nothing is transferred for an item that differs on both sides.
@@ -170,13 +168,6 @@ pub fn plan_sync(local: &Manifest, remote: &Manifest, local_skipped: &[SkippedEn
         actions.extend(merge_diff(SyncClass::Bike, bike_id, l, r));
     }
 
-    let log_keys: BTreeSet<&str> = local.bike_log.iter().map(|e| e.key.as_str()).chain(remote.bike_log.iter().map(|e| e.key.as_str())).collect();
-    for key in log_keys {
-        let l = local.bike_log.iter().find(|e| e.key == key).map(|e| (e.sha256.as_str(), e.size_bytes));
-        let r = remote.bike_log.iter().find(|e| e.key == key).map(|e| (e.sha256.as_str(), e.size_bytes));
-        actions.extend(merge_diff(SyncClass::BikeLog, key, l, r));
-    }
-
     apply_local_skips(local, remote, local_skipped, &mut actions, &mut notes);
 
     actions.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
@@ -256,7 +247,6 @@ fn class_rank(c: SyncClass) -> u8 {
         SyncClass::Track => 5,
         SyncClass::Profile => 6,
         SyncClass::Bike => 7,
-        SyncClass::BikeLog => 8,
     }
 }
 
@@ -541,7 +531,7 @@ mod tests {
     use crate::store::sync::manifest::{BlobEntry, DerivedEntry, SessionJsonEntry};
 
     fn empty_manifest() -> Manifest {
-        Manifest { schema_version: 1, generated_at_ms: 0, blobs: Vec::new(), sessions: Vec::new(), workbooks: Vec::new(), tracks: Vec::new(), profiles: Vec::new(), bikes: Vec::new(), bike_log: Vec::new() }
+        Manifest { schema_version: 1, generated_at_ms: 0, blobs: Vec::new(), sessions: Vec::new(), workbooks: Vec::new(), tracks: Vec::new(), profiles: Vec::new(), bikes: Vec::new() }
     }
 
     fn dp(sha256: &str, importer_version: &str, seam_correction_version: &str) -> DataParquetEntry {
@@ -985,14 +975,14 @@ mod tests {
     }
 
     #[test]
-    fn plan_sync_bike_log_one_side_copies_across_and_differing_copies_merge() {
+    fn plan_sync_bikes_one_side_copies_across_and_differing_copies_merge() {
         // Arrange
-        use super::super::manifest::BikeLogFileEntry;
-        let entry = |key: &str, sha: &str| BikeLogFileEntry { key: key.to_string(), sha256: sha.repeat(64), size_bytes: 10 };
+        use super::super::manifest::BikeEntry;
+        let bike = |id: &str, sha: &str| BikeEntry { bike_id: id.to_string(), sha256: sha.repeat(64), size_bytes: 10 };
         let mut local = empty_manifest();
         let mut remote = empty_manifest();
-        local.bike_log = vec![entry("gt/note-a", "1"), entry("gt/note-b", "2"), entry("gt/note-same", "4")];
-        remote.bike_log = vec![entry("gt/note-b", "3"), entry("gt/note-c", "5"), entry("gt/note-same", "4")];
+        local.bikes = vec![bike("a", "1"), bike("b", "2"), bike("same", "4")];
+        remote.bikes = vec![bike("b", "3"), bike("c", "5"), bike("same", "4")];
 
         // Act
         let plan = plan_sync(&local, &remote, &[]);
@@ -1008,9 +998,9 @@ mod tests {
             })
             .collect();
         assert_eq!(got.len(), 3);
-        assert!(got.contains(&("push", "gt/note-a")));
-        assert!(got.contains(&("merge", "gt/note-b")));
-        assert!(got.contains(&("pull", "gt/note-c")));
+        assert!(got.contains(&("push", "a")));
+        assert!(got.contains(&("merge", "b")));
+        assert!(got.contains(&("pull", "c")));
     }
 
 }

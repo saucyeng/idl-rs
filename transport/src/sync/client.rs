@@ -63,8 +63,8 @@ pub struct SyncRunResult {
     pub tracks_updated: u32,
     /// Successful `SyncClass::Profile` transfers, pull and push combined.
     pub profiles_updated: u32,
-    /// Successful `SyncClass::Bike` and `SyncClass::BikeLog` transfers, pull
-    /// and push combined.
+    /// Successful `SyncClass::Bike` transfers (a bike and its log), pull and
+    /// push combined.
     pub bike_log_updated: u32,
 }
 
@@ -108,9 +108,7 @@ const MAX_RAW_FILE_BODY_BYTES: u64 = 512 * 1024 * 1024;
 fn body_cap(class: SyncClass) -> u64 {
     match class {
         SyncClass::Blob | SyncClass::Derived | SyncClass::DataParquet => MAX_RAW_FILE_BODY_BYTES,
-        SyncClass::SessionJson | SyncClass::Workbook | SyncClass::Track | SyncClass::Profile | SyncClass::Bike | SyncClass::BikeLog => {
-            MAX_DOCUMENT_BODY_BYTES
-        }
+        SyncClass::SessionJson | SyncClass::Workbook | SyncClass::Track | SyncClass::Profile | SyncClass::Bike => MAX_DOCUMENT_BODY_BYTES,
     }
 }
 
@@ -135,7 +133,6 @@ fn item_shape_is_valid(item: &SyncItem) -> bool {
         SyncClass::Blob | SyncClass::Derived | SyncClass::DataParquet | SyncClass::SessionJson => IdClass::Session,
         SyncClass::Workbook | SyncClass::Track | SyncClass::Profile => IdClass::Uuid,
         SyncClass::Bike => return bikelog::is_valid_id(&item.key),
-        SyncClass::BikeLog => return bikelog::parse_log_key(&item.key).is_some(),
     };
     is_valid_id(&item.key, key_class)
 }
@@ -174,7 +171,7 @@ fn phase_of(class: SyncClass) -> &'static str {
         SyncClass::Workbook => "workbooks",
         SyncClass::Track => "tracks",
         SyncClass::Profile => "profiles",
-        SyncClass::Bike | SyncClass::BikeLog => "bike_log",
+        SyncClass::Bike => "bike_log",
     }
 }
 
@@ -352,7 +349,7 @@ fn tally_success(item: &SyncItem, is_pull: bool, install_outcome: Option<Install
         }
         SyncClass::Track => result.tracks_updated += 1,
         SyncClass::Profile => result.profiles_updated += 1,
-        SyncClass::Bike | SyncClass::BikeLog => result.bike_log_updated += 1,
+        SyncClass::Bike => result.bike_log_updated += 1,
     }
 }
 
@@ -370,7 +367,6 @@ fn item_url(base_url: &str, item: &SyncItem) -> Result<String, TransportError> {
         SyncClass::Track => format!("{base_url}/track/{}", item.key),
         SyncClass::Profile => format!("{base_url}/profile/{}", item.key),
         SyncClass::Bike => format!("{base_url}/bike/{}", item.key),
-        SyncClass::BikeLog => format!("{base_url}/bikelog/{}", item.key),
     })
 }
 
@@ -542,9 +538,7 @@ fn build_install_context(item: &SyncItem, remote_manifest: &Manifest) -> Result<
                 .ok_or_else(|| sync_error(format!("remote manifest has no workbook entry for {}", item.key)))?;
             Ok(InstallContext { peer_workbook_file_name: Some(entry.file_name.clone()), ..Default::default() })
         }
-        SyncClass::Blob | SyncClass::Derived | SyncClass::Track | SyncClass::Profile | SyncClass::Bike | SyncClass::BikeLog => {
-            Ok(InstallContext::default())
-        }
+        SyncClass::Blob | SyncClass::Derived | SyncClass::Track | SyncClass::Profile | SyncClass::Bike => Ok(InstallContext::default()),
     }
 }
 
@@ -628,10 +622,6 @@ fn read_local_item_bytes(data_root: &Path, item: &SyncItem, local_manifest: &Man
         }
         SyncClass::Bike => {
             safe_join(data_root, &["bikes", &format!("{}.json", item.key)]).ok_or_else(|| sync_error("bike path would land outside data_root"))?
-        }
-        SyncClass::BikeLog => {
-            let (bike_id, kind, entry_id) = bikelog::parse_log_key(&item.key).ok_or_else(|| sync_error(format!("{:?} is not a bike-log key", item.key)))?;
-            bikelog::entry_path(data_root, bike_id, kind, entry_id)
         }
     };
     std::fs::read(&path).map_err(|e| sync_error(format!("reading local {:?} {}: {e}", item.class, item.key)))
