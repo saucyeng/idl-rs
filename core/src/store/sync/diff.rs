@@ -48,6 +48,11 @@ pub enum SyncClass {
     Workbook,
     Track,
     Profile,
+    /// `bikes/<id>.json`; `key` is the bike id. Merged by the receiver.
+    Bike,
+    /// `bikelog/<bike>/<kind>-<id>.json`; `key` is `<bike>/<kind>-<id>`.
+    /// Merged by the receiver as a union of versions.
+    BikeLog,
 }
 
 /// Why nothing is transferred for an item that differs on both sides.
@@ -158,6 +163,20 @@ pub fn plan_sync(local: &Manifest, remote: &Manifest, local_skipped: &[SkippedEn
         }
     }
 
+    let bike_ids: BTreeSet<&str> = local.bikes.iter().map(|b| b.bike_id.as_str()).chain(remote.bikes.iter().map(|b| b.bike_id.as_str())).collect();
+    for bike_id in bike_ids {
+        let l = local.bikes.iter().find(|b| b.bike_id == bike_id).map(|b| (b.sha256.as_str(), b.size_bytes));
+        let r = remote.bikes.iter().find(|b| b.bike_id == bike_id).map(|b| (b.sha256.as_str(), b.size_bytes));
+        actions.extend(merge_diff(SyncClass::Bike, bike_id, l, r));
+    }
+
+    let log_keys: BTreeSet<&str> = local.bike_log.iter().map(|e| e.key.as_str()).chain(remote.bike_log.iter().map(|e| e.key.as_str())).collect();
+    for key in log_keys {
+        let l = local.bike_log.iter().find(|e| e.key == key).map(|e| (e.sha256.as_str(), e.size_bytes));
+        let r = remote.bike_log.iter().find(|e| e.key == key).map(|e| (e.sha256.as_str(), e.size_bytes));
+        actions.extend(merge_diff(SyncClass::BikeLog, key, l, r));
+    }
+
     apply_local_skips(local, remote, local_skipped, &mut actions, &mut notes);
 
     actions.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
@@ -210,6 +229,19 @@ fn workbook_file_name_from_skip_path(path: &str) -> Option<String> {
     }
 }
 
+/// Bike and bike-log rule (bike-log spec §4): one side only, copy it
+/// across; both, with different bytes, fetch the peer's copy and merge. The
+/// merge is a symmetric union, so the two sides converge once each has run.
+fn merge_diff(class: SyncClass, key: &str, local: Option<(&str, u64)>, remote: Option<(&str, u64)>) -> Option<SyncAction> {
+    let item = |size_bytes| SyncItem { class, key: key.to_string(), session_id: None, size_bytes };
+    match (local, remote) {
+        (None, None) => None,
+        (None, Some((_, size))) => Some(SyncAction::Pull(item(size))),
+        (Some((_, size)), None) => Some(SyncAction::Push(item(size))),
+        (Some((l, _)), Some((r, size))) => (l != r).then(|| SyncAction::PullForMerge(item(size))),
+    }
+}
+
 fn find_session<'a>(m: &'a Manifest, session_id: &str) -> Option<&'a SessionEntry> {
     m.sessions.iter().find(|s| s.session_id == session_id)
 }
@@ -223,6 +255,8 @@ fn class_rank(c: SyncClass) -> u8 {
         SyncClass::Workbook => 4,
         SyncClass::Track => 5,
         SyncClass::Profile => 6,
+        SyncClass::Bike => 7,
+        SyncClass::BikeLog => 8,
     }
 }
 
@@ -507,7 +541,7 @@ mod tests {
     use crate::store::sync::manifest::{BlobEntry, DerivedEntry, SessionJsonEntry};
 
     fn empty_manifest() -> Manifest {
-        Manifest { schema_version: 1, generated_at_ms: 0, blobs: Vec::new(), sessions: Vec::new(), workbooks: Vec::new(), tracks: Vec::new(), profiles: Vec::new() }
+        Manifest { schema_version: 1, generated_at_ms: 0, blobs: Vec::new(), sessions: Vec::new(), workbooks: Vec::new(), tracks: Vec::new(), profiles: Vec::new(), bikes: Vec::new(), bike_log: Vec::new() }
     }
 
     fn dp(sha256: &str, importer_version: &str, seam_correction_version: &str) -> DataParquetEntry {
@@ -949,4 +983,34 @@ mod tests {
             }]
         );
     }
+
+    #[test]
+    fn plan_sync_bike_log_one_side_copies_across_and_differing_copies_merge() {
+        // Arrange
+        use super::super::manifest::BikeLogFileEntry;
+        let entry = |key: &str, sha: &str| BikeLogFileEntry { key: key.to_string(), sha256: sha.repeat(64), size_bytes: 10 };
+        let mut local = empty_manifest();
+        let mut remote = empty_manifest();
+        local.bike_log = vec![entry("gt/note-a", "1"), entry("gt/note-b", "2"), entry("gt/note-same", "4")];
+        remote.bike_log = vec![entry("gt/note-b", "3"), entry("gt/note-c", "5"), entry("gt/note-same", "4")];
+
+        // Act
+        let plan = plan_sync(&local, &remote, &[]);
+
+        // Assert
+        let got: Vec<(&str, &str)> = plan
+            .actions
+            .iter()
+            .map(|a| match a {
+                SyncAction::Pull(i) => ("pull", i.key.as_str()),
+                SyncAction::Push(i) => ("push", i.key.as_str()),
+                SyncAction::PullForMerge(i) => ("merge", i.key.as_str()),
+            })
+            .collect();
+        assert_eq!(got.len(), 3);
+        assert!(got.contains(&("push", "gt/note-a")));
+        assert!(got.contains(&("merge", "gt/note-b")));
+        assert!(got.contains(&("pull", "gt/note-c")));
+    }
+
 }

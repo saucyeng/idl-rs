@@ -258,6 +258,29 @@ fn check_id(id: &str) -> Result<(), BikeLogError> {
     }
 }
 
+/// Whether `id` is usable as a bike or entry id (a safe file name).
+pub fn is_valid_id(id: &str) -> bool {
+    check_id(id).is_ok()
+}
+
+/// The sync key of a log entry file: `<bike_id>/<kind>-<entry_id>`, its
+/// path under `bikelog/` without `.json`.
+pub fn log_key(bike_id: &str, kind: EntryKind, entry_id: &str) -> String {
+    format!("{bike_id}/{}{entry_id}", kind.file_prefix())
+}
+
+/// Splits a sync key from [`log_key`] into `(bike_id, kind, entry_id)`;
+/// `None` for anything else, including unsafe ids.
+pub fn parse_log_key(key: &str) -> Option<(&str, EntryKind, &str)> {
+    let (bike_id, stem) = key.split_once('/')?;
+    let (kind, entry_id) = if let Some(id) = stem.strip_prefix(EntryKind::Note.file_prefix()) {
+        (EntryKind::Note, id)
+    } else {
+        (EntryKind::Sheet, stem.strip_prefix(EntryKind::Sheet.file_prefix())?)
+    };
+    (is_valid_id(bike_id) && is_valid_id(entry_id)).then_some((bike_id, kind, entry_id))
+}
+
 /// `<data>/bikes/<bike_id>.json`.
 pub fn bike_path(data_root: &Path, bike_id: &str) -> PathBuf {
     data_root.join("bikes").join(format!("{bike_id}.json"))
@@ -599,6 +622,23 @@ mod tests {
         assert_eq!(sheets.entries.iter().map(|e| e.entry_id.as_str()).collect::<Vec<_>>(), vec!["01B"]);
         assert_eq!(all.entries.len(), 2);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_log_key_round_trips_log_key_and_refuses_anything_else() {
+        // Arrange
+        let key = log_key("gt-force", EntryKind::Sheet, "01ABC");
+
+        // Act
+        let parsed = parse_log_key(&key);
+
+        // Assert
+        assert_eq!(key, "gt-force/sheet-01ABC");
+        assert_eq!(parsed, Some(("gt-force", EntryKind::Sheet, "01ABC")));
+        assert_eq!(parse_log_key("gt/note-01"), Some(("gt", EntryKind::Note, "01")));
+        for bad in ["gt", "gt/other-01", "../x/note-01", "gt/note-", "gt/note-a/b", "gt/note-a.b"] {
+            assert_eq!(parse_log_key(bad), None, "{bad}");
+        }
     }
 
     #[test]

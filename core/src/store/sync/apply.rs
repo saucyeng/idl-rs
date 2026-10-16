@@ -163,6 +163,8 @@ pub fn install(data_root: &Path, item: &SyncItem, bytes: &[u8], peer_name: &str,
         SyncClass::Workbook => install_workbook(data_root, item, bytes, peer_name, ctx),
         SyncClass::Track => install_track(data_root, bytes),
         SyncClass::Profile => install_profile(data_root, bytes),
+        SyncClass::Bike => install_bike(data_root, item, bytes),
+        SyncClass::BikeLog => install_bike_log(data_root, item, bytes),
     }
 }
 
@@ -511,6 +513,37 @@ fn install_profile(data_root: &Path, bytes: &[u8]) -> Result<InstallOutcome, Syn
         }
     }
     crate::store::profile::save(data_root, &peer)?;
+    Ok(InstallOutcome::Installed)
+}
+
+fn bikelog_error(e: crate::store::bikelog::BikeLogError) -> SyncError {
+    let kind = if e.kind == crate::store::bikelog::BikeLogErrorKind::Io { SyncErrorKind::Io } else { SyncErrorKind::Malformed };
+    SyncError { kind, message: e.message }
+}
+
+/// Bike (bike-log spec §4): merged with the local copy part by part, the
+/// newer of each part winning. The bike's id must be the one asked for.
+fn install_bike(data_root: &Path, item: &SyncItem, bytes: &[u8]) -> Result<InstallOutcome, SyncError> {
+    let peer: crate::store::bikelog::Bike = serde_json::from_slice(bytes).map_err(|e| malformed(format!("bike: {e}")))?;
+    if peer.bike_id != item.key || !crate::store::bikelog::is_valid_id(&peer.bike_id) {
+        return Err(malformed(format!("bike: asked for {:?}, received {:?}", item.key, peer.bike_id)));
+    }
+    crate::store::bikelog::save_bike(data_root, &peer).map_err(bikelog_error)?;
+    Ok(InstallOutcome::Installed)
+}
+
+/// Bike-log entry (bike-log spec §4): merged with the local copy as a union
+/// of versions, so no edit from either side is lost. The entry's bike,
+/// kind and id must match the key asked for.
+fn install_bike_log(data_root: &Path, item: &SyncItem, bytes: &[u8]) -> Result<InstallOutcome, SyncError> {
+    let peer: crate::store::bikelog::Entry = serde_json::from_slice(bytes).map_err(|e| malformed(format!("bike log: {e}")))?;
+    let Some((bike_id, kind, entry_id)) = crate::store::bikelog::parse_log_key(&item.key) else {
+        return Err(malformed(format!("bike log: {:?} is not a log key", item.key)));
+    };
+    if peer.bike_id != bike_id || peer.kind != kind || peer.entry_id != entry_id {
+        return Err(malformed(format!("bike log: asked for {:?}, received a different entry", item.key)));
+    }
+    crate::store::bikelog::save_entry(data_root, &peer).map_err(bikelog_error)?;
     Ok(InstallOutcome::Installed)
 }
 

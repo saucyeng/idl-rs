@@ -108,6 +108,9 @@ pub struct SyncResultDto {
     pub sessions_updated: u32,
     pub tracks_updated: u32,
     pub profiles_updated: u32,
+    /// Bikes and bike-log entries transferred, pull and push combined
+    /// (added 2026-10-16, bike-log spec §4).
+    pub bike_log_updated: u32,
 }
 
 impl From<idl_transport::sync::SyncRunResult> for SyncResultDto {
@@ -119,6 +122,7 @@ impl From<idl_transport::sync::SyncRunResult> for SyncResultDto {
             sessions_updated: r.sessions_updated,
             tracks_updated: r.tracks_updated,
             profiles_updated: r.profiles_updated,
+            bike_log_updated: r.bike_log_updated,
         }
     }
 }
@@ -933,7 +937,7 @@ mod tests {
         let peer_status = PeerStatusDto { peer_id: "p1".to_string(), name: "Pit Tablet".to_string(), online: true, protocol_version: 1, paired_at_ms: 42 };
         let this_device = ThisDeviceDto { peer_id: "self".to_string(), name: "idl1".to_string() };
         let sync_status = SyncStatusDto { paired_peers: vec![peer_status.clone()], discovered_peers: Vec::new(), last_sync_utc_ms: Some(7), this_device };
-        let sync_result = SyncResultDto { blobs_transferred: 1, workbooks_merged: 2, conflicts: 3, sessions_updated: 4, tracks_updated: 5, profiles_updated: 6 };
+        let sync_result = SyncResultDto { blobs_transferred: 1, workbooks_merged: 2, conflicts: 3, sessions_updated: 4, tracks_updated: 5, profiles_updated: 6, bike_log_updated: 7 };
         let pairing_offer = PairingOfferDto { code: "004200".to_string(), expires_at_ms: 99 };
 
         // Act
@@ -955,7 +959,7 @@ mod tests {
         result_keys.sort();
         assert_eq!(
             result_keys,
-            vec!["blobs_transferred", "conflicts", "profiles_updated", "sessions_updated", "tracks_updated", "workbooks_merged"]
+            vec!["bike_log_updated", "blobs_transferred", "conflicts", "profiles_updated", "sessions_updated", "tracks_updated", "workbooks_merged"]
         );
 
         let mut offer_keys: Vec<&str> = offer_json.as_object().unwrap().keys().map(String::as_str).collect();
