@@ -582,6 +582,14 @@ async fn download_with<W: WifiTransport>(
     let bytes = std::fs::read(&tmp_path)
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading back {}: {e}", tmp_path.display())))?;
     let size_bytes = bytes.len() as u64;
+    // A stream that ended early (the logger's SD read failed, 2026-10-16)
+    // is not a ride: keep the `.part` for the next attempt.
+    if file.size_bytes > 0 && size_bytes < file.size_bytes {
+        return Err(IpcError::new(
+            IpcErrorKind::Wifi,
+            format!("the logger sent {size_bytes} of {} bytes", file.size_bytes),
+        ));
+    }
     let sha256 = sha256_hex(&bytes);
 
     // C4 §2's fixed sharded convention: first 2 hex chars as a
@@ -2232,6 +2240,26 @@ pub(crate) mod tests {
         ) -> Result<(), idl_transport::wifi_transport::OtaPushError> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn download_files_via_a_stream_shorter_than_the_listed_size_fails_and_keeps_the_part() {
+        // Arrange
+        let data_dir = tempfile::tempdir().unwrap();
+        let wifi = BatchWifi { content: b"ride".to_vec(), fail: None };
+        let events = StdMutex::new(Vec::new());
+        let emit = |e: TransferEvent| events.lock().unwrap().push(e);
+        let cancel = tokio::sync::Notify::new();
+
+        // Act
+        let end = download_files_via(&wifi, "dev", &wanted(&["a.idl1"], 10), data_dir.path(), &cancel, &emit).await;
+
+        // Assert
+        let done = events.lock().unwrap().iter().filter(|e| matches!(e, TransferEvent::Done { .. })).count();
+        let parts = std::fs::read_dir(data_dir.path().join("tmp")).unwrap().count();
+        assert!(end.link_failed);
+        assert_eq!(done, 0);
+        assert_eq!(parts, 1);
     }
 
     #[tokio::test(start_paused = true)]
