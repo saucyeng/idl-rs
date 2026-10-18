@@ -25,3 +25,5 @@ pub mod session_json;
 pub mod settings;
 pub mod sync;
 pub mod verify;
+/// Linking MP4s to sessions (video spec §3–§4, C1 §6 `videos`).
+pub mod video;

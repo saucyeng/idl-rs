@@ -125,6 +125,11 @@ pub struct SessionJson {
     /// Additive, added 2026-10-16.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bike_log: Option<crate::store::bikelog::SessionBikeLog>,
+    /// Videos linked to this session, tombstones included (C1 §6, video
+    /// spec §3.2). Additive, added 2026-10-16; omitted when empty. Sync
+    /// merges it by entry, keyed by `blob_sha256` (C4 §6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub videos: Vec<crate::video::VideoLink>,
 }
 
 impl VersionedConfig for SessionJson {
@@ -348,6 +353,7 @@ pub fn empty_session_json(session_id: impl Into<String>) -> SessionJson {
         lap_detector_version: None,
         bike_id: String::new(),
         bike_log: None,
+        videos: Vec::new(),
     }
 }
 
@@ -542,6 +548,53 @@ mod tests {
         // Act + Assert
         assert_eq!(effective_start_ms(&header_doc, 42), 42);
         assert_eq!(effective_start_ms(&legacy_doc, 42), 42);
+    }
+
+    #[test]
+    fn session_json_with_no_videos_omits_the_key_and_a_file_without_it_parses_empty() {
+        // Arrange
+        let doc = empty_session_json("abc123");
+        let legacy = r#"{"schema_version":1,"session_id":"legacy"}"#;
+
+        // Act
+        let text = serde_json::to_string(&doc).unwrap();
+        let parsed = parse_session_json(legacy.as_bytes()).unwrap();
+
+        // Assert
+        assert!(!text.contains("videos"));
+        assert!(parsed.videos.is_empty());
+    }
+
+    #[test]
+    fn session_json_with_a_video_and_a_tombstone_round_trips() {
+        // Arrange
+        let root = temp_root();
+        let mut doc = empty_session_json("abc123");
+        let live = crate::video::VideoLink {
+            blob_sha256: "a".repeat(64),
+            size_bytes: 4_100_000_000,
+            file_name: "GX010123.MP4".to_string(),
+            video_codec: "hevc".to_string(),
+            width_px: 3840,
+            height_px: 2160,
+            fps: 59.94,
+            duration_s: 530.5,
+            offset_s: -4.2,
+            sync_method: crate::video::SyncMethod::Gpmf,
+            unlinked: false,
+            updated_at_ms: 1_700_000_000_000,
+        };
+        let tombstone = crate::video::VideoLink { blob_sha256: "b".repeat(64), unlinked: true, ..live.clone() };
+        doc.videos = vec![live, tombstone];
+
+        // Act
+        write_session_json(&root, "abc123", &doc, None).unwrap();
+        let back = read_session_json(&root.join("sessions").join("abc123").join("session.json")).unwrap();
+
+        // Assert
+        assert_eq!(back, doc);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

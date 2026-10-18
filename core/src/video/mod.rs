@@ -95,8 +95,11 @@ pub enum VideoErrorKind {
     NoOverlap,
     /// More than one session overlaps the video (inbox only).
     Ambiguous,
-    /// The session, or the `videos` entry, does not exist.
+    /// The session, or the `videos` entry, does not exist (or the entry's
+    /// file is not on this device, for re-estimation).
     NotFound,
+    /// A caller-supplied argument is invalid (a non-finite offset).
+    InvalidArgument,
     /// The caller's cancel flag was set during a copy. Nothing was linked.
     Cancelled,
 }

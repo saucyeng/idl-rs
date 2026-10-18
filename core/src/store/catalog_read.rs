@@ -114,6 +114,9 @@ pub struct SessionDetail {
     /// What the session took from its bike's log: the entries and the
     /// setup sheet at its start (C1 §6).
     pub bike_log: Option<crate::store::bikelog::SessionBikeLog>,
+    /// Live linked videos, in `session.json` order, each with whether its
+    /// file is on this device (C3 §3.12).
+    pub videos: Vec<crate::video::SessionVideo>,
 }
 
 /// Mirrors C1 §6 `session.json`'s `laps[]` object field for field — the
@@ -400,6 +403,7 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
         });
     }
 
+    let videos = crate::store::video::session_videos(data_root, &doc);
     Ok(SessionDetail {
         session_id: session_id.to_string(),
         device_id: metadata.device_id,
@@ -429,6 +433,7 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
         overlay_lap_key: doc.overlay_lap_key,
         starred_lap_number: doc.starred_lap_number,
         track_visits_library_hash: doc.track_visits_library_hash,
+        videos,
         bike_id: doc.bike_id,
         bike_log: doc.bike_log,
     })
