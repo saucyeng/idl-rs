@@ -78,6 +78,9 @@ mod tests {
         // (c) the inbox: removes the dropped file only *after* a successful
         // import (R191); a failed import renames it into `inbox/failed/`.
         ("tauri/src/inbox.rs", "import_one"),
+        // An inbox `.mp4` is removed only after it linked to exactly one
+        // session, its bytes then being in `blobs/` (C4 §2, 2026-10-16).
+        ("tauri/src/inbox.rs", "link_one_video"),
         // (d) catalog.sqlite and its -wal/-shm sidecars — a rebuildable
         // index, never `blobs/` or `sessions/`.
         ("core/src/store/catalog.rs", "rebuild_catalog_with_progress"),
@@ -97,10 +100,21 @@ mod tests {
         ("tauri/src/commands/app.rs", "copy_verify_delete"),
         ("tauri/src/commands/app.rs", "move_data_dir_with"),
         ("tauri/src/commands/app.rs", "prune_emptied_dirs"),
-        // (e) the one and only blob-deleting path: `delete_session` with
+        // (e) the blob-deleting paths: `delete_session` with
         // `delete_blob: true`, after confirming no other session references
         // the same content hash.
         ("tauri/src/commands/catalog.rs", "delete_session_via"),
+        // `unlink_video` with `delete_file: true` (C3 §3.12): one video's
+        // MP4 blob, only when no session's live `videos` entry still
+        // references it. Per device; the tombstone stops sync restoring it.
+        ("core/src/store/video.rs", "unlink_video"),
+        // `link_video`: removes the MP4 blob this same call copied in when
+        // the link then fails and nothing links that blob (never a blob it
+        // found already present).
+        ("core/src/store/video.rs", "link_video"),
+        // `copy_into_blobs`: its own `tmp/video-<uuid>.part` on a failed or
+        // cancelled copy, or when the blob turns out to exist already.
+        ("core/src/store/video.rs", "copy_into_blobs"),
     ];
 
     /// The idl-rs workspace root (`tauri/`'s parent).

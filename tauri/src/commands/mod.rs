@@ -22,6 +22,8 @@ pub mod scatter;
 pub mod seams;
 pub mod sync;
 pub mod tiles;
+/// Linked video (C3 §3.12).
+pub mod video;
 pub mod workbook;
 
 /// Reports the engine crate version so the UI (and sync peers) can prove

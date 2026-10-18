@@ -154,6 +154,19 @@ pub enum IpcErrorKind {
     /// keeps running; the app never aborts on allocation failure (CLAUDE.md
     /// §5). `detail` carries `{ needed_bytes, budget_bytes, hint }`.
     ResourceExhausted,
+    /// `VideoErrorKind::Parse` (C3 §3.12, added 2026-10-16) — Video:
+    /// `link_video`, `match_videos`, `reestimate_video_offset`. Not an MP4
+    /// the engine can read. `detail` carries `{ reason }`.
+    VideoParse,
+    /// `VideoErrorKind::NoOverlap` (C3 §3.12) — Video: `link_video`,
+    /// `match_videos`, `reestimate_video_offset`, the inbox. The video's time
+    /// span misses the session's. `detail` carries `{ video_start_utc_ms,
+    /// video_end_utc_ms, session_start_utc_ms, session_end_utc_ms }`, UTC ms,
+    /// each `null` when unknown.
+    VideoNoOverlap,
+    /// `VideoErrorKind::Ambiguous` (C3 §3.12) — the inbox only: more than
+    /// one session overlaps the video. `detail` carries `{ session_ids }`.
+    VideoAmbiguous,
 }
 
 /// One JSON error crossing every fallible command (C3 §2). `detail`'s shape
@@ -374,9 +387,95 @@ impl From<idl_rs::store::scan::ScanError> for IpcError {
     }
 }
 
+/// C3 §3.12 (Video). `VideoErrorKind` maps to the three `video_*` kinds,
+/// `not_found`, `invalid_argument` and `io`. `NoGpmf` never leaves core's
+/// estimator in practice (it falls back to the creation time); it reads as
+/// a parse failure if it ever does. `Cancelled` has no C3 row because no
+/// command cancels a link (C3 §3.12 defines none); it folds into
+/// `internal`.
+impl From<idl_rs::video::VideoError> for IpcError {
+    fn from(e: idl_rs::video::VideoError) -> Self {
+        use idl_rs::video::{VideoErrorDetail, VideoErrorKind};
+        match e.kind {
+            VideoErrorKind::Parse | VideoErrorKind::NoGpmf => {
+                let detail = serde_json::json!({ "reason": e.message.clone() });
+                IpcError::with_detail(IpcErrorKind::VideoParse, e.message, detail)
+            }
+            VideoErrorKind::NoOverlap => {
+                let detail = match e.detail {
+                    VideoErrorDetail::Spans(s) => serde_json::json!({
+                        "video_start_utc_ms": s.video_start_utc_ms,
+                        "video_end_utc_ms": s.video_end_utc_ms,
+                        "session_start_utc_ms": s.session_start_utc_ms,
+                        "session_end_utc_ms": s.session_end_utc_ms,
+                    }),
+                    _ => serde_json::json!({
+                        "video_start_utc_ms": null,
+                        "video_end_utc_ms": null,
+                        "session_start_utc_ms": null,
+                        "session_end_utc_ms": null,
+                    }),
+                };
+                IpcError::with_detail(IpcErrorKind::VideoNoOverlap, e.message, detail)
+            }
+            VideoErrorKind::Ambiguous => {
+                let ids = match e.detail {
+                    VideoErrorDetail::SessionIds(ids) => ids,
+                    _ => Vec::new(),
+                };
+                IpcError::with_detail(IpcErrorKind::VideoAmbiguous, e.message, serde_json::json!({ "session_ids": ids }))
+            }
+            VideoErrorKind::NotFound => IpcError::new(IpcErrorKind::NotFound, e.message),
+            VideoErrorKind::InvalidArgument => IpcError::new(IpcErrorKind::InvalidArgument, e.message),
+            VideoErrorKind::Io => IpcError::new(IpcErrorKind::Io, e.message),
+            VideoErrorKind::Cancelled => IpcError::new(IpcErrorKind::Internal, e.message),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_error_no_overlap_serialises_as_video_no_overlap_with_both_spans() {
+        // Arrange
+        let e = idl_rs::video::VideoError::no_overlap(
+            "misses",
+            idl_rs::video::OverlapSpans {
+                video_start_utc_ms: Some(1),
+                video_end_utc_ms: Some(2),
+                session_start_utc_ms: Some(3),
+                session_end_utc_ms: None,
+            },
+        );
+
+        // Act
+        let json = serde_json::to_value(IpcError::from(e)).unwrap();
+
+        // Assert
+        assert_eq!(json["kind"], "video_no_overlap");
+        assert_eq!(json["detail"]["video_start_utc_ms"], 1);
+        assert_eq!(json["detail"]["session_start_utc_ms"], 3);
+        assert!(json["detail"]["session_end_utc_ms"].is_null());
+    }
+
+    #[test]
+    fn video_error_parse_and_ambiguous_carry_reason_and_session_ids() {
+        // Arrange
+        let parse = idl_rs::video::VideoError::parse("mp4: no moov/mvhd found");
+        let ambiguous = idl_rs::video::VideoError::ambiguous("two sessions", vec!["a".to_string(), "b".to_string()]);
+
+        // Act
+        let parse = serde_json::to_value(IpcError::from(parse)).unwrap();
+        let ambiguous = serde_json::to_value(IpcError::from(ambiguous)).unwrap();
+
+        // Assert
+        assert_eq!(parse["kind"], "video_parse");
+        assert_eq!(parse["detail"]["reason"], "mp4: no moov/mvhd found");
+        assert_eq!(ambiguous["kind"], "video_ambiguous");
+        assert_eq!(ambiguous["detail"]["session_ids"], serde_json::json!(["a", "b"]));
+    }
 
     #[test]
     fn ipc_error_kind_serialises_snake_case_matching_c3() {

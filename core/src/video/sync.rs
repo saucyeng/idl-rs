@@ -196,8 +196,8 @@ pub fn estimate_sync(telemetry: Option<&VideoTelemetry>, info: &Mp4Info, clock: 
             OverlapSpans {
                 video_start_utc_ms: video_span.map(|s| s.0),
                 video_end_utc_ms: video_span.map(|s| s.1),
-                session_start_utc_ms,
-                session_end_utc_ms: session_start_utc_ms + (session_len_s * 1000.0).round() as i64,
+                session_start_utc_ms: Some(session_start_utc_ms),
+                session_end_utc_ms: Some(session_start_utc_ms + (session_len_s * 1000.0).round() as i64),
             },
         ));
     }
@@ -303,8 +303,8 @@ mod tests {
             VideoErrorDetail::Spans(OverlapSpans {
                 video_start_utc_ms: Some(600_000),
                 video_end_utc_ms: Some(660_000),
-                session_start_utc_ms: 1_000_000,
-                session_end_utc_ms: 1_121_000,
+                session_start_utc_ms: Some(1_000_000),
+                session_end_utc_ms: Some(1_121_000),
             })
         );
     }

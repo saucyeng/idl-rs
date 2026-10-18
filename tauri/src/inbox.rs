@@ -213,6 +213,9 @@ fn import_one(data_dir: &Path, file: &Path) -> Result<(), IpcError> {
                 format!("{} has no file extension to choose an importer from", file.display()),
             )
         })?;
+    if ext == "mp4" {
+        return link_one_video(data_dir, file);
+    }
     let logger_file = ext == "idl0" || ext == "idl1";
     if !logger_file && idl_rs::import::importer_for_extension(&ext).is_none() {
         return Err(IpcError::new(IpcErrorKind::InvalidArgument, format!("no importer covers '.{ext}' files")));
@@ -227,6 +230,44 @@ fn import_one(data_dir: &Path, file: &Path) -> Result<(), IpcError> {
     }
     .map_err(IpcError::from)?;
 
+    std::fs::remove_file(file)
+        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("removing {}: {e}", file.display())))?;
+    Ok(())
+}
+
+/// An `.mp4` is linked, not imported (C4 §2, added 2026-10-16): it is
+/// matched to sessions by time, and exactly one overlapping session links
+/// it; then the inbox copy is deleted, its bytes being in `blobs/`. No
+/// overlapping session is `video_no_overlap`, several is
+/// `video_ambiguous` naming them; either way the caller moves the file to
+/// `failed/` for the user to link by hand.
+fn link_one_video(data_dir: &Path, file: &Path) -> Result<(), IpcError> {
+    use idl_rs::video::{OverlapSpans, VideoError};
+    let matched = idl_rs::store::video::match_videos(data_dir, &[file.to_path_buf()])
+        .pop()
+        .ok_or_else(|| IpcError::new(IpcErrorKind::Internal, "match_videos answered no file"))?;
+    if let Some(e) = matched.error {
+        return Err(e.into());
+    }
+    match matched.session_ids.as_slice() {
+        [session_id] => {
+            let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+            let never = std::sync::atomic::AtomicBool::new(false);
+            idl_rs::store::video::link_video(data_dir, session_id, file, now_ms, &never, &mut |_| {})?;
+        }
+        [] => {
+            let spans = OverlapSpans {
+                video_start_utc_ms: matched.video_span_utc_ms.map(|s| s.0),
+                video_end_utc_ms: matched.video_span_utc_ms.map(|s| s.1),
+                session_start_utc_ms: None,
+                session_end_utc_ms: None,
+            };
+            return Err(VideoError::no_overlap(format!("no session overlaps {}", file.display()), spans).into());
+        }
+        many => {
+            return Err(VideoError::ambiguous(format!("{} sessions overlap {}; link it by hand", many.len(), file.display()), many.to_vec()).into());
+        }
+    }
     std::fs::remove_file(file)
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("removing {}: {e}", file.display())))?;
     Ok(())
@@ -374,6 +415,29 @@ mod tests {
         assert!(state.path.join("failed").join("broken.idl0").is_file());
         assert!(state.path.join("failed").join("broken.idl0.error.txt").is_file());
         assert!(!state.path.join("broken.idl0").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inbox_a_dropped_mp4_no_session_overlaps_moves_to_failed_with_video_no_overlap() {
+        // Arrange — a timed video in an empty library.
+        let root = temp_root();
+        let state = InboxState::start_with_settle(&root, Duration::from_millis(20)).unwrap();
+        let created_1904_s = 1_700_000_000 + 2_082_844_800;
+        let bytes = idl_rs::video::mp4box::fixture::synthetic_mp4(created_1904_s, &[]);
+
+        // Act
+        std::fs::write(state.path.join("GX010001.MP4"), bytes).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        wait_idle(&state);
+
+        // Assert
+        let status = state.status();
+        assert_eq!(status.failed.len(), 1);
+        assert_eq!(status.failed[0].error.kind, IpcErrorKind::VideoNoOverlap);
+        assert_eq!(status.failed[0].error.detail.as_ref().unwrap()["video_start_utc_ms"], 1_700_000_000_000i64);
+        assert!(state.path.join("failed").join("GX010001.MP4").is_file());
 
         let _ = std::fs::remove_dir_all(&root);
     }

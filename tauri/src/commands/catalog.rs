@@ -234,6 +234,9 @@ pub struct SessionDetail {
     pub bike_id: String,
     /// What the session took from its bike's log (C1 §6, C3 §3.11).
     pub bike_log: Option<idl_rs::store::bikelog::SessionBikeLog>,
+    /// Live linked videos, in `session.json` order, each with `on_device`
+    /// (C3 §3.12).
+    pub videos: Vec<idl_rs::video::SessionVideo>,
 }
 
 impl From<catalog_read::SessionDetail> for SessionDetail {
@@ -266,6 +269,7 @@ impl From<catalog_read::SessionDetail> for SessionDetail {
             track_visits_library_hash: d.track_visits_library_hash,
             bike_id: d.bike_id,
             bike_log: d.bike_log,
+            videos: d.videos,
         }
     }
 }

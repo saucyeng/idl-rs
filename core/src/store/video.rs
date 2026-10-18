@@ -48,6 +48,9 @@ pub struct VideoMatch {
     pub path: PathBuf,
     /// Overlapping session ids, ascending.
     pub session_ids: Vec<String>,
+    /// The video's span, UTC ms `(first frame, end)`; `None` when the file
+    /// could not be read or carries no time.
+    pub video_span_utc_ms: Option<(i64, i64)>,
     /// Why the file could not be matched, when it could not.
     pub error: Option<VideoError>,
 }
@@ -435,18 +438,20 @@ pub fn match_videos(data_root: &Path, paths: &[PathBuf]) -> Vec<VideoMatch> {
         .map(|path| {
             let span = probe_file(path).map(|(info, telemetry)| video_span_utc_ms(telemetry.as_ref(), &info));
             match span {
-                Err(e) => VideoMatch { path: path.clone(), session_ids: Vec::new(), error: Some(e) },
+                Err(e) => VideoMatch { path: path.clone(), session_ids: Vec::new(), video_span_utc_ms: None, error: Some(e) },
                 Ok(None) => VideoMatch {
                     path: path.clone(),
                     session_ids: Vec::new(),
+                    video_span_utc_ms: None,
                     error: Some(VideoError::no_overlap(
                         format!("{} carries no time (no GPS time, no creation time); link it to a session by hand", path.display()),
-                        OverlapSpans { video_start_utc_ms: None, video_end_utc_ms: None, session_start_utc_ms: 0, session_end_utc_ms: 0 },
+                        OverlapSpans { video_start_utc_ms: None, video_end_utc_ms: None, session_start_utc_ms: None, session_end_utc_ms: None },
                     )),
                 },
                 Ok(Some((v0, v1))) => VideoMatch {
                     path: path.clone(),
                     session_ids: sessions.iter().filter(|(_, (s0, s1))| v0 <= *s1 && v1 >= *s0).map(|(id, _)| id.clone()).collect(),
+                    video_span_utc_ms: Some((v0, v1)),
                     error: None,
                 },
             }
@@ -586,7 +591,7 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, VideoErrorKind::NoOverlap);
-        assert!(matches!(err.detail, VideoErrorDetail::Spans(s) if s.session_start_utc_ms == START_MS));
+        assert!(matches!(err.detail, VideoErrorDetail::Spans(s) if s.session_start_utc_ms == Some(START_MS)));
         assert!(!root.join("blobs").exists());
         assert!(doc(&root, S1).videos.is_empty());
 

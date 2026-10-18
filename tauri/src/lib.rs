@@ -27,6 +27,9 @@ pub mod platform;
 pub mod session_cache;
 pub mod session_source;
 pub mod state;
+/// The `idl1-video` URI scheme's request logic (C3 §3.12): playback bytes
+/// for linked videos, registered on the builder in `app/src-tauri`.
+pub mod video;
 pub mod watcher;
 pub use error::{IpcError, IpcErrorKind};
 
@@ -132,5 +135,10 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::sync::pair_with_link,
         commands::sync::unpair_peer,
         commands::sync::set_sync_device_name,
+        commands::video::link_video,
+        commands::video::match_videos,
+        commands::video::set_video_offset,
+        commands::video::reestimate_video_offset,
+        commands::video::unlink_video,
     ]
 }

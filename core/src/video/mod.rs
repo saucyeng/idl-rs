@@ -106,7 +106,8 @@ pub enum VideoErrorKind {
 
 /// The two time spans a [`VideoErrorKind::NoOverlap`] names, UTC ms since
 /// the Unix epoch. The video's side is `None` when the file carries no time
-/// anchor at all.
+/// anchor at all; the session's side is `None` when no one session is
+/// meant (a file matched against the whole library).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlapSpans {
     /// The video's first frame, UTC ms.
@@ -114,9 +115,9 @@ pub struct OverlapSpans {
     /// The video's end, UTC ms.
     pub video_end_utc_ms: Option<i64>,
     /// The session's start, UTC ms.
-    pub session_start_utc_ms: i64,
+    pub session_start_utc_ms: Option<i64>,
     /// The session's end, UTC ms.
-    pub session_end_utc_ms: i64,
+    pub session_end_utc_ms: Option<i64>,
 }
 
 /// Structured detail beside a [`VideoError`]'s message.
