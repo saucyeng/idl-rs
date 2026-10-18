@@ -19,7 +19,7 @@ use idl_rs::store::blob::blob_path;
 use idl_rs::store::sync::apply::{install, InstallContext, InstallOutcome};
 use idl_rs::store::sync::diff::{plan_sync, SyncAction, SyncClass, SyncItem};
 use idl_rs::store::sync::ids::{is_valid_id, safe_join, IdClass};
-use idl_rs::store::sync::manifest::{build_manifest, Manifest};
+use idl_rs::store::sync::manifest::{build_manifest, Manifest, BLOB_KIND_VIDEO};
 
 use crate::error::{TransportError, TransportErrorKind};
 use crate::wifi_transport::{parse_content_range, range_header};
@@ -66,6 +66,44 @@ pub struct SyncRunResult {
     /// Successful `SyncClass::Bike` transfers (a bike and its log), pull and
     /// push combined.
     pub bike_log_updated: u32,
+    /// Video blobs deliberately not moved (C4 §6): pulls this device skips
+    /// because it does not hold video (mobile), and pushes a peer declined
+    /// with `409 {"skipped": "video"}`. Skipped, not failed: never logged as
+    /// a failure. A Rust-side detail like [`Self::sessions_touched`]; C3
+    /// §3.9's `SyncResult` wire shape is unchanged.
+    pub videos_skipped: u32,
+}
+
+/// Whether this build holds video blobs (C4 §6, video spec §10 item 3):
+/// mobile neither pulls nor accepts them by default.
+pub fn holds_video() -> bool {
+    !cfg!(any(target_os = "android", target_os = "ios"))
+}
+
+/// How a push ended when it did not fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushOutcome {
+    /// The peer took the bytes (`200`).
+    Sent,
+    /// The peer declined a video blob (`409 {"skipped": "video"}`, C4 §6).
+    SkippedVideo,
+}
+
+/// Removes the pulls of `kind: "video"` blobs (per `remote`'s manifest)
+/// from `actions` when this device does not hold video (`holds_video`
+/// false). Returns how many were removed.
+fn drop_video_pulls(actions: &mut Vec<SyncAction>, remote: &Manifest, holds_video: bool) -> u32 {
+    if holds_video {
+        return 0;
+    }
+    let videos: BTreeSet<&str> =
+        remote.blobs.iter().filter(|b| b.kind.as_deref() == Some(BLOB_KIND_VIDEO)).map(|b| b.sha256.as_str()).collect();
+    let before = actions.len();
+    actions.retain(|a| match a {
+        SyncAction::Pull(item) | SyncAction::PullForMerge(item) => !(item.class == SyncClass::Blob && videos.contains(item.key.as_str())),
+        SyncAction::Push(_) => true,
+    });
+    (before - actions.len()) as u32
 }
 
 /// One progress tick. `phase` is C3 §3.9's union as Task 1 widened it:
@@ -222,9 +260,10 @@ pub async fn sync_with_peer(
     let (local_manifest, local_skipped) =
         build_manifest(data_root, now_ms).map_err(|e| sync_error(format!("building local manifest: {e}")))?;
 
-    let plan = plan_sync(&local_manifest, &remote_manifest, &local_skipped);
+    let mut plan = plan_sync(&local_manifest, &remote_manifest, &local_skipped);
 
     let mut result = SyncRunResult::default();
+    result.videos_skipped += drop_video_pulls(&mut plan.actions, &remote_manifest, holds_video());
     let mut sessions_touched: BTreeSet<String> = BTreeSet::new();
 
     for phase in PHASES {
@@ -321,7 +360,14 @@ async fn run_one_action(
         SyncAction::Pull(_) | SyncAction::PullForMerge(_) => {
             pull_and_install(client, base_url, peer, data_root, item, remote_manifest, now_ms).await.map(|o| (true, Some(o)))
         }
-        SyncAction::Push(_) => push_item(client, base_url, peer, data_root, item, local_manifest).await.map(|()| (false, None)),
+        SyncAction::Push(_) => match push_item(client, base_url, peer, data_root, item, local_manifest).await {
+            Ok(PushOutcome::Sent) => Ok((false, None)),
+            Ok(PushOutcome::SkippedVideo) => {
+                result.videos_skipped += 1;
+                return;
+            }
+            Err(e) => Err(e),
+        },
     };
     match outcome {
         Ok((is_pull, install_outcome)) => tally_success(item, is_pull, install_outcome, result, sessions_touched),
@@ -632,15 +678,29 @@ fn read_local_item_bytes(data_root: &Path, item: &SyncItem, local_manifest: &Man
 /// present) — counts as success (this task's brief: "a `200` reporting no
 /// write still counts as success, not a transfer" — that distinction lives
 /// in the peer's own `InstallOutcome`, which this response never carries).
-async fn push_item(client: &reqwest::Client, base_url: &str, peer: &Peer, data_root: &Path, item: &SyncItem, local_manifest: &Manifest) -> Result<(), TransportError> {
+/// A blob answered `409 {"skipped": "video"}` is a peer that does not hold
+/// video (C4 §6): [`PushOutcome::SkippedVideo`], not a failure.
+async fn push_item(client: &reqwest::Client, base_url: &str, peer: &Peer, data_root: &Path, item: &SyncItem, local_manifest: &Manifest) -> Result<PushOutcome, TransportError> {
     let bytes = read_local_item_bytes(data_root, item, local_manifest)?;
     let url = item_url(base_url, item)?;
     let response = client.put(&url).bearer_auth(&peer.token).body(bytes).send().await.map_err(|e| sync_error(format!("PUT {url} failed: {e}")))?;
     let status = response.status();
+    if status == reqwest::StatusCode::CONFLICT && item.class == SyncClass::Blob {
+        let body = bounded_bytes(response, MAX_DOCUMENT_BODY_BYTES, "PUT blob 409").await?;
+        if is_skipped_video_body(&body) {
+            return Ok(PushOutcome::SkippedVideo);
+        }
+        return Err(sync_error(format!("PUT {url} returned status {status}")));
+    }
     if !status.is_success() {
         return Err(sync_error(format!("PUT {url} returned status {status}")));
     }
-    Ok(())
+    Ok(PushOutcome::Sent)
+}
+
+/// `true` for C4 §6's `{"skipped": "video"}` answer body.
+fn is_skipped_video_body(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v.get("skipped").and_then(|s| s.as_str()) == Some(BLOB_KIND_VIDEO))
 }
 
 #[cfg(test)]
@@ -671,6 +731,47 @@ mod tests {
     }
 
     fn no_progress(_p: SyncProgress) {}
+
+    fn manifest_with_blobs(blobs: Vec<idl_rs::store::sync::manifest::BlobEntry>) -> Manifest {
+        Manifest { schema_version: 1, generated_at_ms: 0, blobs, sessions: Vec::new(), workbooks: Vec::new(), tracks: Vec::new(), profiles: Vec::new(), bikes: Vec::new() }
+    }
+
+    fn blob_pull(sha: &str) -> SyncAction {
+        SyncAction::Pull(SyncItem { class: SyncClass::Blob, key: sha.to_string(), session_id: None, size_bytes: 1 })
+    }
+
+    #[test]
+    fn drop_video_pulls_a_device_without_video_drops_only_video_blob_pulls() {
+        // Arrange
+        use idl_rs::store::sync::manifest::BlobEntry;
+        let video = "a".repeat(64);
+        let log = "b".repeat(64);
+        let remote = manifest_with_blobs(vec![
+            BlobEntry { sha256: video.clone(), size_bytes: 1, kind: Some(BLOB_KIND_VIDEO.to_string()) },
+            BlobEntry { sha256: log.clone(), size_bytes: 1, kind: None },
+        ]);
+        let push = SyncAction::Push(SyncItem { class: SyncClass::Blob, key: "c".repeat(64), session_id: None, size_bytes: 1 });
+        let mut on_phone = vec![blob_pull(&video), blob_pull(&log), push.clone()];
+        let mut on_desktop = on_phone.clone();
+
+        // Act
+        let dropped_phone = drop_video_pulls(&mut on_phone, &remote, false);
+        let dropped_desktop = drop_video_pulls(&mut on_desktop, &remote, true);
+
+        // Assert
+        assert_eq!(dropped_phone, 1);
+        assert_eq!(on_phone, vec![blob_pull(&log), push]);
+        assert_eq!(dropped_desktop, 0);
+        assert_eq!(on_desktop.len(), 3);
+    }
+
+    #[test]
+    fn is_skipped_video_body_recognises_only_the_c4_answer() {
+        // Act + Assert
+        assert!(is_skipped_video_body(br#"{"skipped":"video"}"#));
+        assert!(!is_skipped_video_body(br#"{"skipped":"log"}"#));
+        assert!(!is_skipped_video_body(b"conflict"));
+    }
 
     /// Spawns a one-shot raw HTTP/1.1 server that writes `raw_response`
     /// verbatim to the first connection it accepts, then closes it — R178:
