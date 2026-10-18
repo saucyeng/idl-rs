@@ -3,7 +3,39 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # .cargo/config.toml pins target-dir to a Windows path shared across the
+      # dev machine's worktrees; on Linux that path cannot be joined into
+      # LD_LIBRARY_PATH. The env var overrides it.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Tauri v2 Linux prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test -p idl-rs -p idl-rs-cli
+        run: cargo test -p idl-rs -p idl-rs-cli -- --test-threads=4
+
+      - name: cargo test -p idl-rs-tauri
+        run: cargo test -p idl-rs-tauri -- --test-threads=4
+
+      - name: cargo test -p idl-transport
+        run: cargo test -p idl-transport -- --test-threads=4
