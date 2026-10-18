@@ -54,7 +54,10 @@ impl SessionClock {
     /// non-finite epochs are dropped; then a pair is kept only if its
     /// offset `epoch_ms − recorded_ms` is within [`GLITCH_TOLERANCE_MS`] of
     /// the median offset, so one wild epoch removes only itself rather than
-    /// every fix after it; of exact-duplicate epochs the first is kept.
+    /// every fix after it; last, a pair whose epoch is not after the last
+    /// kept one is dropped (an exact duplicate keeps the first), so the
+    /// result increases by construction. A small backwards glitch inside
+    /// the tolerance costs at most about that many ms of fixes.
     pub fn new(start_utc_ms: i64, duration_s: f64, gps_epoch_ms: &[f64], gps_t_s: &[f64]) -> Self {
         let candidates: Vec<(f64, f64)> = gps_epoch_ms
             .iter()
@@ -70,13 +73,12 @@ impl SessionClock {
                 if (e - t * 1000.0 - median).abs() > GLITCH_TOLERANCE_MS {
                     continue;
                 }
-                if gps.last().is_some_and(|&(last_e, _)| e == last_e) {
+                if gps.last().is_some_and(|&(last_e, _)| e <= last_e) {
                     continue;
                 }
                 gps.push((e, t));
             }
         }
-        debug_assert!(gps.windows(2).all(|w| w[0].0 < w[1].0), "kept GPS epochs must increase");
         SessionClock { gps, start_utc_ms, duration_s }
     }
 
@@ -538,6 +540,22 @@ mod tests {
         // Assert
         assert_eq!(clock.gps.len(), 9);
         assert!((clock.epoch_ms_to_session_s(104_000.0) - 4.0).abs() < 1e-9, "interpolated across the gap");
+    }
+
+    #[test]
+    fn session_clock_a_small_backwards_glitch_inside_the_tolerance_removes_only_that_fix() {
+        // Arrange — fix 4 lands 500 ms before fix 3: near the median offset,
+        // but not after the last kept epoch.
+        let (epochs, times) = ride(10, &[(4, 102_500.0)]);
+
+        // Act
+        let clock = SessionClock::new(0, 9.0, &epochs, &times);
+
+        // Assert
+        assert_eq!(clock.gps.len(), 9);
+        assert!(clock.gps.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!((clock.epoch_ms_to_session_s(104_000.0) - 4.0).abs() < 1e-9);
+        assert!((clock.epoch_ms_to_session_s(107_250.0) - 7.25).abs() < 1e-9, "later fixes map");
     }
 
     #[test]
