@@ -154,7 +154,8 @@ pub struct CellOutput {
     /// "math" | "table" | "js" | "video" — never "prose" (ledger R21; prose has no
     /// fence id and never gets its own `CellOutput`).
     pub kind: String,
-    /// `null` for `math`/`js` (their results live in `defs`); for a `table`
+    /// `null` for `math`/`js` (their results live in `defs`) and for `video`
+    /// (no output; it is emitted so the app can place its prose); for a `table`
     /// cell, `{ model, results }` on success (ledger R21) — `null` when no
     /// session is bound (nothing to evaluate against) or the table JSON
     /// itself failed to parse (that structural error is in `errors`).

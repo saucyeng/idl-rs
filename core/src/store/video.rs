@@ -22,7 +22,7 @@ use crate::store::session_json::{effective_start_ms, parse_session_json, read_se
 use crate::video::gpmf::{parse_gpmf, VideoTelemetry};
 use crate::video::mp4box::{probe_path, Mp4Info};
 use crate::video::sync::{estimate_sync, video_span_utc_ms, SessionClock, SyncEstimate};
-use crate::video::{OverlapSpans, SessionVideo, SyncMethod, VideoError, VideoErrorKind, VideoLink};
+use crate::video::{SessionVideo, SyncMethod, VideoError, VideoErrorKind, VideoLink};
 
 /// Bytes read and written per step of the streaming copy.
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
@@ -395,14 +395,23 @@ pub fn video_blobs(data_root: &Path) -> BTreeSet<String> {
 }
 
 /// A session's live entries, in `session.json` order, each with whether its
-/// blob is on this device (C3 §3.12, `get_session`'s `videos`).
+/// blob is on this device and how many other sessions link it live (C3
+/// §3.12, `get_session`'s `videos`). `other_links` comes from a scan of
+/// every session's `session.json`, the canonical files, not the catalog.
 pub fn session_videos(data_root: &Path, doc: &SessionJson) -> Vec<SessionVideo> {
-    doc.videos
-        .iter()
-        .filter(|v| !v.unlinked)
+    let live: Vec<&VideoLink> = doc.videos.iter().filter(|v| !v.unlinked).collect();
+    if live.is_empty() {
+        return Vec::new();
+    }
+    let others: Vec<SessionJson> = all_session_docs(data_root).into_iter().filter(|d| d.session_id != doc.session_id).collect();
+    live.into_iter()
         .map(|v| SessionVideo {
             link: v.clone(),
             on_device: is_sha256_hex(&v.blob_sha256) && blob_exists(data_root, &v.blob_sha256),
+            other_links: others
+                .iter()
+                .filter(|d| d.videos.iter().any(|o| !o.unlinked && o.blob_sha256 == v.blob_sha256))
+                .count() as u32,
         })
         .collect()
 }
@@ -420,8 +429,7 @@ fn session_span_utc_ms(session_dir: &Path) -> Option<(i64, i64)> {
 /// For each file, the sessions whose UTC span overlaps the video's (C3
 /// §3.12 `match_videos`). Reads only each file's container header and each
 /// session's footer. A file that is not a readable MP4 carries `Parse`; one
-/// with no time anchor matches nothing and carries `NoOverlap` with the
-/// video's span unknown.
+/// with no time anchor matches nothing and carries `NoTime`.
 pub fn match_videos(data_root: &Path, paths: &[PathBuf]) -> Vec<VideoMatch> {
     let mut sessions: Vec<(String, (i64, i64))> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(data_root.join("sessions")) {
@@ -443,10 +451,7 @@ pub fn match_videos(data_root: &Path, paths: &[PathBuf]) -> Vec<VideoMatch> {
                     path: path.clone(),
                     session_ids: Vec::new(),
                     video_span_utc_ms: None,
-                    error: Some(VideoError::no_overlap(
-                        format!("{} carries no time (no GPS time, no creation time); link it to a session by hand", path.display()),
-                        OverlapSpans { video_start_utc_ms: None, video_end_utc_ms: None, session_start_utc_ms: None, session_end_utc_ms: None },
-                    )),
+                    error: Some(VideoError::new(VideoErrorKind::NoTime, crate::video::NO_TIME_MESSAGE)),
                 },
                 Ok(Some((v0, v1))) => VideoMatch {
                     path: path.clone(),
@@ -769,11 +774,15 @@ mod tests {
         link(&root, S2, &source, 1).unwrap();
 
         // Act
+        let shared = session_videos(&root, &doc(&root, S1));
         let t1 = unlink_video(&root, S1, &sha, true, 5).unwrap();
+        let after = session_videos(&root, &doc(&root, S2));
         let kept = blob_exists(&root, &sha);
         unlink_video(&root, S2, &sha, true, 6).unwrap();
 
         // Assert
+        assert_eq!(shared[0].other_links, 1, "S2 links it too");
+        assert_eq!(after[0].other_links, 0, "S1's entry is a tombstone now");
         assert!(t1.unlinked);
         assert_eq!(t1.updated_at_ms, 5);
         assert!(kept, "S2 still linked it");
@@ -846,7 +855,7 @@ mod tests {
         assert!(out[0].error.is_none());
         assert!(out[1].session_ids.is_empty());
         assert!(out[1].error.is_none());
-        assert_eq!(out[2].error.as_ref().unwrap().kind, VideoErrorKind::NoOverlap);
+        assert_eq!(out[2].error.as_ref().unwrap().kind, VideoErrorKind::NoTime);
         assert_eq!(out[3].error.as_ref().unwrap().kind, VideoErrorKind::Parse);
 
         let _ = std::fs::remove_dir_all(&root);

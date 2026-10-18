@@ -161,12 +161,17 @@ pub enum IpcErrorKind {
     /// `VideoErrorKind::NoOverlap` (C3 §3.12) — Video: `link_video`,
     /// `match_videos`, `reestimate_video_offset`, the inbox. The video's time
     /// span misses the session's. `detail` carries `{ video_start_utc_ms,
-    /// video_end_utc_ms, session_start_utc_ms, session_end_utc_ms }`, UTC ms,
-    /// each `null` when unknown.
+    /// video_end_utc_ms, session_start_utc_ms, session_end_utc_ms }`, UTC ms.
+    /// The session's two are `null` only from the inbox, when no session in
+    /// the library overlaps.
     VideoNoOverlap,
     /// `VideoErrorKind::Ambiguous` (C3 §3.12) — the inbox only: more than
     /// one session overlaps the video. `detail` carries `{ session_ids }`.
     VideoAmbiguous,
+    /// `VideoErrorKind::NoTime` (C3 §3.12, lead ruling E4) — Video:
+    /// `match_videos`, the inbox. The file carries no recording time to
+    /// match by. No detail.
+    VideoNoTime,
 }
 
 /// One JSON error crossing every fallible command (C3 §2). `detail`'s shape
@@ -402,21 +407,18 @@ impl From<idl_rs::video::VideoError> for IpcError {
                 IpcError::with_detail(IpcErrorKind::VideoParse, e.message, detail)
             }
             VideoErrorKind::NoOverlap => {
-                let detail = match e.detail {
-                    VideoErrorDetail::Spans(s) => serde_json::json!({
-                        "video_start_utc_ms": s.video_start_utc_ms,
-                        "video_end_utc_ms": s.video_end_utc_ms,
-                        "session_start_utc_ms": s.session_start_utc_ms,
-                        "session_end_utc_ms": s.session_end_utc_ms,
-                    }),
-                    _ => serde_json::json!({
-                        "video_start_utc_ms": null,
-                        "video_end_utc_ms": null,
-                        "session_start_utc_ms": null,
-                        "session_end_utc_ms": null,
-                    }),
-                };
-                IpcError::with_detail(IpcErrorKind::VideoNoOverlap, e.message, detail)
+                match e.detail {
+                    VideoErrorDetail::Spans(s) => {
+                        let detail = serde_json::json!({
+                            "video_start_utc_ms": s.video_start_utc_ms,
+                            "video_end_utc_ms": s.video_end_utc_ms,
+                            "session_start_utc_ms": s.session_start_utc_ms,
+                            "session_end_utc_ms": s.session_end_utc_ms,
+                        });
+                        IpcError::with_detail(IpcErrorKind::VideoNoOverlap, e.message, detail)
+                    }
+                    _ => IpcError::new(IpcErrorKind::VideoNoOverlap, e.message),
+                }
             }
             VideoErrorKind::Ambiguous => {
                 let ids = match e.detail {
@@ -425,6 +427,7 @@ impl From<idl_rs::video::VideoError> for IpcError {
                 };
                 IpcError::with_detail(IpcErrorKind::VideoAmbiguous, e.message, serde_json::json!({ "session_ids": ids }))
             }
+            VideoErrorKind::NoTime => IpcError::new(IpcErrorKind::VideoNoTime, e.message),
             VideoErrorKind::NotFound => IpcError::new(IpcErrorKind::NotFound, e.message),
             VideoErrorKind::InvalidArgument => IpcError::new(IpcErrorKind::InvalidArgument, e.message),
             VideoErrorKind::Io => IpcError::new(IpcErrorKind::Io, e.message),
@@ -443,8 +446,8 @@ mod tests {
         let e = idl_rs::video::VideoError::no_overlap(
             "misses",
             idl_rs::video::OverlapSpans {
-                video_start_utc_ms: Some(1),
-                video_end_utc_ms: Some(2),
+                video_start_utc_ms: 1,
+                video_end_utc_ms: 2,
                 session_start_utc_ms: Some(3),
                 session_end_utc_ms: None,
             },

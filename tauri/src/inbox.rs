@@ -256,12 +256,8 @@ fn link_one_video(data_dir: &Path, file: &Path) -> Result<(), IpcError> {
             idl_rs::store::video::link_video(data_dir, session_id, file, now_ms, &never, &mut |_| {})?;
         }
         [] => {
-            let spans = OverlapSpans {
-                video_start_utc_ms: matched.video_span_utc_ms.map(|s| s.0),
-                video_end_utc_ms: matched.video_span_utc_ms.map(|s| s.1),
-                session_start_utc_ms: None,
-                session_end_utc_ms: None,
-            };
+            let (video_start_utc_ms, video_end_utc_ms) = matched.video_span_utc_ms.unwrap_or((0, 0));
+            let spans = OverlapSpans { video_start_utc_ms, video_end_utc_ms, session_start_utc_ms: None, session_end_utc_ms: None };
             return Err(VideoError::no_overlap(format!("no session overlaps {}", file.display()), spans).into());
         }
         many => {

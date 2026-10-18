@@ -77,6 +77,10 @@ pub struct SessionVideo {
     /// `true` when `blobs/sha256/…` holds the MP4 here. A missing blob is a
     /// normal state (C1 §6): deleted on this device, or never pulled.
     pub on_device: bool,
+    /// How many *other* sessions have a live entry for the same blob (C3
+    /// §3.12): what the unlink prompt's "also delete the file" default
+    /// turns on.
+    pub other_links: u32,
 }
 
 /// What went wrong in the video subsystem. C3 §3.12 maps these to
@@ -95,6 +99,11 @@ pub enum VideoErrorKind {
     NoOverlap,
     /// More than one session overlaps the video (inbox only).
     Ambiguous,
+    /// The file carries no recording time (no GPMF GPS time, no container
+    /// creation time), so it cannot be matched to a session by time
+    /// (`match_videos`, the inbox). `link_video` never raises it: it links
+    /// such a file as manual at offset 0.
+    NoTime,
     /// The session, or the `videos` entry, does not exist (or the entry's
     /// file is not on this device, for re-estimation).
     NotFound,
@@ -105,15 +114,14 @@ pub enum VideoErrorKind {
 }
 
 /// The two time spans a [`VideoErrorKind::NoOverlap`] names, UTC ms since
-/// the Unix epoch. The video's side is `None` when the file carries no time
-/// anchor at all; the session's side is `None` when no one session is
-/// meant (a file matched against the whole library).
+/// the Unix epoch. The session's side is `None` when no one session is
+/// meant (an inbox file that overlaps no session in the library).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverlapSpans {
     /// The video's first frame, UTC ms.
-    pub video_start_utc_ms: Option<i64>,
+    pub video_start_utc_ms: i64,
     /// The video's end, UTC ms.
-    pub video_end_utc_ms: Option<i64>,
+    pub video_end_utc_ms: i64,
     /// The session's start, UTC ms.
     pub session_start_utc_ms: Option<i64>,
     /// The session's end, UTC ms.
@@ -170,6 +178,9 @@ impl VideoError {
         VideoError { kind: VideoErrorKind::Ambiguous, message: message.into(), detail: VideoErrorDetail::SessionIds(session_ids) }
     }
 }
+
+/// [`VideoErrorKind::NoTime`]'s message (C3 §3.12, lead ruling E4).
+pub const NO_TIME_MESSAGE: &str = "This video has no recording time to match by; link it from the session.";
 
 impl fmt::Display for VideoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -232,13 +243,14 @@ mod tests {
     #[test]
     fn session_video_serialises_flat_with_on_device() {
         // Arrange
-        let v = SessionVideo { link: link(), on_device: true };
+        let v = SessionVideo { link: link(), on_device: true, other_links: 2 };
 
         // Act
         let value = serde_json::to_value(&v).unwrap();
 
         // Assert
         assert_eq!(value["on_device"], true);
+        assert_eq!(value["other_links"], 2);
         assert_eq!(value["blob_sha256"], "a".repeat(64));
     }
 }

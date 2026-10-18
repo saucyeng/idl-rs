@@ -185,7 +185,8 @@ pub fn estimate_sync(telemetry: Option<&VideoTelemetry>, info: &Mp4Info, clock: 
     let video_start_s = offset_s;
     let video_end_s = offset_s + info.duration_s;
     if video_end_s < 0.0 || video_start_s > session_len_s {
-        let video_span = video_span_utc_ms(telemetry, info);
+        // An anchored video always has a span (the anchor exists).
+        let (video_start_utc_ms, video_end_utc_ms) = video_span_utc_ms(telemetry, info).unwrap_or((epoch_ms, epoch_ms));
         let session_start_utc_ms = clock.start_utc_ms();
         return Err(VideoError::no_overlap(
             format!(
@@ -194,8 +195,8 @@ pub fn estimate_sync(telemetry: Option<&VideoTelemetry>, info: &Mp4Info, clock: 
                  set the offset by hand"
             ),
             OverlapSpans {
-                video_start_utc_ms: video_span.map(|s| s.0),
-                video_end_utc_ms: video_span.map(|s| s.1),
+                video_start_utc_ms,
+                video_end_utc_ms,
                 session_start_utc_ms: Some(session_start_utc_ms),
                 session_end_utc_ms: Some(session_start_utc_ms + (session_len_s * 1000.0).round() as i64),
             },
@@ -301,8 +302,8 @@ mod tests {
         assert_eq!(
             err.detail,
             VideoErrorDetail::Spans(OverlapSpans {
-                video_start_utc_ms: Some(600_000),
-                video_end_utc_ms: Some(660_000),
+                video_start_utc_ms: 600_000,
+                video_end_utc_ms: 660_000,
                 session_start_utc_ms: Some(1_000_000),
                 session_end_utc_ms: Some(1_121_000),
             })
