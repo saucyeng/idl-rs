@@ -404,12 +404,13 @@ fn write_file(path: &PathBuf, bytes: &[u8]) -> Result<(), CliError> {
         .map_err(|e| CliError::io(format!("writing {}: {e}", path.display())))
 }
 
-/// `math` / `table` / `js`.
+/// `math` / `table` / `js` / `video`.
 fn kind_name(kind: CellKindToken) -> &'static str {
     match kind {
         CellKindToken::Math => "math",
         CellKindToken::Table => "table",
         CellKindToken::Js => "js",
+        CellKindToken::Video => "video",
     }
 }
 

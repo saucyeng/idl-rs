@@ -425,7 +425,7 @@ pub fn migrate_cell_body(
     let new_body = match kind {
         CellKindToken::Math => rewrite_math_fence(cell_id, body, &mut renames),
         CellKindToken::Table => rewrite_table_fence(cell_id, body, &mut renames),
-        CellKindToken::Js => body.to_string(),
+        CellKindToken::Js | CellKindToken::Video => body.to_string(),
     };
     (new_body, renames)
 }

@@ -133,7 +133,7 @@ pub fn eval_cells(
         .map(|cell| {
             let defs = match cell.kind_token {
                 CellKindToken::Math => math_cell_defs(doc, cell, &mut resolved, &mut resolved_units),
-                CellKindToken::Table | CellKindToken::Js => Vec::new(),
+                CellKindToken::Table | CellKindToken::Js | CellKindToken::Video => Vec::new(),
             };
             let errors = errors_by_cell.remove(cell.id.as_str()).unwrap_or_default();
             CellEvalResult { cell_id: cell.id.clone(), kind: cell.kind_token, defs, errors }
@@ -269,6 +269,21 @@ mod tests {
     }
 
     // ---- Step 1/3: one entry per cell, in document order (L3-R25) ----
+
+    #[test]
+    fn a_video_cell_one_entry_with_no_definitions() {
+        // Arrange
+        let video = CellDoc { kind_token: CellKindToken::Video, raw_fence_body: "{}\n".to_string(), ..math_cell("eeeeeeee") };
+        let d = doc(vec![video], Vec::new());
+
+        // Act
+        let got = eval_cells(&d, &[], &EmptyLookup, &no_laps());
+
+        // Assert
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, CellKindToken::Video);
+        assert!(got[0].defs.is_empty());
+    }
 
     #[test]
     fn two_math_cells_one_two_def_one_single_a_table_cell_a_js_cell_one_entry_per_cell_in_document_order_two_def_cell_has_two_defrslts(

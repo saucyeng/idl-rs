@@ -218,7 +218,9 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
                     Err(e) => errors.push(e),
                 }
             }
-            CellKindToken::Js => {}
+            // C2 §2.1: a `video` body is a JSON object kept verbatim, with
+            // no keys defined yet, so there is nothing to parse or check.
+            CellKindToken::Js | CellKindToken::Video => {}
         }
     }
 
@@ -330,6 +332,7 @@ pub fn render_workbook(doc: &WorkbookDoc) -> String {
             CellKindToken::Math => "math",
             CellKindToken::Table => "table",
             CellKindToken::Js => "js",
+            CellKindToken::Video => "video",
         };
         out.push_str("```");
         out.push_str(kind);
@@ -397,6 +400,23 @@ mod tests {
         assert!(doc.cells[0].raw_fence_body.contains("fork_bottom_out = [fork_travel] > 195"));
         assert_eq!(doc.cells[1].id, "e5f6a7b8");
         assert_eq!(doc.cells[1].kind_token, CellKindToken::Js);
+    }
+
+    #[test]
+    fn a_video_cell_parses_as_video_and_renders_its_body_verbatim_unknown_keys_included() {
+        // Arrange
+        let markdown = "---\nid: 9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d\nname: Test\n---\n\n```video id=c0ffee00\n{ \"later\": [1, 2], \"x\": \"y\" }\n```\n";
+
+        // Act
+        let (doc, errors) = parse_workbook(markdown).unwrap();
+        let rendered = render_workbook(&doc);
+
+        // Assert
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(doc.cells.len(), 1);
+        assert_eq!(doc.cells[0].kind_token, CellKindToken::Video);
+        assert_eq!(doc.cells[0].id, "c0ffee00");
+        assert!(rendered.contains("```video id=c0ffee00\n{ \"later\": [1, 2], \"x\": \"y\" }\n```"), "{rendered}");
     }
 
     #[test]

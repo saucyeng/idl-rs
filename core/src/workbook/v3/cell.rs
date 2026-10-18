@@ -1,7 +1,7 @@
 //! Fence scanning, `id=hex8` assignment/generation, and prose-span
 //! attachment for workbook v3 (C2 §2.2–§2.4). Walks the document body (the
 //! text after front matter) with `pulldown-cmark`'s event stream to find
-//! fenced `math`/`table`/`js` cells; every other fence (including a bare
+//! fenced `math`/`table`/`js`/`video` cells; every other fence (including a bare
 //! ` ``` `) is inert and produces no [`CellDoc`] (C2 §1).
 
 use std::collections::HashSet;
@@ -22,6 +22,10 @@ pub enum CellKindToken {
     Table,
     /// ` ```js ` — an Observable Runtime cell (C2 §5).
     Js,
+    /// ` ```video ` — the primary session's linked video at the cursor (C2
+    /// §2.1, added 2026-10-16). Body: one JSON object, kept verbatim; no
+    /// keys are defined yet. Not evaluated: no host variable, no output.
+    Video,
 }
 
 /// One fenced cell (C2 §2). Prose itself is not a cell (§2.4) — it attaches
@@ -35,7 +39,7 @@ pub struct CellDoc {
     /// path's job, not this task's — [`scan_cells`] only ever returns an
     /// in-memory id.
     pub id: String,
-    /// `math` / `table` / `js`.
+    /// `math` / `table` / `js` / `video`.
     pub kind_token: CellKindToken,
     /// Raw Markdown text (not rendered — this lane does not render prose)
     /// from the end of the previous cell (or end of front matter, for the
@@ -61,7 +65,7 @@ pub struct CellDoc {
 
 /// Parses a fence's info string against C2 §2.2's `fence_open` grammar:
 /// `cell_kind (" " attr)*`, `attr ::= "id=" hex8`, `hex8 ::= [0-9a-f]{8}`.
-/// Returns `(kind, id)` when `info` names a math/table/js cell — `id` is
+/// Returns `(kind, id)` when `info` names a math/table/js/video cell — `id` is
 /// `Some` only when a well-formed `id=<hex8>` attribute was present.
 /// Any other attribute is the "reserved attribute namespace" C2 §2.2
 /// describes (room for a future `key=value`); this task neither interprets
@@ -74,6 +78,7 @@ fn parse_fence_open(info: &str) -> Option<(CellKindToken, Option<String>)> {
         "math" => CellKindToken::Math,
         "table" => CellKindToken::Table,
         "js" => CellKindToken::Js,
+        "video" => CellKindToken::Video,
         _ => return None,
     };
 

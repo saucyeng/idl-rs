@@ -151,7 +151,7 @@ pub struct ProseSpan {
 pub struct CellOutput {
     /// C2 fence-string id.
     pub cell_id: String,
-    /// "math" | "table" | "js" — never "prose" (ledger R21; prose has no
+    /// "math" | "table" | "js" | "video" — never "prose" (ledger R21; prose has no
     /// fence id and never gets its own `CellOutput`).
     pub kind: String,
     /// `null` for `math`/`js` (their results live in `defs`); for a `table`
@@ -292,6 +292,7 @@ fn cell_kind_str(k: CellKindToken) -> &'static str {
         CellKindToken::Math => "math",
         CellKindToken::Table => "table",
         CellKindToken::Js => "js",
+        CellKindToken::Video => "video",
     }
 }
 
