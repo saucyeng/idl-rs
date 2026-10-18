@@ -32,6 +32,7 @@
 //! here rather than invoked.
 
 use crate::store::session_json::SessionJson;
+use crate::video::VideoLink;
 
 /// One user-owned field's per-field merge (C4 §6): "changed" means "not
 /// equal to this type's zero value" (see this module's doc comment); a
@@ -58,6 +59,29 @@ fn merge_field<T: PartialEq + Default>(local: T, peer: T, local_newer: bool) -> 
             }
         }
     }
+}
+
+/// C4 §6's `videos` rule (added 2026-10-16): merged by entry, keyed by
+/// `blob_sha256`, never as one field. An entry on one side only is kept; an
+/// entry on both takes the side whose entry-level `updated_at_ms` is newer,
+/// as a whole, and an exact tie keeps local. Tombstones (`unlinked: true`)
+/// are entries like any other, which is what stops the union bringing an
+/// unlinked video back. Order: local's entries in local order, then the
+/// peer-only ones in peer order.
+fn merge_videos(local: &[VideoLink], peer: &[VideoLink]) -> Vec<VideoLink> {
+    let mut out: Vec<VideoLink> = local
+        .iter()
+        .map(|l| match peer.iter().find(|p| p.blob_sha256 == l.blob_sha256) {
+            Some(p) if p.updated_at_ms > l.updated_at_ms => p.clone(),
+            _ => l.clone(),
+        })
+        .collect();
+    for p in peer {
+        if !local.iter().any(|l| l.blob_sha256 == p.blob_sha256) {
+            out.push(p.clone());
+        }
+    }
+    out
 }
 
 /// C4 §6's `session.json` per-field merge. `local`/`peer` are each side's
@@ -112,6 +136,7 @@ pub fn merge_session_json(
         lap_detector_version: local.lap_detector_version.clone(),
         bike_id,
         bike_log,
+        videos: merge_videos(&local.videos, &peer.videos),
     }
 }
 
@@ -196,6 +221,84 @@ mod tests {
         assert_eq!(merged.lap_detector_version, Some("v-local".to_string()));
         assert_eq!(merged.track_visits_library_hash, Some("hash-local".to_string()));
         assert!(merged.laps.is_empty());
+    }
+
+    fn video(sha: char, offset_s: f64, unlinked: bool, updated_at_ms: i64) -> VideoLink {
+        VideoLink {
+            blob_sha256: sha.to_string().repeat(64),
+            size_bytes: 1,
+            file_name: format!("{sha}.mp4"),
+            video_codec: "h264".to_string(),
+            width_px: 1920,
+            height_px: 1080,
+            fps: 30.0,
+            duration_s: 60.0,
+            offset_s,
+            sync_method: crate::video::SyncMethod::Manual,
+            unlinked,
+            updated_at_ms,
+        }
+    }
+
+    #[test]
+    fn merge_session_json_videos_linked_on_different_sides_both_survive() {
+        // Arrange
+        let mut local = empty_session_json("s1");
+        local.videos = vec![video('a', 0.0, false, 10)];
+        let mut peer = empty_session_json("s1");
+        peer.videos = vec![video('b', 0.0, false, 20)];
+
+        // Act — the file-level recency must not matter to the entry rule.
+        let merged = merge_session_json(&local, &peer, 999, 1);
+
+        // Assert
+        assert_eq!(merged.videos, vec![video('a', 0.0, false, 10), video('b', 0.0, false, 20)]);
+    }
+
+    #[test]
+    fn merge_session_json_the_same_video_on_both_sides_the_newer_entry_wins_whole() {
+        // Arrange — a manual offset made on the peer later.
+        let mut local = empty_session_json("s1");
+        local.videos = vec![video('a', 1.0, false, 10)];
+        let mut peer = empty_session_json("s1");
+        peer.videos = vec![video('a', 7.5, false, 30)];
+
+        // Act
+        let merged = merge_session_json(&local, &peer, 100, 1);
+
+        // Assert
+        assert_eq!(merged.videos, vec![video('a', 7.5, false, 30)]);
+    }
+
+    #[test]
+    fn merge_session_json_the_same_video_with_equal_stamps_keeps_local() {
+        // Arrange
+        let mut local = empty_session_json("s1");
+        local.videos = vec![video('a', 1.0, false, 10)];
+        let mut peer = empty_session_json("s1");
+        peer.videos = vec![video('a', 2.0, false, 10)];
+
+        // Act
+        let merged = merge_session_json(&local, &peer, 1, 100);
+
+        // Assert
+        assert_eq!(merged.videos, vec![video('a', 1.0, false, 10)]);
+    }
+
+    #[test]
+    fn merge_session_json_a_newer_tombstone_unlinks_and_an_older_one_does_not() {
+        // Arrange — the peer unlinked `a` after the local edit; local
+        // re-linked `b` after the peer unlinked it.
+        let mut local = empty_session_json("s1");
+        local.videos = vec![video('a', 0.0, false, 10), video('b', 0.0, false, 50)];
+        let mut peer = empty_session_json("s1");
+        peer.videos = vec![video('a', 0.0, true, 20), video('b', 0.0, true, 40)];
+
+        // Act
+        let merged = merge_session_json(&local, &peer, 100, 100);
+
+        // Assert
+        assert_eq!(merged.videos, vec![video('a', 0.0, true, 20), video('b', 0.0, false, 50)]);
     }
 
     #[test]

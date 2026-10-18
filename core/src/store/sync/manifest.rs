@@ -22,7 +22,17 @@ pub struct BlobEntry {
     pub sha256: String,
     /// File size in bytes.
     pub size_bytes: u64,
+    /// What the blob is, when it is not a log (C4 §6, added 2026-10-16):
+    /// [`BLOB_KIND_VIDEO`] for an MP4 that a `session.json` `videos`
+    /// entry, live or tombstoned, references. Omitted for a log; an older
+    /// peer ignores it. A string rather than an enum, so a later kind does
+    /// not break an older reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
+
+/// [`BlobEntry::kind`] for a linked video's MP4 (C4 §6).
+pub const BLOB_KIND_VIDEO: &str = "video";
 
 /// One `sessions/<id>/derived/<sha256>.parquet` manifest entry — content-
 /// addressed like [`BlobEntry`], never overwritten (C4 §6).
@@ -264,6 +274,7 @@ fn file_mtime_ms(meta: &std::fs::Metadata) -> i64 {
 /// `verify_data_dir`'s finding to make, not this walk's (ruling R90).
 fn collect_blobs(data_root: &Path) -> Vec<BlobEntry> {
     let mut out = Vec::new();
+    let videos = crate::store::video::video_blobs(data_root);
     let shards_dir = data_root.join("blobs").join("sha256");
     let Ok(shards) = std::fs::read_dir(&shards_dir) else { return out };
     for shard in shards.flatten() {
@@ -275,7 +286,9 @@ fn collect_blobs(data_root: &Path) -> Vec<BlobEntry> {
                 continue;
             }
             let file_name = entry.file_name().to_string_lossy().into_owned();
-            out.push(BlobEntry { sha256: format!("{shard_name}{file_name}"), size_bytes: meta.len() });
+            let sha256 = format!("{shard_name}{file_name}");
+            let kind = videos.contains(&sha256).then(|| BLOB_KIND_VIDEO.to_string());
+            out.push(BlobEntry { sha256, size_bytes: meta.len(), kind });
         }
     }
     out
@@ -937,7 +950,10 @@ mod tests {
         let manifest = Manifest {
             schema_version: 1,
             generated_at_ms: 1_756_857_600_000,
-            blobs: vec![BlobEntry { sha256: "a".repeat(64), size_bytes: 12_345_678 }],
+            blobs: vec![
+                BlobEntry { sha256: "a".repeat(64), size_bytes: 12_345_678, kind: None },
+                BlobEntry { sha256: "9".repeat(64), size_bytes: 4_100_000_000, kind: Some(BLOB_KIND_VIDEO.to_string()) },
+            ],
             sessions: vec![SessionEntry {
                 session_id: "s1".to_string(),
                 data_parquet: Some(DataParquetEntry {
@@ -973,6 +989,65 @@ mod tests {
         assert_eq!(json["profiles"][0]["profile_id"], "p-1");
         assert_eq!(json["workbooks"][0]["workbook_id"], "wb-1");
         assert_eq!(json["bikes"][0]["bike_id"], "gt");
+        assert!(json["blobs"][0].get("kind").is_none(), "a log blob omits kind");
+        assert_eq!(json["blobs"][1]["kind"], "video");
+    }
+
+    #[test]
+    fn blob_entry_kind_an_older_peers_entry_reads_as_a_log_and_an_older_reader_ignores_kind() {
+        // Arrange — an entry as a pre-video peer sends it, and this build's
+        // video entry read by a struct shaped like that peer's.
+        #[derive(Deserialize)]
+        struct OlderBlobEntry {
+            sha256: String,
+            size_bytes: u64,
+        }
+        let older = r#"{"sha256":"aa","size_bytes":3}"#;
+        let newer = serde_json::to_string(&BlobEntry { sha256: "bb".to_string(), size_bytes: 4, kind: Some(BLOB_KIND_VIDEO.to_string()) }).unwrap();
+
+        // Act
+        let read_by_new: BlobEntry = serde_json::from_str(older).unwrap();
+        let read_by_old: OlderBlobEntry = serde_json::from_str(&newer).unwrap();
+
+        // Assert
+        assert_eq!(read_by_new.kind, None);
+        assert_eq!((read_by_old.sha256.as_str(), read_by_old.size_bytes), ("bb", 4));
+    }
+
+    #[test]
+    fn build_manifest_marks_a_blob_a_videos_entry_references_as_video() {
+        // Arrange — two blobs; a session's tombstoned entry names one.
+        use crate::store::blob::write_blob;
+        use crate::store::session_json::{empty_session_json, write_session_json};
+        let root = std::env::temp_dir().join(format!("idl-rs-manifest-video-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = write_blob(&root, b"a log").unwrap();
+        let mp4 = write_blob(&root, b"an mp4").unwrap();
+        let mut doc = empty_session_json("00112233445566778899aabbccddeeff");
+        doc.videos.push(crate::video::VideoLink {
+            blob_sha256: mp4.clone(),
+            size_bytes: 6,
+            file_name: "a.mp4".to_string(),
+            video_codec: "h264".to_string(),
+            width_px: 1,
+            height_px: 1,
+            fps: 1.0,
+            duration_s: 1.0,
+            offset_s: 0.0,
+            sync_method: crate::video::SyncMethod::Manual,
+            unlinked: true,
+            updated_at_ms: 1,
+        });
+        write_session_json(&root, "00112233445566778899aabbccddeeff", &doc, None).unwrap();
+
+        // Act
+        let (m, _) = build_manifest(&root, 0).unwrap();
+
+        // Assert
+        let kind_of = |sha: &str| m.blobs.iter().find(|b| b.sha256 == sha).unwrap().kind.clone();
+        assert_eq!(kind_of(&log), None);
+        assert_eq!(kind_of(&mp4), Some("video".to_string()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

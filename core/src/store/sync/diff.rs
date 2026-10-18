@@ -549,8 +549,8 @@ mod tests {
         // Arrange
         let mut local = empty_manifest();
         let mut remote = empty_manifest();
-        remote.blobs.push(BlobEntry { sha256: "r".repeat(64), size_bytes: 10 });
-        local.blobs.push(BlobEntry { sha256: "l".repeat(64), size_bytes: 20 });
+        remote.blobs.push(BlobEntry { sha256: "r".repeat(64), size_bytes: 10, kind: None });
+        local.blobs.push(BlobEntry { sha256: "l".repeat(64), size_bytes: 20, kind: None });
 
         // Act
         let plan = plan_sync(&local, &remote, &[]);
@@ -565,7 +565,7 @@ mod tests {
     fn plan_sync_identical_manifests_an_empty_plan() {
         // Arrange
         let mut m = empty_manifest();
-        m.blobs.push(BlobEntry { sha256: "a".repeat(64), size_bytes: 5 });
+        m.blobs.push(BlobEntry { sha256: "a".repeat(64), size_bytes: 5, kind: None });
         m.sessions.push(SessionEntry {
             session_id: "s1".to_string(),
             data_parquet: Some(dp("h1", "0.1.0", "v1")),
@@ -843,8 +843,8 @@ mod tests {
         // Arrange
         let mut local = empty_manifest();
         let mut remote = empty_manifest();
-        local.blobs.push(BlobEntry { sha256: "l".repeat(64), size_bytes: 1 });
-        remote.blobs.push(BlobEntry { sha256: "r".repeat(64), size_bytes: 2 });
+        local.blobs.push(BlobEntry { sha256: "l".repeat(64), size_bytes: 1, kind: None });
+        remote.blobs.push(BlobEntry { sha256: "r".repeat(64), size_bytes: 2, kind: None });
         local.tracks.push(TrackEntry { track_id: "t1".to_string(), sha256: "l".to_string(), size_bytes: 3, updated_at_ms: 1 });
         remote.tracks.push(TrackEntry { track_id: "t1".to_string(), sha256: "r".to_string(), size_bytes: 4, updated_at_ms: 2 });
 
