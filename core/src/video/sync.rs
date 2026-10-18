@@ -36,27 +36,47 @@ pub struct SessionClock {
     duration_s: f64,
 }
 
+/// How far a GPS fix's offset (`epoch_ms − recorded_ms`) may sit from the
+/// session's median offset and still count, ms.
+const GLITCH_TOLERANCE_MS: f64 = 2_000.0;
+
 /// Seconds of session per ms of UTC when no GPS interval gives a slope:
 /// wall-clock 1:1, which is what `GPS_EpochMs` means anyway.
 const WALL_CLOCK_SLOPE_S_PER_MS: f64 = 0.001;
 
 impl SessionClock {
     /// A clock from `GPS_EpochMs` values (`gps_epoch_ms`, UTC ms) and their
-    /// recorded times (`gps_t_s`, session s), index-aligned. Pairs whose UTC
-    /// is not finite, not positive (the logger's pre-lock zero), or not
-    /// strictly after the previous kept pair are dropped. `start_utc_ms` is
-    /// the session's effective start (UTC ms); `duration_s` its length (s).
+    /// recorded times (`gps_t_s`, session s), index-aligned. `start_utc_ms`
+    /// is the session's effective start (UTC ms); `duration_s` its length
+    /// (s).
+    ///
+    /// Glitch filter (lead ruling, 2026-10-18): zero (pre-lock) and
+    /// non-finite epochs are dropped; then a pair is kept only if its
+    /// offset `epoch_ms − recorded_ms` is within [`GLITCH_TOLERANCE_MS`] of
+    /// the median offset, so one wild epoch removes only itself rather than
+    /// every fix after it; of exact-duplicate epochs the first is kept.
     pub fn new(start_utc_ms: i64, duration_s: f64, gps_epoch_ms: &[f64], gps_t_s: &[f64]) -> Self {
-        let mut gps: Vec<(f64, f64)> = Vec::new();
-        for (&e, &t) in gps_epoch_ms.iter().zip(gps_t_s) {
-            if !e.is_finite() || e <= 0.0 || !t.is_finite() {
-                continue;
+        let candidates: Vec<(f64, f64)> = gps_epoch_ms
+            .iter()
+            .zip(gps_t_s)
+            .map(|(&e, &t)| (e, t))
+            .filter(|&(e, t)| e.is_finite() && e > 0.0 && t.is_finite())
+            .collect();
+        let mut offsets: Vec<f64> = candidates.iter().map(|&(e, t)| e - t * 1000.0).collect();
+        offsets.sort_by(f64::total_cmp);
+        let mut gps: Vec<(f64, f64)> = Vec::with_capacity(candidates.len());
+        if let Some(&median) = offsets.get(offsets.len() / 2) {
+            for (e, t) in candidates {
+                if (e - t * 1000.0 - median).abs() > GLITCH_TOLERANCE_MS {
+                    continue;
+                }
+                if gps.last().is_some_and(|&(last_e, _)| e == last_e) {
+                    continue;
+                }
+                gps.push((e, t));
             }
-            if gps.last().is_some_and(|&(last_e, _)| e <= last_e) {
-                continue;
-            }
-            gps.push((e, t));
         }
+        debug_assert!(gps.windows(2).all(|w| w[0].0 < w[1].0), "kept GPS epochs must increase");
         SessionClock { gps, start_utc_ms, duration_s }
     }
 
@@ -472,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn session_clock_drops_pre_lock_zeros_and_non_increasing_fixes() {
+    fn session_clock_drops_pre_lock_zeros_and_a_repeated_epoch() {
         // Arrange — the logger writes 0 before GPS lock; a repeated epoch
         // must not divide by zero.
         let clock = SessionClock::new(0, 10.0, &[0.0, 0.0, 5000.0, 5000.0, 6000.0], &[0.0, 1.0, 2.0, 3.0, 4.0]);
@@ -482,6 +502,69 @@ mod tests {
 
         // Assert
         assert!((t - 3.0).abs() < 1e-9, "interpolated between (5000, 2) and (6000, 4): {t}");
+    }
+
+    /// 1 Hz fixes from epoch 100_000 ms, recorded at t = 0, 1, 2… s, with
+    /// `glitch` overriding some epochs.
+    fn ride(n: usize, glitch: &[(usize, f64)]) -> (Vec<f64>, Vec<f64>) {
+        let mut epochs: Vec<f64> = (0..n).map(|i| 100_000.0 + i as f64 * 1000.0).collect();
+        for &(i, e) in glitch {
+            epochs[i] = e;
+        }
+        (epochs, (0..n).map(|i| i as f64).collect())
+    }
+
+    #[test]
+    fn session_clock_a_far_future_spike_mid_ride_removes_only_that_fix() {
+        // Arrange — fix 5 claims to be a year ahead.
+        let (epochs, times) = ride(10, &[(5, 100_000.0 + 3.15e10)]);
+
+        // Act
+        let clock = SessionClock::new(0, 9.0, &epochs, &times);
+
+        // Assert — nine fixes left, and the ones after the spike still map.
+        assert_eq!(clock.gps.len(), 9);
+        assert!((clock.epoch_ms_to_session_s(107_500.0) - 7.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn session_clock_a_single_backwards_glitch_removes_only_that_fix() {
+        // Arrange — fix 4 jumps an hour back.
+        let (epochs, times) = ride(10, &[(4, 104_000.0 - 3_600_000.0)]);
+
+        // Act
+        let clock = SessionClock::new(0, 9.0, &epochs, &times);
+
+        // Assert
+        assert_eq!(clock.gps.len(), 9);
+        assert!((clock.epoch_ms_to_session_s(104_000.0) - 4.0).abs() < 1e-9, "interpolated across the gap");
+    }
+
+    #[test]
+    fn session_clock_pre_lock_zeros_are_dropped() {
+        // Arrange
+        let (epochs, times) = ride(6, &[(0, 0.0), (1, 0.0)]);
+
+        // Act
+        let clock = SessionClock::new(0, 5.0, &epochs, &times);
+
+        // Assert
+        assert_eq!(clock.gps.len(), 4);
+        assert_eq!(clock.gps[0], (102_000.0, 2.0));
+    }
+
+    #[test]
+    fn session_clock_repeated_epochs_keep_the_first() {
+        // Arrange — the receiver repeats fix 3's epoch at t = 4 (1 s late,
+        // inside the tolerance).
+        let (epochs, times) = ride(6, &[(4, 103_000.0)]);
+
+        // Act
+        let clock = SessionClock::new(0, 5.0, &epochs, &times);
+
+        // Assert
+        assert_eq!(clock.gps.iter().filter(|&&(e, _)| e == 103_000.0).collect::<Vec<_>>(), vec![&(103_000.0, 3.0)]);
+        assert_eq!(clock.gps.len(), 5);
     }
 
     #[test]
