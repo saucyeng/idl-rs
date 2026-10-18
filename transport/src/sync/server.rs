@@ -22,6 +22,7 @@
 //!   real, current file name is looked up from the manifest and this
 //!   fallback never triggers).
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -35,7 +36,7 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use idl_rs::store::blob::blob_path;
-use idl_rs::store::sync::apply::{install, InstallContext};
+use idl_rs::store::sync::apply::{install, install_blob_file, InstallContext};
 use idl_rs::store::sync::diff::{SyncClass, SyncItem};
 use idl_rs::store::sync::ids::{is_valid_id, safe_join, IdClass};
 use idl_rs::store::sync::manifest::build_manifest;
@@ -285,22 +286,36 @@ fn is_valid_hash(s: &str) -> bool {
 /// brief: `Accept-Ranges: bytes`; `206`/`Content-Range` for a valid range;
 /// `416` for an unsatisfiable one). `404` if `path` is not a file — never
 /// leaks whether a directory exists at that path vs. nothing at all.
-fn serve_file(path: &Path, headers: &HeaderMap) -> Response {
-    let Ok(bytes) = std::fs::read(path) else {
+/// Streamed from disk (lead ruling E1, 2026-10-18): a video blob can be
+/// gigabytes, so the file is never read whole.
+async fn serve_file(path: &Path, headers: &HeaderMap) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let len = bytes.len() as u64;
+    let Ok(meta) = file.metadata().await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !meta.is_file() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let len = meta.len();
 
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     match parse_range(range_header, len) {
         Ok(None) => {
-            let mut response = Response::new(Body::from(bytes));
+            let mut response = Response::new(Body::from_stream(reader_chunks(file)));
             response.headers_mut().insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+            response.headers_mut().insert(header::CONTENT_LENGTH, len.into());
             response
         }
         Ok(Some((start, end))) => {
-            let slice = bytes[start as usize..=end as usize].to_vec();
-            let mut response = Response::new(Body::from(slice));
+            if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            let window = file.take(end - start + 1);
+            let mut response = Response::new(Body::from_stream(reader_chunks(window)));
+            response.headers_mut().insert(header::CONTENT_LENGTH, (end - start + 1).into());
             *response.status_mut() = StatusCode::PARTIAL_CONTENT;
             response.headers_mut().insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
             response
@@ -316,6 +331,25 @@ fn serve_file(path: &Path, headers: &HeaderMap) -> Response {
         }
         Err(_) => StatusCode::BAD_REQUEST.into_response(),
     }
+}
+
+/// An async reader (a file, or a ranged window of one) as a stream of
+/// chunks of at most 256 KiB, for a response body that must not hold the
+/// file in memory.
+fn reader_chunks<R: tokio::io::AsyncRead + Unpin + Send + 'static>(reader: R) -> impl futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static {
+    use tokio::io::AsyncReadExt;
+    futures::stream::unfold(Some(reader), |state| async move {
+        let mut reader = state?;
+        let mut buf = vec![0u8; 256 * 1024];
+        match reader.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(buf), Some(reader)))
+            }
+            Err(e) => Some((Err(e), None)),
+        }
+    })
 }
 
 /// Generous cap for a small syncable document body — `session.json`,
@@ -385,20 +419,88 @@ async fn handle_blob_get(State(state): State<ServerState>, AxumPath(hash): AxumP
         return StatusCode::NOT_FOUND.into_response();
     }
     let path = blob_path(&state.data_root, &hash);
-    serve_file(&path, &headers)
+    serve_file(&path, &headers).await
+}
+
+/// What this server does with a blob `PUT`, decided from its own merged
+/// `session.json` files before any byte is read (C4 §6, lead ruling E2):
+/// `None` declines it (`409 {"skipped": "video"}`); `Some(cap)` accepts up
+/// to `cap` bytes. A linked video is declined on a device that does not
+/// hold video, and anywhere only tombstones reference it; otherwise it has
+/// no cap. Every other blob keeps [`MAX_RAW_FILE_BODY_BYTES`].
+fn blob_put_cap(videos: &BTreeSet<String>, live: &BTreeSet<String>, hash: &str, holds_video: bool) -> Option<u64> {
+    if !videos.contains(hash) {
+        return Some(MAX_RAW_FILE_BODY_BYTES as u64);
+    }
+    (holds_video && live.contains(hash)).then_some(u64::MAX)
+}
+
+/// Streams a request body into `part`, refusing past `cap` bytes with `413`
+/// (and removing `part`), or `400` on a broken stream. Never holds the body
+/// in memory (lead ruling E1).
+async fn receive_body_to_part(body: Body, part: &Path, cap: u64) -> Result<(), Response> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = part.parent() {
+        if tokio::fs::create_dir_all(parent).await.is_err() {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    }
+    let Ok(mut file) = tokio::fs::File::create(part).await else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    };
+    let mut stream = body.into_data_stream();
+    let mut total = 0u64;
+    let failure = loop {
+        let Some(chunk) = stream.next().await else { break None };
+        let Ok(chunk) = chunk else { break Some(StatusCode::BAD_REQUEST) };
+        total += chunk.len() as u64;
+        if total > cap {
+            break Some(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        if file.write_all(&chunk).await.is_err() {
+            break Some(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let flushed = file.flush().await.is_ok();
+    drop(file);
+    match (failure, flushed) {
+        (None, true) => Ok(()),
+        (failure, _) => {
+            let _ = tokio::fs::remove_file(part).await;
+            Err(failure.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR).into_response())
+        }
+    }
 }
 
 async fn handle_blob_put(State(state): State<ServerState>, AxumPath(hash): AxumPath<String>, request: Request) -> Response {
     if !is_valid_hash(&hash) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let bytes = match read_body(request.into_body(), MAX_RAW_FILE_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(r) => return r,
+    let root = state.data_root.clone();
+    let linked = tokio::task::spawn_blocking(move || (idl_rs::store::video::video_blobs(&root), idl_rs::store::video::live_video_blobs(&root))).await;
+    let Ok((videos, live)) = linked else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let item = SyncItem { class: SyncClass::Blob, key: hash, session_id: None, size_bytes: bytes.len() as u64 };
-    install_response(&state.data_root, &item, &bytes, &state.name, &InstallContext::default())
+    let Some(cap) = blob_put_cap(&videos, &live, &hash, super::client::holds_video()) else {
+        return (StatusCode::CONFLICT, [(header::CONTENT_TYPE, "application/json")], SKIPPED_VIDEO_BODY).into_response();
+    };
+    let part = state.data_root.join("tmp").join(format!("put-{}.part", uuid::Uuid::new_v4()));
+    if let Err(response) = receive_body_to_part(request.into_body(), &part, cap).await {
+        return response;
+    }
+    let (root, key, file) = (state.data_root.clone(), hash.clone(), part.clone());
+    let installed = tokio::task::spawn_blocking(move || install_blob_file(&root, &key, &file)).await;
+    let _ = tokio::fs::remove_file(&part).await;
+    match installed {
+        Ok(Ok(_)) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => (StatusCode::UNPROCESSABLE_ENTITY, e.message).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
+
+/// C4 §6's answer to a declined video `PUT`.
+const SKIPPED_VIDEO_BODY: &str = "{\"skipped\":\"video\"}";
 
 /// Splits a `derived/<file_name>` route segment into its sha256 hash,
 /// requiring the literal `.parquet` suffix `matchit` cannot itself capture
@@ -423,7 +525,7 @@ async fn handle_derived_get(
     let Some(path) = safe_join(&state.data_root, &["sessions", &id, "derived", &format!("{hash}.parquet")]) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    serve_file(&path, &headers)
+    serve_file(&path, &headers).await
 }
 
 async fn handle_derived_put(
@@ -453,7 +555,7 @@ async fn handle_data_parquet_get(State(state): State<ServerState>, AxumPath(id):
     let Some(path) = safe_join(&state.data_root, &["sessions", &id, "data.parquet"]) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    serve_file(&path, &headers)
+    serve_file(&path, &headers).await
 }
 
 /// See this module's doc comment: no claimed version pair reaches this
@@ -478,7 +580,7 @@ async fn handle_session_json_get(State(state): State<ServerState>, AxumPath(id):
     let Some(path) = safe_join(&state.data_root, &["sessions", &id, "session.json"]) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    serve_file(&path, &headers)
+    serve_file(&path, &headers).await
 }
 
 async fn handle_session_json_put(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, request: Request) -> Response {
@@ -511,7 +613,7 @@ async fn handle_workbook_get(State(state): State<ServerState>, AxumPath(id): Axu
     let Some(path) = safe_join(&state.data_root, &["workbooks", &format!("{file_name}.idl1wb")]) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    serve_file(&path, &headers)
+    serve_file(&path, &headers).await
 }
 
 async fn handle_workbook_put(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, request: Request) -> Response {
@@ -538,7 +640,7 @@ async fn handle_track_get(State(state): State<ServerState>, AxumPath(id): AxumPa
     let Some(path) = safe_join(&state.data_root, &["tracks", &format!("{id}.idl0t")]) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    serve_file(&path, &headers)
+    serve_file(&path, &headers).await
 }
 
 async fn handle_track_put(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, request: Request) -> Response {
@@ -560,7 +662,7 @@ async fn handle_profile_get(State(state): State<ServerState>, AxumPath(id): Axum
     let Some(path) = safe_join(&state.data_root, &["profiles", &format!("{id}.idl0p")]) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    serve_file(&path, &headers)
+    serve_file(&path, &headers).await
 }
 
 async fn handle_profile_put(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, request: Request) -> Response {
@@ -582,7 +684,7 @@ async fn handle_bike_get(State(state): State<ServerState>, AxumPath(id): AxumPat
     let Some(path) = safe_join(&state.data_root, &["bikes", &format!("{id}.json")]) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    serve_file(&path, &headers)
+    serve_file(&path, &headers).await
 }
 
 async fn handle_bike_put(State(state): State<ServerState>, AxumPath(id): AxumPath<String>, request: Request) -> Response {
@@ -718,6 +820,64 @@ mod tests {
 
         server.shutdown().await;
         let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn blob_put_then_get_a_body_larger_than_the_stream_chunk_round_trips() {
+        // Arrange — 1 MiB + 3 bytes: four 256 KiB chunks and a tail, both
+        // ways (lead ruling E1). Small enough to hold in a test.
+        let data_root = temp_data_root();
+        let token = "tok".to_string();
+        let (server, _peers) = start_test_server(
+            data_root.clone(),
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let content: Vec<u8> = (0..(1024 * 1024 + 3)).map(|i| (i % 251) as u8).collect();
+        let digest = idl_rs::store::atomic::sha256_hex(&content);
+
+        // Act
+        let put = client.put(format!("{}/blob/{digest}", base_url(&server))).bearer_auth(&token).body(content.clone()).send().await.unwrap();
+        let whole = client.get(format!("{}/blob/{digest}", base_url(&server))).bearer_auth(&token).send().await.unwrap();
+        let whole_len = whole.headers().get("content-length").unwrap().to_str().unwrap().to_string();
+        let whole_body = whole.bytes().await.unwrap();
+        let range = client
+            .get(format!("{}/blob/{digest}", base_url(&server)))
+            .bearer_auth(&token)
+            .header("Range", "bytes=262140-262150")
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(put.status(), reqwest::StatusCode::OK);
+        assert_eq!(std::fs::read(blob_path(&data_root, &digest)).unwrap(), content);
+        assert_eq!(whole_len, content.len().to_string());
+        assert_eq!(&whole_body[..], &content[..]);
+        assert_eq!(&range[..], &content[262_140..=262_150], "a range across a chunk boundary");
+        let leftovers = std::fs::read_dir(data_root.join("tmp")).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(leftovers, 0, "no put-*.part left behind");
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn blob_put_cap_a_log_keeps_the_raw_cap_a_live_video_has_none_and_a_video_can_be_declined() {
+        // Arrange
+        let videos: BTreeSet<String> = ["v".repeat(64), "t".repeat(64)].into_iter().collect();
+        let live: BTreeSet<String> = ["v".repeat(64)].into_iter().collect();
+
+        // Act + Assert
+        assert_eq!(blob_put_cap(&videos, &live, &"l".repeat(64), true), Some(MAX_RAW_FILE_BODY_BYTES as u64));
+        assert_eq!(blob_put_cap(&videos, &live, &"l".repeat(64), false), Some(MAX_RAW_FILE_BODY_BYTES as u64));
+        assert_eq!(blob_put_cap(&videos, &live, &"v".repeat(64), true), Some(u64::MAX));
+        assert_eq!(blob_put_cap(&videos, &live, &"v".repeat(64), false), None, "a phone declines video");
+        assert_eq!(blob_put_cap(&videos, &live, &"t".repeat(64), true), None, "only tombstones reference it");
     }
 
     #[tokio::test]

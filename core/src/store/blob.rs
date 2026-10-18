@@ -80,6 +80,24 @@ pub fn read_blob(data_root: &Path, sha256_hex: &str) -> Result<Vec<u8>, BlobStor
     std::fs::read(&path).map_err(|e| BlobStoreError::new(BlobStoreErrorKind::Io, format!("read {}: {e}", path.display())))
 }
 
+/// SHA-256 of a file's bytes, lowercase hex, read in 1 MiB chunks so a
+/// multi-GB file (a video, C4 §6) is never held in memory.
+pub fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Verifies a blob's own bytes hash to the digest its path encodes (C4 §7
 /// finding #1). Used by `verify` (Task 12) and by [`write_blob`]'s callers
 /// who want extra paranoia beyond the fast-path existence check.
@@ -163,6 +181,23 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, BlobStoreErrorKind::HashMismatch);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sha256_file_matches_the_in_memory_digest_across_chunk_boundaries() {
+        // Arrange — just over two 1 MiB chunks.
+        let root = temp_root();
+        let bytes: Vec<u8> = (0..(2 * 1024 * 1024 + 17)).map(|i| (i % 251) as u8).collect();
+        let path = root.join("f");
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Act
+        let digest = sha256_file(&path).unwrap();
+
+        // Assert
+        assert_eq!(digest, sha256_hex(&bytes));
 
         let _ = std::fs::remove_dir_all(&root);
     }

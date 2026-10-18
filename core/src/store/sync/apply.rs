@@ -184,6 +184,37 @@ fn install_blob(data_root: &Path, item: &SyncItem, bytes: &[u8]) -> Result<Insta
     Ok(InstallOutcome::Installed)
 }
 
+/// Installs a blob from a file already on disk (`part`, a finished download
+/// or upload under `tmp/`) without reading it into memory (lead ruling E1,
+/// 2026-10-18: a video blob can be gigabytes). The file is hashed in a
+/// stream and must hash to `sha256`, else `Malformed` and nothing is
+/// written. On success it is renamed into `blobs/sha256/…`; when that blob
+/// already exists the rename is skipped (a verified no-op, C4 §4) and
+/// `part` is left for the caller to discard, as it is on any error.
+pub fn install_blob_file(data_root: &Path, sha256: &str, part: &Path) -> Result<InstallOutcome, SyncError> {
+    let sha256 = validated_id(sha256, IdClass::Session, "blob")?;
+    let digest = crate::store::blob::sha256_file(part)
+        .map_err(|e| SyncError { kind: SyncErrorKind::Io, message: format!("hashing {}: {e}", part.display()) })?;
+    if digest != sha256 {
+        return Err(malformed(format!("blob: requested {sha256}, received bytes hash to {digest}")));
+    }
+    let path = crate::store::blob::blob_path(data_root, &digest);
+    if path.is_file() {
+        return Ok(InstallOutcome::Installed);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| SyncError { kind: SyncErrorKind::Io, message: format!("create {}: {e}", parent.display()) })?;
+    }
+    if let Err(e) = std::fs::rename(part, &path) {
+        if path.is_file() {
+            return Ok(InstallOutcome::Installed); // another writer won the race
+        }
+        return Err(SyncError { kind: SyncErrorKind::Io, message: format!("rename into {}: {e}", path.display()) });
+    }
+    Ok(InstallOutcome::Installed)
+}
+
 /// Content-addressed like a blob, but session-scoped and never overwritten
 /// once present (C4 §6: "name is content").
 fn install_derived(data_root: &Path, item: &SyncItem, bytes: &[u8]) -> Result<InstallOutcome, SyncError> {
@@ -564,6 +595,46 @@ mod tests {
         // Assert
         assert_eq!(outcome, InstallOutcome::Installed);
         assert_eq!(read_blob(&root, &digest).unwrap(), bytes);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_blob_file_a_part_larger_than_a_hash_chunk_lands_by_rename() {
+        // Arrange — 3 MiB + 5 bytes, over the 1 MiB hashing chunk.
+        let root = temp_root();
+        let bytes: Vec<u8> = (0..(3 * 1024 * 1024 + 5)).map(|i| (i % 253) as u8).collect();
+        let digest = sha256_hex(&bytes);
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
+        let part = root.join("tmp").join("x.part");
+        std::fs::write(&part, &bytes).unwrap();
+
+        // Act
+        let outcome = install_blob_file(&root, &digest, &part).unwrap();
+
+        // Assert
+        assert_eq!(outcome, InstallOutcome::Installed);
+        assert_eq!(read_blob(&root, &digest).unwrap(), bytes);
+        assert!(!part.exists(), "renamed, not copied");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_blob_file_a_wrong_hash_is_malformed_and_writes_nothing() {
+        // Arrange
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
+        let part = root.join("tmp").join("x.part");
+        std::fs::write(&part, b"bytes").unwrap();
+
+        // Act
+        let err = install_blob_file(&root, &"f".repeat(64), &part).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, SyncErrorKind::Malformed);
+        assert!(!root.join("blobs").exists());
+        assert!(part.exists(), "left for the caller to discard");
 
         let _ = std::fs::remove_dir_all(&root);
     }

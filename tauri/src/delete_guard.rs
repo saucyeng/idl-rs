@@ -63,8 +63,13 @@ mod tests {
         ("tauri/src/commands/device.rs", "download_with"),
         // Resumable download `.part` files under `tmp/`, dropped on a cap
         // breach and again once the bytes are complete (R102).
-        ("transport/src/sync/client.rs", "download_item_with_cap"),
+        ("transport/src/sync/client.rs", "download_to_part"),
         ("transport/src/sync/client.rs", "pull_and_install"),
+        // The sync server's streamed blob `PUT` (lead ruling E1): its own
+        // `tmp/put-<uuid>.part`, dropped on a cap breach or broken stream,
+        // and again once installed (renamed away) or refused.
+        ("transport/src/sync/server.rs", "receive_body_to_part"),
+        ("transport/src/sync/server.rs", "handle_blob_put"),
         // `write_json_atomic`: tmp-file write/rename/cleanup for
         // peers.json/identity.json, which live outside `<data>`.
         ("transport/src/sync/pairing.rs", "write_json_atomic"),

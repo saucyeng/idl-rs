@@ -16,7 +16,7 @@ use tokio::io::AsyncWriteExt;
 
 use idl_rs::store::atomic::sha256_hex;
 use idl_rs::store::blob::blob_path;
-use idl_rs::store::sync::apply::{install, InstallContext, InstallOutcome};
+use idl_rs::store::sync::apply::{install, install_blob_file, InstallContext, InstallOutcome};
 use idl_rs::store::sync::diff::{plan_sync, SyncAction, SyncClass, SyncItem};
 use idl_rs::store::sync::ids::{is_valid_id, safe_join, IdClass};
 use idl_rs::store::sync::manifest::{build_manifest, Manifest, BLOB_KIND_VIDEO};
@@ -108,10 +108,11 @@ fn drop_video_pulls(actions: &mut Vec<SyncAction>, remote: &Manifest, holds_vide
 
 /// One progress tick. `phase` is C3 §3.9's union as Task 1 widened it:
 /// `"manifest"`, `"blobs"`, `"sessions"`, `"workbooks"`, `"tracks"`,
-/// `"profiles"`, `"bike_log"`, always in that order and never repeating (this task's
-/// brief, "Key logic"). `total` is the planned action count for the current
-/// phase; it is `None` only during `"manifest"`, before [`plan_sync`] has
-/// run.
+/// `"profiles"`, `"bike_log"`, `"videos"`, always in that order and never
+/// repeating (this task's brief, "Key logic"). `total` is the planned
+/// action count for the current phase — bytes, in `"videos"` (lead ruling
+/// E2, 2026-10-18); it is `None` only during `"manifest"`, before
+/// [`plan_sync`] has run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncProgress {
     pub done: u64,
@@ -120,8 +121,42 @@ pub struct SyncProgress {
 }
 
 /// The post-manifest phases, in the fixed order [`SyncProgress::phase`]
-/// moves through. A [`SyncClass`] maps onto exactly one via [`phase_of`].
-const PHASES: [&str; 6] = ["blobs", "sessions", "workbooks", "tracks", "profiles", "bike_log"];
+/// moves through. An action maps onto exactly one via [`phase_of_action`].
+/// `"videos"` is last (lead ruling E2): a video blob moves only after
+/// `session.json` has merged, so whether it is still linked is known.
+const PHASES: [&str; 7] = ["blobs", "sessions", "workbooks", "tracks", "profiles", "bike_log", "videos"];
+
+/// `true` when `manifest` marks blob `sha256` as a linked video (C4 §6).
+fn is_video_blob(manifest: &Manifest, sha256: &str) -> bool {
+    manifest.blobs.iter().any(|b| b.sha256 == sha256 && b.kind.as_deref() == Some(BLOB_KIND_VIDEO))
+}
+
+/// The phase an action runs in: [`phase_of`] its class, except a video
+/// blob — by the sending side's manifest (`remote` for a pull, `local` for
+/// a push) — which runs in `"videos"`.
+fn phase_of_action(action: &SyncAction, remote: &Manifest, local: &Manifest) -> &'static str {
+    let item = item_of(action);
+    if item.class == SyncClass::Blob {
+        let sender = match action {
+            SyncAction::Push(_) => local,
+            SyncAction::Pull(_) | SyncAction::PullForMerge(_) => remote,
+        };
+        if is_video_blob(sender, &item.key) {
+            return "videos";
+        }
+    }
+    phase_of(item.class)
+}
+
+/// Keeps, of the `"videos"` phase's actions, those whose blob a live
+/// `videos` entry references in this side's merged `session.json` files
+/// (`live`): C4 §6's "not pulled when unlinked", and its mirror for
+/// pushes. Returns how many were dropped.
+fn keep_live_videos(actions: &mut Vec<&SyncAction>, live: &BTreeSet<String>) -> u32 {
+    let before = actions.len();
+    actions.retain(|a| live.contains(&item_of(a).key));
+    (before - actions.len()) as u32
+}
 
 /// Builds a `TransportErrorKind::Sync` error with `message`.
 fn sync_error(message: impl Into<String>) -> TransportError {
@@ -267,11 +302,33 @@ pub async fn sync_with_peer(
     let mut sessions_touched: BTreeSet<String> = BTreeSet::new();
 
     for phase in PHASES {
-        let actions: Vec<&SyncAction> = plan.actions.iter().filter(|a| phase_of(item_of(a).class) == phase).collect();
+        let mut actions: Vec<&SyncAction> =
+            plan.actions.iter().filter(|a| phase_of_action(a, &remote_manifest, &local_manifest) == phase).collect();
+        if phase == "videos" {
+            // Decided now, against the session.json files the "sessions"
+            // phase just merged (lead ruling E2).
+            let root = data_root.to_path_buf();
+            let live = tokio::task::spawn_blocking(move || idl_rs::store::video::live_video_blobs(&root))
+                .await
+                .map_err(|e| sync_error(format!("reading linked videos: {e}")))?;
+            result.videos_skipped += keep_live_videos(&mut actions, &live);
+            let total: u64 = actions.iter().map(|a| item_of(a).size_bytes).sum();
+            on_progress(SyncProgress { done: 0, total: Some(total), phase });
+            let mut done = 0u64;
+            for action in actions {
+                let base = done;
+                let on_bytes = |n: u64| on_progress(SyncProgress { done: (base + n).min(total), total: Some(total), phase });
+                run_one_action(&client, &base_url, peer, data_root, action, &remote_manifest, &local_manifest, now_ms, &mut result, &mut sessions_touched, &on_bytes)
+                    .await;
+                done += item_of(action).size_bytes;
+                on_progress(SyncProgress { done: done.min(total), total: Some(total), phase });
+            }
+            continue;
+        }
         let total = actions.len() as u64;
         on_progress(SyncProgress { done: 0, total: Some(total), phase });
         for (i, action) in actions.into_iter().enumerate() {
-            run_one_action(&client, &base_url, peer, data_root, action, &remote_manifest, &local_manifest, now_ms, &mut result, &mut sessions_touched)
+            run_one_action(&client, &base_url, peer, data_root, action, &remote_manifest, &local_manifest, now_ms, &mut result, &mut sessions_touched, &|_| {})
                 .await;
             on_progress(SyncProgress { done: (i + 1) as u64, total: Some(total), phase });
         }
@@ -354,11 +411,12 @@ async fn run_one_action(
     now_ms: i64,
     result: &mut SyncRunResult,
     sessions_touched: &mut BTreeSet<String>,
+    on_bytes: &(dyn Fn(u64) + Send + Sync),
 ) {
     let item = item_of(action);
     let outcome = match action {
         SyncAction::Pull(_) | SyncAction::PullForMerge(_) => {
-            pull_and_install(client, base_url, peer, data_root, item, remote_manifest, now_ms).await.map(|o| (true, Some(o)))
+            pull_and_install(client, base_url, peer, data_root, item, remote_manifest, now_ms, on_bytes).await.map(|o| (true, Some(o)))
         }
         SyncAction::Push(_) => match push_item(client, base_url, peer, data_root, item, local_manifest).await {
             Ok(PushOutcome::Sent) => Ok((false, None)),
@@ -472,6 +530,24 @@ async fn download_item(client: &reqwest::Client, base_url: &str, token: &str, da
 /// exercise the cap-refusal paths with a small `cap` instead of allocating
 /// hundreds of MiB (R178).
 async fn download_item_with_cap(client: &reqwest::Client, base_url: &str, token: &str, data_root: &Path, item: &SyncItem, cap: u64) -> Result<Vec<u8>, TransportError> {
+    let tmp_path = download_to_part(client, base_url, token, data_root, item, cap, &|_| {}).await?;
+    tokio::fs::read(&tmp_path).await.map_err(|e| sync_error(format!("reading back {}: {e}", tmp_path.display())))
+}
+
+/// [`download_item_with_cap`]'s streaming half: everything up to a complete
+/// `tmp/<digest>.part` on disk, whose path it returns, without reading the
+/// file back (lead ruling E1: a video blob is installed from the file,
+/// never from memory). `on_bytes` is told the `.part`'s length after every
+/// chunk written, bytes.
+async fn download_to_part(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    data_root: &Path,
+    item: &SyncItem,
+    cap: u64,
+    on_bytes: &(dyn Fn(u64) + Send + Sync),
+) -> Result<PathBuf, TransportError> {
     let url = item_url(base_url, item)?;
     let tmp_path = tmp_part_path(data_root, item);
     let tmp_dir = tmp_path.parent().expect("tmp_part_path always has a tmp/ parent");
@@ -544,11 +620,12 @@ async fn download_item_with_cap(client: &reqwest::Client, base_url: &str, token:
             return Err(sync_error(format!("GET {url}: response exceeded the {cap}-byte cap for {:?} mid-stream; discarded the .part", item.class)));
         }
         file.write_all(&chunk).await.map_err(|e| sync_error(format!("writing {}: {e}", tmp_path.display())))?;
+        on_bytes(total);
     }
     file.flush().await.map_err(|e| sync_error(format!("flushing {}: {e}", tmp_path.display())))?;
     drop(file);
 
-    tokio::fs::read(&tmp_path).await.map_err(|e| sync_error(format!("reading back {}: {e}", tmp_path.display())))
+    Ok(tmp_path)
 }
 
 /// The manifest-sourced detail `item.class` needs beyond its bare identity
@@ -611,9 +688,25 @@ async fn pull_and_install(
     item: &SyncItem,
     remote_manifest: &Manifest,
     now_ms: i64,
+    on_bytes: &(dyn Fn(u64) + Send + Sync),
 ) -> Result<InstallOutcome, TransportError> {
     if !item_shape_is_valid(item) {
         return Err(sync_error(format!("{:?} item has a malformed session_id/key shape: session_id={:?} key={}", item.class, item.session_id, item.key)));
+    }
+    if item.class == SyncClass::Blob {
+        // Lead ruling E1: a blob streams to its `.part`, is hashed from the
+        // file and renamed into place; it is never held in memory. A video
+        // has no size cap; everything else keeps the raw-file cap.
+        let cap = if is_video_blob(remote_manifest, &item.key) { u64::MAX } else { MAX_RAW_FILE_BODY_BYTES };
+        let part = download_to_part(client, base_url, &peer.token, data_root, item, cap, on_bytes).await?;
+        let (root, key, file) = (data_root.to_path_buf(), item.key.clone(), part.clone());
+        let install_result = match tokio::task::spawn_blocking(move || install_blob_file(&root, &key, &file)).await {
+            Ok(r) => r.map_err(|e| sync_error(format!("install Blob {}: {e}", item.key))),
+            Err(e) => Err(sync_error(format!("install Blob {}: {e}", item.key))),
+        };
+        // Complete either way: renamed into `blobs/`, or refused (R102).
+        let _ = tokio::fs::remove_file(&part).await;
+        return install_result;
     }
     let bytes = download_item(client, base_url, &peer.token, data_root, item).await?;
 
@@ -681,9 +774,16 @@ fn read_local_item_bytes(data_root: &Path, item: &SyncItem, local_manifest: &Man
 /// A blob answered `409 {"skipped": "video"}` is a peer that does not hold
 /// video (C4 §6): [`PushOutcome::SkippedVideo`], not a failure.
 async fn push_item(client: &reqwest::Client, base_url: &str, peer: &Peer, data_root: &Path, item: &SyncItem, local_manifest: &Manifest) -> Result<PushOutcome, TransportError> {
-    let bytes = read_local_item_bytes(data_root, item, local_manifest)?;
+    let body = if item.class == SyncClass::Blob {
+        // Lead ruling E1: a blob is streamed from disk, never read whole.
+        let path = blob_path(data_root, &item.key);
+        let file = tokio::fs::File::open(&path).await.map_err(|e| sync_error(format!("opening local blob {}: {e}", item.key)))?;
+        reqwest::Body::wrap_stream(file_chunks(file))
+    } else {
+        reqwest::Body::from(read_local_item_bytes(data_root, item, local_manifest)?)
+    };
     let url = item_url(base_url, item)?;
-    let response = client.put(&url).bearer_auth(&peer.token).body(bytes).send().await.map_err(|e| sync_error(format!("PUT {url} failed: {e}")))?;
+    let response = client.put(&url).bearer_auth(&peer.token).body(body).send().await.map_err(|e| sync_error(format!("PUT {url} failed: {e}")))?;
     let status = response.status();
     if status == reqwest::StatusCode::CONFLICT && item.class == SyncClass::Blob {
         let body = bounded_bytes(response, MAX_DOCUMENT_BODY_BYTES, "PUT blob 409").await?;
@@ -696,6 +796,27 @@ async fn push_item(client: &reqwest::Client, base_url: &str, peer: &Peer, data_r
         return Err(sync_error(format!("PUT {url} returned status {status}")));
     }
     Ok(PushOutcome::Sent)
+}
+
+/// Bytes read per chunk when streaming a file onto the wire.
+const STREAM_CHUNK_BYTES: usize = 256 * 1024;
+
+/// A file as a stream of chunks of at most [`STREAM_CHUNK_BYTES`], for a
+/// request or response body that must not hold the file in memory.
+pub(crate) fn file_chunks(file: tokio::fs::File) -> impl futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static {
+    use tokio::io::AsyncReadExt;
+    futures::stream::unfold(Some(file), |state| async move {
+        let mut file = state?;
+        let mut buf = vec![0u8; STREAM_CHUNK_BYTES];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(buf), Some(file)))
+            }
+            Err(e) => Some((Err(e), None)),
+        }
+    })
 }
 
 /// `true` for C4 §6's `{"skipped": "video"}` answer body.
@@ -928,6 +1049,111 @@ mod tests {
         // Assert
         assert_eq!(result.blobs_transferred, 1);
         assert_eq!(std::fs::read(blob_path(&local_root, &sha)).unwrap(), content);
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&local_root);
+        let _ = std::fs::remove_dir_all(&remote_root);
+    }
+
+    /// Writes `content` as a blob under `root` and a session whose
+    /// `session.json` links it as a video, live or tombstoned.
+    fn write_linked_video(root: &Path, content: &[u8], unlinked: bool, updated_at_ms: i64) -> String {
+        use idl_rs::store::session_json::{empty_session_json, write_session_json};
+        let sha = idl_rs::store::blob::write_blob(root, content).unwrap();
+        let session_id = "00112233445566778899aabbccddeeff";
+        let mut doc = empty_session_json(session_id);
+        doc.videos.push(idl_rs::video::VideoLink {
+            blob_sha256: sha.clone(),
+            size_bytes: content.len() as u64,
+            file_name: "GX010001.MP4".to_string(),
+            video_codec: "h264".to_string(),
+            width_px: 1920,
+            height_px: 1080,
+            fps: 30.0,
+            duration_s: 1.0,
+            offset_s: 0.0,
+            sync_method: idl_rs::video::SyncMethod::Manual,
+            unlinked,
+            updated_at_ms,
+        });
+        write_session_json(root, session_id, &doc, None).unwrap();
+        sha
+    }
+
+    #[tokio::test]
+    async fn sync_with_peer_a_linked_video_on_the_peer_is_pulled_in_the_videos_phase_after_sessions() {
+        // Arrange — over 1 MiB, so the pull streams in several chunks.
+        let local_root = temp_data_root();
+        let remote_root = temp_data_root();
+        let content: Vec<u8> = (0..(1024 * 1024 + 7)).map(|i| (i % 249) as u8).collect();
+        let sha = write_linked_video(&remote_root, &content, false, 10);
+        let token = "tok-v";
+        let server = start_test_server(remote_root.clone(), token).await;
+        let peer = test_peer(token);
+        let seen: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let on_progress = move |p: SyncProgress| sink.lock().unwrap().push(p);
+
+        // Act
+        let result = sync_with_peer(&local_root, &peer, server.local_addr(), 1000, &on_progress).await.unwrap();
+
+        // Assert
+        assert_eq!(result.blobs_transferred, 1, "a video counts as a blob transfer");
+        assert_eq!(std::fs::read(blob_path(&local_root, &sha)).unwrap(), content);
+        let seen = seen.lock().unwrap();
+        let videos: Vec<&SyncProgress> = seen.iter().filter(|p| p.phase == "videos").collect();
+        assert_eq!(videos.first().unwrap().total, Some(content.len() as u64), "bytes, not items");
+        assert_eq!(videos.last().unwrap().done, content.len() as u64);
+        let last_session = seen.iter().rposition(|p| p.phase == "sessions").unwrap();
+        let first_video = seen.iter().position(|p| p.phase == "videos").unwrap();
+        assert!(last_session < first_video, "videos come after sessions");
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&local_root);
+        let _ = std::fs::remove_dir_all(&remote_root);
+    }
+
+    #[tokio::test]
+    async fn sync_with_peer_a_video_only_tombstones_reference_is_not_pulled() {
+        // Arrange — the peer unlinked it but kept the file.
+        let local_root = temp_data_root();
+        let remote_root = temp_data_root();
+        let sha = write_linked_video(&remote_root, b"an unlinked video", true, 10);
+        let token = "tok-t";
+        let server = start_test_server(remote_root.clone(), token).await;
+        let peer = test_peer(token);
+
+        // Act
+        let result = sync_with_peer(&local_root, &peer, server.local_addr(), 1000, &no_progress).await.unwrap();
+
+        // Assert
+        assert_eq!(result.blobs_transferred, 0);
+        assert_eq!(result.videos_skipped, 1);
+        assert!(!blob_path(&local_root, &sha).is_file());
+        assert!(local_root.join("sessions").join("00112233445566778899aabbccddeeff").join("session.json").is_file(), "the tombstone itself syncs");
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&local_root);
+        let _ = std::fs::remove_dir_all(&remote_root);
+    }
+
+    #[tokio::test]
+    async fn sync_with_peer_a_linked_video_here_is_pushed_streamed() {
+        // Arrange
+        let local_root = temp_data_root();
+        let remote_root = temp_data_root();
+        let content: Vec<u8> = (0..(600 * 1024)).map(|i| (i % 247) as u8).collect();
+        let sha = write_linked_video(&local_root, &content, false, 10);
+        let token = "tok-p";
+        let server = start_test_server(remote_root.clone(), token).await;
+        let peer = test_peer(token);
+
+        // Act
+        let result = sync_with_peer(&local_root, &peer, server.local_addr(), 1000, &no_progress).await.unwrap();
+
+        // Assert
+        assert_eq!(result.blobs_transferred, 1);
+        assert_eq!(std::fs::read(blob_path(&remote_root, &sha)).unwrap(), content);
 
         server.shutdown().await;
         let _ = std::fs::remove_dir_all(&local_root);

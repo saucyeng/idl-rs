@@ -21,7 +21,9 @@ btleplug = "0.13.0"
 # Task 8 adds "net": `SyncServer::start` binds a real `tokio::net::TcpListener`
 # for `axum::serve` (this crate's own runtime rule is unchanged — it never
 # spawns one; it serves on whichever runtime drove `start`).
-tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "io-util", "net"] }
+# The video lane adds "fs": blobs stream from and to disk (lead ruling E1,
+# 2026-10-18), and the client already used `tokio::fs` for its `.part` files.
+tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "io-util", "net", "fs"] }
 # Task 7: needed to construct/parse GATT characteristic UUIDs against
 # btleplug's `Uuid`-typed `Characteristic::uuid` field (already resolved in
 # the workspace lockfile via btleplug's own dependency on uuid 1.26.0 — this
