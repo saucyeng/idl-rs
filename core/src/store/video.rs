@@ -123,6 +123,17 @@ fn session_clock(data_root: &Path, session_id: &str) -> Result<SessionClock, Vid
     SessionClock::read(&dir, effective_start_ms(&doc, meta.timestamp_utc_ms))
 }
 
+/// idl0's estimator ([`estimate_sync`]) for a file with a time anchor; a
+/// file with neither GPMF GPS time nor a creation time, which idl0 refused
+/// with `Parse`, is [`SyncMethod::Manual`] at offset 0 here (video spec
+/// §4.3 item 3, C3 §3.12).
+fn estimate_or_manual(telemetry: Option<&VideoTelemetry>, info: &Mp4Info, clock: &SessionClock) -> Result<SyncEstimate, VideoError> {
+    if video_span_utc_ms(telemetry, info).is_none() {
+        return Ok(SyncEstimate { offset_s: 0.0, confidence: 0.0, method: SyncMethod::Manual });
+    }
+    estimate_sync(telemetry, info, clock)
+}
+
 /// Probes a file: container facts plus GPMF telemetry. A GPMF track that
 /// does not parse is treated as absent, so estimation falls back to the
 /// creation time rather than refusing the file.
@@ -239,7 +250,7 @@ pub fn link_video(
     on_progress(LinkProgress { phase: "probing", done: 0, total: None });
     let (info, telemetry) = probe_file(source)?;
     let estimate: Result<SyncEstimate, VideoError> =
-        session_clock(data_root, session_id).and_then(|clock| estimate_sync(telemetry.as_ref(), &info, &clock));
+        session_clock(data_root, session_id).and_then(|clock| estimate_or_manual(telemetry.as_ref(), &info, &clock));
     if let Err(e) = &estimate {
         if e.kind != VideoErrorKind::NoOverlap {
             return Err(e.clone());
@@ -317,7 +328,7 @@ pub fn reestimate_video_offset(data_root: &Path, session_id: &str, blob_sha256: 
         return Err(not_found(format!("video {blob_sha256} is not on this device")));
     }
     let (info, telemetry) = probe_file(&blob_path(data_root, blob_sha256))?;
-    let est = estimate_sync(telemetry.as_ref(), &info, &session_clock(data_root, session_id)?)?;
+    let est = estimate_or_manual(telemetry.as_ref(), &info, &session_clock(data_root, session_id)?)?;
     modify_session_json(data_root, session_id, |doc| {
         let entry = live_entry_mut(doc, blob_sha256)?;
         entry.offset_s = est.offset_s;

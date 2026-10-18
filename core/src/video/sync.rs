@@ -5,8 +5,9 @@
 //! Contract (C1 §6): `session_time_s = video_time_s + offset_s`, where
 //! `session_time_s` is the session's `*_time_secs` clock (t = 0 at its first
 //! sample). Estimation prefers the GPMF UTC anchor, then the container
-//! creation time, then gives up to a manual offset of 0. A video whose span
-//! misses the session is refused.
+//! creation time; with neither it is idl0's `Parse` error, which the
+//! linking code (`store::video`) turns into a manual offset of 0. A video
+//! whose span misses the session is refused.
 //!
 //! The session's clock is [`SessionClock`]: `GPS_EpochMs` samples paired
 //! with their own recorded times, extrapolated beyond the GPS span rather
@@ -89,6 +90,12 @@ impl SessionClock {
         self.duration_s
     }
 
+    /// [`Self::epoch_ms_to_session_s`] over many instants, input order
+    /// kept — the shape of idl0's `epoch_ms_to_time_secs_extrapolated`.
+    pub fn epochs_ms_to_session_s(&self, epochs_ms: &[f64]) -> Vec<f64> {
+        epochs_ms.iter().map(|&e| self.epoch_ms_to_session_s(e)).collect()
+    }
+
     /// Maps a UTC instant (ms) to session seconds. Inside the GPS span it
     /// interpolates between the bracketing fixes; outside it extrapolates
     /// with the nearest interval's slope, so an instant before the session
@@ -129,7 +136,7 @@ impl SessionClock {
 pub struct SyncEstimate {
     /// `session_time_s = video_time_s + offset_s`, in seconds.
     pub offset_s: f64,
-    /// 0.9 for `gpmf`, 0.3 for `creation_time`, 0.0 for `manual`.
+    /// 0.9 for `gpmf`, 0.3 for `creation_time`, 0.0 for a manual fallback.
     pub confidence: f64,
     /// Which anchor the offset came from.
     pub method: SyncMethod,
@@ -160,18 +167,22 @@ pub fn video_span_utc_ms(telemetry: Option<&VideoTelemetry>, info: &Mp4Info) -> 
 }
 
 /// Estimate the video↔session offset. Prefers the GPMF UTC anchor
-/// (`telemetry`), falling back to the container `creation_time` in `info`,
-/// then to [`SyncMethod::Manual`] at offset 0 when the file has neither.
+/// (`telemetry`), falling back to the container `creation_time` in `info`.
 ///
-/// Errors: [`crate::video::VideoErrorKind::NoOverlap`] (detail: both spans,
-/// UTC ms) when an anchored video's span misses the session. The anchor is
+/// Errors: `Parse` when neither anchor exists (idl0's behaviour; the caller
+/// links such a file as manual at 0); [`crate::video::VideoErrorKind::NoOverlap`]
+/// (detail: both spans, UTC ms) when the mapped video span misses the
+/// session. The anchor is
 /// mapped through [`SessionClock::epoch_ms_to_session_s`], which
 /// extrapolates: an anchor from outside the session must stay outside it,
 /// or footage from a different run saturates to the session edge and passes
 /// the overlap check with a fabricated offset.
 pub fn estimate_sync(telemetry: Option<&VideoTelemetry>, info: &Mp4Info, clock: &SessionClock) -> Result<SyncEstimate, VideoError> {
     let Some((t_video_s, epoch_ms, method)) = anchor(telemetry, info) else {
-        return Ok(SyncEstimate { offset_s: 0.0, confidence: 0.0, method: SyncMethod::Manual });
+        return Err(VideoError::parse(
+            "no sync anchor: video has neither GPMF UTC nor a container creation time; \
+             pass a manual --offset",
+        ));
     };
     let session_s = clock.epoch_ms_to_session_s(epoch_ms as f64);
     let offset_s = session_s - t_video_s;
@@ -357,16 +368,89 @@ mod tests {
     }
 
     #[test]
-    fn estimate_sync_no_anchor_and_no_creation_time_is_manual_at_zero() {
+    fn estimate_sync_no_anchor_and_no_creation_time_is_parse_error() {
         // Arrange
         let clock = clock_with_origin(1_000_000, 120.0);
 
         // Act
-        let est = estimate_sync(None, &info(60.0, None), &clock).unwrap();
+        let err = estimate_sync(None, &info(60.0, None), &clock).unwrap_err();
 
         // Assert
-        assert_eq!(est.method, SyncMethod::Manual);
-        assert_eq!(est.offset_s, 0.0);
+        assert_eq!(err.kind, VideoErrorKind::Parse);
+        assert!(err.message.contains("--offset"));
+    }
+
+    // ---- idl0 handle.rs `epoch_ms_to_time_secs_extrapolated` tests, ported
+    // to SessionClock (idl-rs tag `idl0-video-export`, handle.rs:1467–1559).
+
+    /// `n` GPS fixes `step_ms` apart from `first_ms`, recorded at the
+    /// uniform times idl0's index / rate gave them (`i / rate_hz`).
+    fn clock_from_uniform_gps(start_utc_ms: i64, first_ms: f64, step_ms: f64, n: usize, rate_hz: f64) -> SessionClock {
+        let epochs: Vec<f64> = (0..n).map(|i| first_ms + i as f64 * step_ms).collect();
+        let times: Vec<f64> = (0..n).map(|i| i as f64 / rate_hz).collect();
+        SessionClock::new(start_utc_ms, (n - 1) as f64 / rate_hz, &epochs, &times)
+    }
+
+    #[test]
+    fn epoch_ms_to_session_s_maps_below_span_to_negative_seconds() {
+        // Arrange — 1 Hz GPS starting at epoch 10_000 ms.
+        let clock = clock_from_uniform_gps(10_000, 10_000.0, 1000.0, 5, 1.0);
+
+        // Act — 3 s before the first fix.
+        let out = clock.epochs_ms_to_session_s(&[7_000.0]);
+
+        // Assert — clamping would give 0.0; the true mapping is -3 s.
+        assert!((out[0] - -3.0).abs() < 1e-9, "got {}", out[0]);
+    }
+
+    #[test]
+    fn epoch_ms_to_session_s_maps_above_span_past_the_end() {
+        // Arrange — 1 Hz GPS, 5 fixes → span ends at t = 4 s.
+        let clock = clock_from_uniform_gps(10_000, 10_000.0, 1000.0, 5, 1.0);
+
+        // Act — 6 s past the last fix (last fix epoch 14_000 → t = 4).
+        let out = clock.epochs_ms_to_session_s(&[20_000.0]);
+
+        // Assert — clamping would give 4.0; the true mapping is 10 s.
+        assert!((out[0] - 10.0).abs() < 1e-9, "got {}", out[0]);
+    }
+
+    #[test]
+    fn epoch_ms_to_session_s_inside_the_span_interpolates_like_the_clamped_mapping() {
+        // Arrange — 10 Hz GPS from epoch 1000 ms. idl0 compared against its
+        // clamped twin, which idl1's SessionClock has no need of; the values
+        // that twin gives are written out instead.
+        let clock = clock_from_uniform_gps(1000, 1000.0, 100.0, 10, 10.0);
+
+        // Act
+        let out = clock.epochs_ms_to_session_s(&[1000.0, 1250.0, 1900.0]);
+
+        // Assert
+        for (got, want) in out.iter().zip([0.0, 0.25, 0.9]) {
+            assert!((got - want).abs() < 1e-12, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn epoch_ms_to_session_s_falls_back_to_the_session_origin_without_gps() {
+        // Arrange — no GPS_EpochMs; origin = timestamp_utc_ms = 2000.
+        let clock = SessionClock::new(2000, 1.0, &[], &[]);
+
+        // Act — (5000 - 2000)/1000 = 3.0 s.
+        let out = clock.epochs_ms_to_session_s(&[5000.0, 2000.0]);
+
+        // Assert
+        assert!((out[0] - 3.0).abs() < 1e-9);
+        assert!((out[1] - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn epoch_ms_to_session_s_empty_input_is_empty() {
+        // Arrange
+        let clock = SessionClock::new(0, 0.0, &[], &[]);
+
+        // Act + Assert
+        assert!(clock.epochs_ms_to_session_s(&[]).is_empty());
     }
 
     #[test]
