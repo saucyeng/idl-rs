@@ -47,6 +47,7 @@ pub mod track_artifact;
 pub mod track_projection;
 pub mod tracks;
 pub mod variance;
+pub mod video;
 pub mod wire_golden;
 pub mod workbook;
 
