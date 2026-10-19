@@ -533,6 +533,19 @@ mod tests {
         LinkTiming::default()
     }
 
+    /// A stub logger that accepts the connection.
+    fn reachable() -> StubBle {
+        StubBle {
+            connect_result: Ok(idl_transport::ConnectionInfo {
+                device_id: "AA".to_string(),
+                name: "IDL1-TEST".to_string(),
+                firmware_version: "0.3.0".to_string(),
+                connected: true,
+            }),
+            ..Default::default()
+        }
+    }
+
     async fn settle() {
         for _ in 0..20 {
             tokio::task::yield_now().await;
@@ -548,7 +561,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Act
-        let actor = run_link("AA".into(), &connections, || async { Ok(StubBle::default()) }, rx, &publish, &|| {}, timing());
+        let actor = run_link("AA".into(), &connections, || async { Ok(reachable()) }, rx, &publish, &|| {}, timing());
         let drive = async {
             settle().await;
             let _ = tx.send(Intent::Stop);
@@ -572,7 +585,7 @@ mod tests {
         let c = connects.clone();
         let new_ble = move || {
             c.fetch_add(1, Ordering::SeqCst);
-            async { Ok(StubBle::default()) }
+            async { Ok(reachable()) }
         };
 
         // Act — past one silence window and a fast retry.
@@ -601,7 +614,7 @@ mod tests {
         let c = connects.clone();
         let new_ble = move || {
             c.fetch_add(1, Ordering::SeqCst);
-            async { Ok(StubBle::default()) }
+            async { Ok(reachable()) }
         };
 
         // Act — lent for far longer than the silence window.
@@ -636,7 +649,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Act
-        let actor = run_link("AA".into(), &connections, || async { Ok(StubBle::default()) }, rx, &publish, &on_record, timing());
+        let actor = run_link("AA".into(), &connections, || async { Ok(reachable()) }, rx, &publish, &on_record, timing());
         let drive = async {
             settle().await;
             let _ = tx.send(Intent::Lend);
