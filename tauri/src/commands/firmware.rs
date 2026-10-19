@@ -533,6 +533,12 @@ pub async fn push_firmware<R: tauri::Runtime>(
 ) -> Result<OtaOutcome, IpcError> {
     let source_is_catalog = matches!(source, FirmwareSource::Catalog { .. });
     publish_state(&app, &ota, OtaState::Idle);
+    // The link actor stands back for the push and its reboot; given back
+    // after, when it adopts the link the push's own reconnect made.
+    {
+        use tauri::Manager;
+        app.state::<crate::link::Links>().send(&device_id, crate::link::Intent::Lend);
+    }
 
     let result = async {
         let image = load_image(&app, &ota, &source, &firmware_repo, channel, &progress).await?;
@@ -557,6 +563,14 @@ pub async fn push_firmware<R: tauri::Runtime>(
     }
     .await;
 
+    {
+        // Pushed: the logger rebooted and the push reconnected (the actor
+        // adopts that link). Failed: Bluetooth may be off for a minute while
+        // the logger leaves WiFi mode.
+        use tauri::Manager;
+        let boot = result.is_ok();
+        app.state::<crate::link::Links>().send(&device_id, crate::link::Intent::Return { boot, quick: false });
+    }
     if let Err(ref e) = result {
         publish_state(&app, &ota, OtaState::Failed { error: e.clone() });
     }

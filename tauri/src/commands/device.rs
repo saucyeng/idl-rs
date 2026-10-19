@@ -449,10 +449,8 @@ async fn disconnect_device_via<T: BleTransport>(
 }
 
 /// Transport-agnostic core of `device_status`: reads via `connections`'
-/// managed entry for `device_id` when one exists (no reconnect); otherwise
-/// builds a fresh transport via `new_ble`, connects, reads, and disconnects
-/// — the "otherwise connect-act-disconnect" degrade path C3 §3.8 names for
-/// this command cluster.
+/// managed entry for `device_id`; `not_found` without one (the link actor
+/// owns connecting, logger link design §6).
 async fn device_status_via<T, F, Fut>(
     connections: &ConnectionMap<T>,
     device_id: &str,
@@ -463,16 +461,15 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T, TransportError>>,
 {
+    // Managed link only (logger link design §6, 2026-10-19): the old
+    // connect-read-close fallback raced the link actor's reconnect, and on
+    // Android closing it tore down the actor's link.
+    let _ = new_ble;
     let managed = connections.lock().unwrap().get(device_id).cloned();
-    let status = if let Some(ble) = managed {
-        ble.lock().await.read_status().await.map_err(IpcError::from)?
-    } else {
-        let mut ble = new_ble().await.map_err(IpcError::from)?;
-        ble.connect(device_id).await.map_err(IpcError::from)?;
-        let result = ble.read_status().await;
-        let _ = ble.disconnect().await;
-        result.map_err(IpcError::from)?
+    let Some(ble) = managed else {
+        return Err(IpcError::new(IpcErrorKind::NotFound, "the logger isn't connected"));
     };
+    let status = ble.lock().await.read_status().await.map_err(IpcError::from)?;
     Ok(status.into())
 }
 
@@ -770,6 +767,7 @@ async fn download_files_via<W: WifiTransport>(
 #[tauri::command]
 pub async fn download_files(
     connections: tauri::State<'_, Connections>,
+    links: tauri::State<'_, crate::link::Links>,
     transfers: tauri::State<'_, crate::state::WifiTransfers>,
     device_id: String,
     files: Vec<WantedFile>,
@@ -784,13 +782,23 @@ pub async fn download_files(
         .cloned()
         .ok_or_else(|| IpcError::new(IpcErrorKind::NotFound, "connect to the logger first"))?;
     let name = platform::name_for(&device_id)?;
-    switch_to_wifi_mode(&*managed.lock().await).await?;
+    // The link actor stands back for the whole session (logger link design
+    // §4) and takes the link back at the end, on every path.
+    links.send(&device_id, crate::link::Intent::Lend);
+    let give_back = |quick: bool| {
+        links.send(&device_id, crate::link::Intent::Return { boot: false, quick });
+    };
+    if let Err(e) = switch_to_wifi_mode(&*managed.lock().await).await {
+        give_back(true);
+        return Err(e);
+    }
     let wifi = match platform::open_device_wifi(&name).await {
         Ok(w) => w,
         Err(e) => {
             // No WiFi link: Bluetooth is still up, so end WiFi mode over it.
             let _ = managed.lock().await.send_command(ControlCommand::WifiOff).await;
             platform::release_device_wifi().await;
+            give_back(true);
             return Err(e);
         }
     };
@@ -802,6 +810,7 @@ pub async fn download_files(
     if handed_off {
         // Tell the screen first, so it stops reading status over Bluetooth.
         let _ = events.send(TransferEvent::HandedOff);
+        links.send(&device_id, crate::link::Intent::Note(crate::link::LinkPhase::HandedOff));
         // The logger is dropping this link: retire it, and close our end in
         // the background. Waiting for that close here hung the whole
         // transfer behind a status read still holding the dead link
@@ -822,12 +831,17 @@ pub async fn download_files(
     let end = download_files_via(&wifi, &device_id, &files, &data_dir.0, &cancel, &emit).await;
     transfers.0.lock().unwrap().remove(&device_id);
 
+    // Record pressed meanwhile (`link_record`): end with POST /record, so
+    // the logger starts recording the moment WiFi mode ends; WiFi off if
+    // the firmware predates it.
+    let record = links.take_record_request(&device_id);
     let wifi_closed = if handed_off {
-        wifi.wifi_off().await.is_ok()
+        (record && wifi.record().await.is_ok()) || wifi.wifi_off().await.is_ok()
     } else {
         managed.lock().await.send_command(ControlCommand::WifiOff).await.is_ok()
     };
     platform::release_device_wifi().await;
+    give_back(wifi_closed);
     let _ = end.link_failed;
     Ok(TransferSummary { handed_off, wifi_closed, cancelled: end.cancelled })
 }
@@ -1069,22 +1083,29 @@ pub async fn ble_connect(device_id: String) -> Result<ConnectionInfo, IpcError> 
 /// `ConnectionInfo` describes a connection the caller can assume still
 /// exists afterward, until `disconnect_device` or a later `connect_device`
 /// for the same `device_id` tears it down.
-#[tauri::command]
-pub async fn connect_device(
-    connections: tauri::State<'_, Connections>,
-    device_id: String,
-) -> Result<ConnectionInfo, IpcError> {
-    let ble = PlatformBle::new().await.map_err(IpcError::from)?;
-    connect_device_via(&connections.0, ble, &device_id).await
+///
+/// Since 2026-10-19 this pairs the logger with its link actor
+/// (`crate::link`), which connects and keeps it connected, and waits for
+/// the first connection.
+#[tauri::command(async)]
+pub async fn connect_device<R: tauri::Runtime>(app: tauri::AppHandle<R>, device_id: String) -> Result<ConnectionInfo, IpcError> {
+    crate::link::wait_ready(&app, &device_id, Duration::from_secs(20)).await
 }
 
 /// Tears down `device_id`'s managed connection, if any (C3 §3.8).
 /// Disconnecting an unconnected device is a no-op, not an error.
-#[tauri::command]
+///
+/// Since 2026-10-19 this unpairs the logger: its link actor disconnects
+/// and stops.
+#[tauri::command(async)]
 pub async fn disconnect_device(
     connections: tauri::State<'_, Connections>,
+    links: tauri::State<'_, crate::link::Links>,
     device_id: String,
 ) -> Result<(), IpcError> {
+    if links.send(&device_id, crate::link::Intent::Stop) {
+        return Ok(());
+    }
     disconnect_device_via(&connections.0, &device_id).await
 }
 
@@ -1800,41 +1821,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn device_status_via_no_managed_connection_connects_reads_and_disconnects() {
+    async fn device_status_via_no_managed_connection_is_not_found_and_never_connects() {
         // Arrange
         let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
-        let connect_calls = Arc::new(AtomicUsize::new(0));
-        let disconnect_calls = Arc::new(AtomicUsize::new(0));
-        let connect_calls_for_factory = connect_calls.clone();
-        let disconnect_calls_for_factory = disconnect_calls.clone();
+        let built = Arc::new(AtomicUsize::new(0));
+        let b = built.clone();
 
         // Act
-        let status = device_status_via(&connections, "AA:BB", move || {
-            let connect_calls = connect_calls_for_factory.clone();
-            let disconnect_calls = disconnect_calls_for_factory.clone();
-            async move {
-                Ok(StubBle {
-                    connect_result: Ok(idl_transport::ConnectionInfo {
-                        device_id: "AA:BB".to_string(),
-                        name: "IDL0-A3F2".to_string(),
-                        firmware_version: "1.0.0".to_string(),
-                        connected: true,
-                    }),
-                    status_override: StdMutex::new(Some(DeviceStatus { battery_pct: Some(7), ..Default::default() })),
-                    connect_calls,
-                    disconnect_calls,
-                    ..Default::default()
-                })
-            }
+        let result = device_status_via(&connections, "AA:BB", move || {
+            b.fetch_add(1, Ordering::SeqCst);
+            async { Ok(StubBle::default()) }
         })
-        .await
-        .unwrap();
+        .await;
 
         // Assert
-        assert_eq!(status.battery_pct, Some(7));
-        assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(disconnect_calls.load(Ordering::SeqCst), 1);
-        assert!(connections.lock().unwrap().is_empty());
+        assert_eq!(result.unwrap_err().kind, IpcErrorKind::NotFound);
+        assert_eq!(built.load(Ordering::SeqCst), 0);
     }
 
     #[test]

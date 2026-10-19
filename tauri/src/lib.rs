@@ -19,6 +19,7 @@ pub mod error;
 /// `unsupported_platform`.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod inbox;
+pub mod link;
 pub mod memory;
 #[cfg(target_os = "android")]
 pub mod mobile;
@@ -58,6 +59,11 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::device::download_files,
         commands::device::cancel_wifi_transfer,
         commands::device::power_off_device,
+        link::link_watch,
+        link::link_pair,
+        link::link_forget,
+        link::link_kick,
+        link::link_record,
         commands::device::bluetooth_state,
         commands::device::request_bluetooth_on,
         commands::device::push_config,

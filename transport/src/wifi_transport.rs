@@ -196,6 +196,13 @@ pub trait WifiTransport {
     /// `POST /wifi_off` (SPEC §6.1) — the normal WiFi-exit path.
     async fn wifi_off(&self) -> Result<(), TransportError>;
 
+    /// `POST /record` (SPEC §6.1, added 2026-10-19): ends WiFi mode and
+    /// starts a session, as the logger's button does. Firmware before
+    /// 0.3.0-beta.11 answers 404, which is an error here.
+    async fn record(&self) -> Result<(), TransportError> {
+        Err(TransportError::new(TransportErrorKind::Wifi, "POST /record is not supported by this transport"))
+    }
+
     /// `GET /files` (SPEC §6.1).
     async fn list_files(&self) -> Result<Vec<DeviceFile>, TransportError>;
 
@@ -311,6 +318,17 @@ impl WifiTransport for ReqwestWifi {
             .map_err(|e| wifi_error(format!("POST /wifi_off failed: {e}")))?
             .error_for_status()
             .map_err(|e| wifi_error(format!("POST /wifi_off returned an error status: {e}")))?;
+        Ok(())
+    }
+
+    async fn record(&self) -> Result<(), TransportError> {
+        self.client
+            .post(format!("{}/record", self.base_url))
+            .send()
+            .await
+            .map_err(|e| wifi_error(format!("POST /record failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| wifi_error(format!("POST /record returned an error status: {e}")))?;
         Ok(())
     }
 
