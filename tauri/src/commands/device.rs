@@ -391,6 +391,38 @@ async fn connect_device_via<T: BleTransport>(
 /// disconnects it if one was present. Disconnecting an unconnected
 /// `device_id` is a no-op, `Ok(())` — never `not_found` (C3 §3.8's own
 /// wording).
+/// The transport-agnostic core of [`power_off_device`]: sends
+/// `CMD_POWER_OFF` over the managed link, then retires the link — the
+/// logger drops it as it shuts down.
+async fn power_off_device_via<T: BleTransport>(
+    connections: &ConnectionMap<T>,
+    device_id: &str,
+) -> Result<(), IpcError> {
+    let ble = connections
+        .lock()
+        .unwrap()
+        .get(device_id)
+        .cloned()
+        .ok_or_else(|| IpcError::new(IpcErrorKind::NotFound, "connect to the logger first"))?;
+    ble.lock().await.send_command(ControlCommand::PowerOff).await.map_err(IpcError::from)?;
+    let retired = connections.lock().unwrap().remove(device_id);
+    if let Some(ble) = retired {
+        let _ = tokio::time::timeout(Duration::from_secs(5), async move {
+            let _ = ble.lock().await.disconnect().await;
+        })
+        .await;
+    }
+    Ok(())
+}
+
+/// C3 §3.8 `power_off_device(device_id)` (added 2026-10-19): powers the
+/// logger off over its managed Bluetooth link — the long-press shutdown —
+/// and drops the link. `not_found` without a connection.
+#[tauri::command(async)]
+pub async fn power_off_device(connections: tauri::State<'_, Connections>, device_id: String) -> Result<(), IpcError> {
+    power_off_device_via(&connections.0, &device_id).await
+}
+
 async fn disconnect_device_via<T: BleTransport>(
     connections: &ConnectionMap<T>,
     device_id: &str,
@@ -1687,6 +1719,34 @@ pub(crate) mod tests {
         assert!(result.is_ok());
         assert!(!connections.lock().unwrap().contains_key("AA:BB"));
         assert_eq!(ble.lock().await.disconnect_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn power_off_device_via_connected_sends_the_command_and_retires_the_link() {
+        // Arrange
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        let ble = Arc::new(tokio::sync::Mutex::new(StubBle::default()));
+        connections.lock().unwrap().insert("AA:BB".to_string(), ble.clone());
+
+        // Act
+        let result = power_off_device_via(&connections, "AA:BB").await;
+
+        // Assert
+        assert!(result.is_ok());
+        assert_eq!(ble.lock().await.send_command_calls.load(Ordering::SeqCst), 1);
+        assert!(!connections.lock().unwrap().contains_key("AA:BB"));
+    }
+
+    #[tokio::test]
+    async fn power_off_device_via_unconnected_is_not_found() {
+        // Arrange
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+
+        // Act
+        let result = power_off_device_via(&connections, "AA:BB").await;
+
+        // Assert
+        assert_eq!(result.unwrap_err().kind, IpcErrorKind::NotFound);
     }
 
     #[tokio::test]

@@ -18,6 +18,9 @@ pub enum ControlCommand {
     /// Snapshots the ten newest session files into the FF06 read-back
     /// buffer, so new sessions can be spotted without WiFi (SPEC §7.2).
     FilesReadBegin = 0x0A,
+    /// Powers the logger off, as a long button press does: any session is
+    /// closed first, and the button wakes it (SPEC §7.2, added 2026-10-19).
+    PowerOff = 0x0B,
 }
 
 impl ControlCommand {
@@ -82,6 +85,7 @@ mod tests {
             (ControlCommand::ConfigCommit, 0x08),
             (ControlCommand::ConfigReadBegin, 0x09),
             (ControlCommand::FilesReadBegin, 0x0A),
+            (ControlCommand::PowerOff, 0x0B),
         ];
 
         // Act / Assert
