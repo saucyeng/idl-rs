@@ -118,6 +118,46 @@ pub(crate) async fn release_device_wifi() {
     crate::mobile::wifi::release().await;
 }
 
+/// C3 §3.8 `bluetooth_state` / `request_bluetooth_on` (added 2026-10-19):
+/// whether the phone's Bluetooth is there and on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BluetoothState {
+    /// The device has a Bluetooth adapter.
+    pub present: bool,
+    /// It is switched on.
+    pub on: bool,
+    /// The app can ask the system to turn it on (Android); elsewhere the
+    /// user does it in system settings.
+    pub can_request: bool,
+}
+
+/// The adapter's state now. Desktop reports it as on: btleplug's scan
+/// errors say when it isn't.
+pub(crate) async fn bluetooth_state() -> Result<BluetoothState, IpcError> {
+    #[cfg(target_os = "android")]
+    {
+        let s = crate::mobile::ble::adapter_state().await.map_err(IpcError::from)?;
+        Ok(BluetoothState { present: s.present, on: s.on, can_request: true })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Ok(BluetoothState { present: true, on: true, can_request: false })
+    }
+}
+
+/// Asks the system to turn Bluetooth on (Android shows its own prompt).
+pub(crate) async fn request_bluetooth_on() -> Result<BluetoothState, IpcError> {
+    #[cfg(target_os = "android")]
+    {
+        let s = crate::mobile::ble::request_adapter_on().await.map_err(IpcError::from)?;
+        Ok(BluetoothState { present: s.present, on: s.on, can_request: true })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        bluetooth_state().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;

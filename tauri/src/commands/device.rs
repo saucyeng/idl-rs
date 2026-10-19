@@ -415,6 +415,20 @@ async fn power_off_device_via<T: BleTransport>(
     Ok(())
 }
 
+/// C3 §3.8 `bluetooth_state()` (added 2026-10-19): whether Bluetooth is on,
+/// checked before scanning or connecting so "off" reads as "off".
+#[tauri::command(async)]
+pub async fn bluetooth_state() -> Result<platform::BluetoothState, IpcError> {
+    platform::bluetooth_state().await
+}
+
+/// C3 §3.8 `request_bluetooth_on()` (added 2026-10-19): Android's own
+/// "turn Bluetooth on?" prompt; the state after it.
+#[tauri::command(async)]
+pub async fn request_bluetooth_on() -> Result<platform::BluetoothState, IpcError> {
+    platform::request_bluetooth_on().await
+}
+
 /// C3 §3.8 `power_off_device(device_id)` (added 2026-10-19): powers the
 /// logger off over its managed Bluetooth link — the long-press shutdown —
 /// and drops the link. `not_found` without a connection.

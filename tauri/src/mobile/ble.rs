@@ -328,3 +328,23 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+/// Whether the phone has Bluetooth and whether it is switched on.
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
+pub(crate) struct AdapterState {
+    /// The phone has a Bluetooth adapter at all.
+    pub present: bool,
+    /// It is switched on.
+    pub on: bool,
+}
+
+/// The adapter's state now (no prompt).
+pub(crate) async fn adapter_state() -> Result<AdapterState, TransportError> {
+    call("bleAdapterState", (), TransportErrorKind::Ble).await
+}
+
+/// Asks Android to turn Bluetooth on (its own prompt) when it is off.
+pub(crate) async fn request_adapter_on() -> Result<AdapterState, TransportError> {
+    ensure_permissions().await?;
+    call("bleRequestEnable", (), TransportErrorKind::Ble).await
+}
