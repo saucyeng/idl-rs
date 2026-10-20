@@ -125,6 +125,23 @@ struct Imu {
     overrun_blocks: usize,
 }
 
+impl Imu {
+    /// An empty segment with this IMU's recorded axes, for after a restart.
+    fn fresh_segment(&self) -> Imu {
+        let mut fresh = Imu::default();
+        for (to, from) in [(&mut fresh.low, &self.low), (&mut fresh.high, &self.high)] {
+            to.axes = from.axes.clone();
+            to.values = vec![Vec::new(); from.axes.len()];
+        }
+        fresh
+    }
+}
+
+/// LOGGER_EVENT code for "IMU recovered" (spec §4.3): the firmware re-ran the
+/// IMU's init, so its FIFO and TIMESTAMP counter restarted. Blocks after it
+/// are a new clock segment.
+const EVT_IMU_RECOVERED: u8 = 5;
+
 /// Where an IMU's chip timestamp is used, so one unwrap pass can route it.
 #[derive(Clone, Copy)]
 enum ChipUse {
@@ -192,6 +209,9 @@ pub fn parse_idl1(bytes: &[u8]) -> Result<ParseResult, ParseError> {
     // Header fields this parser doesn't know (a later version's) sit between
     // the registry and the CRC; skip them.
     r.skip(header_len - r.position(), "header remainder")?;
+    // Each IMU as clock segments: a new one starts at every "IMU recovered"
+    // event, because the restarted chip's TIMESTAMP counter starts over.
+    let mut imus: [Vec<Imu>; 3] = imus.map(|imu| vec![imu]);
 
     let mut acc = ChannelAccumulator::new();
     let mut channel_slot: HashMap<u16, usize> = HashMap::new();
@@ -223,7 +243,16 @@ pub fn parse_idl1(bytes: &[u8]) -> Result<ParseResult, ParseError> {
                 acc.push("GPS_Hdop", hdop_x100 as f64 * 0.01);
             }
             REC_CHANNEL_SAMPLE => read_channel_sample(&mut r, len, &registry, &mut acc, &mut channel_slot, &mut channel_ts)?,
-            REC_LOGGER_EVENT => warnings.extend(read_logger_event(&mut r, len)?),
+            REC_LOGGER_EVENT => {
+                let (warning, event) = read_logger_event(&mut r, len)?;
+                warnings.extend(warning);
+                if let Some((EVT_IMU_RECOVERED, source)) = event {
+                    if let Some(segments) = imus.get_mut(source as usize) {
+                        let fresh = segments[0].fresh_segment();
+                        segments.push(fresh);
+                    }
+                }
+            }
             REC_SESSION_SUMMARY => warnings.extend(read_session_summary(&mut r, len)?),
             _ => {}
         }
@@ -233,42 +262,41 @@ pub fn parse_idl1(bytes: &[u8]) -> Result<ParseResult, ParseError> {
         }
     }
 
-    // Each IMU's sample times on the ESP32 clock.
-    let mut timed: Vec<(usize, bool, Vec<f64>, Vec<Option<usize>>, Vec<GapSpan>, f64)> = Vec::new();
-    for (i, imu) in imus.iter_mut().enumerate() {
-        if imu.overrun_blocks > 0 {
+    // Each IMU's sample times on the ESP32 clock, segment by segment, then
+    // joined: (imu, high-g?, times, values per axis, gaps, rate).
+    let mut timed: Vec<(usize, bool, Vec<f64>, Vec<Vec<i16>>, Vec<GapSpan>, f64)> = Vec::new();
+    for (i, segments) in imus.iter().enumerate() {
+        let overruns: usize = segments.iter().map(|s| s.overrun_blocks).sum();
+        if overruns > 0 {
             warnings.push(ImportWarning {
                 kind: ImportWarningKind::LoggerDiagnostic,
-                message: format!("IMU{i}: FIFO overrun flagged in {} reads", imu.overrun_blocks),
+                message: format!("IMU{i}: FIFO overrun flagged in {overruns} reads"),
             });
         }
-        let (pairs, low_marks, high_marks) = unwrap_chip_times(imu);
-        let map = idl1_timing::fit_clock_map(&pairs, CLOCK_FIT_WINDOW_US);
-        for (high, stream, marks) in [(false, &imu.low, low_marks), (true, &imu.high, high_marks)] {
-            if stream.count == 0 || stream.axes.is_empty() {
-                continue;
+        for high in [false, true] {
+            let mut joined: Option<(Vec<f64>, Vec<Vec<i16>>, Vec<GapSpan>, f64, usize)> = None;
+            for imu in segments {
+                let stream = if high { &imu.high } else { &imu.low };
+                if stream.count == 0 || stream.axes.is_empty() {
+                    continue;
+                }
+                let (esp, source, gaps, rate) = time_stream(i, high, imu, &mut warnings);
+                let (times, values, all_gaps, best_rate, best_len) =
+                    joined.get_or_insert_with(|| (Vec::new(), vec![Vec::new(); stream.axes.len()], Vec::new(), rate, 0));
+                let base = times.len();
+                all_gaps.extend(gaps.into_iter().map(|g| GapSpan { start: g.start + base, len: g.len }));
+                for (a, axis) in values.iter_mut().enumerate() {
+                    axis.extend(fill_lost(&stream.values[a], &source));
+                }
+                times.extend(esp);
+                // The rate of the longest segment speaks for the channel.
+                if stream.count > *best_len {
+                    *best_len = stream.count;
+                    *best_rate = rate;
+                }
             }
-            let label = if high { format!("IMU{i} high-g") } else { format!("IMU{i}") };
-            let rate_hz = stream.axes[0].rate_mhz as f64 / 1000.0;
-            match (map.as_ref(), idl1_timing::place_samples(stream.count, &marks)) {
-                (Some(map), Some(placed)) => {
-                    let esp: Vec<f64> = placed.chip.iter().map(|&c| map.map(c)).collect();
-                    let gaps = placed.lost.iter().map(|l| GapSpan { start: l.start, len: l.len }).collect();
-                    let period_us = placed.period_ticks * map.mean_slope();
-                    let rate = if period_us > 0.0 { 1e6 / period_us } else { rate_hz };
-                    timed.push((i, high, esp, placed.source, gaps, rate));
-                }
-                _ => {
-                    warnings.push(ImportWarning {
-                        kind: ImportWarningKind::TimingFallback,
-                        message: format!(
-                            "{label}: too few chip timestamps to time samples by the chip clock; timed from read instants at the nominal {rate_hz} Hz"
-                        ),
-                    });
-                    let esp = read_instant_times(&stream.blocks, rate_hz);
-                    let source = (0..stream.count).map(Some).collect();
-                    timed.push((i, high, esp, source, Vec::new(), rate_hz));
-                }
+            if let Some((times, values, gaps, rate, _)) = joined {
+                timed.push((i, high, times, values, gaps, rate));
             }
         }
     }
@@ -284,8 +312,8 @@ pub fn parse_idl1(bytes: &[u8]) -> Result<ParseResult, ParseError> {
         .unwrap_or(0);
 
     let mut channels: Vec<Channel> = Vec::new();
-    for (i, high, esp, source, gaps, rate) in timed {
-        let stream = if high { &imus[i].high } else { &imus[i].low };
+    for (i, high, esp, values, gaps, rate) in timed {
+        let stream = if high { &imus[i][0].high } else { &imus[i][0].low };
         let t_us = strictly_increasing(esp.iter().map(|&t| t.round() as i64 - t0).collect());
         let source_kind = if high { format!("imu{i}_hg") } else { format!("imu{i}") };
         for (a, entry) in stream.axes.iter().enumerate() {
@@ -294,7 +322,7 @@ pub fn parse_idl1(bytes: &[u8]) -> Result<ParseResult, ParseError> {
                 t_us: t_us.clone(),
                 t_recorded_us: None,
                 nominal_rate_hz: rate,
-                column: RawColumn::I16 { data: fill_lost(&stream.values[a], &source), scale: entry.scale, offset: entry.offset },
+                column: RawColumn::I16 { data: values[a].clone(), scale: entry.scale, offset: entry.offset },
                 source_kind: source_kind.clone(),
                 unit: entry.units.clone(),
                 gaps: gaps.clone(),
@@ -449,9 +477,42 @@ fn gps_unit(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Reads one IMU_BLOCK (spec §4.4) into `imus`. A block for an IMU index
+/// One clock segment's stream timed on the ESP32 clock: sample times, the
+/// received sample behind each slot (`None` = lost), lost runs, and the
+/// measured rate in Hz. Falls back to read instants, with a warning, when
+/// the segment has too few chip timestamps.
+fn time_stream(i: usize, high: bool, imu: &Imu, warnings: &mut Vec<ImportWarning>) -> (Vec<f64>, Vec<Option<usize>>, Vec<GapSpan>, f64) {
+    let stream = if high { &imu.high } else { &imu.low };
+    let (pairs, low_marks, high_marks) = unwrap_chip_times(imu);
+    let marks = if high { high_marks } else { low_marks };
+    let rate_hz = stream.axes[0].rate_mhz as f64 / 1000.0;
+    let map = idl1_timing::fit_clock_map(&pairs, CLOCK_FIT_WINDOW_US);
+    match (map.as_ref(), idl1_timing::place_samples(stream.count, &marks)) {
+        (Some(map), Some(placed)) => {
+            let esp: Vec<f64> = placed.chip.iter().map(|&c| map.map(c)).collect();
+            let gaps = placed.lost.iter().map(|l| GapSpan { start: l.start, len: l.len }).collect();
+            let period_us = placed.period_ticks * map.mean_slope();
+            let rate = if period_us > 0.0 { 1e6 / period_us } else { rate_hz };
+            (esp, placed.source, gaps, rate)
+        }
+        _ => {
+            let label = if high { format!("IMU{i} high-g") } else { format!("IMU{i}") };
+            warnings.push(ImportWarning {
+                kind: ImportWarningKind::TimingFallback,
+                message: format!(
+                    "{label}: too few chip timestamps to time samples by the chip clock; timed from read instants at the nominal {rate_hz} Hz"
+                ),
+            });
+            let esp = read_instant_times(&stream.blocks, rate_hz);
+            let source = (0..stream.count).map(Some).collect();
+            (esp, source, Vec::new(), rate_hz)
+        }
+    }
+}
+
+/// Reads one IMU_BLOCK (spec §4.4) into the current segment of its IMU. A block for an IMU index
 /// past 2, or one too short for its own counts, is skipped whole.
-fn read_imu_block(r: &mut ByteReader, len: usize, imus: &mut [Imu; 3]) -> Result<(), ParseError> {
+fn read_imu_block(r: &mut ByteReader, len: usize, imus: &mut [Vec<Imu>; 3]) -> Result<(), ParseError> {
     if len < IMU_BLOCK_FIXED_BYTES {
         return Ok(());
     }
@@ -462,7 +523,7 @@ fn read_imu_block(r: &mut ByteReader, len: usize, imus: &mut [Imu; 3]) -> Result
     let n_samples = r.u16("n_samples")? as usize;
     let n_hg = r.u16("n_hg")? as usize;
     let n_ts = r.u8("n_ts")? as usize;
-    let Some(imu) = imus.get_mut(idx) else { return Ok(()) };
+    let Some(imu) = imus.get_mut(idx).and_then(|segments| segments.last_mut()) else { return Ok(()) };
     let need = IMU_BLOCK_FIXED_BYTES + n_samples * 2 * imu.low.axes.len() + n_hg * 2 * imu.high.axes.len() + n_ts * TS_WORD_BYTES;
     if need > len {
         return Ok(());
@@ -632,19 +693,20 @@ fn event_name(code: u8) -> &'static str {
 }
 
 /// Reads one LOGGER_EVENT (spec §4.3: code u8, source u16, count u32,
-/// timestamp_us i64) as an import warning.
-fn read_logger_event(r: &mut ByteReader, len: usize) -> Result<Option<ImportWarning>, ParseError> {
+/// timestamp_us i64) as an import warning, plus its `(code, source)`.
+fn read_logger_event(r: &mut ByteReader, len: usize) -> Result<(Option<ImportWarning>, Option<(u8, u16)>), ParseError> {
     if len < 15 {
-        return Ok(None);
+        return Ok((None, None));
     }
     let code = r.u8("event code")?;
     let source = r.u16("event source")?;
     let count = r.u32("event count")?;
     let ts = r.i64("event timestamp_us")?;
-    Ok(Some(ImportWarning {
+    let warning = ImportWarning {
         kind: ImportWarningKind::LoggerDiagnostic,
         message: format!("logger: {} (source {source}) ×{count} at device time {:.3} s", event_name(code), ts as f64 / 1e6),
-    }))
+    };
+    Ok((Some(warning), Some((code, source))))
 }
 
 /// Reads SESSION_SUMMARY (spec §4.3: n_imu u8; per IMU overruns u32,
@@ -991,6 +1053,64 @@ pub(crate) mod tests {
         assert_eq!(r.session.source_format, SourceFormat::Idl1);
         assert_eq!(r.session.session_id, "0102030405060708090a0b0c0d0e0f10");
         assert!(r.import_warnings.is_empty(), "{:?}", r.import_warnings);
+    }
+
+    /// `seconds` of IMU `imu` at 480 Hz starting at ESP32 time `start_us`,
+    /// on a chip whose TIMESTAMP counter read 0 at `chip_zero_us`. Sample k's
+    /// value is `first_value + k`.
+    fn imu_stream_at(b: &mut Builder, imu: u8, seconds: i64, start_us: i64, chip_zero_us: i64, first_value: i16) {
+        let tick_us = 21.75_f64;
+        let period_us = 1e6 / 480.0;
+        let total = (seconds as f64 * 480.0) as usize;
+        let chip = |t_us: f64| ((t_us - chip_zero_us as f64) / tick_us).round() as u32;
+        let mut k = 0usize;
+        let mut read_us = start_us + 20_000;
+        while k < total {
+            let (mut samples, mut ts) = (Vec::new(), Vec::new());
+            while k < total && (start_us as f64 + k as f64 * period_us) < read_us as f64 {
+                let t = start_us as f64 + k as f64 * period_us;
+                if k % 32 == 0 {
+                    ts.push((samples.len() as u16, 0, chip(t)));
+                }
+                samples.push([first_value + k as i16; 6]);
+                k += 1;
+            }
+            b.imu_block(imu, 0, read_us + 300, chip(read_us as f64), &samples, &[], &ts);
+            read_us += 20_000;
+        }
+    }
+
+    #[test]
+    fn parse_idl1_imu_restart_mid_session_starts_a_new_clock_segment() {
+        // Arrange — 3 s, then the firmware re-inits IMU1 (its TIMESTAMP
+        // counter starts over at 4 s), then 3 s more.
+        let mut b = Builder::new();
+        b.imu_axes(1, 480);
+        imu_stream_at(&mut b, 1, 3, 0, 0, 0);
+        b.logger_event(4, 1, 1, 3_100_000);
+        b.logger_event(5, 1, 1, 3_990_000);
+        imu_stream_at(&mut b, 1, 3, 4_000_000, 4_000_000, 2000);
+        b.end();
+
+        // Act
+        let r = parse_idl1(&b.build()).unwrap();
+
+        // Assert — both segments on the chip clock, in order, the second
+        // starting ~4 s after the first, each spaced at 480 Hz.
+        let ax = find(&r, "IMU1_AccelX");
+        assert_eq!(ax.t_us.len(), 2880);
+        assert!(!r.import_warnings.iter().any(|w| w.kind == ImportWarningKind::TimingFallback), "{:?}", r.import_warnings);
+        assert!(ax.t_us.windows(2).all(|w| w[1] > w[0]));
+        let restart = (ax.t_us[1440] - ax.t_us[0]) as f64;
+        assert!((restart - 4e6).abs() < 100.0, "second segment at {restart} µs");
+        for seg in [&ax.t_us[..1440], &ax.t_us[1440..]] {
+            let spacing = (seg[1439] - seg[0]) as f64 / 1439.0;
+            assert!((spacing - 1e6 / 480.0).abs() < 0.5, "spacing {spacing}");
+        }
+        assert!((ax.nominal_rate_hz - 480.0).abs() < 0.5, "rate {}", ax.nominal_rate_hz);
+        let v = ax.materialize();
+        assert!((v[1440] - 2000.0 * 0.000488).abs() < 1e-6);
+        assert!(r.import_warnings.iter().any(|w| w.message.contains("IMU recovered")));
     }
 
     #[test]
