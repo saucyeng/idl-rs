@@ -113,6 +113,9 @@ pub(crate) struct LinkTiming {
     /// The longest a borrower may keep the link before the actor takes it
     /// back.
     pub lend_limit: Duration,
+    /// How often a Ready link sends `CMD_KEEPALIVE`, so the logger can drop
+    /// a link whose app died (SPEC §7.2 link liveness, 2026-10-21).
+    pub keepalive: Duration,
 }
 
 impl Default for LinkTiming {
@@ -126,6 +129,7 @@ impl Default for LinkTiming {
             returning_wait: Duration::from_millis(500),
             boot_wait: Duration::from_secs(4),
             lend_limit: Duration::from_secs(20 * 60),
+            keepalive: Duration::from_secs(5),
         }
     }
 }
@@ -249,12 +253,17 @@ pub(crate) async fn run_link<B, F, Fut>(
         view.pending_record = false;
         publish(view.clone());
 
+        // Silence is measured from the last status only: a keepalive tick or
+        // an intent waking the loop must not restart it, or a link whose
+        // status stopped would never be noticed.
+        let mut silent_at = Instant::now() + timing.status_silence;
+        let mut keepalive = tokio::time::interval_at(Instant::now() + timing.keepalive, timing.keepalive);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let silence = tokio::time::sleep(timing.status_silence);
-            tokio::pin!(silence);
             tokio::select! {
                 status = async { match status_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => match status {
                     Some(status) => {
+                        silent_at = Instant::now() + timing.status_silence;
                         view.status = Some(status.into());
                         view.status_at_ms = Some(now_ms());
                         publish(view.clone());
@@ -267,7 +276,17 @@ pub(crate) async fn run_link<B, F, Fut>(
                         continue 'outer;
                     }
                 },
-                _ = &mut silence => {
+                _ = keepalive.tick() => {
+                    // "Still here" (SPEC §7.2). The result is ignored: older
+                    // firmware rejects the byte, and a dead link is the
+                    // silence check's job. Bounded, so a borrower holding the
+                    // link can't stall the actor.
+                    let _ = tokio::time::timeout(timing.keepalive, async {
+                        link.lock().await.send_command(ControlCommand::Keepalive).await
+                    })
+                    .await;
+                }
+                _ = tokio::time::sleep_until(silent_at) => {
                     // Silent past the 1 Hz publish: dead, whatever the
                     // stack says.
                     lost(connections, &device_id, &link, &mut view, publish);
@@ -602,6 +621,39 @@ mod tests {
         assert!(connects.load(Ordering::SeqCst) >= 2);
         let phases = views.lock().unwrap().clone();
         assert!(phases.contains(&LinkPhase::Seeking), "{phases:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_link_ready_link_sends_keepalives_and_a_silent_one_is_still_dropped() {
+        // Arrange — the stub never sends status.
+        let connections: ConnectionMap<StubBle> = StdMutex::new(HashMap::new());
+        let views = StdMutex::new(Vec::new());
+        let publish = |v: LinkView| views.lock().unwrap().push(v.phase);
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Act — just past one keepalive period, then past the silence window.
+        let actor = run_link("AA".into(), &connections, || async { Ok(reachable()) }, rx, &publish, &|| {}, timing());
+        let drive = async {
+            settle().await;
+            tokio::time::sleep(timing().keepalive + Duration::from_millis(100)).await;
+            settle().await;
+            let link = connections.lock().unwrap().get("AA").cloned().expect("connected");
+            let sent = {
+                let ble = link.lock().await;
+                (ble.send_command_calls.load(Ordering::SeqCst), *ble.last_command.lock().unwrap())
+            };
+            tokio::time::sleep(timing().status_silence - timing().keepalive).await;
+            settle().await;
+            let _ = tx.send(Intent::Stop);
+            sent
+        };
+        let ((), sent) = tokio::join!(actor, drive);
+
+        // Assert
+        assert_eq!(sent, (1, Some(ControlCommand::Keepalive)));
+        let phases = views.lock().unwrap().clone();
+        let ready = phases.iter().position(|p| *p == LinkPhase::Ready).expect("ready");
+        assert!(phases[ready..].contains(&LinkPhase::Seeking), "silent link dropped despite keepalives: {phases:?}");
     }
 
     #[tokio::test(start_paused = true)]

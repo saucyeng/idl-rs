@@ -21,6 +21,11 @@ pub enum ControlCommand {
     /// Powers the logger off, as a long button press does: any session is
     /// closed first, and the button wakes it (SPEC §7.2, added 2026-10-19).
     PowerOff = 0x0B,
+    /// "Still here": sent every 5 s while the app uses the link, so the
+    /// logger can drop a link whose app has died (SPEC §7.2 link liveness,
+    /// added 2026-10-21). Older firmware rejects it; callers ignore the
+    /// result.
+    Keepalive = 0x0C,
 }
 
 impl ControlCommand {
@@ -86,6 +91,7 @@ mod tests {
             (ControlCommand::ConfigReadBegin, 0x09),
             (ControlCommand::FilesReadBegin, 0x0A),
             (ControlCommand::PowerOff, 0x0B),
+            (ControlCommand::Keepalive, 0x0C),
         ];
 
         // Act / Assert
