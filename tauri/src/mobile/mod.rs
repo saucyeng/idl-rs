@@ -24,6 +24,13 @@ pub fn install(handle: PluginHandle<tauri::Wry>) {
 
 /// Runs `command` on the Kotlin plugin, failing as `kind` on any plugin or
 /// JNI error. The plugin's reject message becomes the error's message.
+///
+/// The plugin call runs on its own task, so a caller that gives up (a
+/// `tokio::time::timeout` around a connect) drops only the join handle and
+/// the call still takes Kotlin's late answer. Dropping the pending call
+/// itself made tauri's response handler unwrap a closed channel
+/// (tauri 2.11.5 `plugin/mobile.rs:307`) inside a JNI callback, which
+/// aborts the app: the crash ~10 s into a search (2026-10-21).
 pub(crate) async fn call<T: DeserializeOwned>(
     command: &str,
     payload: impl Serialize,
@@ -32,8 +39,15 @@ pub(crate) async fn call<T: DeserializeOwned>(
     let plugin = PLUGIN
         .get()
         .ok_or_else(|| TransportError::new(kind, "the Android device plugin is not registered"))?;
-    plugin
-        .run_mobile_plugin_async(command, payload)
+    let payload = serde_json::to_value(payload)
+        .map_err(|e| TransportError::new(kind, format!("{command}: payload did not serialise: {e}")))?;
+    let name = command.to_string();
+    let task = tauri::async_runtime::spawn(async move {
+        plugin.run_mobile_plugin_async::<serde_json::Value>(&name, payload).await.map_err(|e| e.to_string())
+    });
+    let value = task
         .await
-        .map_err(|e| TransportError::new(kind, format!("{command}: {e}")))
+        .map_err(|e| TransportError::new(kind, format!("{command}: the plugin call's task failed: {e}")))?
+        .map_err(|e| TransportError::new(kind, format!("{command}: {e}")))?;
+    serde_json::from_value(value).map_err(|e| TransportError::new(kind, format!("{command}: unexpected answer: {e}")))
 }
