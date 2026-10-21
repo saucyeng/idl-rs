@@ -22,6 +22,36 @@ pub fn install(handle: PluginHandle<tauri::Wry>) {
     let _ = PLUGIN.set(handle);
 }
 
+#[derive(serde::Serialize)]
+struct CrashSetupArgs<'a> {
+    dir: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct ShareArgs<'a> {
+    title: &'a str,
+    text: &'a str,
+}
+
+/// Tells the plugin where crash reports go (its uncaught-exception handler
+/// writes there) and has it turn the last run's exit reasons into reports
+/// (crash reports spec, 2026-10-21). Idempotent; a failure only costs the
+/// Android-side reports, so it is not returned.
+pub async fn crash_setup(dir: &std::path::Path) {
+    let dir = dir.to_string_lossy();
+    // `call` wants a transport kind; this is neither Bluetooth nor WiFi, and
+    // the result is dropped, so the kind never reaches anyone.
+    let _ = call::<serde_json::Value>("crashSetup", CrashSetupArgs { dir: &dir }, TransportErrorKind::Ble).await;
+}
+
+/// Opens Android's share sheet with `text`. A plugin failure is `io`.
+pub(crate) async fn share_text(title: &str, text: &str) -> Result<(), crate::error::IpcError> {
+    call::<serde_json::Value>("shareText", ShareArgs { title, text }, TransportErrorKind::Ble)
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::error::IpcError::new(crate::error::IpcErrorKind::Io, e.message))
+}
+
 /// Runs `command` on the Kotlin plugin, failing as `kind` on any plugin or
 /// JNI error. The plugin's reject message becomes the error's message.
 ///

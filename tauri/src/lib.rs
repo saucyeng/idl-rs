@@ -9,6 +9,8 @@
 //! ```
 
 pub mod commands;
+/// Local crash reports (C3 §3.13, 2026-10-21).
+pub mod crash;
 /// Build-time guard over the engine's delete sites (ruling R196). Test-only
 /// — it contains no runtime code, only the scan and the audited allowlist.
 #[cfg(test)]
@@ -149,5 +151,8 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::video::set_video_offset,
         commands::video::reestimate_video_offset,
         commands::video::unlink_video,
+        crash::crash_reports,
+        crash::dismiss_crash_reports,
+        crash::share_crash_report,
     ]
 }
