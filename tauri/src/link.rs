@@ -640,7 +640,8 @@ mod tests {
             let link = connections.lock().unwrap().get("AA").cloned().expect("connected");
             let sent = {
                 let ble = link.lock().await;
-                (ble.send_command_calls.load(Ordering::SeqCst), *ble.last_command.lock().unwrap())
+                let last = *ble.last_command.lock().unwrap();
+                (ble.send_command_calls.load(Ordering::SeqCst), last)
             };
             tokio::time::sleep(timing().status_silence - timing().keepalive).await;
             settle().await;
