@@ -183,6 +183,18 @@ fn keep_live_videos(actions: &mut Vec<&SyncAction>, live: &BTreeSet<String>) -> 
     (before - actions.len()) as u32
 }
 
+/// Video blobs linked live from the `session.json` of any of `ids`, read from
+/// `data_root` (so after the sessions phase it includes what the run merged).
+/// Ids that are not session-id shaped, or have no readable `session.json`,
+/// contribute nothing.
+fn selected_live_videos(data_root: &Path, ids: &BTreeSet<String>) -> BTreeSet<String> {
+    ids.iter()
+        .filter(|id| is_valid_id(id, IdClass::Session))
+        .filter_map(|id| idl_rs::store::session_json::read_session_json(&data_root.join("sessions").join(id).join("session.json")).ok())
+        .flat_map(|d| d.videos.into_iter().filter(|v| !v.unlinked).map(|v| v.blob_sha256))
+        .collect()
+}
+
 /// Builds a `TransportErrorKind::Sync` error with `message`.
 fn sync_error(message: impl Into<String>) -> TransportError {
     TransportError::new(TransportErrorKind::Sync, message.into())
@@ -350,6 +362,13 @@ pub async fn sync_with_peer(
             let live = tokio::task::spawn_blocking(move || idl_rs::store::video::live_video_blobs(&root))
                 .await
                 .map_err(|e| sync_error(format!("reading linked videos: {e}")))?;
+            let live = match &selection.sessions {
+                None => live,
+                Some(ids) => {
+                    let linked = selected_live_videos(data_root, ids);
+                    live.intersection(&linked).cloned().collect()
+                }
+            };
             result.videos_skipped += keep_live_videos(&mut actions, &live);
             let total: u64 = actions.iter().map(|a| item_of(a).size_bytes).sum();
             on_progress(SyncProgress { done: 0, total: Some(total), phase });
@@ -1174,6 +1193,79 @@ mod tests {
         });
         write_session_json(root, session_id, &doc, None).unwrap();
         sha
+    }
+
+    /// Writes a second session `session_id` linking its own video `content`.
+    fn write_linked_video_in(root: &Path, session_id: &str, content: &[u8]) -> String {
+        use idl_rs::store::session_json::{empty_session_json, write_session_json};
+        let sha = idl_rs::store::blob::write_blob(root, content).unwrap();
+        let mut doc = empty_session_json(session_id);
+        doc.videos.push(idl_rs::video::VideoLink {
+            blob_sha256: sha.clone(),
+            size_bytes: content.len() as u64,
+            file_name: "GX010002.MP4".to_string(),
+            video_codec: "h264".to_string(),
+            width_px: 1920,
+            height_px: 1080,
+            fps: 30.0,
+            duration_s: 1.0,
+            offset_s: 0.0,
+            sync_method: idl_rs::video::SyncMethod::Manual,
+            unlinked: false,
+            updated_at_ms: 10,
+        });
+        write_session_json(root, session_id, &doc, None).unwrap();
+        sha
+    }
+
+    #[tokio::test]
+    async fn sync_with_peer_a_session_selection_pulls_only_the_selected_sessions_video() {
+        // Arrange — the peer has two sessions, each linking its own video.
+        let local_root = temp_data_root();
+        let remote_root = temp_data_root();
+        let selected_sha = write_linked_video(&remote_root, b"selected video", false, 10);
+        let other_sha = write_linked_video_in(&remote_root, "ffeeddccbbaa99887766554433221100", b"unselected video");
+        let token = "tok-sel";
+        let server = start_test_server(remote_root.clone(), token).await;
+        let peer = test_peer(token);
+        let selection = SyncSelection { sessions: Some(["00112233445566778899aabbccddeeff".to_string()].into()), ..SyncSelection::everything() };
+
+        // Act
+        let result = sync_with_peer(&local_root, &peer, server.local_addr(), 1000, &selection, &no_progress).await.unwrap();
+
+        // Assert
+        assert!(blob_path(&local_root, &selected_sha).is_file());
+        assert!(!blob_path(&local_root, &other_sha).is_file());
+        assert_eq!(result.blobs_transferred, 1);
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&local_root);
+        let _ = std::fs::remove_dir_all(&remote_root);
+    }
+
+    #[tokio::test]
+    async fn sync_with_peer_a_session_selection_pushes_only_the_selected_sessions_video() {
+        // Arrange — this device has two sessions with videos; the peer is empty.
+        let local_root = temp_data_root();
+        let remote_root = temp_data_root();
+        let selected_sha = write_linked_video(&local_root, b"selected video", false, 10);
+        let other_sha = write_linked_video_in(&local_root, "ffeeddccbbaa99887766554433221100", b"unselected video");
+        let token = "tok-selp";
+        let server = start_test_server(remote_root.clone(), token).await;
+        let peer = test_peer(token);
+        let selection = SyncSelection { sessions: Some(["00112233445566778899aabbccddeeff".to_string()].into()), ..SyncSelection::everything() };
+
+        // Act
+        sync_with_peer(&local_root, &peer, server.local_addr(), 1000, &selection, &no_progress).await.unwrap();
+
+        // Assert
+        assert!(blob_path(&remote_root, &selected_sha).is_file());
+        assert!(!blob_path(&remote_root, &other_sha).is_file());
+        assert!(!remote_root.join("sessions").join("ffeeddccbbaa99887766554433221100").exists());
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&local_root);
+        let _ = std::fs::remove_dir_all(&remote_root);
     }
 
     #[tokio::test]

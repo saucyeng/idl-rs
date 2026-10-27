@@ -40,6 +40,10 @@ pub struct SyncSelection {
     pub workbooks: Option<BTreeSet<String>>,
     /// Push only items the peer does not have at all (never an update or a merge):
     /// the "Send new" rule. Pulls are not affected by this flag.
+    /// Checked per item for `data.parquet`, `session.json`, workbooks, tracks,
+    /// profiles and bikes; content-addressed blobs and derived channels are
+    /// always "absent" by construction, so a new derived file for a session
+    /// the peer already holds is still sent (harmless).
     #[serde(default)]
     pub absent_only: bool,
 }
@@ -80,7 +84,7 @@ fn selected_blobs(ids: &BTreeSet<String>, local: &Manifest, remote: &Manifest) -
             continue;
         }
         let hashes: Vec<&str> =
-            entries.iter().filter_map(|s| s.data_parquet.as_ref()).map(|d| d.blob_sha256.as_str()).filter(|h| !h.is_empty()).collect();
+            entries.iter().filter_map(|s| s.data_parquet.as_ref()).filter_map(|d| d.blob_sha256.as_deref()).collect();
         if hashes.is_empty() {
             eprintln!("sync: selected session {id} has no blob_sha256 in its manifest entry (older peer); its blob is not moved");
         }
@@ -115,7 +119,8 @@ fn remote_has(remote: &Manifest, item: &SyncItem) -> bool {
 /// 5. Workbooks pass iff `workbooks` is `None` or names the workbook.
 /// 6. Blobs: with `sessions` set, a log blob passes iff a selected session's
 ///    `blob_sha256` names it; a video blob (`kind: "video"`, either manifest)
-///    passes unchanged so today's liveness rule (`keep_live_videos`) decides.
+///    passes here and is narrowed in the client's `"videos"` phase to the
+///    blobs the selected sessions' (merged, local) `session.json` link live.
 pub fn filter_plan(plan: SyncPlan, selection: &SyncSelection, local: &Manifest, remote: &Manifest) -> SyncPlan {
     let blobs = selection.sessions.as_ref().map(|ids| selected_blobs(ids, local, remote));
 
@@ -176,7 +181,7 @@ mod tests {
                 importer_version: "1.0.0".to_string(),
                 seam_correction_version: "v1".to_string(),
                 engine_version: "1.0.0".to_string(),
-                blob_sha256: blob.to_string(),
+                blob_sha256: Some(blob.to_string()),
             }),
             derived: vec![DerivedEntry { sha256: "e".repeat(64), size_bytes: 1 }],
             session_json: Some(SessionJsonEntry { sha256: "f".repeat(64), size_bytes: 1, updated_at_ms: 0 }),
@@ -298,7 +303,7 @@ mod tests {
     fn filter_plan_a_session_whose_manifest_lacks_blob_sha256_moves_without_its_blob() {
         // Arrange
         let (plan, local, mut remote) = two_pulled_one_pushed();
-        remote.sessions[0].data_parquet.as_mut().unwrap().blob_sha256 = String::new();
+        remote.sessions[0].data_parquet.as_mut().unwrap().blob_sha256 = None;
         let sel = SyncSelection { sessions: set(&["aaaa"]), ..SyncSelection::everything() };
 
         // Act
@@ -314,7 +319,7 @@ mod tests {
     fn filter_plan_the_blob_hash_is_taken_from_the_local_manifest_when_only_it_has_one() {
         // Arrange
         let (plan, mut local, mut remote) = two_pulled_one_pushed();
-        remote.sessions[0].data_parquet.as_mut().unwrap().blob_sha256 = String::new();
+        remote.sessions[0].data_parquet.as_mut().unwrap().blob_sha256 = None;
         local.sessions.push(session("aaaa", &"a1".repeat(32)));
         let sel = SyncSelection { sessions: set(&["aaaa"]), ..SyncSelection::everything() };
 
@@ -460,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_plan_a_video_blob_passes_a_session_selection_for_the_liveness_rule_to_decide() {
+    fn filter_plan_a_video_blob_passes_a_session_selection_for_the_videos_phase_to_narrow() {
         // Arrange
         let vid = "9a".repeat(32);
         let mut remote = empty();

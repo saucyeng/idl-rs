@@ -62,11 +62,11 @@ pub struct DataParquetEntry {
     pub engine_version: String,
     /// SHA-256 (64 lowercase hex) of the session's source blob, read from
     /// the `blob_sha256` key of this file's metadata (C1 §4.3). Added
-    /// 2026-10-27 (library tiers, C4 §6); empty when an older peer's
-    /// manifest omits it, in which case the blob is not part of the
-    /// session's selective-sync closure.
-    #[serde(default)]
-    pub blob_sha256: String,
+    /// 2026-10-27 (library tiers, C4 §6); `None` when an older peer's
+    /// manifest omits it (or the key is absent), in which case the blob is
+    /// not part of the session's selective-sync closure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_sha256: Option<String>,
 }
 
 /// One `sessions/<id>/session.json` manifest entry. `updated_at_ms` is the
@@ -310,12 +310,12 @@ fn collect_blobs(data_root: &Path) -> Vec<BlobEntry> {
 /// `importer_version`, `seam_correction_version`, `engine_version` — are
 /// private, not the function itself, and its field set differs) rather
 /// than widening that struct's visibility for a three-field subset.
-fn read_data_parquet_manifest_fields(path: &Path) -> Option<(String, String, String, String)> {
+fn read_data_parquet_manifest_fields(path: &Path) -> Option<(String, String, String, Option<String>)> {
     let file = std::fs::File::open(path).ok()?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
     let kv = builder.metadata().file_metadata().key_value_metadata()?;
     let get = |k: &str| kv.iter().find(|e| e.key == k).and_then(|e| e.value.clone());
-    Some((get("importer_version")?, get("seam_correction_version")?, get("engine_version")?, get("blob_sha256").unwrap_or_default()))
+    Some((get("importer_version")?, get("seam_correction_version")?, get("engine_version")?, get("blob_sha256")))
 }
 
 fn collect_sessions(data_root: &Path) -> (Vec<SessionEntry>, Vec<SkippedEntry>) {
@@ -653,7 +653,7 @@ mod tests {
         assert_eq!(dp.importer_version, "0.1.0");
         assert!(!dp.seam_correction_version.is_empty());
         assert!(!dp.engine_version.is_empty());
-        assert_eq!(dp.blob_sha256, sha256_hex(&blob_bytes));
+        assert_eq!(dp.blob_sha256, Some(sha256_hex(&blob_bytes)));
         let sj = session.session_json.as_ref().unwrap();
         let sj_bytes = std::fs::read(root.join("sessions").join("s1").join("session.json")).unwrap();
         assert_eq!(sj.sha256, sha256_hex(&sj_bytes));
@@ -972,7 +972,7 @@ mod tests {
                     importer_version: "0.3.0".to_string(),
                     seam_correction_version: "v1".to_string(),
                     engine_version: "0.7.2".to_string(),
-                    blob_sha256: "1".repeat(64),
+                    blob_sha256: Some("1".repeat(64)),
                 }),
                 derived: vec![DerivedEntry { sha256: "c".repeat(64), size_bytes: 4321 }],
                 session_json: Some(SessionJsonEntry { sha256: "d".repeat(64), size_bytes: 512, updated_at_ms: 1_756_857_600_000 }),
@@ -1005,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn data_parquet_entry_an_older_peers_entry_without_blob_sha256_parses_with_it_empty() {
+    fn data_parquet_entry_an_older_peers_entry_without_blob_sha256_parses_with_it_none() {
         // Arrange
         let older = r#"{"sha256":"aa","size_bytes":3,"importer_version":"0.1.0","seam_correction_version":"v1","engine_version":"0.7.2"}"#;
 
@@ -1013,7 +1013,8 @@ mod tests {
         let entry: DataParquetEntry = serde_json::from_str(older).unwrap();
 
         // Assert
-        assert_eq!(entry.blob_sha256, "");
+        assert_eq!(entry.blob_sha256, None);
+        assert!(serde_json::to_value(&entry).unwrap().get("blob_sha256").is_none());
     }
 
     #[test]
