@@ -507,7 +507,8 @@ fn resolve_peer_and_addr(peer_id: &str, peers: &[Peer], discovered: &HashMap<Str
 /// auto-trigger task (silent — no open channel to report on). Marks
 /// `peer_id` running for the duration (the auto-trigger decision's own
 /// "never while a sync for that peer is already running" rule reads this
-/// same set) and records the completion time in `last_sync` on success.
+/// same set), refusing with a `sync` error, before any request, if it already
+/// is (the check and the mark are one atomic step), and records the completion time in `last_sync` on success.
 ///
 /// Catalog re-index is per touched session id
 /// (`idl_rs::store::catalog::index_session`, mirroring `rescan_tracks_via`
@@ -525,7 +526,9 @@ pub(crate) async fn run_one_sync(
     on_progress: &(dyn Fn(idl_transport::sync::SyncProgress) + Send + Sync),
 ) -> Result<idl_transport::sync::SyncRunResult, IpcError> {
     let peer_id = peer.peer_id.clone();
-    running.lock().unwrap_or_else(|e| e.into_inner()).insert(peer_id.clone());
+    if !running.lock().unwrap_or_else(|e| e.into_inner()).insert(peer_id.clone()) {
+        return Err(IpcError::new(IpcErrorKind::Sync, format!("a sync with {} is already running", peer.name)));
+    }
     let result = idl_transport::sync::sync_with_peer(data_root, peer, addr, now_ms(), selection, on_progress).await;
     running.lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_id);
     let result = result.map_err(IpcError::from)?;
@@ -545,7 +548,8 @@ pub(crate) async fn run_one_sync(
 
 /// C3 §3.9 `sync_now(peer_id, progress)`: resolves `peer_id`'s address from
 /// the browse set and runs [`run_one_sync`], forwarding each tick as C3's
-/// `Progress` on `progress`.
+/// `Progress` on `progress`. A run already in progress for the peer is
+/// refused with a `sync` error ("a sync with <name> is already running").
 #[tauri::command]
 pub async fn sync_now(
     peer_id: String,
@@ -566,19 +570,89 @@ pub async fn sync_now(
     Ok(SyncResultDto::from(result))
 }
 
+/// The `selection` argument of `sync_selection` as it arrives over IPC: raw
+/// strings, parsed by [`parse_selection`] so every failure is a typed
+/// `invalid_argument` rather than a deserialiser error before the handler runs.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SyncSelectionArg {
+    /// `"both"`, `"pull"` or `"push"`.
+    direction: String,
+    /// Session ids (lowercase hex); absent = every session.
+    #[serde(default)]
+    sessions: Option<Vec<String>>,
+    /// Workbook ids (lowercase UUIDs); absent = every workbook.
+    #[serde(default)]
+    workbooks: Option<Vec<String>>,
+    /// Push only what the peer lacks entirely; absent = false.
+    #[serde(default)]
+    absent_only: Option<bool>,
+}
+
+fn invalid_argument(message: String) -> IpcError {
+    IpcError::new(IpcErrorKind::InvalidArgument, message)
+}
+
+/// Parses `sync_selection`'s raw `selection` argument. A malformed object, a
+/// `direction` other than `both`/`pull`/`push`, a session id that is not
+/// session-id shaped or a workbook id that is not a UUID is
+/// `invalid_argument`, with the message naming the bad value.
+fn parse_selection(raw: serde_json::Value) -> Result<idl_transport::sync::SyncSelection, IpcError> {
+    use idl_rs::store::sync::ids::{is_valid_id, IdClass};
+    use idl_transport::sync::{SyncDirection, SyncSelection};
+    let arg: SyncSelectionArg = serde_json::from_value(raw).map_err(|e| invalid_argument(format!("malformed selection: {e}")))?;
+    let direction = match arg.direction.as_str() {
+        "both" => SyncDirection::Both,
+        "pull" => SyncDirection::Pull,
+        "push" => SyncDirection::Push,
+        other => return Err(invalid_argument(format!("unknown sync direction {other:?}: expected both, pull or push"))),
+    };
+    let checked = |ids: Option<Vec<String>>, class: IdClass, what: &str| -> Result<Option<std::collections::BTreeSet<String>>, IpcError> {
+        match ids {
+            None => Ok(None),
+            Some(ids) => {
+                if let Some(bad) = ids.iter().find(|id| !is_valid_id(id, class)) {
+                    return Err(invalid_argument(format!("malformed {what} id: {bad:?}")));
+                }
+                Ok(Some(ids.into_iter().collect()))
+            }
+        }
+    };
+    Ok(SyncSelection {
+        direction,
+        sessions: checked(arg.sessions, IdClass::Session, "session")?,
+        workbooks: checked(arg.workbooks, IdClass::Uuid, "workbook")?,
+        absent_only: arg.absent_only.unwrap_or(false),
+    })
+}
+
+/// Parses `set_peer_auto_sync`'s raw `rule`: `off`, `send_new` or `mirror`,
+/// otherwise `invalid_argument` naming the value.
+fn parse_auto_sync_rule(rule: &str) -> Result<idl_transport::sync::AutoSync, IpcError> {
+    use idl_transport::sync::AutoSync;
+    match rule {
+        "off" => Ok(AutoSync::Off),
+        "send_new" => Ok(AutoSync::SendNew),
+        "mirror" => Ok(AutoSync::Mirror),
+        other => Err(invalid_argument(format!("unknown auto-sync rule {other:?}: expected off, send_new or mirror"))),
+    }
+}
+
 /// `sync_selection(peer_id, selection, on_progress)` (library tiers spec 4a):
 /// [`run_one_sync`] restricted to `selection` — `{ direction, sessions?,
 /// workbooks?, absent_only }` — with the same running guard, catalog re-index,
 /// `last_sync` bookkeeping and `Progress` forwarding as `sync_now` (which is
-/// this command with `SyncSelection::everything()`).
+/// this command with `SyncSelection::everything()`). `selection` is parsed by
+/// [`parse_selection`]: a bad direction or id is `invalid_argument`. A run
+/// already in progress for the peer is refused with a `sync` error.
 #[tauri::command]
 pub async fn sync_selection(
     peer_id: String,
-    selection: idl_transport::sync::SyncSelection,
+    selection: serde_json::Value,
     on_progress: tauri::ipc::Channel<crate::commands::device::Progress>,
     state: tauri::State<'_, SyncState>,
     data_dir: tauri::State<'_, DataDir>,
 ) -> Result<SyncResultDto, IpcError> {
+    let selection = parse_selection(selection)?;
     let (peer, addr) = {
         let peers = state.peers.lock().unwrap_or_else(|e| e.into_inner());
         let discovered = state.discovered.lock().unwrap_or_else(|e| e.into_inner());
@@ -640,10 +714,12 @@ pub struct PeerLibraryDto {
 
 /// Classifies each row of the peer's `summary` against `local` (this device's
 /// manifest), using `remote` (the peer's manifest) for the peer's hashes.
-/// A session is `Absent` with no local entry, `Same` when its `data.parquet`
-/// and `session.json` hashes both equal the peer's (a file missing on both
-/// sides counts as equal), `Differs` otherwise — including when the peer's
-/// manifest no longer lists it. A workbook is compared by sha256 the same way.
+/// A session is `Absent` with no local entry; `Differs` when the local copy
+/// has no `data.parquet` (a pull repairs it, whatever the peer has) or the
+/// peer's manifest no longer lists it; `Same` when its `data.parquet` and
+/// `session.json` hashes both equal the peer's (a `session.json` missing on
+/// both sides counts as equal); `Differs` otherwise. A workbook is compared
+/// by sha256 the same way.
 pub(crate) fn peer_library_dto(
     summary: idl_rs::store::library_summary::LibrarySummary,
     remote: &idl_rs::store::sync::manifest::Manifest,
@@ -662,6 +738,7 @@ pub(crate) fn peer_library_dto(
         .map(|session| {
             let here = match local_sessions.get(session.session_id.as_str()) {
                 None => HereStatus::Absent,
+                Some(mine) if mine.data_parquet.is_none() => HereStatus::Differs,
                 Some(mine) => match remote_sessions.get(session.session_id.as_str()) {
                     Some(theirs) if hashes(mine) == hashes(theirs) => HereStatus::Same,
                     _ => HereStatus::Differs,
@@ -702,10 +779,13 @@ pub async fn peer_library(
         resolve_peer_and_addr(&peer_id, &peers, &discovered)?
     };
 
+    // The local manifest hashes every file: start it before the network round
+    // trips so the two overlap.
+    let root = data_dir.0.clone();
+    let local = tauri::async_runtime::spawn_blocking(move || idl_rs::store::sync::manifest::build_manifest(&root, now_ms()));
     let summary = idl_transport::sync::fetch_library(addr, &peer).await.map_err(IpcError::from)?;
     let remote = idl_transport::sync::fetch_peer_manifest(addr, &peer).await.map_err(IpcError::from)?;
-    let root = data_dir.0.clone();
-    let local = tauri::async_runtime::spawn_blocking(move || idl_rs::store::sync::manifest::build_manifest(&root, now_ms()))
+    let local = local
         .await
         .map_err(|e| IpcError::new(IpcErrorKind::Internal, format!("building the local manifest: {e}")))?
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("building the local manifest: {}", e.message)))?
@@ -745,9 +825,10 @@ fn set_peer_auto_sync_via(
 #[tauri::command]
 pub async fn set_peer_auto_sync(
     peer_id: String,
-    rule: idl_transport::sync::AutoSync,
+    rule: String,
     state: tauri::State<'_, SyncState>,
 ) -> Result<PeerStatusDto, IpcError> {
+    let rule = parse_auto_sync_rule(&rule)?;
     let peer = set_peer_auto_sync_via(&state.peers_path, &state.peers, &peer_id, rule)?;
     let discovered = state.discovered.lock().unwrap_or_else(|e| e.into_inner());
     Ok(peer_status_dto(&peer, &discovered))
@@ -1577,5 +1658,163 @@ mod tests {
             (dto.blob_bytes, dto.session_bytes, dto.workbook_bytes, dto.track_bytes, dto.profile_bytes, dto.bike_log_bytes, dto.elapsed_ms),
             (100, 20, 3, 4, 5, 6, 700)
         );
+    }
+
+    // -- review fixes: typed argument errors, here edge cases, running guard --
+
+    #[test]
+    fn parse_selection_a_bad_direction_invalid_argument_naming_the_value() {
+        // Arrange
+        let raw = serde_json::json!({ "direction": "sideways" });
+
+        // Act
+        let err = parse_selection(raw).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert!(err.message.contains("sideways"), "{}", err.message);
+    }
+
+    #[test]
+    fn parse_selection_a_malformed_session_or_workbook_id_invalid_argument() {
+        // Arrange
+        let bad_session = serde_json::json!({ "direction": "pull", "sessions": ["0123456789abcdef", "../etc"] });
+        let bad_workbook = serde_json::json!({ "direction": "pull", "workbooks": ["not-a-uuid"] });
+
+        // Act
+        let session_err = parse_selection(bad_session).unwrap_err();
+        let workbook_err = parse_selection(bad_workbook).unwrap_err();
+
+        // Assert
+        assert_eq!(session_err.kind, IpcErrorKind::InvalidArgument);
+        assert!(session_err.message.contains("../etc"), "{}", session_err.message);
+        assert_eq!(workbook_err.kind, IpcErrorKind::InvalidArgument);
+        assert!(workbook_err.message.contains("not-a-uuid"), "{}", workbook_err.message);
+    }
+
+    #[test]
+    fn parse_selection_a_non_object_invalid_argument() {
+        // Arrange
+        let raw = serde_json::json!("pull");
+
+        // Act
+        let err = parse_selection(raw).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_selection_a_valid_object_maps_every_field() {
+        // Arrange
+        let raw = serde_json::json!({
+            "direction": "push",
+            "sessions": ["0123456789abcdef"],
+            "workbooks": ["4d5e6f7a-8b9c-4d4e-af5a-6b7c8d9e0f1a"],
+            "absent_only": true
+        });
+
+        // Act
+        let selection = parse_selection(raw).unwrap();
+
+        // Assert
+        assert_eq!(selection.direction, idl_transport::sync::SyncDirection::Push);
+        assert_eq!(selection.sessions.unwrap().len(), 1);
+        assert_eq!(selection.workbooks.unwrap().len(), 1);
+        assert!(selection.absent_only);
+    }
+
+    #[test]
+    fn parse_auto_sync_rule_each_rule_parses_and_an_unknown_one_is_invalid_argument() {
+        // Arrange / Act
+        let parsed: Vec<_> = ["off", "send_new", "mirror"].iter().map(|r| parse_auto_sync_rule(r).unwrap()).collect();
+        let err = parse_auto_sync_rule("everything").unwrap_err();
+
+        // Assert
+        assert_eq!(
+            parsed,
+            vec![idl_transport::sync::AutoSync::Off, idl_transport::sync::AutoSync::SendNew, idl_transport::sync::AutoSync::Mirror]
+        );
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert!(err.message.contains("everything"), "{}", err.message);
+    }
+
+    fn here_of(local: SessionEntry, remote: SessionEntry) -> HereStatus {
+        let summary = LibrarySummary { schema_version: 1, sessions: vec![library_session("aa")], workbooks: Vec::new() };
+        peer_library_dto(summary, &manifest(vec![remote], Vec::new()), &manifest(vec![local], Vec::new())).sessions[0].here
+    }
+
+    #[test]
+    fn peer_library_dto_a_local_session_without_data_parquet_differs_whatever_the_peer_has() {
+        // Arrange
+        let mut no_parquet = session_entry("aa", "p", "j");
+        no_parquet.data_parquet = None;
+        let mut peer_no_parquet = session_entry("aa", "p", "j");
+        peer_no_parquet.data_parquet = None;
+
+        // Act
+        let against_parquet = here_of(no_parquet.clone(), session_entry("aa", "p", "j"));
+        let against_none = here_of(no_parquet, peer_no_parquet);
+
+        // Assert
+        assert_eq!(against_parquet, HereStatus::Differs);
+        assert_eq!(against_none, HereStatus::Differs);
+    }
+
+    #[test]
+    fn peer_library_dto_a_local_parquet_against_a_peer_without_one_differs() {
+        // Arrange
+        let mut peer_no_parquet = session_entry("aa", "p", "j");
+        peer_no_parquet.data_parquet = None;
+
+        // Act
+        let here = here_of(session_entry("aa", "p", "j"), peer_no_parquet);
+
+        // Assert
+        assert_eq!(here, HereStatus::Differs);
+    }
+
+    #[test]
+    fn peer_library_dto_session_json_missing_on_both_sides_with_equal_parquet_is_same_and_on_one_side_differs() {
+        // Arrange
+        let mut local_no_json = session_entry("aa", "p", "j");
+        local_no_json.session_json = None;
+        let mut peer_no_json = session_entry("aa", "p", "j");
+        peer_no_json.session_json = None;
+
+        // Act
+        let both_missing = here_of(local_no_json.clone(), peer_no_json);
+        let one_missing = here_of(local_no_json, session_entry("aa", "p", "j"));
+
+        // Assert
+        assert_eq!(both_missing, HereStatus::Same);
+        assert_eq!(one_missing, HereStatus::Differs);
+    }
+
+    #[test]
+    fn run_one_sync_a_peer_already_running_is_refused_before_any_request_and_stays_marked() {
+        // Arrange
+        let running = std::sync::Mutex::new(HashSet::from(["peer-1".to_string()]));
+        let last_sync = std::sync::Mutex::new(HashMap::new());
+        let dir = tempfile::tempdir().unwrap();
+        let no_progress = |_p: idl_transport::sync::SyncProgress| {};
+
+        // Act
+        let result = tauri::async_runtime::block_on(run_one_sync(
+            &running,
+            &last_sync,
+            dir.path(),
+            &peer("peer-1"),
+            "127.0.0.1:9".parse().unwrap(),
+            &idl_transport::sync::SyncSelection::everything(),
+            &no_progress,
+        ));
+
+        // Assert
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, IpcErrorKind::Sync);
+        assert!(err.message.contains("is already running"), "{}", err.message);
+        assert!(running.lock().unwrap().contains("peer-1"), "the first run's mark must survive");
+        assert!(last_sync.lock().unwrap().is_empty());
     }
 }

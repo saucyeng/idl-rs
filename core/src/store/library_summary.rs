@@ -6,8 +6,9 @@
 //! Built read-only from the serving library's `catalog.sqlite` — the catalog
 //! is an index, so a library whose catalog is missing, mid-rebuild or of
 //! another schema version answers [`LibrarySummaryErrorKind::CatalogUnavailable`]
-//! rather than being repaired here. Nothing under `<data>` is created or
-//! written by this module.
+//! rather than being repaired here. `catalog.sqlite` itself is never written
+//! or created by this module; SQLite may create its `-wal`/`-shm` sidecar
+//! files next to it when it opens the WAL-mode database.
 
 use std::fmt;
 use std::path::Path;
@@ -30,10 +31,15 @@ pub struct LibrarySession {
     pub timestamp_utc_ms: i64,
     /// Recording length, milliseconds; `None` when the catalog has no duration.
     pub duration_ms: Option<i64>,
+    /// Venue name; `None` when blank.
     pub venue_name: Option<String>,
+    /// Event name; `None` when blank.
     pub event_name: Option<String>,
+    /// Rider name; `None` when blank.
     pub rider: Option<String>,
+    /// Bike name; `None` when blank.
     pub bike: Option<String>,
+    /// Session tag; `None` when blank.
     pub tag: Option<String>,
     /// `"idl0"`, `"fit"`, `"gpx"` or `"csv"`.
     pub source_format: String,
@@ -79,7 +85,9 @@ pub enum LibrarySummaryErrorKind {
 /// Error from [`library_summary`]. Never `Err(String)` (CLAUDE.md §5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibrarySummaryError {
+    /// What class of failure this is.
     pub kind: LibrarySummaryErrorKind,
+    /// Detail from the catalog open or query, for the log.
     pub message: String,
 }
 
