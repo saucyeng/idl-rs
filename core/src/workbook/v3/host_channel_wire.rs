@@ -98,6 +98,28 @@ pub fn encode_host_channel_idlh(hc: &HostChannel, budget: u32) -> Vec<u8> {
     let v: Vec<f64> = hc.v.iter().step_by(step).copied().collect();
     let t: Vec<f64> = if hc.t.is_empty() { Vec::new() } else { hc.t.iter().step_by(step).copied().collect() };
 
+    write_idlh(&v, &t, hc.axis)
+}
+
+/// [`encode_host_channel_idlh`] over a [`super::HostChannelView`]: the same
+/// bytes for the same value, but the seconds are computed only for the
+/// emitted points (at most `budget`), so the full-rate `t` array a
+/// [`HostChannel`] would hold (8 B per sample) is never built. `v` is read in
+/// place from the evaluator's own buffer.
+pub fn encode_host_channel_view_idlh(view: &super::HostChannelView, budget: u32) -> Vec<u8> {
+    let budget = budget.max(1) as usize;
+    let step = view.v.len().div_ceil(budget).max(1);
+
+    let v: Vec<f64> = view.v.iter().step_by(step).copied().collect();
+    let t: Vec<f64> = (0..view.t_len()).step_by(step).map(|i| view.t_at(i)).collect();
+
+    write_idlh(&v, &t, view.axis)
+}
+
+/// Lays out the 24-byte `IDLH` header, then `t`, then `v`, both little-endian
+/// `f64`. `t` and `v` are already decimated; `axis` is reported only when `t`
+/// is non-empty.
+fn write_idlh(v: &[f64], t: &[f64], axis: AxisKind) -> Vec<u8> {
     let has_t = !t.is_empty();
     let length = v.len() as u32;
     let t_length = t.len() as u32;
@@ -110,14 +132,14 @@ pub fn encode_host_channel_idlh(hc: &HostChannel, budget: u32) -> Vec<u8> {
     out.extend_from_slice(&t_length.to_le_bytes());
     // `axis_kind` is `None` whenever there is no axis to describe, so the
     // field can never claim a kind for an empty `t`.
-    let kind = if has_t { hc.axis } else { AxisKind::None };
+    let kind = if has_t { axis } else { AxisKind::None };
     out.extend_from_slice(&(kind as u16).to_le_bytes());
     out.extend_from_slice(&[0u8; 6]);
 
-    for x in &t {
+    for x in t {
         out.extend_from_slice(&x.to_le_bytes());
     }
-    for x in &v {
+    for x in v {
         out.extend_from_slice(&x.to_le_bytes());
     }
 
@@ -284,5 +306,31 @@ mod tests {
         assert_eq!(bytes.len(), 24 + 2 * 8 + 2 * 8);
         assert_eq!(read_f64(&bytes, 24), 0.0);
         assert_eq!(read_f64(&bytes, 40), 7.0);
+    }
+
+    #[test]
+    fn encode_host_channel_view_idlh_a_decimated_view_is_byte_identical_to_the_owned_channel_for_both_axes() {
+        // Arrange
+        let v: Vec<f64> = (0..1000).map(|i| i as f64 * 0.5).collect();
+        let t_us: Vec<i64> = (0..1000).map(|i| i * 1_250).collect();
+        let laps: Vec<i64> = (1..=1000).collect();
+        let unit = crate::math::units::UnitLabel::Dimensionless;
+        let cases = [
+            (t_us, crate::math::ValueAxis::Time),
+            (laps, crate::math::ValueAxis::Lap),
+            (Vec::new(), crate::math::ValueAxis::Time),
+        ];
+
+        for (t, axis) in cases {
+            let view = super::super::HostChannelView::new(t.into(), v.clone().into(), unit.clone(), axis);
+            for budget in [1, 7, 300, 65536] {
+                // Act
+                let from_view = encode_host_channel_view_idlh(&view, budget);
+                let from_owned = encode_host_channel_idlh(&view.to_host_channel(), budget);
+
+                // Assert
+                assert_eq!(from_view, from_owned, "budget {budget}, axis {axis:?}");
+            }
+        }
     }
 }

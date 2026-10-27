@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use idl_rs::math::eval::LapSpan;
 use idl_rs::math::{ChannelLookup, MathLapContext, MathOverlay};
 use idl_rs::session::handle::{ChannelSource, SessionHandle};
+use idl_rs::session::samples::ChannelSamples;
 use idl_rs::session::Channel;
 use idl_rs::store::parquet::open_session_lazy_with;
 use idl_rs::store::session_json::{empty_session_json, read_session_json, LapJson, SessionJson};
@@ -71,12 +72,16 @@ impl CachedChannelSource {
 
 impl ChannelSource for CachedChannelSource {
     fn channel(&self, channel_id: &str) -> Option<Channel> {
+        self.channel_samples(channel_id).map(|samples| samples.to_channel())
+    }
+
+    /// The cache's own `Arc`, handed out without a copy: the evaluator's
+    /// handle reads the cached raw column and the cached time axis in place,
+    /// so a document that names a channel costs the cache one decode and the
+    /// evaluation nothing resident on top of it.
+    fn channel_samples(&self, channel_id: &str) -> Option<Arc<ChannelSamples>> {
         match self.cache.channel(&self.session_dir, &self.session_id, channel_id) {
-            // One copy out of the shared `Arc`: the evaluator's handle needs
-            // an owned `Channel`, and the cache keeps its own for the next
-            // command. Bounded by the channels one document actually names,
-            // and released when the evaluation returns.
-            Ok(samples) => Some(samples.to_channel()),
+            Ok(samples) => Some(samples),
             Err(e) => {
                 if e.kind != IpcErrorKind::NotFound {
                     let mut slot = self.first_error.lock().unwrap_or_else(|p| p.into_inner());

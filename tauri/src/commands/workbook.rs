@@ -54,9 +54,9 @@ pub struct HostChannelRef {
     pub has_t: bool,
 }
 
-impl From<&idl_rs::workbook::v3::HostChannel> for HostChannelRef {
-    fn from(h: &idl_rs::workbook::v3::HostChannel) -> Self {
-        Self { length: h.length as u32, has_t: !h.t.is_empty() }
+impl From<&idl_rs::workbook::v3::HostChannelView> for HostChannelRef {
+    fn from(h: &idl_rs::workbook::v3::HostChannelView) -> Self {
+        Self { length: h.length as u32, has_t: h.has_t() }
     }
 }
 
@@ -545,7 +545,20 @@ fn build_cell_outputs(
     // by `(cell_id, name)`, so every cell — including the offending one —
     // always gets its own result back; no defensive net needed here.
     let cell_results = idl_rs::workbook::v3::eval_cells(doc, structural, handle, lap_ctx);
+    cell_outputs_from(&cell_results, doc, handle, lap_ctx, session_bound)
+}
 
+/// [`build_cell_outputs`] from an evaluation that has already run — a shared
+/// one from the [`crate::eval_registry::EvalRegistry`] — so the wire shape is
+/// built identically whether the cells were just evaluated or kept from an
+/// earlier call.
+fn cell_outputs_from(
+    cell_results: &[idl_rs::workbook::v3::CellEvalResult],
+    doc: &idl_rs::workbook::v3::WorkbookDoc,
+    handle: &SessionHandle,
+    lap_ctx: &MathLapContext,
+    session_bound: bool,
+) -> Vec<CellOutput> {
     cell_results
         .iter()
         .zip(doc.cells.iter())
@@ -676,17 +689,26 @@ fn eval_workbook_v2_via(
                 Ok(h) => h,
                 Err(e) => return WindowEval::Error { error: with_window_index(e, i) },
             };
-            prefetch_document_channels(cache, data_dir, &window.session_id, &doc, &handle);
             let lap_ctx = match load_window_context(data_dir, window, &handle) {
                 Ok(c) => c,
                 Err(e) => return WindowEval::Error { error: with_window_index(e, i) },
             };
-            let ok = build_cell_outputs(&doc, &structural, &handle, &lap_ctx, true);
+            // One evaluation per key, however many callers ask (a notebook's
+            // charts each fetch a definition of this same window): the first
+            // runs it, the rest wait for it. The decodes it needs are
+            // prefetched only on that first run.
+            let key = evaluation_key(data_dir, &markdown, Some(window));
+            let evaluation = cache.evals().get_or_evaluate(&key, || {
+                prefetch_document_channels(cache, data_dir, &window.session_id, &doc, &handle);
+                evaluate_checked(&doc, &structural, &handle, Some(&*source), &lap_ctx)
+            });
             // Per-window attribution (R121): a decode this window could not
             // be given is this window's failure, not the whole call's.
-            match source.take_first_error() {
-                Some(e) => WindowEval::Error { error: with_window_index(e, i) },
-                None => WindowEval::Ok { ok },
+            match evaluation {
+                Ok(evaluation) => {
+                    WindowEval::Ok { ok: cell_outputs_from(evaluation.cells(), &doc, &handle, &lap_ctx, true) }
+                }
+                Err(e) => WindowEval::Error { error: with_window_index(e, i) },
             }
         })
         .collect())
@@ -774,7 +796,7 @@ fn fetch_host_channel_via(
     // definition reaches here carrying `AxisKind::Lap` and serialises its lap
     // numbers as its `t`. This call site no longer chooses — choosing is what
     // made every definition claim seconds regardless of its shape.
-    Ok(idl_rs::workbook::v3::encode_host_channel_idlh(hc, budget))
+    Ok(idl_rs::workbook::v3::encode_host_channel_view_idlh(hc, budget))
 }
 
 /// Transport-agnostic core of `fetch_host_channel_v2` (C3 §3.4, R117.7).
@@ -823,24 +845,27 @@ fn fetch_host_channel_v2_via(
         .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("reading {}: {e}", path.display())))?;
     let (doc, structural) = parse_workbook(&markdown).map_err(fatal_parse_error)?;
 
-    let (handle, source, lap_ctx) = match window {
-        Some(w) => {
-            let (handle, source) = load_lazy_session_handle(data_dir, &w.session_id, cache)?;
-            let lap_ctx = load_window_context(data_dir, w, &handle)?;
-            (handle, Some(source), lap_ctx)
-        }
-        None => (empty_session_handle(), None, MathLapContext::empty()),
-    };
+    // The same evaluation `eval_workbook_v2` runs for this window, shared by
+    // key: concurrent fetches wait on one run, and a fetch that arrives after
+    // the open reads its definition out of the kept result instead of
+    // evaluating the whole document again to return one value.
+    let key = evaluation_key(data_dir, &markdown, window);
+    let evaluation = cache.evals().get_or_evaluate(&key, || {
+        let (handle, source, lap_ctx) = match window {
+            Some(w) => {
+                let (handle, source) = load_lazy_session_handle(data_dir, &w.session_id, cache)?;
+                let lap_ctx = load_window_context(data_dir, w, &handle)?;
+                prefetch_document_channels(cache, data_dir, &w.session_id, &doc, &handle);
+                (handle, Some(source), lap_ctx)
+            }
+            None => (empty_session_handle(), None, MathLapContext::empty()),
+        };
+        // A refused decode is the caller's answer, not a missing definition
+        // (R211.2): `evaluate_checked` returns it ahead of any cell.
+        evaluate_checked(&doc, &structural, &handle, source.as_deref(), &lap_ctx)
+    })?;
 
-    let cell_results = idl_rs::workbook::v3::eval_cells(&doc, &structural, &handle, &lap_ctx);
-
-    // See `fetch_host_channel_via`: a refused decode is the caller's answer,
-    // not a missing definition (R211.2).
-    if let Some(err) = source.and_then(|s| s.take_first_error()) {
-        return Err(err);
-    }
-
-    let def = cell_results.iter().flat_map(|c| c.defs.iter()).find(|d| d.name == def_name).ok_or_else(|| {
+    let def = evaluation.def(def_name).ok_or_else(|| {
         IpcError::new(IpcErrorKind::NotFound, format!("no definition named '{def_name}' in workbook '{id}'"))
     })?;
 
@@ -855,8 +880,64 @@ fn fetch_host_channel_v2_via(
     // The axis kind rides on the value (C2 §3.6, ruling R233): a `[lap]`
     // definition reaches here carrying `AxisKind::Lap` and serialises its lap
     // numbers as its `t`. This call site no longer chooses — choosing is what
-    // made every definition claim seconds regardless of its shape.
-    Ok(idl_rs::workbook::v3::encode_host_channel_idlh(hc, budget))
+    // made every definition claim seconds regardless of its shape. Encoded
+    // from the kept value in place: only the emitted points are converted.
+    Ok(idl_rs::workbook::v3::encode_host_channel_view_idlh(hc, budget))
+}
+
+/// Runs `eval_cells` and then, as [`eval_workbook_via`] does, surfaces the
+/// first decode failure `source` recorded (a channel refused for memory or
+/// unreadable) ahead of the cells: the document is fine, the machine is busy,
+/// and per-cell `math_unknown_channel` would say otherwise (R211.2).
+fn evaluate_checked(
+    doc: &idl_rs::workbook::v3::WorkbookDoc,
+    structural: &[WorkbookError],
+    handle: &SessionHandle,
+    source: Option<&crate::session_source::CachedChannelSource>,
+    lap_ctx: &MathLapContext,
+) -> Result<Vec<idl_rs::workbook::v3::CellEvalResult>, IpcError> {
+    let cells = idl_rs::workbook::v3::eval_cells(doc, structural, handle, lap_ctx);
+    match source.and_then(|s| s.take_first_error()) {
+        Some(err) => Err(err),
+        None => Ok(cells),
+    }
+}
+
+/// The [`crate::eval_registry::EvalKey`] of evaluating workbook `markdown`
+/// against `window` (evaluation-memory spec §4.2.A): the workbook's bytes, the
+/// window's session and span, the data's identity (`blob_sha256`, importer and
+/// seam-correction versions, read from `data.parquet`'s footer), the bytes of
+/// the session's `session.json` (its laps and sectors reach the evaluator as
+/// the lap context), and the engine version. A change in any of them is a new
+/// key, so the next call evaluates again.
+///
+/// Never fails: an unreadable footer or a missing `session.json` is hashed as
+/// such, and the evaluation that follows reports the real error (an error is
+/// never kept, so it cannot be served from here later).
+fn evaluation_key(data_dir: &Path, markdown: &str, window: Option<&WindowDto>) -> crate::eval_registry::EvalKey {
+    let (session, span) = match window {
+        Some(w) => (w.session_id.clone(), format!("{:?}", w.span)),
+        None => (String::new(), "no session".to_string()),
+    };
+    let (identity, session_json) = match window {
+        Some(w) => {
+            let dir = session_dir(data_dir, &w.session_id);
+            let identity = match idl_rs::store::parquet::read_session_metadata(&dir.join("data.parquet")) {
+                Ok(m) => format!("{}|{}|{}", m.blob_sha256, m.importer_version, m.seam_correction_version),
+                Err(e) => format!("unreadable: {e:?}"),
+            };
+            (identity, std::fs::read(dir.join("session.json")).unwrap_or_default())
+        }
+        None => (String::new(), Vec::new()),
+    };
+    crate::eval_registry::EvalKey::from_parts(&[
+        markdown.as_bytes(),
+        session.as_bytes(),
+        span.as_bytes(),
+        identity.as_bytes(),
+        &session_json,
+        idl_rs::VERSION.as_bytes(),
+    ])
 }
 
 /// A `table` cell's `value` (C3 §3.4): `{ model, results }` when a session is
@@ -3000,6 +3081,100 @@ version: 3
         assert_eq!(t_length, 0, "lap_start_time is a scalar, no recorded time axis");
         let v0 = f64::from_le_bytes(bytes[24..32].try_into().unwrap());
         assert_eq!(v0, 2.0, "lap 3 starts at 2.0s per four_lap_doc");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The two-definition workbook the registry tests share: `x` is the lap's
+    /// start, `y` a second value, so a test can change the bytes without
+    /// changing what `x` means.
+    fn registry_workbook(extra: &str) -> String {
+        format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = lap_start_time(1)\n{extra}```\n"
+        )
+    }
+
+    fn lap_three_window() -> WindowDto {
+        WindowDto {
+            session_id: "s1".to_string(),
+            span: crate::session_source::SpanDto::Lap { lap_number: 3 },
+            colour: "--chart-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn fetch_host_channel_v2_via_seven_concurrent_fetches_on_one_key_after_eval_workbook_v2_one_evaluation_runs() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
+        write_workbook(&root, "test.idl1wb", &registry_workbook(""));
+        let window = lap_three_window();
+        let cache = SessionCache::new();
+        eval_workbook_v2_via(&cache, &root, WB_ID, std::slice::from_ref(&window)).unwrap();
+
+        // Act
+        let fetched: Vec<Vec<u8>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..7)
+                .map(|_| scope.spawn(|| fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 65536).unwrap()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // Assert — the open evaluated once; the seven fetches read that result.
+        assert_eq!(cache.evals().runs(), 1);
+        assert!(fetched.iter().all(|b| b == &fetched[0]));
+        assert_eq!(f64::from_le_bytes(fetched[0][24..32].try_into().unwrap()), 2.0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_host_channel_v2_via_seven_concurrent_fetches_with_nothing_kept_yet_one_evaluation_runs() {
+        // Arrange — no `eval_workbook_v2` first: the fetches race for the key.
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
+        write_workbook(&root, "test.idl1wb", &registry_workbook(""));
+        let window = lap_three_window();
+        let cache = SessionCache::new();
+
+        // Act
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..7)
+                .map(|_| scope.spawn(|| fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 65536).unwrap()))
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+
+        // Assert
+        assert_eq!(cache.evals().runs(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_host_channel_v2_via_workbook_bytes_change_between_calls_second_call_re_evaluates() {
+        // Arrange
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
+        write_workbook(&root, "test.idl1wb", &registry_workbook(""));
+        let window = lap_three_window();
+        let cache = SessionCache::new();
+        fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 65536).unwrap();
+        fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 65536).unwrap();
+        assert_eq!(cache.evals().runs(), 1, "unchanged bytes are served from the kept evaluation");
+
+        // Act — the same definition, a different document.
+        write_workbook(&root, "test.idl1wb", &registry_workbook("y = 2 + 3\n"));
+        let after = fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "y", 65536).unwrap();
+
+        // Assert
+        assert_eq!(cache.evals().runs(), 2);
+        assert_eq!(f64::from_le_bytes(after[24..32].try_into().unwrap()), 5.0);
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -68,6 +68,17 @@ pub fn budget_bytes() -> u64 {
     share.min(MAX_BUDGET_BYTES).max(MIN_BUDGET_BYTES)
 }
 
+/// How many bytes of finished workbook evaluations the app keeps
+/// (`eval_registry::EvalRegistry`), given the session cache's budget of
+/// `session_budget_bytes`: half of it.
+///
+/// The one place this is decided. It is a stand-in until the machine-aware
+/// budget replaces `budget_bytes` (evaluation-memory spec §4.2.G, Phase 3),
+/// which should change this function and nothing around it.
+pub fn eval_cache_cap_bytes(session_budget_bytes: u64) -> u64 {
+    session_budget_bytes / 2
+}
+
 /// The C3 §1 `resource_exhausted` error for an allocation of
 /// `needed_bytes` against `budget_bytes`, with a human-readable `hint`
 /// naming what was being attempted.
@@ -132,6 +143,15 @@ mod tests {
         // Assert
         assert!(budget >= MIN_BUDGET_BYTES);
         assert!(budget <= MAX_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn eval_cache_cap_bytes_is_half_the_session_budget() {
+        // Arrange + Act
+        let cap = eval_cache_cap_bytes(2 * 1024 * 1024 * 1024);
+
+        // Assert
+        assert_eq!(cap, 1024 * 1024 * 1024);
     }
 
     #[test]

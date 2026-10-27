@@ -3,6 +3,12 @@
 //! before the default hook runs; the next launch lists the reports and the UI
 //! offers to share them. Nothing leaves the device unless the user shares it.
 //! A dismissed report moves to `crash/seen/`; nothing is deleted.
+//!
+//! A panic hook cannot see an allocation-failure abort or a kill by the OS,
+//! so [`install`] also keeps a run marker (`crash/running.json`, the process
+//! id and start time): written at startup, removed by [`mark_clean_exit`], and
+//! found still in place, naming a dead process, by the next launch, which
+//! reports it once as an abnormal exit (evaluation-memory spec §4.2.H).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -18,6 +24,25 @@ pub const MAX_REPORT_BYTES: usize = 64 * 1024;
 
 /// The sub-directory a dismissed report moves to.
 const SEEN_DIR: &str = "seen";
+
+/// The run marker's file name in the crash directory. Not a report name
+/// (`<kind>-<ms>.txt`), so [`pending`] never lists it.
+const MARKER_FILE: &str = "running.json";
+
+/// The first line of the report an abnormal exit produces.
+pub const ABNORMAL_EXIT_HEADLINE: &str = "idl1 closed unexpectedly (likely out of memory)";
+
+/// What `running.json` holds: the process that wrote it. Present only while
+/// that process is meant to be running.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunMarker {
+    /// Operating-system process id of the run that wrote the marker.
+    pub pid: u32,
+    /// The app version that run was.
+    pub version: String,
+    /// When the run started, ms since the Unix epoch.
+    pub started_at_ms: u64,
+}
 
 /// Where reports live (managed state).
 pub struct CrashDir(pub PathBuf);
@@ -79,6 +104,7 @@ pub fn install(dir: PathBuf, version: String) {
         return;
     }
     let _ = std::fs::create_dir_all(&dir);
+    begin_run(&dir, &version);
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let at_ms = now_ms();
@@ -89,6 +115,65 @@ pub fn install(dir: PathBuf, version: String) {
         let _ = std::fs::write(dir.join(format!("panic-{at_ms}.txt")), text);
         previous(info);
     }));
+}
+
+/// Whether a process with id `pid` exists right now.
+fn process_alive(pid: u32) -> bool {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), false);
+    sys.process(pid).is_some()
+}
+
+/// The text of an abnormal-exit report for the run `marker` describes.
+pub fn format_abnormal_exit_report(marker: &RunMarker, noticed_at_ms: u64) -> String {
+    format!(
+        "{ABNORMAL_EXIT_HEADLINE}
+         app: {version} ({os}/{arch})
+         the previous run (pid {pid}) started {started} ms since the Unix epoch and left its run marker behind
+         noticed: {noticed_at_ms} ms since the Unix epoch
+         
+         The process ended without a panic report or a clean shutdown: the operating system          killed it or an allocation failed. Nothing more is known.
+",
+        version = marker.version,
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        pid = marker.pid,
+        started = marker.started_at_ms,
+    )
+}
+
+/// Starts a run: reports a marker left by a dead process, then writes this
+/// process's own marker. Called by [`install`]; separate so tests can drive it
+/// against a temporary directory.
+///
+/// A marker naming this very process, or a process that is still alive, is
+/// not reported (another copy of the app is running; or this is a second call
+/// from the same process). Either way the marker is replaced, so a report is
+/// made **once**. An unreadable marker is dropped silently, and nothing here
+/// returns an error or panics: a failure to write is a lost breadcrumb, not a
+/// reason to stop the app.
+pub fn begin_run(dir: &Path, version: &str) {
+    let marker_path = dir.join(MARKER_FILE);
+    let now = now_ms();
+    let own_pid = std::process::id();
+    if let Some(old) = std::fs::read(&marker_path).ok().and_then(|b| serde_json::from_slice::<RunMarker>(&b).ok()) {
+        if old.pid != own_pid && !process_alive(old.pid) {
+            let text = format_abnormal_exit_report(&old, now);
+            let _ = std::fs::write(dir.join(format!("abnormal-{now}.txt")), text);
+        }
+    }
+    let marker = RunMarker { pid: own_pid, version: version.to_string(), started_at_ms: now };
+    if let Ok(bytes) = serde_json::to_vec(&marker) {
+        let _ = std::fs::write(&marker_path, bytes);
+    }
+}
+
+/// Ends a run cleanly: removes the run marker so the next launch reports
+/// nothing. The app calls this when the event loop exits (`RunEvent::Exit`);
+/// a missing marker is not an error.
+pub fn mark_clean_exit(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(MARKER_FILE));
 }
 
 /// The ms timestamp in a report's file name (`<kind>-<ms>.txt`).
@@ -249,6 +334,54 @@ mod tests {
 
         assert_eq!(result.unwrap_err().kind, IpcErrorKind::InvalidArgument);
         assert_eq!(pending(tmp.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn crash_marker_left_by_a_dead_pid_reported_once_as_an_abnormal_exit() {
+        // Arrange — a marker whose process cannot exist.
+        let tmp = tempfile::tempdir().unwrap();
+        let dead = RunMarker { pid: u32::MAX - 1, version: "0.3.0".to_string(), started_at_ms: 1000 };
+        std::fs::write(tmp.path().join(MARKER_FILE), serde_json::to_vec(&dead).unwrap()).unwrap();
+
+        // Act — two launches in a row.
+        begin_run(tmp.path(), "0.4.0");
+        begin_run(tmp.path(), "0.4.0");
+
+        // Assert — one report, naming the run that died; the marker is now ours.
+        let reports = pending(tmp.path()).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].text.starts_with(ABNORMAL_EXIT_HEADLINE));
+        assert!(reports[0].text.contains(&format!("pid {}", u32::MAX - 1)));
+        let marker: RunMarker = serde_json::from_slice(&std::fs::read(tmp.path().join(MARKER_FILE)).unwrap()).unwrap();
+        assert_eq!(marker.pid, std::process::id());
+        assert_eq!(marker.version, "0.4.0");
+    }
+
+    #[test]
+    fn crash_marker_removed_on_a_clean_exit_next_launch_reports_nothing() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        begin_run(tmp.path(), "0.4.0");
+
+        // Act
+        mark_clean_exit(tmp.path());
+        begin_run(tmp.path(), "0.4.0");
+
+        // Assert
+        assert!(pending(tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn crash_marker_unreadable_is_dropped_without_a_report() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(MARKER_FILE), b"not json").unwrap();
+
+        // Act
+        begin_run(tmp.path(), "0.4.0");
+
+        // Assert
+        assert!(pending(tmp.path()).unwrap().is_empty());
     }
 
     #[test]

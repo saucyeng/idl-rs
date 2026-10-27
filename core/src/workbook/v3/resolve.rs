@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::math::eval::{evaluate_with_constants, ChannelLookup, EvalOutput, LookupChannel, MathLapContext};
+use crate::math::eval::{evaluate_shared, ChannelLookup, LookupChannel, MathLapContext, SharedEvalOutput};
 use crate::math::resolve::channel_refs;
 use crate::math::{MathEvalError, MathEvalErrorKind};
 
@@ -140,7 +140,7 @@ pub fn resolve_workbook_defs(
     constants: &HashMap<String, f64>,
     lookup: &dyn ChannelLookup,
     lap_ctx: &MathLapContext,
-) -> HashMap<DefKey, Result<EvalOutput, MathEvalError>> {
+) -> HashMap<DefKey, Result<SharedEvalOutput, MathEvalError>> {
     let def_names: std::collections::HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
 
     // Each def's within-defs dependency names, computed once up front. Keyed
@@ -172,7 +172,7 @@ pub fn resolve_workbook_defs(
         });
 
     let mut resolved: HashMap<String, (Arc<[f64]>, f64, Arc<[i64]>)> = HashMap::new();
-    let mut results: HashMap<DefKey, Result<EvalOutput, MathEvalError>> = HashMap::new();
+    let mut results: HashMap<DefKey, Result<SharedEvalOutput, MathEvalError>> = HashMap::new();
     let mut remaining: Vec<&MathCellDef> = defs.iter().collect();
 
     loop {
@@ -188,7 +188,7 @@ pub fn resolve_workbook_defs(
             }
 
             let overlay = OverlayLookup { base: lookup, resolved: &resolved };
-            let out = evaluate_with_constants(&def.expr_text, constants, &overlay, lap_ctx);
+            let out = evaluate_shared(&def.expr_text, constants, &overlay, lap_ctx);
             match &out {
                 Ok(eval_out) => {
                     // Cross-referencing overlay: still name-keyed (see this
@@ -202,11 +202,9 @@ pub fn resolve_workbook_defs(
                     if std::ptr::eq(primary_for_name[def.name.as_str()], def) {
                         resolved.insert(
                             def.name.clone(),
-                            (
-                                Arc::from(eval_out.samples.as_slice()),
-                                eval_out.sample_rate_hz,
-                                Arc::from(eval_out.t_us.as_slice()),
-                            ),
+                            // Shared with `results`: one `Arc` pair per value,
+                            // not a second copy (8 B + 8 B per sample).
+                            (eval_out.samples.clone(), eval_out.sample_rate_hz, eval_out.t_us.clone()),
                         );
                     }
                 }
@@ -459,10 +457,10 @@ mod tests {
     /// (ledger R47) — every test below uses a single `cell_id` ("c1") per
     /// def, so this is a thin convenience over the real `DefKey`.
     fn get<'a>(
-        out: &'a HashMap<DefKey, Result<EvalOutput, MathEvalError>>,
+        out: &'a HashMap<DefKey, Result<SharedEvalOutput, MathEvalError>>,
         cell_id: &str,
         name: &str,
-    ) -> &'a Result<EvalOutput, MathEvalError> {
+    ) -> &'a Result<SharedEvalOutput, MathEvalError> {
         &out[&(cell_id.to_string(), name.to_string())]
     }
 
@@ -672,9 +670,9 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &HashMap::new(), &EmptyLookup, &no_laps());
 
         // Assert
-        assert_eq!(get(&out, "c1", "C").as_ref().unwrap().samples, vec![10.0]);
-        assert_eq!(get(&out, "c1", "B").as_ref().unwrap().samples, vec![11.0]);
-        assert_eq!(get(&out, "c1", "A").as_ref().unwrap().samples, vec![12.0]);
+        assert_eq!(get(&out, "c1", "C").as_ref().unwrap().samples.to_vec(), vec![10.0]);
+        assert_eq!(get(&out, "c1", "B").as_ref().unwrap().samples.to_vec(), vec![11.0]);
+        assert_eq!(get(&out, "c1", "A").as_ref().unwrap().samples.to_vec(), vec![12.0]);
     }
 
     #[test]
@@ -707,7 +705,7 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &HashMap::new(), &base, &no_laps());
 
         // Assert
-        assert_eq!(get(&out, "c1", "Speed").as_ref().unwrap().samples, vec![99.0]);
+        assert_eq!(get(&out, "c1", "Speed").as_ref().unwrap().samples.to_vec(), vec![99.0]);
     }
 
     #[test]
@@ -719,9 +717,9 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &HashMap::new(), &EmptyLookup, &no_laps());
 
         // Assert
-        assert_eq!(get(&out, "c1", "A").as_ref().unwrap().samples, vec![1.0]);
-        assert_eq!(get(&out, "c1", "B").as_ref().unwrap().samples, vec![2.0]);
-        assert_eq!(get(&out, "c1", "C").as_ref().unwrap().samples, vec![3.0]);
+        assert_eq!(get(&out, "c1", "A").as_ref().unwrap().samples.to_vec(), vec![1.0]);
+        assert_eq!(get(&out, "c1", "B").as_ref().unwrap().samples.to_vec(), vec![2.0]);
+        assert_eq!(get(&out, "c1", "C").as_ref().unwrap().samples.to_vec(), vec![3.0]);
     }
 
     #[test]
@@ -735,7 +733,7 @@ mod tests {
 
         // Assert
         assert_eq!(get(&out, "c1", "bad").as_ref().unwrap_err().kind, MathEvalErrorKind::Parse);
-        assert_eq!(get(&out, "c1", "ok").as_ref().unwrap().samples, vec![5.0]);
+        assert_eq!(get(&out, "c1", "ok").as_ref().unwrap().samples.to_vec(), vec![5.0]);
     }
 
     #[test]
@@ -749,7 +747,7 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &HashMap::new(), &base, &no_laps());
 
         // Assert
-        assert_eq!(get(&out, "c1", "scaled").as_ref().unwrap().samples, vec![2.0, 4.0]);
+        assert_eq!(get(&out, "c1", "scaled").as_ref().unwrap().samples.to_vec(), vec![2.0, 4.0]);
     }
 
     #[test]
@@ -763,9 +761,9 @@ mod tests {
 
         // Assert
         assert_eq!(out.len(), 3);
-        assert_eq!(get(&out, "c1", "A").as_ref().unwrap().samples, vec![10.0]);
-        assert_eq!(get(&out, "c1", "B").as_ref().unwrap().samples, vec![11.0]);
-        assert_eq!(get(&out, "c1", "C").as_ref().unwrap().samples, vec![12.0]);
+        assert_eq!(get(&out, "c1", "A").as_ref().unwrap().samples.to_vec(), vec![10.0]);
+        assert_eq!(get(&out, "c1", "B").as_ref().unwrap().samples.to_vec(), vec![11.0]);
+        assert_eq!(get(&out, "c1", "C").as_ref().unwrap().samples.to_vec(), vec![12.0]);
     }
 
     #[test]
@@ -778,7 +776,7 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &constants, &EmptyLookup, &no_laps());
 
         // Assert
-        assert_eq!(get(&out, "c1", "scaled").as_ref().unwrap().samples, vec![164.0]);
+        assert_eq!(get(&out, "c1", "scaled").as_ref().unwrap().samples.to_vec(), vec![164.0]);
     }
 
     #[test]
@@ -795,8 +793,8 @@ mod tests {
 
         // Assert — both keyed entries present, each cell's own value intact.
         assert_eq!(out.len(), 2);
-        assert_eq!(get(&out, "c1", "x").as_ref().unwrap().samples, vec![1.0]);
-        assert_eq!(get(&out, "c2", "x").as_ref().unwrap().samples, vec![2.0]);
+        assert_eq!(get(&out, "c1", "x").as_ref().unwrap().samples.to_vec(), vec![1.0]);
+        assert_eq!(get(&out, "c2", "x").as_ref().unwrap().samples.to_vec(), vec![2.0]);
     }
 
     #[test]
@@ -813,8 +811,8 @@ mod tests {
         let out = resolve_workbook_defs(&defs, &HashMap::new(), &EmptyLookup, &no_laps());
 
         // Assert
-        assert_eq!(get(&out, "c1", "x").as_ref().unwrap().samples, vec![10.0]);
-        assert_eq!(get(&out, "c2", "x").as_ref().unwrap().samples, vec![20.0]);
-        assert_eq!(get(&out, "c3", "y").as_ref().unwrap().samples, vec![11.0], "y must resolve against the first-declared x (10), not the second (20)");
+        assert_eq!(get(&out, "c1", "x").as_ref().unwrap().samples.to_vec(), vec![10.0]);
+        assert_eq!(get(&out, "c2", "x").as_ref().unwrap().samples.to_vec(), vec![20.0]);
+        assert_eq!(get(&out, "c3", "y").as_ref().unwrap().samples.to_vec(), vec![11.0], "y must resolve against the first-declared x (10), not the second (20)");
     }
 }

@@ -304,6 +304,23 @@ pub struct EvalOutput {
     pub axis: ValueAxis,
 }
 
+/// [`EvalOutput`] with the buffers behind `Arc`s, as [`evaluate_shared`]
+/// returns it. One value is stored once: the evaluator's final value, the
+/// resolver's cross-reference overlay and the caller's result all hold these
+/// same two allocations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SharedEvalOutput {
+    /// The values; one `f64` per sample (8 B each).
+    pub samples: Arc<[f64]>,
+    /// Sample rate, Hz; `0.0` for a scalar-as-channel result.
+    pub sample_rate_hz: f64,
+    /// Per-sample recording time, microseconds since the session's first
+    /// sample (8 B each); see [`EvalOutput::t_us`].
+    pub t_us: Arc<[i64]>,
+    /// What [`Self::t_us`] measures.
+    pub axis: ValueAxis,
+}
+
 fn err(kind: MathEvalErrorKind, msg: impl Into<String>) -> MathEvalError {
     MathEvalError::new(kind, msg)
 }
@@ -332,21 +349,43 @@ pub fn evaluate_with_constants(
     lookup: &dyn ChannelLookup,
     lap_ctx: &MathLapContext,
 ) -> Result<EvalOutput, MathEvalError> {
+    let shared = evaluate_shared(expression, constants, lookup, lap_ctx)?;
+    Ok(EvalOutput {
+        samples: shared.samples.to_vec(),
+        sample_rate_hz: shared.sample_rate_hz,
+        t_us: shared.t_us.to_vec(),
+        axis: shared.axis,
+    })
+}
+
+/// [`evaluate_with_constants`] without the copy out of the evaluator: the
+/// returned [`SharedEvalOutput`] holds the very `Arc` pair the final value
+/// owned, so a caller that keeps the result (the workbook resolver) shares it
+/// with everything else that reads it instead of duplicating 16 B per sample.
+pub fn evaluate_shared(
+    expression: &str,
+    constants: &HashMap<String, f64>,
+    lookup: &dyn ChannelLookup,
+    lap_ctx: &MathLapContext,
+) -> Result<SharedEvalOutput, MathEvalError> {
     let ast = crate::math::parse::parse_with_constants(expression, constants)?;
     // Memoize lookups for this pass so a channel referenced N times is widened
     // once and shared (Arc) across references. See MemoLookup.
     let memo = MemoLookup::new(lookup);
     let value = eval(&ast, &memo, lap_ctx)?;
     match value {
-        Value::Channel(c) => Ok(EvalOutput {
-            samples: c.samples.to_vec(),
+        Value::Channel(c) => Ok(SharedEvalOutput {
+            samples: c.samples,
             sample_rate_hz: c.sample_rate_hz,
-            t_us: c.t_us.to_vec(),
+            t_us: c.t_us,
             axis: c.axis,
         }),
-        Value::Scalar(v) => {
-            Ok(EvalOutput { samples: vec![v], sample_rate_hz: 0.0, t_us: Vec::new(), axis: ValueAxis::Time })
-        }
+        Value::Scalar(v) => Ok(SharedEvalOutput {
+            samples: Arc::from(vec![v]),
+            sample_rate_hz: 0.0,
+            t_us: Arc::from(&[] as &[i64]),
+            axis: ValueAxis::Time,
+        }),
         Value::Str(_) => Err(err(
             MathEvalErrorKind::Type,
             "Expression evaluated to a string, not a channel or scalar",
@@ -527,12 +566,9 @@ pub(crate) fn elemwise(
             // for a mismatch that is not about rates at all.
             let axis = require_same_shape(op_name, &a, &b)?;
             let t_us = combine_t_us(op_name, &a.t_us, &b.t_us)?;
-            let mut out = Vec::with_capacity(a.samples.len());
-            for i in 0..a.samples.len() {
-                out.push(op(a.samples[i], b.samples[i])?);
-            }
+            let out = collect_fallible(a.samples.len(), |i| op(a.samples[i], b.samples[i]))?;
             Ok(Value::Channel(ChannelValue {
-                samples: Arc::from(out),
+                samples: out,
                 sample_rate_hz: a.sample_rate_hz,
                 channel_id: None,
                 t_us,
@@ -540,9 +576,9 @@ pub(crate) fn elemwise(
             }))
         }
         (Value::Channel(a), Value::Scalar(b)) => {
-            let out = a.samples.iter().map(|&x| op(x, b)).collect::<Result<Vec<_>, _>>()?;
+            let out = collect_fallible(a.samples.len(), |i| op(a.samples[i], b))?;
             Ok(Value::Channel(ChannelValue {
-                samples: Arc::from(out),
+                samples: out,
                 sample_rate_hz: a.sample_rate_hz,
                 channel_id: None,
                 // L3-R12: a channel×scalar op keeps the channel operand's
@@ -552,9 +588,9 @@ pub(crate) fn elemwise(
             }))
         }
         (Value::Scalar(a), Value::Channel(b)) => {
-            let out = b.samples.iter().map(|&x| op(a, x)).collect::<Result<Vec<_>, _>>()?;
+            let out = collect_fallible(b.samples.len(), |i| op(a, b.samples[i]))?;
             Ok(Value::Channel(ChannelValue {
-                samples: Arc::from(out),
+                samples: out,
                 sample_rate_hz: b.sample_rate_hz,
                 channel_id: None,
                 t_us: b.t_us,
@@ -658,7 +694,7 @@ fn combine_t_us(op_name: &str, a: &Arc<[i64]>, b: &Arc<[i64]>) -> Result<Arc<[i6
     if b.is_empty() {
         return Ok(a.clone());
     }
-    if a.as_ref() == b.as_ref() {
+    if Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref() {
         return Ok(a.clone());
     }
     Err(err(
@@ -983,13 +1019,49 @@ fn lap_shaped(
 /// A derived `[t]` channel. The overwhelming majority of results: everything
 /// that operates on session samples stays on the time axis.
 fn channel(samples: Vec<f64>, sample_rate_hz: f64, t_us: Arc<[i64]>) -> Value {
+    channel_shared(Arc::from(samples), sample_rate_hz, t_us)
+}
+
+/// [`channel`] for a result already built as an `Arc` (see
+/// [`collect_fallible`]): no `Vec` is made, so no second copy of the samples
+/// exists while the value is wrapped.
+fn channel_shared(samples: Arc<[f64]>, sample_rate_hz: f64, t_us: Arc<[i64]>) -> Value {
     Value::Channel(ChannelValue {
-        samples: Arc::from(samples),
+        samples,
         sample_rate_hz,
         channel_id: None,
         t_us,
         axis: ValueAxis::Time,
     })
+}
+
+/// Builds an `n`-sample buffer straight into its final `Arc` allocation
+/// (8 B × `n`, once), calling `f(i)` for each index in order and returning the
+/// first error. A `collect::<Result<Vec<_>, _>>()` followed by `Arc::from`
+/// holds the buffer twice (16 B × `n`) while it converts; collecting a
+/// `Range` map into an `Arc<[f64]>` is a single allocation. After an error
+/// the remaining slots are filled without calling `f` again, so the cost of a
+/// failed element-wise op is one pass of constants.
+fn collect_fallible<E>(n: usize, mut f: impl FnMut(usize) -> Result<f64, E>) -> Result<Arc<[f64]>, E> {
+    let mut first_err: Option<E> = None;
+    let out: Arc<[f64]> = (0..n)
+        .map(|i| {
+            if first_err.is_some() {
+                return f64::NAN;
+            }
+            match f(i) {
+                Ok(v) => v,
+                Err(e) => {
+                    first_err = Some(e);
+                    f64::NAN
+                }
+            }
+        })
+        .collect();
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
 }
 
 
@@ -1771,15 +1843,14 @@ fn call_function(
             // combine_t_us already gives elemwise(), naming both spans.
             let t_us = combine_t_us("where(cond,t,f)", &cond.t_us, &value_t_us(&args[1]))?;
             let t_us = combine_t_us("where(cond,t,f)", &t_us, &value_t_us(&args[2]))?;
-            let mut out = vec![0.0; n];
-            for i in 0..n {
-                out[i] = if cond.samples[i] != 0.0 {
-                    value_at(&args[1], i)?
+            let out = collect_fallible(n, |i| {
+                if cond.samples[i] != 0.0 {
+                    value_at(&args[1], i)
                 } else {
-                    value_at(&args[2], i)?
-                };
-            }
-            Ok(channel(out, cond.sample_rate_hz, t_us))
+                    value_at(&args[2], i)
+                }
+            })?;
+            Ok(channel_shared(out, cond.sample_rate_hz, t_us))
         }
         // R242: the explicit, and only, way two channels recorded on different
         // clocks come together. Never implicit — C2 §3.6.2 rule 4 ("never an
@@ -1812,7 +1883,7 @@ fn call_function(
         "current_lap" => {
             require_arg_count(name, &args, 0)?;
             let (len, rate) = resolve_time_base(lookup);
-            let out = (0..len)
+            let out: Arc<[f64]> = (0..len)
                 .map(|i| {
                     crate::variance::current_lap_at(&lap_ctx.main_lap_bounds, i as f64 / rate) as f64
                 })
@@ -1821,7 +1892,7 @@ fn call_function(
             // widened source — there is no real t_us to inherit here, and
             // synthesizing one from i/rate would be exactly the fabricated
             // axis L3-R12 forbids. Empty (no established axis).
-            Ok(channel(out, rate, Arc::from(&[] as &[i64])))
+            Ok(channel_shared(out, rate, Arc::from(&[] as &[i64])))
         }
         "lap_start_time" => {
             require_arg_count(name, &args, 1)?;

@@ -1679,6 +1679,12 @@ impl ChannelSource for ParquetChannelSource {
     fn channel(&self, channel_id: &str) -> Option<Channel> {
         read_channel(&self.session_dir, channel_id).ok().map(ChannelSamples::into_channel)
     }
+
+    /// The decode as the `Arc` the handle keeps, with no `into_channel` /
+    /// `from_channel` round trip (which copies both time axes twice).
+    fn channel_samples(&self, channel_id: &str) -> Option<std::sync::Arc<ChannelSamples>> {
+        read_channel(&self.session_dir, channel_id).ok().map(std::sync::Arc::new)
+    }
 }
 
 /// Every channel a lazy [`SessionHandle`] over `session_dir` can serve,

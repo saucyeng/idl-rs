@@ -65,7 +65,8 @@ use idl_rs::store::parquet::{
 };
 
 use crate::error::{IpcError, IpcErrorKind};
-use crate::memory::{budget_bytes, resource_exhausted, with_estimate_margin};
+use crate::eval_registry::EvalRegistry;
+use crate::memory::{budget_bytes, eval_cache_cap_bytes, resource_exhausted, with_estimate_margin};
 
 /// How long a decode waits for the budget to free up before giving up
 /// (ruling R211.2). Long enough that a notebook full of cells binding at
@@ -207,6 +208,10 @@ struct Shared {
     /// Where decode progress goes and how often, cloned out once per decode
     /// and never held across one.
     progress: Mutex<Progress>,
+    /// The workbook evaluations that read this cache's channels, shared and
+    /// single-flight per key (evaluation-memory spec §4.2.A). Here so the
+    /// app's one managed `SessionCache` carries it: no extra managed state.
+    evals: EvalRegistry,
 }
 
 /// The decode-progress reporting settings — see
@@ -290,8 +295,14 @@ impl SessionCache {
                 released: Condvar::new(),
                 decoded: Condvar::new(),
                 progress: Mutex::new(Progress::default()),
+                evals: EvalRegistry::with_cap(eval_cache_cap_bytes(budget_bytes)),
             }),
         }
+    }
+
+    /// The workbook evaluations sharing this cache — see [`EvalRegistry`].
+    pub fn evals(&self) -> &EvalRegistry {
+        &self.shared.evals
     }
 
     /// Installs the sink every later decode reports progress to (ruling

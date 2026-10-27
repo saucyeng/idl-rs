@@ -10,6 +10,7 @@
 //! here threads a [`Session`] into Task 9's `eval_cells`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -98,6 +99,84 @@ pub fn to_host_channel(
     // `t` for the same reason.
     let kind = if t.is_empty() { super::AxisKind::None } else { super::AxisKind::from(axis) };
     HostChannel { length: v.len(), t, v: v.to_vec(), unit, axis: kind }
+}
+
+/// A definition's result held as the evaluator's own buffers, with the
+/// conversion to [`HostChannel`]'s seconds deferred to the points actually
+/// sent. [`to_host_channel`] copies both arrays (16 B per sample) for every
+/// definition, although a workbook open sends none of them and a chart fetch
+/// sends one decimated to at most 65,536 points; this keeps the `Arc` pair the
+/// evaluator produced and lets
+/// [`encode_host_channel_view_idlh`](super::encode_host_channel_view_idlh)
+/// read it in place. Same fields and meanings as [`HostChannel`], except the
+/// time axis is the raw `t_us`, not seconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostChannelView {
+    /// Number of values; always `v.len()`.
+    pub length: usize,
+    /// The channel's values, verbatim (8 B per sample), shared with the
+    /// evaluator's output.
+    pub v: Arc<[f64]>,
+    /// Per-sample recording time, microseconds since the session's first
+    /// sample (8 B per sample), shared with the evaluator's output. For a
+    /// [`AxisKind::Lap`] channel these are 1-based lap numbers, not
+    /// microseconds. Empty when there is no recorded axis.
+    pub t_us: Arc<[i64]>,
+    /// This channel's unit (R164).
+    pub unit: crate::math::units::UnitLabel,
+    /// What [`Self::t_us`] measures; [`AxisKind::None`] whenever no `t` would
+    /// be produced, exactly as [`HostChannel::axis`].
+    pub axis: super::AxisKind,
+}
+
+impl HostChannelView {
+    /// Wraps an evaluator result without copying it. `axis` is derived as
+    /// [`to_host_channel`] derives it: [`AxisKind::None`] when there is no
+    /// time axis to describe (`t_us` or `v` empty).
+    pub fn new(
+        t_us: Arc<[i64]>,
+        v: Arc<[f64]>,
+        unit: crate::math::units::UnitLabel,
+        axis: crate::math::ValueAxis,
+    ) -> Self {
+        let kind = if t_us.len().min(v.len()) == 0 { super::AxisKind::None } else { super::AxisKind::from(axis) };
+        HostChannelView { length: v.len(), v, t_us, unit, axis: kind }
+    }
+
+    /// Number of time-axis points the equivalent [`HostChannel::t`] has:
+    /// `min(t_us.len(), v.len())`, 0 when there is no recorded axis.
+    pub fn t_len(&self) -> usize {
+        self.t_us.len().min(self.v.len())
+    }
+
+    /// Whether the channel carries a recorded time axis
+    /// (`!HostChannel::t.is_empty()`).
+    pub fn has_t(&self) -> bool {
+        self.t_len() > 0
+    }
+
+    /// The time-axis value at index `i` (< [`Self::t_len`]) in the unit the
+    /// wire carries: seconds for a time axis, the lap number itself for a lap
+    /// axis ([`to_host_channel`]'s rule).
+    pub fn t_at(&self, i: usize) -> f64 {
+        match self.axis {
+            super::AxisKind::Lap => self.t_us[i] as f64,
+            _ => self.t_us[i] as f64 / 1e6,
+        }
+    }
+
+    /// Materialises the owned [`HostChannel`] (16 B per sample). For callers
+    /// that need the whole array; the wire path does not.
+    pub fn to_host_channel(&self) -> HostChannel {
+        let n = self.t_len();
+        HostChannel {
+            length: self.length,
+            t: (0..n).map(|i| self.t_at(i)).collect(),
+            v: self.v.to_vec(),
+            unit: self.unit.clone(),
+            axis: self.axis,
+        }
+    }
 }
 
 /// General host-variable channel lookup (C2 §5.1's `channel(name, {lap,

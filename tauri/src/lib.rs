@@ -16,6 +16,9 @@ pub mod crash;
 #[cfg(test)]
 mod delete_guard;
 pub mod error;
+/// Shared, single-flight workbook evaluations keyed by their inputs
+/// (evaluation-memory spec §4.2.A).
+pub mod eval_registry;
 /// `<data>/inbox` watching (C4 §2, ruling R191). Desktop only — the inbox
 /// does not exist on mobile, where `inbox_status` returns
 /// `unsupported_platform`.

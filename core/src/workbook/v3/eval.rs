@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use crate::math::MathEvalError;
 
-use super::host::to_host_channel;
+use super::host::HostChannelView;
 use super::resolve::resolve_workbook_defs;
 use super::{CellDoc, CellKindToken, WorkbookDoc, WorkbookError};
 
@@ -33,8 +33,11 @@ pub struct CellDefResult {
     pub name: String,
     /// The definition's `# label: <text>` display name, if any (C2 §3.1).
     pub label: Option<String>,
-    /// The resolved channel, host-variable shape (C2 §5.1), on success.
-    pub value: Option<crate::workbook::v3::HostChannel>,
+    /// The resolved channel, host-variable shape (C2 §5.1), on success. A
+    /// [`HostChannelView`]: it shares the evaluator's buffers instead of
+    /// copying them into a [`super::HostChannel`] nobody may read; call
+    /// [`HostChannelView::to_host_channel`] to materialise one.
+    pub value: Option<HostChannelView>,
     /// This definition's sample rate, Hz, on success (ruling R144,
     /// `runs/2026-09-03/decisions.md`) — [`crate::math::eval::EvalOutput::sample_rate_hz`]
     /// verbatim, except `0.0` (that field's "scalar-as-channel" / no-rate
@@ -153,7 +156,7 @@ pub fn eval_cells(
 fn math_cell_defs(
     doc: &WorkbookDoc,
     cell: &CellDoc,
-    resolved: &mut HashMap<super::resolve::DefKey, Result<crate::math::eval::EvalOutput, MathEvalError>>,
+    resolved: &mut HashMap<super::resolve::DefKey, Result<crate::math::eval::SharedEvalOutput, MathEvalError>>,
     resolved_units: &mut HashMap<
         super::resolve::DefKey,
         (crate::math::units::Unit, Vec<crate::math::units::UnitNote>),
@@ -181,7 +184,7 @@ fn math_cell_defs(
                 Ok(out) => CellDefResult {
                     name: def.name.clone(),
                     label: def.label.clone(),
-                    value: Some(to_host_channel(&out.t_us, &out.samples, unit.clone(), out.axis)),
+                    value: Some(HostChannelView::new(out.t_us, out.samples, unit.clone(), out.axis)),
                     // 0.0 is EvalOutput::sample_rate_hz's own "scalar-as-channel /
                     // no rate" marker — normalize it to None so this field means
                     // "not applicable" the same way for a scalar as for a failure.
@@ -353,7 +356,7 @@ mod tests {
 
         let ok = &got[0].defs[1];
         assert_eq!(ok.name, "ok");
-        assert_eq!(ok.value.as_ref().unwrap().v, vec![5.0]);
+        assert_eq!(ok.value.as_ref().unwrap().v.to_vec(), vec![5.0]);
         assert!(ok.error.is_none());
 
         // A scalar-literal definition has no rate — genuinely not
@@ -410,7 +413,7 @@ mod tests {
         assert_eq!(got[0].errors.len(), 1);
         assert_eq!(got[0].errors[0], CellError::Structural(structural[0].clone()));
         assert!(got[1].errors.is_empty());
-        assert_eq!(got[1].defs[0].value.as_ref().unwrap().v, vec![2.0]);
+        assert_eq!(got[1].defs[0].value.as_ref().unwrap().v.to_vec(), vec![2.0]);
     }
 
     #[test]
@@ -444,5 +447,52 @@ mod tests {
         // Assert
         assert_eq!(got[0].errors, vec![CellError::Structural(structural[0].clone())]);
         assert!(got[0].defs.is_empty());
+    }
+
+    /// One long channel `x`, 1 Hz-spaced `t_us`, behind `Arc`s the lookup hands out
+    /// by clone, as the cache-backed handle does.
+    struct LongChannel {
+        samples: std::sync::Arc<[f64]>,
+        t_us: std::sync::Arc<[i64]>,
+    }
+    impl ChannelLookup for LongChannel {
+        fn lookup(&self, name: &str) -> Option<crate::math::eval::LookupChannel> {
+            (name == "x").then(|| crate::math::eval::LookupChannel {
+                samples: self.samples.clone(),
+                sample_rate_hz: 1000.0,
+                t_us: self.t_us.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn eval_cells_ten_chained_full_rate_defs_over_a_1e6_sample_channel_peak_under_8b_n_12_plus_1mb() {
+        // Arrange — d1 = [x] * 2, d2 = [d1] + 1, ... ten full-rate values, each
+        // read by the next. Today every value is stored four times (32 B per
+        // sample); shared, each is stored once (8 B per sample).
+        const N: usize = 1_000_000;
+        let lookup = LongChannel {
+            samples: (0..N).map(|i| i as f64).collect(),
+            t_us: (0..N as i64).map(|i| i * 1000).collect(),
+        };
+        let ops = ["* 2", "+ 1", "* 0.5", "- 3", "* 1.5", "+ 2", "* 0.25", "- 1", "* 3", "+ 4"];
+        let defs: Vec<MathCellDef> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, op)| {
+                let source = if i == 0 { "[x]".to_string() } else { format!("[d{i}]") };
+                def("aaaaaaaa", &format!("d{}", i + 1), &format!("{source} {op}"), i)
+            })
+            .collect();
+        let d = doc(vec![math_cell("aaaaaaaa")], defs);
+
+        // Act
+        let (got, peak) = crate::counting_alloc::peak_of(|| eval_cells(&d, &[], &lookup, &no_laps()));
+
+        // Assert
+        assert_eq!(got[0].defs.len(), 10);
+        assert!(got[0].defs.iter().all(|r| r.value.as_ref().map(|v| v.length) == Some(N)));
+        let bound = 8 * N * 12 + 1_000_000;
+        assert!(peak < bound, "peak {peak} B is not under {bound} B");
     }
 }

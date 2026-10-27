@@ -95,6 +95,15 @@ impl ChannelSamples {
         }
     }
 
+    /// Span of the recorded time axis in milliseconds, 0 when it has fewer
+    /// than two distinct points; the same formula as [`Channel::duration_ms`].
+    pub fn duration_ms(&self) -> i64 {
+        match (self.t_us.first(), self.t_us.last()) {
+            (Some(&first), Some(&last)) if last > first => ((last - first) as f64 / 1000.0).round() as i64,
+            _ => 0,
+        }
+    }
+
     /// Number of samples.
     pub fn len(&self) -> usize {
         self.column.len()

@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::parse::parse;
 use crate::session::synthesis::synthesize_base_channels;
+use crate::session::samples::ChannelSamples;
 use crate::session::{Channel, ParseError, ParseResult, RawColumn, Session};
 
 /// Compact session summary. Mirrors roadmap §11 seam #2 (single summary
@@ -113,6 +114,15 @@ pub const TIME_CHANNEL_ID: &str = "Time";
 pub trait ChannelSource: std::fmt::Debug + Send + Sync {
     /// `channel_id`'s samples, decoded now, or `None` (see the trait docs).
     fn channel(&self, channel_id: &str) -> Option<Channel>;
+
+    /// [`Self::channel`], as the shared allocation. A source that already
+    /// holds `Arc<ChannelSamples>` (the app's `SessionCache`) overrides this
+    /// to hand the **same** `Arc` out, so a lazy handle reads the cache's
+    /// buffers instead of owning a copy of them (18 B per sample). The
+    /// default wraps [`Self::channel`], which owns its result already.
+    fn channel_samples(&self, channel_id: &str) -> Option<Arc<ChannelSamples>> {
+        self.channel(channel_id).map(|c| Arc::new(ChannelSamples::from_channel(c)))
+    }
 }
 
 /// One channel's identity as a session's index knows it — everything a lazy
@@ -150,6 +160,12 @@ pub struct LazyChannelInfo {
 struct Lazy {
     index: Vec<LazyChannelInfo>,
     source: Arc<dyn ChannelSource>,
+    /// What the source has handed out: the source's own `Arc`s, never copies.
+    /// `lookup`, `channel_dims`, `unit_of` and `metadata` read these directly.
+    shared: Arc<RwLock<HashMap<String, Option<Arc<ChannelSamples>>>>>,
+    /// Owned [`Channel`] copies of the entries in `shared`, built only when
+    /// an accessor that needs a `&Channel` (`with_channel`: tiles, lap
+    /// slices, seams) first touches a channel. The evaluator never does.
     decoded: Arc<RwLock<HashMap<String, Option<Channel>>>>,
 }
 
@@ -194,6 +210,7 @@ impl Clone for SessionHandle {
             lazy: self.lazy.as_ref().map(|l| Lazy {
                 index: l.index.clone(),
                 source: Arc::clone(&l.source),
+                shared: Arc::clone(&l.shared),
                 decoded: Arc::clone(&l.decoded),
             }),
         }
@@ -415,7 +432,12 @@ impl SessionHandle {
             truncation_warning: None,
             import_warnings: Vec::new(),
             derived: RwLock::new(HashMap::new()),
-            lazy: Some(Lazy { index, source, decoded: Arc::new(RwLock::new(HashMap::new())) }),
+            lazy: Some(Lazy {
+                index,
+                source,
+                shared: Arc::new(RwLock::new(HashMap::new())),
+                decoded: Arc::new(RwLock::new(HashMap::new())),
+            }),
         }
     }
 
@@ -438,7 +460,7 @@ impl SessionHandle {
         let (channel_count, duration_ms) = match &self.lazy {
             Some(lazy) => (
                 lazy.index.len() as u32,
-                lazy.decoded.read().unwrap().values().flatten().map(|c| c.duration_ms()).max().unwrap_or(0),
+                lazy.shared.read().unwrap().values().flatten().map(|c| c.duration_ms()).max().unwrap_or(0),
             ),
             None => (
                 self.session.channels.len() as u32,
@@ -729,8 +751,8 @@ impl SessionHandle {
     /// is not counted (capacity is an allocator detail); lazy columns count
     /// only their base storage (`Ramp` 0, `Interp` its GPS-rate base).
     pub fn resident_bytes(&self) -> u64 {
-        fn channel_bytes(c: &Channel) -> u64 {
-            let col = match &c.column {
+        fn parts_bytes(column: &RawColumn, t_us: usize, t_recorded_us: Option<usize>) -> u64 {
+            let col = match column {
                 RawColumn::I16 { data, .. } => data.len() * 2,
                 RawColumn::I32 { data, .. } => data.len() * 4,
                 RawColumn::F32 { data, .. } => data.len() * 4,
@@ -738,8 +760,13 @@ impl SessionHandle {
                 RawColumn::Ramp { .. } => 0,
                 RawColumn::Interp { base, .. } => base.len() * 8,
             };
-            let times = c.t_us.len() * 8 + c.t_recorded_us.as_ref().map_or(0, |t| t.len() * 8);
-            (col + times) as u64
+            (col + t_us * 8 + t_recorded_us.unwrap_or(0) * 8) as u64
+        }
+        fn channel_bytes(c: &Channel) -> u64 {
+            parts_bytes(&c.column, c.t_us.len(), c.t_recorded_us.as_ref().map(|t| t.len()))
+        }
+        fn samples_bytes(c: &ChannelSamples) -> u64 {
+            parts_bytes(&c.column, c.t_us.len(), c.t_recorded_us.as_ref().map(|t| t.len()))
         }
         let cols: u64 = self.session.channels.iter().map(channel_bytes).sum();
         let math: u64 = self.derived.read().unwrap().values().map(channel_bytes).sum();
@@ -749,7 +776,11 @@ impl SessionHandle {
         let lazily_decoded: u64 = self
             .lazy
             .as_ref()
-            .map(|l| l.decoded.read().unwrap().values().flatten().map(channel_bytes).sum())
+            .map(|l| {
+                let shared: u64 = l.shared.read().unwrap().values().flatten().map(|c| samples_bytes(c)).sum();
+                let copies: u64 = l.decoded.read().unwrap().values().flatten().map(channel_bytes).sum();
+                shared + copies
+            })
             .unwrap_or(0);
         cols + math + lazily_decoded
     }
@@ -827,15 +858,11 @@ impl SessionHandle {
             if lazy.index.iter().any(|i| i.channel_id == channel_id) {
                 let known = lazy.decoded.read().unwrap().contains_key(channel_id);
                 if !known {
-                    // The decode runs with **no** lock held — it is the
-                    // slowest thing in the process, and holding the store
-                    // across it would serialise every other channel's
-                    // lookup behind it. Two threads racing for the same
-                    // cold channel both decode and the loser's copy is
-                    // dropped by `or_insert`, exactly as `SessionCache`
-                    // documents for the same race: one redundant decode,
-                    // never a wrong answer.
-                    let decoded = lazy.source.channel(channel_id);
+                    // An owned `Channel` is built from the shared samples
+                    // (a copy of both time axes) only because this accessor
+                    // asked for a `&Channel`; `lookup`, `channel_dims` and
+                    // `unit_of` — the evaluator's three — never get here.
+                    let decoded = self.lazy_samples(channel_id).map(|s| s.to_channel());
                     lazy.decoded.write().unwrap().entry(channel_id.to_string()).or_insert(decoded);
                 }
                 let store = lazy.decoded.read().unwrap();
@@ -848,6 +875,35 @@ impl SessionHandle {
         }
         let store = self.derived.read().unwrap();
         store.get(&DerivedKey::from_token(channel_id)).map(|c| f(c))
+    }
+
+    /// The shared samples of lazy-handle channel `channel_id`, asked of the
+    /// source once and remembered (a miss too). `None` for an eager handle,
+    /// a name the index does not list, a channel an eager `session.channels`
+    /// entry already answers, or a source that has no samples for it. The
+    /// returned `Arc` is the source's own: no sample is copied.
+    fn lazy_samples(&self, channel_id: &str) -> Option<Arc<ChannelSamples>> {
+        let lazy = self.lazy.as_ref()?;
+        if self.session.channels.iter().any(|c| c.channel_id == channel_id) {
+            return None;
+        }
+        // Only names the index knows are ever put to the source: a math-store
+        // output or a lap-slice token is not a column of the file, and asking
+        // for one would cost a footer read per expression that mentions it.
+        if !lazy.index.iter().any(|i| i.channel_id == channel_id) {
+            return None;
+        }
+        if let Some(slot) = lazy.shared.read().unwrap().get(channel_id) {
+            return slot.clone();
+        }
+        // The decode runs with **no** lock held — it is the slowest thing in
+        // the process, and holding the store across it would serialise every
+        // other channel's lookup behind it. Two threads racing for the same
+        // cold channel both decode and the loser's copy is dropped by
+        // `or_insert`, exactly as `SessionCache` documents for the same
+        // race: one redundant decode, never a wrong answer.
+        let fetched = lazy.source.channel_samples(channel_id);
+        lazy.shared.write().unwrap().entry(channel_id.to_string()).or_insert(fetched).clone()
     }
 
     /// Decimate the chart tile at (`tier`, `tile_index`) for `channel_id`.
@@ -1215,6 +1271,16 @@ impl crate::math::eval::ChannelLookup for SessionHandle {
         // a present channel with no samples. An empty array would evaluate
         // to a wrong answer silently; `None` surfaces as
         // `math_unknown_channel` on that one definition.
+        //
+        // A lazy handle's channel is read from the source's shared samples
+        // and its `t_us` is that same `Arc`, not a copy of it.
+        if let Some(s) = self.lazy_samples(name) {
+            return Some(crate::math::eval::LookupChannel {
+                samples: Arc::from(s.column.try_materialize()?),
+                sample_rate_hz: s.nominal_rate_hz,
+                t_us: Arc::clone(&s.t_us),
+            });
+        }
         self.with_channel(name, |c| {
             Some(crate::math::eval::LookupChannel {
                 samples: Arc::from(c.try_materialize()?),
@@ -1228,12 +1294,18 @@ impl crate::math::eval::ChannelLookup for SessionHandle {
     fn channel_dims(&self, name: &str) -> Option<(usize, f64)> {
         // (len, rate) without materializing — the closed-form time base reads
         // this so the zero-storage `Time` ramp is never widened.
+        if let Some(s) = self.lazy_samples(name) {
+            return Some((s.len(), s.nominal_rate_hz));
+        }
         self.with_channel(name, |c| (c.len(), c.nominal_rate_hz))
     }
 
     fn unit_of(&self, name: &str) -> Option<String> {
         // Flatten "" (C1 §4.1's "no unit recorded") into None so the unit
         // pass sees one absent-unit case, not two (R154).
+        if let Some(s) = self.lazy_samples(name) {
+            return Some(s.unit.clone()).filter(|u| !u.is_empty());
+        }
         self.with_channel(name, |c| c.unit.clone()).filter(|u| !u.is_empty())
     }
 
@@ -2646,5 +2718,69 @@ mod gps_channel_values_tests {
 
         // Assert
         assert_eq!((lo, hi), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod lazy_shared_tests {
+    use super::*;
+    use crate::math::eval::ChannelLookup;
+
+    /// A source holding one channel's `Arc`, which it hands out by clone.
+    #[derive(Debug)]
+    struct Held(Arc<ChannelSamples>);
+
+    impl ChannelSource for Held {
+        fn channel(&self, channel_id: &str) -> Option<Channel> {
+            (channel_id == self.0.channel_id).then(|| self.0.to_channel())
+        }
+
+        fn channel_samples(&self, channel_id: &str) -> Option<Arc<ChannelSamples>> {
+            (channel_id == self.0.channel_id).then(|| Arc::clone(&self.0))
+        }
+    }
+
+    fn lazy_over(held: &Arc<ChannelSamples>) -> SessionHandle {
+        let empty = SessionHandle::from_channels(
+            SessionMetaInput { session_id: String::new(), device_id: None, timestamp_utc_ms: 0, config_checksum: None },
+            Vec::new(),
+        );
+        let index = vec![LazyChannelInfo {
+            channel_id: held.channel_id.clone(),
+            nominal_rate_hz: held.nominal_rate_hz,
+            unit: held.unit.clone(),
+            max_length: held.len(),
+            synthesized: false,
+        }];
+        SessionHandle::lazy(empty.session.clone(), index, Arc::new(Held(Arc::clone(held))))
+    }
+
+    #[test]
+    fn lookup_a_lazy_channel_the_source_holds_t_us_is_the_sources_own_arc() {
+        // Arrange
+        let held = Arc::new(ChannelSamples::from_channel(Channel::from_f64("A", 100.0, vec![1.0, 2.0, 3.0])));
+        let handle = lazy_over(&held);
+
+        // Act
+        let got = handle.lookup("A").expect("A is in the index");
+
+        // Assert
+        assert!(Arc::ptr_eq(&got.t_us, &held.t_us), "t_us must not be copied out of the source");
+        assert_eq!(&*got.samples, &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn channel_dims_and_unit_of_a_lazy_channel_answer_from_the_shared_samples_without_a_channel_copy() {
+        // Arrange
+        let held = Arc::new(ChannelSamples::from_channel(Channel::from_f64("A", 100.0, vec![1.0, 2.0, 3.0])));
+        let handle = lazy_over(&held);
+
+        // Act
+        let dims = handle.channel_dims("A");
+        let copies = handle.lazy.as_ref().unwrap().decoded.read().unwrap().len();
+
+        // Assert
+        assert_eq!(dims, Some((3, 100.0)));
+        assert_eq!(copies, 0, "no owned Channel is built for the evaluator's accessors");
     }
 }

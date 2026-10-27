@@ -216,14 +216,19 @@ pub fn data(_ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
         .defs
         .iter()
         .map(|def| match &def.value {
-            Some(channel) => json!({
-                "name": def.name,
-                "label": def.label,
-                "length": channel.length,
-                "sample_rate_hz": def.sample_rate_hz,
-                "t": channel.t,
-                "v": channel.v,
-            }),
+            Some(view) => {
+                // This verb prints the whole series, so it is the one place
+                // that materialises the seconds array.
+                let channel = view.to_host_channel();
+                json!({
+                    "name": def.name,
+                    "label": def.label,
+                    "length": channel.length,
+                    "sample_rate_hz": def.sample_rate_hz,
+                    "t": channel.t,
+                    "v": channel.v,
+                })
+            }
             None => json!({
                 "name": def.name,
                 "label": def.label,

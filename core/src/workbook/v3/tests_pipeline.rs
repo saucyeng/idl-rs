@@ -92,7 +92,8 @@ fn workbook_v3_pipeline_values_match_a_direct_evaluate_bit_for_bit() {
     // `t.len() ∈ {0, length}` with `0` only for the scalar, and the µs→s
     // conversion (`t_us` in µs, `t` in seconds) is the only transform.
     for (name, direct) in [("a", &direct_a), ("b", &direct_b), ("c", &direct_c), ("avg", &direct_avg)] {
-        let value = by_name(name).value.as_ref().unwrap_or_else(|| panic!("{name} must evaluate to a value"));
+        let value = by_name(name).value.as_ref().unwrap_or_else(|| panic!("{name} must evaluate to a value")).to_host_channel();
+        let value = &value;
 
         assert_eq!(value.v.len(), direct.samples.len(), "{name}: sample count");
         for i in 0..value.v.len() {
@@ -132,7 +133,7 @@ fn tile_built_from_an_evaluated_math_cell_matches_decimate_channel_directly() {
     let lap_ctx = MathLapContext::empty();
     let (doc, structural) = parse_workbook(WORKBOOK_MD).expect("front matter is well-formed");
     let cells = eval_cells(&doc, &structural, &handle, &lap_ctx);
-    let a = cells[0].defs.iter().find(|d| d.name == "a").unwrap().value.as_ref().unwrap();
+    let a = cells[0].defs.iter().find(|d| d.name == "a").unwrap().value.as_ref().unwrap().to_host_channel();
     let tier = 0u32;
     let tile_index = 0u32;
     let column_count = 4u32;
