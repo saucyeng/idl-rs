@@ -15,6 +15,8 @@ pub mod catalog;
 pub mod catalog_read;
 pub mod derived;
 pub mod import;
+/// The read-only library summary served to paired peers (library tiers Phase 1).
+pub mod library_summary;
 pub mod index_job;
 pub mod lap_index;
 pub mod parquet;
