@@ -7,6 +7,21 @@ use serde::{Deserialize, Serialize};
 /// (PLAN §3: a peer advertising a different `v` is listed incompatible).
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// What this device does with a paired peer on its own, without the user
+/// pressing sync (library tiers spec 4a). Stored per peer in `peers.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoSync {
+    /// Never sync this peer automatically. The default, so every pairing made
+    /// before this field existed reads as `Off`.
+    #[default]
+    Off,
+    /// Push only sessions and items the peer does not have at all.
+    SendNew,
+    /// Full two-way sync (today's automatic sync).
+    Mirror,
+}
+
 /// A peer we have paired with. Serialised to the peer file (PLAN §8 Q7);
 /// that file lives outside `<data>` so `token` never syncs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -22,6 +37,10 @@ pub struct Peer {
     pub protocol_version: u32,
     /// Wall-clock time pairing completed, epoch milliseconds.
     pub paired_at_ms: i64,
+    /// What this device syncs with the peer automatically (see [`AutoSync`]).
+    /// Absent in a `peers.json` written before library tiers; reads as `Off`.
+    #[serde(default)]
+    pub auto_sync: AutoSync,
 }
 
 /// A pairing code offered by this instance (C3 §3.9's `PairingCode`).

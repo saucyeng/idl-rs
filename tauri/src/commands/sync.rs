@@ -298,6 +298,7 @@ pub async fn pair_with_link(link: String, state: tauri::State<'_, SyncState>) ->
                     token: response.token,
                     protocol_version: response.protocol_version,
                     paired_at_ms: now_ms(),
+                    auto_sync: idl_transport::sync::AutoSync::Off,
                 };
                 {
                     let mut peers = state.peers.lock().unwrap_or_else(|e| e.into_inner());
@@ -443,6 +444,7 @@ pub async fn pair_peer(peer_id: String, code: String, state: tauri::State<'_, Sy
         token: response.token,
         protocol_version: response.protocol_version,
         paired_at_ms: now_ms(),
+        auto_sync: idl_transport::sync::AutoSync::Off,
     };
     {
         let mut peers = state.peers.lock().unwrap_or_else(|e| e.into_inner());
@@ -489,11 +491,12 @@ pub(crate) async fn run_one_sync(
     data_root: &std::path::Path,
     peer: &Peer,
     addr: SocketAddr,
+    selection: &idl_transport::sync::SyncSelection,
     on_progress: &(dyn Fn(idl_transport::sync::SyncProgress) + Send + Sync),
 ) -> Result<idl_transport::sync::SyncRunResult, IpcError> {
     let peer_id = peer.peer_id.clone();
     running.lock().unwrap_or_else(|e| e.into_inner()).insert(peer_id.clone());
-    let result = idl_transport::sync::sync_with_peer(data_root, peer, addr, now_ms(), on_progress).await;
+    let result = idl_transport::sync::sync_with_peer(data_root, peer, addr, now_ms(), selection, on_progress).await;
     running.lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_id);
     let result = result.map_err(IpcError::from)?;
 
@@ -529,7 +532,7 @@ pub async fn sync_now(
     let on_progress = |p: idl_transport::sync::SyncProgress| {
         let _ = progress.send(crate::commands::device::Progress { done: p.done, total: p.total, phase: p.phase.to_string() });
     };
-    let result = run_one_sync(&state.running, &state.last_sync, &data_dir.0, &peer, addr, &on_progress).await?;
+    let result = run_one_sync(&state.running, &state.last_sync, &data_dir.0, &peer, addr, &idl_transport::sync::SyncSelection::everything(), &on_progress).await?;
     Ok(SyncResultDto::from(result))
 }
 
@@ -543,11 +546,26 @@ pub struct AutoSyncCandidate<'a> {
     pub paired: bool,
     /// The protocol version this sighting advertised.
     pub protocol_version: u32,
+    /// What this device is set to do with the peer on its own.
+    pub auto_sync: idl_transport::sync::AutoSync,
+}
+
+/// The selection an automatic sync runs with under `rule` (library tiers
+/// spec 4a): `SendNew` pushes only what the peer lacks entirely, `Mirror` is
+/// the full two-way sync, `Off` never syncs (`None`).
+pub fn auto_sync_selection(rule: idl_transport::sync::AutoSync) -> Option<idl_transport::sync::SyncSelection> {
+    use idl_transport::sync::{AutoSync, SyncDirection, SyncSelection};
+    match rule {
+        AutoSync::Off => None,
+        AutoSync::SendNew => Some(SyncSelection { direction: SyncDirection::Push, sessions: None, workbooks: None, absent_only: true }),
+        AutoSync::Mirror => Some(SyncSelection::everything()),
+    }
 }
 
 /// Whether a newly-seen `peer` should trigger an automatic sync right now
 /// (PLAN §8 Q9, lead ruling R88): never for an unpaired or
-/// protocol-incompatible peer, never while a manual or automatic sync for
+/// protocol-incompatible peer, never when the peer's rule is
+/// [`idl_transport::sync::AutoSync::Off`], never while a manual or automatic sync for
 /// that peer is already running, and at most once per peer per 60 s.
 /// Pure — the background browse task (`SyncState`'s discovery loop) is the
 /// only caller, never a command handler (this task's brief, "Do not").
@@ -565,6 +583,9 @@ pub fn should_auto_sync(
     if peer.protocol_version != idl_transport::sync::PROTOCOL_VERSION {
         return false;
     }
+    if peer.auto_sync == idl_transport::sync::AutoSync::Off {
+        return false;
+    }
     if running.contains(peer.peer_id) {
         return false;
     }
@@ -579,7 +600,7 @@ mod tests {
     use super::*;
 
     fn peer(id: &str) -> Peer {
-        Peer { peer_id: id.to_string(), name: "Pit Tablet".to_string(), token: "tok".to_string(), protocol_version: idl_transport::sync::PROTOCOL_VERSION, paired_at_ms: 1_700_000_000_000 }
+        Peer { peer_id: id.to_string(), name: "Pit Tablet".to_string(), token: "tok".to_string(), protocol_version: idl_transport::sync::PROTOCOL_VERSION, paired_at_ms: 1_700_000_000_000, auto_sync: idl_transport::sync::AutoSync::Off }
     }
 
     // -- sync_status ---------------------------------------------------
@@ -944,7 +965,7 @@ mod tests {
     // -- should_auto_sync -------------------------------------------------
 
     fn candidate(peer_id: &str) -> AutoSyncCandidate<'_> {
-        AutoSyncCandidate { peer_id, paired: true, protocol_version: idl_transport::sync::PROTOCOL_VERSION }
+        AutoSyncCandidate { peer_id, paired: true, protocol_version: idl_transport::sync::PROTOCOL_VERSION, auto_sync: idl_transport::sync::AutoSync::Mirror }
     }
 
     #[test]
@@ -1003,6 +1024,65 @@ mod tests {
 
         // Assert
         assert!(!result);
+    }
+
+    #[test]
+    fn should_auto_sync_a_peer_set_to_off_no() {
+        // Arrange
+        let mut c = candidate("peer-1");
+        c.auto_sync = idl_transport::sync::AutoSync::Off;
+        let running = HashSet::new();
+
+        // Act
+        let result = should_auto_sync(&c, None, 100_000, &running);
+
+        // Assert
+        assert!(!result);
+    }
+
+    #[test]
+    fn should_auto_sync_a_peer_set_to_send_new_yes() {
+        // Arrange
+        let mut c = candidate("peer-1");
+        c.auto_sync = idl_transport::sync::AutoSync::SendNew;
+        let running = HashSet::new();
+
+        // Act
+        let result = should_auto_sync(&c, None, 100_000, &running);
+
+        // Assert
+        assert!(result);
+    }
+
+    #[test]
+    fn auto_sync_selection_each_rule_maps_to_its_selection() {
+        // Arrange
+        use idl_transport::sync::{AutoSync, SyncDirection, SyncSelection};
+
+        // Act
+        let off = auto_sync_selection(AutoSync::Off);
+        let send_new = auto_sync_selection(AutoSync::SendNew).unwrap();
+        let mirror = auto_sync_selection(AutoSync::Mirror).unwrap();
+
+        // Assert
+        assert_eq!(off, None);
+        assert_eq!(send_new.direction, SyncDirection::Push);
+        assert!(send_new.absent_only);
+        assert!(send_new.sessions.is_none() && send_new.workbooks.is_none());
+        assert_eq!(mirror, SyncSelection::everything());
+    }
+
+    #[test]
+    fn peer_a_peers_json_entry_without_auto_sync_reads_as_off() {
+        // Arrange
+        let json = r#"{"peer_id":"p","name":"n","token":"t","protocol_version":1,"paired_at_ms":5}"#;
+
+        // Act
+        let peer: Peer = serde_json::from_str(json).unwrap();
+
+        // Assert
+        assert_eq!(peer.auto_sync, idl_transport::sync::AutoSync::Off);
+        assert_eq!(serde_json::to_value(&peer).unwrap()["auto_sync"], "off");
     }
 
     #[test]

@@ -541,6 +541,7 @@ mod tests {
             importer_version: importer_version.to_string(),
             seam_correction_version: seam_correction_version.to_string(),
             engine_version: "9.9.9".to_string(),
+            blob_sha256: String::new(),
         }
     }
 

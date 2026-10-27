@@ -11,6 +11,7 @@ mod loopback_tests;
 pub mod pairing;
 pub mod pairing_link;
 pub mod range;
+pub mod selection;
 pub mod server;
 pub mod wire;
 
@@ -19,6 +20,7 @@ pub use discovery::{advertise, browse, build_txt, parse_txt, Advertisement, Disc
 pub use identity::{Identity, DEFAULT_NAME};
 pub use pairing_link::{build_link, lan_addrs, parse_link, PairingLink};
 pub use pairing::{check_protocol_version, load_peers, save_peers, PairingState, MAX_ATTEMPTS, PAIRING_TTL_MS};
+pub use selection::{filter_plan, SyncDirection, SyncSelection};
 pub use range::{parse_range, RangeError, RangeErrorKind};
 pub use server::{SyncServer, SyncServerConfig};
-pub use wire::{PairRequest, PairResponse, PairingOffer, Peer, PROTOCOL_VERSION};
+pub use wire::{AutoSync, PairRequest, PairResponse, PairingOffer, Peer, PROTOCOL_VERSION};

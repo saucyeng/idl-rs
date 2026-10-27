@@ -261,6 +261,7 @@ async fn handle_pair(State(state): State<ServerState>, body: axum::body::Bytes) 
             token: token.clone(),
             protocol_version: req.protocol_version,
             paired_at_ms: now_ms(),
+            auto_sync: crate::sync::wire::AutoSync::Off,
         });
     }
 
@@ -736,7 +737,7 @@ mod tests {
         let token = "tok-1".to_string();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();
@@ -777,7 +778,7 @@ mod tests {
         let data_root = temp_data_root();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: "right".to_string(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: "right".to_string(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();
@@ -804,7 +805,7 @@ mod tests {
         let token = "tok".to_string();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();
@@ -830,7 +831,7 @@ mod tests {
         let token = "tok".to_string();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();
@@ -892,7 +893,7 @@ mod tests {
         let token = "tok".to_string();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();
@@ -930,7 +931,7 @@ mod tests {
         let token = "tok".to_string();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();
@@ -959,7 +960,7 @@ mod tests {
         let token = "tok".to_string();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();
@@ -989,7 +990,7 @@ mod tests {
         let token = "tok".to_string();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();
@@ -1018,7 +1019,7 @@ mod tests {
         let token = "tok".to_string();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();
@@ -1046,7 +1047,7 @@ mod tests {
         let token = "tok".to_string();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();
@@ -1193,7 +1194,7 @@ mod tests {
         let token = "tok".to_string();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();
@@ -1222,7 +1223,7 @@ mod tests {
         let token = "tok".to_string();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();
@@ -1258,7 +1259,7 @@ mod tests {
         let token = "tok".to_string();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();
@@ -1296,7 +1297,7 @@ mod tests {
         let token = "tok".to_string();
         let (server, _peers) = start_test_server(
             data_root.clone(),
-            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0 }],
+            vec![Peer { peer_id: "p1".to_string(), name: "Peer".to_string(), token: token.clone(), protocol_version: 1, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }],
         )
         .await;
         let client = reqwest::Client::new();

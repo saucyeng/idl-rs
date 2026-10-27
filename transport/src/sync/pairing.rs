@@ -373,6 +373,7 @@ mod tests {
             token: "secret-token-value".to_string(),
             protocol_version: PROTOCOL_VERSION,
             paired_at_ms: 1_700_000_000_000,
+            auto_sync: crate::sync::wire::AutoSync::Off,
         }];
 
         // Act
@@ -406,6 +407,7 @@ mod tests {
             token: "tok".to_string(),
             protocol_version: PROTOCOL_VERSION,
             paired_at_ms: 42,
+            auto_sync: crate::sync::wire::AutoSync::Off,
         };
 
         // Act

@@ -24,6 +24,7 @@ use idl_rs::store::sync::manifest::{build_manifest, Manifest, BLOB_KIND_VIDEO};
 use crate::error::{TransportError, TransportErrorKind};
 use crate::wifi_transport::{parse_content_range, range_header};
 
+use super::selection::{filter_plan, SyncSelection};
 use super::wire::{PairRequest, PairResponse, Peer, PROTOCOL_VERSION};
 
 /// What one sync run did (C3 §3.9's `SyncResult`, plus what the command
@@ -72,6 +73,30 @@ pub struct SyncRunResult {
     /// a failure. A Rust-side detail like [`Self::sessions_touched`]; C3
     /// §3.9's `SyncResult` wire shape is unchanged.
     pub videos_skipped: u32,
+    /// Bytes of successfully transferred `SyncClass::Blob` items (video
+    /// blobs included), pull and push combined. Each item counts its planned
+    /// size ([`SyncItem::size_bytes`]), so a resumed `.part` counts the whole
+    /// file, not only the resumed tail.
+    pub blob_bytes: u64,
+    /// Bytes of successfully transferred `data.parquet`, derived-channel and
+    /// `session.json` items, pull and push combined; counted like
+    /// [`Self::blob_bytes`].
+    pub session_bytes: u64,
+    /// Bytes of successfully transferred workbooks (pull and push); counted
+    /// like [`Self::blob_bytes`].
+    pub workbook_bytes: u64,
+    /// Bytes of successfully transferred tracks (pull and push); counted like
+    /// [`Self::blob_bytes`].
+    pub track_bytes: u64,
+    /// Bytes of successfully transferred profiles (pull and push); counted
+    /// like [`Self::blob_bytes`].
+    pub profile_bytes: u64,
+    /// Bytes of successfully transferred bikes and their logs (pull and
+    /// push); counted like [`Self::blob_bytes`].
+    pub bike_log_bytes: u64,
+    /// Wall-clock duration of the whole run (manifest fetch to last action),
+    /// milliseconds. With the byte fields it gives the run's throughput.
+    pub elapsed_ms: u64,
 }
 
 /// Whether this build holds video blobs (C4 §6, video spec §10 item 3):
@@ -174,6 +199,14 @@ const MAX_DOCUMENT_BODY_BYTES: u64 = 16 * 1024 * 1024;
 /// server bounds what this client will accept from a `GET` against a peer.
 const MAX_RAW_FILE_BODY_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Write buffer for a pulled item's `.part` file, bytes (1 MiB): fewer, larger
+/// writes than one per network chunk.
+const WRITE_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Minimum time between byte-progress callbacks while a pull streams (100 ms,
+/// so at most 10 a second); one final callback always follows the last byte.
+const PROGRESS_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// The per-class response-body cap a pulled item is held to (R102, the
 /// reverse of `server.rs`'s per-route `read_body(_, MAX_*_BODY_BYTES)`
 /// calls): `Blob`/`Derived`/`DataParquet` are the large/raw tier, every
@@ -272,13 +305,18 @@ fn item_of(action: &SyncAction) -> &SyncItem {
 /// makes the whole run meaningless: a version mismatch, the manifest fetch
 /// itself failing (bad token, peer unreachable), or the local manifest walk
 /// failing.
+///
+/// `selection` narrows the plan right after [`plan_sync`] ([`filter_plan`]);
+/// [`SyncSelection::everything`] is the unrestricted sync.
 pub async fn sync_with_peer(
     data_root: &Path,
     peer: &Peer,
     addr: SocketAddr,
     now_ms: i64,
+    selection: &SyncSelection,
     on_progress: &(dyn Fn(SyncProgress) + Send + Sync),
 ) -> Result<SyncRunResult, TransportError> {
+    let started = std::time::Instant::now();
     if peer.protocol_version != PROTOCOL_VERSION {
         return Err(sync_error(format!(
             "peer {} speaks protocol {}, this build speaks {PROTOCOL_VERSION}",
@@ -295,7 +333,8 @@ pub async fn sync_with_peer(
     let (local_manifest, local_skipped) =
         build_manifest(data_root, now_ms).map_err(|e| sync_error(format!("building local manifest: {e}")))?;
 
-    let mut plan = plan_sync(&local_manifest, &remote_manifest, &local_skipped);
+    let plan = plan_sync(&local_manifest, &remote_manifest, &local_skipped);
+    let mut plan = filter_plan(plan, selection, &local_manifest, &remote_manifest);
 
     let mut result = SyncRunResult::default();
     result.videos_skipped += drop_video_pulls(&mut plan.actions, &remote_manifest, holds_video());
@@ -336,6 +375,7 @@ pub async fn sync_with_peer(
 
     result.sessions_updated = sessions_touched.len() as u32;
     result.sessions_touched = sessions_touched.into_iter().collect(); // BTreeSet -> already sorted
+    result.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(result)
 }
 
@@ -437,13 +477,18 @@ async fn run_one_action(
 /// [`SyncRunResult`] field's own doc comment for exactly what it counts).
 fn tally_success(item: &SyncItem, is_pull: bool, install_outcome: Option<InstallOutcome>, result: &mut SyncRunResult, sessions_touched: &mut BTreeSet<String>) {
     match item.class {
-        SyncClass::Blob => result.blobs_transferred += 1,
+        SyncClass::Blob => {
+            result.blobs_transferred += 1;
+            result.blob_bytes += item.size_bytes;
+        }
         SyncClass::DataParquet | SyncClass::Derived | SyncClass::SessionJson => {
+            result.session_bytes += item.size_bytes;
             if let Some(session_id) = &item.session_id {
                 sessions_touched.insert(session_id.clone());
             }
         }
         SyncClass::Workbook => {
+            result.workbook_bytes += item.size_bytes;
             if is_pull {
                 result.workbooks_merged += 1;
                 if let Some(InstallOutcome::Merged { conflicts }) = install_outcome {
@@ -451,9 +496,18 @@ fn tally_success(item: &SyncItem, is_pull: bool, install_outcome: Option<Install
                 }
             }
         }
-        SyncClass::Track => result.tracks_updated += 1,
-        SyncClass::Profile => result.profiles_updated += 1,
-        SyncClass::Bike => result.bike_log_updated += 1,
+        SyncClass::Track => {
+            result.tracks_updated += 1;
+            result.track_bytes += item.size_bytes;
+        }
+        SyncClass::Profile => {
+            result.profiles_updated += 1;
+            result.profile_bytes += item.size_bytes;
+        }
+        SyncClass::Bike => {
+            result.bike_log_updated += 1;
+            result.bike_log_bytes += item.size_bytes;
+        }
     }
 }
 
@@ -537,8 +591,8 @@ async fn download_item_with_cap(client: &reqwest::Client, base_url: &str, token:
 /// [`download_item_with_cap`]'s streaming half: everything up to a complete
 /// `tmp/<digest>.part` on disk, whose path it returns, without reading the
 /// file back (lead ruling E1: a video blob is installed from the file,
-/// never from memory). `on_bytes` is told the `.part`'s length after every
-/// chunk written, bytes.
+/// never from memory). `on_bytes` is told the `.part`'s length, bytes,
+/// at most every 100 ms while streaming and once more at the end.
 async fn download_to_part(
     client: &reqwest::Client,
     base_url: &str,
@@ -607,12 +661,21 @@ async fn download_to_part(
     } else {
         open_options.truncate(true);
     }
-    let mut file = open_options.open(&tmp_path).await.map_err(|e| sync_error(format!("opening {}: {e}", tmp_path.display())))?;
+    let file = open_options.open(&tmp_path).await.map_err(|e| sync_error(format!("opening {}: {e}", tmp_path.display())))?;
+    let mut file = tokio::io::BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
 
     let mut total = existing_len;
+    let mut last_report: Option<std::time::Instant> = None;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| sync_error(format!("GET {url}: stream error: {e}")))?;
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                // Keep what arrived: the .part stays a valid prefix to resume from.
+                let _ = file.flush().await;
+                return Err(sync_error(format!("GET {url}: stream error: {e}")));
+            }
+        };
         total += chunk.len() as u64;
         if total > cap {
             drop(file);
@@ -620,10 +683,14 @@ async fn download_to_part(
             return Err(sync_error(format!("GET {url}: response exceeded the {cap}-byte cap for {:?} mid-stream; discarded the .part", item.class)));
         }
         file.write_all(&chunk).await.map_err(|e| sync_error(format!("writing {}: {e}", tmp_path.display())))?;
-        on_bytes(total);
+        if last_report.is_none_or(|t| t.elapsed() >= PROGRESS_MIN_INTERVAL) {
+            on_bytes(total);
+            last_report = Some(std::time::Instant::now());
+        }
     }
     file.flush().await.map_err(|e| sync_error(format!("flushing {}: {e}", tmp_path.display())))?;
     drop(file);
+    on_bytes(total);
 
     Ok(tmp_path)
 }
@@ -840,7 +907,7 @@ mod tests {
     }
 
     async fn start_test_server(data_root: PathBuf, token: &str) -> SyncServer {
-        let peers = Arc::new(Mutex::new(vec![Peer { peer_id: "server-side".to_string(), name: "Server".to_string(), token: token.to_string(), protocol_version: PROTOCOL_VERSION, paired_at_ms: 0 }]));
+        let peers = Arc::new(Mutex::new(vec![Peer { peer_id: "server-side".to_string(), name: "Server".to_string(), token: token.to_string(), protocol_version: PROTOCOL_VERSION, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }]));
         let pairing = Arc::new(Mutex::new(PairingState::default()));
         let config =
             SyncServerConfig { data_root, port: 0, bind_addr: Ipv4Addr::LOCALHOST.into(), peer_id: "server-peer".to_string(), name: "Server".to_string() };
@@ -848,7 +915,7 @@ mod tests {
     }
 
     fn test_peer(token: &str) -> Peer {
-        Peer { peer_id: "server-peer".to_string(), name: "Server".to_string(), token: token.to_string(), protocol_version: PROTOCOL_VERSION, paired_at_ms: 0 }
+        Peer { peer_id: "server-peer".to_string(), name: "Server".to_string(), token: token.to_string(), protocol_version: PROTOCOL_VERSION, paired_at_ms: 0, auto_sync: crate::sync::wire::AutoSync::Off }
     }
 
     fn no_progress(_p: SyncProgress) {}
@@ -1029,6 +1096,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_with_peer_direction_push_a_blob_only_on_the_peer_is_not_pulled() {
+        // Arrange
+        let local_root = temp_data_root();
+        let remote_root = temp_data_root();
+        let content = b"peer-only blob bytes";
+        let sha = digest(content);
+        let path = blob_path(&remote_root, &sha);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        let token = "tok-d";
+        let server = start_test_server(remote_root.clone(), token).await;
+        let peer = test_peer(token);
+        let selection = SyncSelection { direction: super::super::selection::SyncDirection::Push, ..SyncSelection::everything() };
+
+        // Act
+        let result = sync_with_peer(&local_root, &peer, server.local_addr(), 1000, &selection, &no_progress).await.unwrap();
+
+        // Assert
+        assert_eq!(result.blobs_transferred, 0);
+        assert_eq!(result.blob_bytes, 0);
+        assert!(!blob_path(&local_root, &sha).is_file());
+
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(&local_root);
+        let _ = std::fs::remove_dir_all(&remote_root);
+    }
+
+    #[tokio::test]
     async fn sync_with_peer_a_blob_only_on_the_peer_pulled_verified_counted() {
         // Arrange
         let local_root = temp_data_root();
@@ -1044,10 +1139,11 @@ mod tests {
         let peer = test_peer(token);
 
         // Act
-        let result = sync_with_peer(&local_root, &peer, addr, 1000, &no_progress).await.unwrap();
+        let result = sync_with_peer(&local_root, &peer, addr, 1000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
         // Assert
         assert_eq!(result.blobs_transferred, 1);
+        assert_eq!(result.blob_bytes, content.len() as u64);
         assert_eq!(std::fs::read(blob_path(&local_root, &sha)).unwrap(), content);
 
         server.shutdown().await;
@@ -1095,7 +1191,7 @@ mod tests {
         let on_progress = move |p: SyncProgress| sink.lock().unwrap().push(p);
 
         // Act
-        let result = sync_with_peer(&local_root, &peer, server.local_addr(), 1000, &on_progress).await.unwrap();
+        let result = sync_with_peer(&local_root, &peer, server.local_addr(), 1000, &SyncSelection::everything(), &on_progress).await.unwrap();
 
         // Assert
         assert_eq!(result.blobs_transferred, 1, "a video counts as a blob transfer");
@@ -1124,7 +1220,7 @@ mod tests {
         let peer = test_peer(token);
 
         // Act
-        let result = sync_with_peer(&local_root, &peer, server.local_addr(), 1000, &no_progress).await.unwrap();
+        let result = sync_with_peer(&local_root, &peer, server.local_addr(), 1000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
         // Assert
         assert_eq!(result.blobs_transferred, 0);
@@ -1149,7 +1245,7 @@ mod tests {
         let peer = test_peer(token);
 
         // Act
-        let result = sync_with_peer(&local_root, &peer, server.local_addr(), 1000, &no_progress).await.unwrap();
+        let result = sync_with_peer(&local_root, &peer, server.local_addr(), 1000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
         // Assert
         assert_eq!(result.blobs_transferred, 1);
@@ -1176,7 +1272,7 @@ mod tests {
         let peer = test_peer(token);
 
         // Act
-        let result = sync_with_peer(&local_root, &peer, addr, 1000, &no_progress).await.unwrap();
+        let result = sync_with_peer(&local_root, &peer, addr, 1000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
         // Assert
         assert_eq!(result.blobs_transferred, 1);
@@ -1203,12 +1299,12 @@ mod tests {
         let peer = test_peer(token);
 
         // Act
-        let first = sync_with_peer(&local_root, &peer, addr, 1000, &no_progress).await.unwrap();
-        let second = sync_with_peer(&local_root, &peer, addr, 2000, &no_progress).await.unwrap();
+        let first = sync_with_peer(&local_root, &peer, addr, 1000, &SyncSelection::everything(), &no_progress).await.unwrap();
+        let second = sync_with_peer(&local_root, &peer, addr, 2000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
         // Assert
         assert_eq!(first.blobs_transferred, 1);
-        assert_eq!(second, SyncRunResult::default());
+        assert_eq!(SyncRunResult { elapsed_ms: 0, ..second }, SyncRunResult::default());
 
         server.shutdown().await;
         let _ = std::fs::remove_dir_all(&local_root);
@@ -1239,7 +1335,7 @@ mod tests {
         std::fs::write(&part_path, &content[..10]).unwrap();
 
         // Act
-        let result = sync_with_peer(&local_root, &peer, addr, 1000, &no_progress).await.unwrap();
+        let result = sync_with_peer(&local_root, &peer, addr, 1000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
         // Assert
         assert_eq!(result.blobs_transferred, 1);
@@ -1272,7 +1368,7 @@ mod tests {
         let peer = test_peer(token);
 
         // Act
-        let result = sync_with_peer(&local_root, &peer, addr, 1000, &no_progress).await.unwrap();
+        let result = sync_with_peer(&local_root, &peer, addr, 1000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
         // Assert
         assert_eq!(result.workbooks_merged, 1);
@@ -1296,7 +1392,7 @@ mod tests {
         peer.protocol_version = PROTOCOL_VERSION + 1;
 
         // Act
-        let err = sync_with_peer(&local_root, &peer, unreachable_addr, 1000, &no_progress).await.unwrap_err();
+        let err = sync_with_peer(&local_root, &peer, unreachable_addr, 1000, &SyncSelection::everything(), &no_progress).await.unwrap_err();
 
         // Assert
         assert_eq!(err.kind, TransportErrorKind::Sync);
@@ -1321,7 +1417,7 @@ mod tests {
         let peer = test_peer("wrong-token");
 
         // Act
-        let err = sync_with_peer(&local_root, &peer, addr, 1000, &no_progress).await.unwrap_err();
+        let err = sync_with_peer(&local_root, &peer, addr, 1000, &SyncSelection::everything(), &no_progress).await.unwrap_err();
 
         // Assert
         assert_eq!(err.kind, TransportErrorKind::Sync);
@@ -1368,7 +1464,7 @@ mod tests {
         let peer = test_peer(token);
 
         // Act
-        let result = sync_with_peer(&local_root, &peer, addr, 1000, &no_progress).await.unwrap();
+        let result = sync_with_peer(&local_root, &peer, addr, 1000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
         // Assert — the blob still landed even though the track's own `GET`
         // 404d (its id fails the server's `IdClass::Uuid` shape check).
@@ -1400,7 +1496,7 @@ mod tests {
         let on_progress = move |p: SyncProgress| seen_cb.lock().unwrap().push(p);
 
         // Act
-        sync_with_peer(&local_root, &peer, addr, 1000, &on_progress).await.unwrap();
+        sync_with_peer(&local_root, &peer, addr, 1000, &SyncSelection::everything(), &on_progress).await.unwrap();
 
         // Assert
         let ticks = seen.lock().unwrap();
@@ -1444,7 +1540,7 @@ mod tests {
         let peer = test_peer(token);
 
         // Act
-        sync_with_peer(&local_root, &peer, addr, 1000, &no_progress).await.unwrap();
+        sync_with_peer(&local_root, &peer, addr, 1000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
         // Assert
         let tmp_dir = local_root.join("tmp");
@@ -1489,7 +1585,7 @@ mod tests {
 
         // Act — first run: the resumed prefix is wrong, so the assembled
         // bytes fail `install`'s hash check.
-        let first = sync_with_peer(&local_root, &peer, addr, 1000, &no_progress).await.unwrap();
+        let first = sync_with_peer(&local_root, &peer, addr, 1000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
         // Assert — the failed pull did not count, and the poisoned `.part`
         // is gone rather than left to be resumed again.
@@ -1498,7 +1594,7 @@ mod tests {
 
         // Act — second run: with no `.part` to misresume, the item
         // restarts from byte 0 and succeeds.
-        let second = sync_with_peer(&local_root, &peer, addr, 2000, &no_progress).await.unwrap();
+        let second = sync_with_peer(&local_root, &peer, addr, 2000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
         // Assert
         assert_eq!(second.blobs_transferred, 1);
@@ -1537,14 +1633,14 @@ mod tests {
 
         // Act — first run: the resumed range starts past the peer's
         // (shorter) content, so the server answers 416.
-        let first = sync_with_peer(&local_root, &peer, addr, 1000, &no_progress).await.unwrap();
+        let first = sync_with_peer(&local_root, &peer, addr, 1000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
         // Assert
         assert_eq!(first.blobs_transferred, 0);
         assert!(!part_path.exists(), "stale .part left behind after a 416");
 
         // Act — second run succeeds cleanly with no `.part` to misresume.
-        let second = sync_with_peer(&local_root, &peer, addr, 2000, &no_progress).await.unwrap();
+        let second = sync_with_peer(&local_root, &peer, addr, 2000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
         // Assert
         assert_eq!(second.blobs_transferred, 1);

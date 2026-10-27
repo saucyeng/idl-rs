@@ -29,7 +29,7 @@ use idl_rs::track_artifact::read::read_track;
 use idl_rs::track_artifact::write::write_track;
 use idl_rs::workbook::v3::parse_workbook;
 
-use super::{sync_with_peer, PairRequest, PairResponse, Peer, PairingState, SyncProgress, SyncServer, SyncServerConfig, PROTOCOL_VERSION};
+use super::{sync_with_peer, SyncSelection, PairRequest, PairResponse, Peer, PairingState, SyncProgress, SyncServer, SyncServerConfig, PROTOCOL_VERSION};
 
 fn no_progress(_p: SyncProgress) {}
 
@@ -112,6 +112,7 @@ async fn pair(offerer: &Instance, requester: &Instance) {
         token: parsed.token,
         protocol_version: parsed.protocol_version,
         paired_at_ms: wall_clock_ms(),
+        auto_sync: crate::sync::wire::AutoSync::Off,
     });
 }
 
@@ -126,7 +127,7 @@ fn peer_of(from: &Instance, to_peer_id: &str) -> Peer {
 /// `Peer` record `pair` set up on `from`'s own list.
 async fn run_sync(from: &Instance, to: &Instance, now_ms: i64) -> super::SyncRunResult {
     let peer = peer_of(from, &to.peer_id);
-    sync_with_peer(&from.data_root, &peer, to.addr(), now_ms, &no_progress).await.unwrap()
+    sync_with_peer(&from.data_root, &peer, to.addr(), now_ms, &SyncSelection::everything(), &no_progress).await.unwrap()
 }
 
 /// Writes a workbook file through the store's own atomic-write primitive
@@ -390,7 +391,7 @@ async fn two_peers_sync_run_twice_the_second_run_moves_nothing() {
 
     // Assert
     assert_eq!(first.blobs_transferred, 1);
-    assert_eq!(second, super::SyncRunResult::default());
+    assert_eq!(super::SyncRunResult { elapsed_ms: 0, ..second }, super::SyncRunResult::default());
 
     a.shutdown().await;
     b.shutdown().await;
@@ -542,7 +543,7 @@ async fn two_peers_a_server_killed_mid_transfer_then_restarted_the_resumed_run_c
 
     // Act
     let peer = peer_of(&b, &a_peer_id);
-    let result = sync_with_peer(&b.data_root, &peer, restarted_addr, 1000, &no_progress).await.unwrap();
+    let result = sync_with_peer(&b.data_root, &peer, restarted_addr, 1000, &SyncSelection::everything(), &no_progress).await.unwrap();
 
     // Assert
     assert_eq!(result.blobs_transferred, 1);

@@ -486,8 +486,10 @@ async fn run_discovery_loop<R: tauri::Runtime>(
             peer_id: &sighting.peer_id,
             paired: true,
             protocol_version: sighting.protocol_version,
+            auto_sync: paired_peer.auto_sync,
         };
-        if crate::commands::sync::should_auto_sync(&candidate, last, now, &running_snapshot) {
+        let selection = crate::commands::sync::auto_sync_selection(paired_peer.auto_sync);
+        if let (true, Some(selection)) = (crate::commands::sync::should_auto_sync(&candidate, last, now, &running_snapshot), selection) {
             let addr = sighting.addr;
             let data_root = data_root.clone();
             let peer = paired_peer.clone();
@@ -495,7 +497,7 @@ async fn run_discovery_loop<R: tauri::Runtime>(
             let last_sync = last_sync.clone();
             tauri::async_runtime::spawn(async move {
                 let no_progress = |_p: idl_transport::sync::SyncProgress| {};
-                let _ = crate::commands::sync::run_one_sync(&running, &last_sync, &data_root, &peer, addr, &no_progress).await;
+                let _ = crate::commands::sync::run_one_sync(&running, &last_sync, &data_root, &peer, addr, &selection, &no_progress).await;
             });
         }
     }
