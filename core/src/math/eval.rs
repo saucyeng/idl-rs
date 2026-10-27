@@ -263,9 +263,50 @@ pub struct MathLapContext {
     /// inferred from the length of `laps` — a session with one lap is not a
     /// row context, and guessing from a length is how the two silently swap.
     pub row_lap: Option<u32>,
+    /// Every lap of the **session**, whatever window is shown, or `None` when
+    /// the caller supplies no session context. Set by
+    /// `load_window_context`, where `main_lap_bounds` is the one-entry window
+    /// and so cannot number laps: a windowed value is evaluated over the whole
+    /// session and the window only selects afterwards (memory spec §7 Q1).
+    /// `Some(laps)`: `current_lap()`, `sector_number()`, `lap_start_time()`,
+    /// `lap_start_distance()` and the host `channel(.., {lap})` / `laps`
+    /// read it (real lap numbers, per-lap sectors flattened in arrival order);
+    /// `Some(empty)` means the session has no laps, so `current_lap()` is 0
+    /// everywhere, as in the CLI. `None`: they read `main_lap_bounds` /
+    /// `main_sectors`, the whole-session CLI shape.
+    pub session_laps: Option<Vec<LapSpan>>,
 }
 
 impl MathLapContext {
+    /// 1-based lap number containing session-relative time `t_s` (seconds),
+    /// `0` outside every lap.
+    fn lap_number_at(&self, t_s: f64) -> u32 {
+        match &self.session_laps {
+            None => crate::variance::current_lap_at(&self.main_lap_bounds, t_s),
+            Some(laps) => {
+                laps.iter().find(|l| t_s >= l.start_secs && t_s < l.end_secs).map_or(0, |l| l.lap_number)
+            }
+        }
+    }
+
+    /// Start (seconds) of lap `n`: by real lap number in [`Self::session_laps`]
+    /// when `Some`, else by position in `main_lap_bounds`. `NaN` when absent.
+    fn lap_start_secs(&self, n: u32) -> f64 {
+        match &self.session_laps {
+            None => crate::variance::lap_start_time(&self.main_lap_bounds, n),
+            Some(laps) => laps.iter().find(|l| l.lap_number == n).map_or(f64::NAN, |l| l.start_secs),
+        }
+    }
+
+    /// Sectors `(start_s, end_s)` flattened across laps in arrival order:
+    /// from [`Self::session_laps`] when `Some`, else `main_sectors`.
+    fn numbering_sectors(&self) -> Vec<(f64, f64)> {
+        match &self.session_laps {
+            None => self.main_sectors.clone(),
+            Some(laps) => laps.iter().flat_map(|l| l.sectors.iter().copied()).collect(),
+        }
+    }
+
     /// A context with no laps, no sectors, and no overlay. Used by headless
     /// callers (the CLI) where lap detection has not run — lap-aware functions
     /// then return `MathEvalErrorKind::NoLapContext`.
@@ -278,6 +319,7 @@ impl MathLapContext {
             baseline_row: None,
             laps: Vec::new(),
             row_lap: None,
+            session_laps: None,
         }
     }
 }
@@ -1113,7 +1155,7 @@ fn require_ref_channel(v: &Value, ctx: &str) -> Result<(Arc<[f64]>, f64, Arc<[i6
 // is `start < end`) — the live defect this function now closes. A one-entry
 // vec is therefore always read directly, regardless of what
 // `main_lap_number` says; only a longer vec is still indexed by lap number.
-fn main_lap_window(lap_ctx: &MathLapContext) -> Option<(f64, f64)> {
+pub(crate) fn main_lap_window(lap_ctx: &MathLapContext) -> Option<(f64, f64)> {
     match (lap_ctx.main_lap_number, lap_ctx.main_lap_bounds.as_slice()) {
         (Some(_), [only]) => Some(*only),
         (Some(n), bounds) => bounds.get((n as usize).saturating_sub(1)).copied(),
@@ -1884,9 +1926,7 @@ fn call_function(
             require_arg_count(name, &args, 0)?;
             let (len, rate) = resolve_time_base(lookup);
             let out: Arc<[f64]> = (0..len)
-                .map(|i| {
-                    crate::variance::current_lap_at(&lap_ctx.main_lap_bounds, i as f64 / rate) as f64
-                })
+                .map(|i| lap_ctx.lap_number_at(i as f64 / rate) as f64)
                 .collect();
             // Built off resolve_time_base's closed-form (len, rate), never a
             // widened source — there is no real t_us to inherit here, and
@@ -1897,10 +1937,7 @@ fn call_function(
         "lap_start_time" => {
             require_arg_count(name, &args, 1)?;
             match &args[0] {
-                Value::Scalar(n) => Ok(Value::Scalar(crate::variance::lap_start_time(
-                    &lap_ctx.main_lap_bounds,
-                    n.round() as u32,
-                ))),
+                Value::Scalar(n) => Ok(Value::Scalar(lap_ctx.lap_start_secs(n.round() as u32))),
                 Value::Channel(c) => {
                     let out = c
                         .samples
@@ -1909,7 +1946,7 @@ fn call_function(
                             if n.is_nan() || n <= 0.0 || !n.is_finite() {
                                 f64::NAN
                             } else {
-                                crate::variance::lap_start_time(&lap_ctx.main_lap_bounds, n.round() as u32)
+                                lap_ctx.lap_start_secs(n.round() as u32)
                             }
                         })
                         .collect();
@@ -1936,14 +1973,16 @@ fn call_function(
                     "lap_start_distance(): no [Distance] channel in this session (GPS_SpeedKmh missing).",
                 ));
             }
-            let bounds = &lap_ctx.main_lap_bounds;
             let dist_rate = distance.sample_rate_hz;
             let dist_samples = distance.samples; // owned Vec<f64>, moved in
             let distance_at_lap = |n: i64| -> f64 {
-                if n <= 0 || n as usize > bounds.len() {
+                if n <= 0 {
                     return f64::NAN;
                 }
-                let t_sec = bounds[(n - 1) as usize].0;
+                let t_sec = lap_ctx.lap_start_secs(n as u32);
+                if t_sec.is_nan() {
+                    return f64::NAN;
+                }
                 let idx = (t_sec * dist_rate).round() as i64;
                 if idx < 0 || idx as usize >= dist_samples.len() {
                     return f64::NAN;
@@ -1978,13 +2017,13 @@ fn call_function(
             let (len, rate) = resolve_time_base(lookup);
             // Same closed-form-only basis as current_lap() — no real t_us to
             // inherit, so both branches are empty (no established axis).
-            if lap_ctx.main_sectors.is_empty() {
+            let sectors = lap_ctx.numbering_sectors();
+            if sectors.is_empty() {
                 return Ok(channel(vec![f64::NAN; len], rate, Arc::from(&[] as &[i64])));
             }
             let out = (0..len)
                 .map(|i| {
-                    let idx =
-                        crate::variance::sector_number_at(&lap_ctx.main_sectors, i as f64 / rate);
+                    let idx = crate::variance::sector_number_at(&sectors, i as f64 / rate);
                     if idx == u32::MAX {
                         f64::NAN
                     } else {

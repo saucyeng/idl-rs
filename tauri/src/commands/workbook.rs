@@ -2372,10 +2372,12 @@ mod tests {
     fn eval_workbook_v2_via_two_windows_one_session_different_laps_each_window_sees_its_own_lap() {
         // Arrange — a 4-lap session (R117.2: a repeated session_id across
         // windows is legal and must never be deduped, and comparing two laps
-        // of the same session is the common case). `lap_start_time(1)` reads
-        // `main_lap_bounds[0].0` (`load_window_context`'s `main_lap_number`
-        // is always `Some(1)`), so it differs per window only if each
-        // window's own lap window was actually used.
+        // of the same session is the common case). `mean([ChanA])` over a
+        // 10 Hz staircase 1,2,3,4 (one step per second) reads the window's own sample (lap 2 -> 2.0, lap 3 ->
+        // 3.0), so it differs per window only if each window's own lap window
+        // was actually used. (It was `lap_start_time(1)` while a window
+        // collapsed the lap numbering to one span; lap functions now see the
+        // session's real laps whatever the window, so that is 0.0 for both.)
         //
         // R121/S1-review: the wire `CellOutput.defs[i].value` is a
         // `HostChannelRef { length, has_t }` with no scalar, so both windows
@@ -2385,10 +2387,10 @@ mod tests {
         // `eval_workbook_v2_via`, to inspect the actual resolved
         // `HostChannel.v[0]` scalar, which *can* disagree.
         let root = temp_root();
-        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        seed_session(&root, "s1", "ChanA", (0..40).map(|i| (i / 10 + 1) as f64).collect(), (0..40).map(|i| i * 100_000).collect());
         write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
         let markdown = format!(
-            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = lap_start_time(1)\n```\n"
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = mean([ChanA])\n```\n"
         );
         write_workbook(&root, "test.idl1wb", &markdown);
         let windows = vec![
@@ -2419,16 +2421,16 @@ mod tests {
             cells[0].defs[0].value.as_ref().unwrap().v[0]
         };
 
-        // Assert — lap 2 starts at 1.0 s, lap 3 starts at 2.0 s
-        // (`four_lap_doc`); each window's evaluation sees only its own.
+        // Assert — lap 2 covers [1, 2) s, lap 3 [2, 3) s (`four_lap_doc`);
+        // each window's evaluation reads only its own.
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0], WindowEval::Ok { .. }));
         let WindowEval::Ok { ok: out1 } = &out[1] else {
             panic!("expected window 1 to resolve, got {:?}", out[1]);
         };
         assert_eq!(out1[0].defs[0].value.as_ref().unwrap().length, 1);
-        assert_eq!(scalar_for(&windows[0]), 1.0);
-        assert_eq!(scalar_for(&windows[1]), 2.0);
+        assert_eq!(scalar_for(&windows[0]), 2.0);
+        assert_eq!(scalar_for(&windows[1]), 3.0);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3091,16 +3093,16 @@ version: 3
     #[test]
     fn fetch_host_channel_v2_via_a_lap_window_agrees_with_eval_workbook_v2_via_on_the_same_window() {
         // Arrange — a 4-lap session (`four_lap_doc`: lap 3 = [2.0, 3.0) s).
-        // `lap_start_time(1)` reads `main_lap_bounds[0].0`
-        // (`load_window_context`'s `main_lap_number` is always `Some(1)`),
-        // so its value differs from the session-wide answer (0.0) only if
-        // the lap window was actually threaded through — the R117 item 7 gap
-        // this task closes.
+        // `mean([ChanA])` over a 10 Hz staircase 1,2,3,4 (one step per second) differs from the
+        // session-wide answer (2.5) only if the lap window was actually
+        // threaded through — the R117 item 7 gap this task closes. (It was
+        // `lap_start_time(1)` while a window collapsed the lap numbering to one
+        // span; lap functions now see the session's real laps, so that is 0.0.)
         let root = temp_root();
-        seed_session(&root, "s1", "ChanA", vec![1.0], vec![0]);
+        seed_session(&root, "s1", "ChanA", (0..40).map(|i| (i / 10 + 1) as f64).collect(), (0..40).map(|i| i * 100_000).collect());
         write_session_json(&root, "s1", &four_lap_doc("s1"), None).unwrap();
         let markdown = format!(
-            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = lap_start_time(1)\n```\n"
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = mean([ChanA])\n```\n"
         );
         write_workbook(&root, "test.idl1wb", &markdown);
         let window = WindowDto {
@@ -3124,9 +3126,9 @@ version: 3
         let t_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
         assert_eq!(marker.length, length);
         assert_eq!(marker.has_t, t_length > 0);
-        assert_eq!(t_length, 0, "lap_start_time is a scalar, no recorded time axis");
+        assert_eq!(t_length, 0, "a reduction is a scalar, no recorded time axis");
         let v0 = f64::from_le_bytes(bytes[24..32].try_into().unwrap());
-        assert_eq!(v0, 2.0, "lap 3 starts at 2.0s per four_lap_doc");
+        assert_eq!(v0, 3.0, "lap 3 is [2, 3) s per four_lap_doc: the staircase value 3");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3136,7 +3138,7 @@ version: 3
     /// changing what `x` means.
     fn registry_workbook(extra: &str) -> String {
         format!(
-            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = lap_start_time(1)\n{extra}```\n"
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = lap_start_time(3)\n{extra}```\n"
         )
     }
 
