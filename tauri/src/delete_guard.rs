@@ -120,6 +120,14 @@ mod tests {
         // `copy_into_blobs`: its own `tmp/video-<uuid>.part` on a failed or
         // cancelled copy, or when the blob turns out to exist already.
         ("core/src/store/video.rs", "copy_into_blobs"),
+        // (f) crash markers, outside `<data>` (app data dir `crash/`,
+        // evaluation memory spec Phase 1, 2026-10-27). `begin_run`: removes
+        // its own `running-<pid>.json.tmp` after a failed rename, and stale
+        // `running-<pid>.json` markers once reported or recognised as an
+        // update. `mark_clean_exit`: this process's own marker on a clean
+        // exit. Never touches a crash report or anything in the library.
+        ("tauri/src/crash.rs", "begin_run"),
+        ("tauri/src/crash.rs", "mark_clean_exit"),
     ];
 
     /// The idl-rs workspace root (`tauri/`'s parent).
