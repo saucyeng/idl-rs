@@ -448,6 +448,13 @@ fn lap_span(lap: &LapJson) -> LapSpan {
     }
 }
 
+/// Every lap of `doc` as a [`LapSpan`], in lap order; empty when `session.json`
+/// is absent or unparseable. The numbering the lap functions use whatever window
+/// is shown ([`MathLapContext::session_laps`]).
+fn session_laps(doc: Option<&SessionJson>) -> Vec<LapSpan> {
+    doc.map(|d| d.laps.iter().map(lap_span).collect()).unwrap_or_default()
+}
+
 /// The laps of `laps` that a window `[start, end)` covers, in lap order —
 /// the domain of a `[lap]` value evaluated under that window.
 ///
@@ -532,6 +539,10 @@ pub fn load_window_context_from(
         // Never a row context: a window is a chart's selection, not a table
         // row's binding. Only `evaluate_table_multi` sets this.
         row_lap: None,
+        // A windowed value is evaluated over the whole session and the window
+        // only selects afterwards (memory spec §7 Q1), so the lap functions
+        // number against every detected lap, not the one-entry window.
+        session_laps: session_laps(session_json.doc.as_ref()),
     })
 }
 
@@ -637,6 +648,9 @@ pub fn load_lap_context(
         baseline_row: None,
         laps,
         row_lap: None,
+        // A designated main lap narrows `main_lap_bounds` to that lap; the lap
+        // functions still number against every lap of the session.
+        session_laps: doc.laps.iter().map(lap_span).collect(),
     })
 }
 
@@ -1417,6 +1431,105 @@ mod tests {
         assert!(ctx.main_sectors.is_empty());
         assert!(ctx.overlay.is_empty());
         assert_eq!(ctx.baseline_row, None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A 4-second, 10 Hz `Speed` session whose `session.json` has the
+    /// four one-second laps of [`four_lap_doc`].
+    fn seed_four_lap_session(root: &Path) -> SessionHandle {
+        let session = Session {
+            session_id: "s1".to_string(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            timestamp_source: TimestampSource::SourceFile,
+            config_checksum: None,
+            source_format: SourceFormat::Fit,
+            blob_sha256: "a".repeat(64),
+            channels: vec![Channel {
+                channel_id: "Speed".to_string(),
+                t_us: (0..40).map(|i| i * 100_000).collect(),
+                t_recorded_us: None,
+                nominal_rate_hz: 10.0,
+                column: RawColumn::F64(vec![1.0; 40]),
+                source_kind: "gps".to_string(),
+                unit: "m/s".to_string(),
+                gaps: Vec::new(),
+            }],
+        };
+        write_session_parquet(root, &session, "0.1.0").unwrap();
+        let mut doc = four_lap_doc("s1");
+        doc.laps[1].sectors = vec![
+            idl_rs::store::session_json::SectorJson { name: "a".to_string(), start_ms: 1_000, end_ms: 1_500, start_time_secs: 1.0, end_time_secs: 1.5 },
+            idl_rs::store::session_json::SectorJson { name: "b".to_string(), start_ms: 1_500, end_ms: 2_000, start_time_secs: 1.5, end_time_secs: 2.0 },
+        ];
+        write_session_json(root, "s1", &doc, None).unwrap();
+        load_lazy_session_handle(root, "s1", &SessionCache::new()).unwrap().0
+    }
+
+    #[test]
+    fn load_window_context_single_lap_window_current_lap_reads_the_real_lap_number() {
+        // Arrange — lap 3 of a 4-lap session, shown as a window.
+        let root = temp_root();
+        let handle = seed_four_lap_session(&root);
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 3 }, colour: String::new() };
+        let ctx = load_window_context(&root, &window, &handle).unwrap();
+
+        // Act
+        let out = idl_rs::math::eval::evaluate("current_lap()", &handle, &ctx).unwrap();
+
+        // Assert — the whole session is evaluated, then the window selects:
+        // inside lap 3 (samples 20..30) the value is 3, never the window-local 1.
+        assert_eq!(&out.samples[20..30], &[3.0; 10]);
+        assert_eq!(out.samples[0], 1.0);
+        assert_eq!(out.samples[39], 4.0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_window_context_lap_three_window_on_t_mask_reduces_to_one() {
+        // Arrange — `on_t = where(current_lap() >= 2, 1, 0)` over lap 3.
+        let root = temp_root();
+        let handle = seed_four_lap_session(&root);
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 3 }, colour: String::new() };
+        let ctx = load_window_context(&root, &window, &handle).unwrap();
+
+        // Act
+        let out = idl_rs::math::eval::evaluate("mean(where(current_lap() >= 2, 1, 0))", &handle, &ctx).unwrap();
+
+        // Assert
+        assert_eq!(out.samples, vec![1.0]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_window_context_lap_window_agrees_with_the_whole_session_context() {
+        // Arrange — the CLI path is `load_lap_context(selection = None)` with the
+        // lap-3 window selected through `main_lap_number`.
+        let root = temp_root();
+        let handle = seed_four_lap_session(&root);
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 3 }, colour: String::new() };
+        let app_ctx = load_window_context(&root, &window, &handle).unwrap();
+        let mut cli_ctx = load_lap_context(&root, "s1", &handle, None).unwrap();
+        cli_ctx.main_lap_number = Some(3);
+        cli_ctx.main_sectors = vec![(1.0, 1.5), (1.5, 2.0)];
+
+        // Act / Assert — same numbers from both for every lap function.
+        for expr in [
+            "mean(current_lap())",
+            "mean(where(current_lap() >= 2, 1, 0))",
+            "mean(sector_number())",
+            "lap_start_time(2)",
+        ] {
+            let app = idl_rs::math::eval::evaluate(expr, &handle, &app_ctx).unwrap();
+            let cli = idl_rs::math::eval::evaluate(expr, &handle, &cli_ctx).unwrap();
+            assert_eq!(app.samples.len(), cli.samples.len(), "{expr}");
+            for (a, c) in app.samples.iter().zip(&cli.samples) {
+                assert!((a.is_nan() && c.is_nan()) || a == c, "{expr}: app {a} vs cli {c}");
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
