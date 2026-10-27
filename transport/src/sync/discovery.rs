@@ -88,6 +88,26 @@ fn scoped_addr_to_socket_addr(addr: &ScopedIp, port: u16) -> SocketAddr {
     }
 }
 
+/// Picks which of a peer's advertised addresses to reach it on: IPv4 first
+/// (any home or pit-lane LAN has it, and it always forms a valid URL), then
+/// routable IPv6, then loopback (a peer on this same host), and an IPv6
+/// link-local address last — its zone id (`fe80::1%4`) cannot be written
+/// into an `http://` URL, so a connect to it fails before it is sent
+/// ("builder error", seen 2026-10-27). `None` for an empty list. Pure — no
+/// network, so it is directly testable.
+pub fn preferred_addr(addrs: &[SocketAddr]) -> Option<SocketAddr> {
+    fn rank(addr: &SocketAddr) -> u8 {
+        match addr.ip() {
+            std::net::IpAddr::V4(v4) if !v4.is_loopback() => 0,
+            std::net::IpAddr::V6(v6) if !v6.is_loopback() && !v6.is_unicast_link_local() => 1,
+            std::net::IpAddr::V4(_) => 2,
+            std::net::IpAddr::V6(v6) if v6.is_loopback() => 3,
+            std::net::IpAddr::V6(_) => 4,
+        }
+    }
+    addrs.iter().copied().min_by_key(rank)
+}
+
 /// Handle to this instance's mDNS advertisement. The service is withdrawn
 /// when this value is dropped (best-effort — `mdns-sd` unregisters
 /// asynchronously and drop cannot wait on it).
@@ -191,8 +211,9 @@ async fn drain_events(events: mdns_sd::Receiver<ServiceEvent>, tx: mpsc::Sender<
             event = events.recv_async() => {
                 let Ok(event) = event else { break };
                 let ServiceEvent::ServiceResolved(info) = event else { continue };
-                let Some(addr) = info.get_addresses().iter().next() else { continue };
-                let socket_addr = scoped_addr_to_socket_addr(addr, info.get_port());
+                let addrs: Vec<SocketAddr> =
+                    info.get_addresses().iter().map(|a| scoped_addr_to_socket_addr(a, info.get_port())).collect();
+                let Some(socket_addr) = preferred_addr(&addrs) else { continue };
                 let txt: Vec<(String, String)> = info
                     .get_properties()
                     .iter()
@@ -225,6 +246,64 @@ mod tests {
         assert_eq!(parsed.name, "Isaac's laptop");
         assert_eq!(parsed.protocol_version, PROTOCOL_VERSION);
         assert_eq!(parsed.addr, addr);
+    }
+
+    #[test]
+    fn preferred_addr_link_local_ipv6_listed_first_the_lan_ipv4_wins() {
+        // Arrange -- the order Windows saw an Ubuntu peer in (2026-10-27).
+        let addrs: Vec<SocketAddr> =
+            vec!["[fe80::3041:a8ff:fe74:b1ad%4]:40431".parse().unwrap(), "192.168.68.70:40431".parse().unwrap()];
+
+        // Act
+        let picked = preferred_addr(&addrs);
+
+        // Assert
+        assert_eq!(picked, Some("192.168.68.70:40431".parse().unwrap()));
+    }
+
+    #[test]
+    fn preferred_addr_loopback_and_lan_ipv4_the_lan_one_wins() {
+        // Arrange
+        let addrs: Vec<SocketAddr> = vec!["127.0.0.1:9000".parse().unwrap(), "10.0.0.5:9000".parse().unwrap()];
+
+        // Act
+        let picked = preferred_addr(&addrs);
+
+        // Assert
+        assert_eq!(picked, Some("10.0.0.5:9000".parse().unwrap()));
+    }
+
+    #[test]
+    fn preferred_addr_link_local_or_loopback_ipv6_loopback_wins() {
+        // Arrange
+        let addrs: Vec<SocketAddr> = vec!["[fe80::1%4]:9000".parse().unwrap(), "[::1]:9000".parse().unwrap()];
+
+        // Act
+        let picked = preferred_addr(&addrs);
+
+        // Assert
+        assert_eq!(picked, Some("[::1]:9000".parse().unwrap()));
+    }
+
+    #[test]
+    fn preferred_addr_only_link_local_still_returned() {
+        // Arrange
+        let addrs: Vec<SocketAddr> = vec!["[fe80::1%4]:9000".parse().unwrap()];
+
+        // Act
+        let picked = preferred_addr(&addrs);
+
+        // Assert
+        assert_eq!(picked, Some("[fe80::1%4]:9000".parse().unwrap()));
+    }
+
+    #[test]
+    fn preferred_addr_empty_none() {
+        // Act
+        let picked = preferred_addr(&[]);
+
+        // Assert
+        assert_eq!(picked, None);
     }
 
     #[test]
