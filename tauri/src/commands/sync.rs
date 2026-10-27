@@ -1,6 +1,7 @@
 //! LAN sync commands (C3 §3.9, L11 Tasks 12–13): `sync_status`, `sync_now`,
-//! `pair_peer`, `start_pairing`, `unpair_peer`, `set_sync_device_name`,
-//! plus the `peer_appeared` event and the pure auto-trigger decision. Thin
+//! `pair_peer`, `start_pairing`, `unpair_peer`, `set_sync_device_name`, and
+//! (library tiers Phase 1) `peer_library`, `sync_selection`,
+//! `set_peer_auto_sync`, plus the `peer_appeared` event and the pure auto-trigger decision. Thin
 //! over `idl-transport`'s
 //! `sync` module — merging, diffing and installing stay in `idl-rs`; the
 //! wire itself stays in `idl-transport` (CLAUDE.md §2, this task's brief).
@@ -33,6 +34,10 @@ pub struct PeerStatusDto {
     pub protocol_version: u32,
     /// Epoch milliseconds when pairing completed.
     pub paired_at_ms: i64,
+    /// What this device syncs with the peer on its own: `"off"`, `"send_new"`
+    /// or `"mirror"` (library tiers spec 4a). `"off"` for a pairing made
+    /// before the field existed.
+    pub auto_sync: idl_transport::sync::AutoSync,
 }
 
 /// This device's own sync identity, as seen by peers (C3 §3.9, ruling
@@ -99,7 +104,8 @@ pub struct SyncStatusDto {
     pub this_device: ThisDeviceDto,
 }
 
-/// `sync_now`'s return (C3 §3.9, all six fields per ruling R102).
+/// `sync_now`'s and `sync_selection`'s return (C3 §3.9, all six fields per
+/// ruling R102, plus the library-tiers throughput fields).
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct SyncResultDto {
     pub blobs_transferred: u32,
@@ -111,6 +117,22 @@ pub struct SyncResultDto {
     /// Bikes and bike-log entries transferred, pull and push combined
     /// (added 2026-10-16, bike-log spec §4).
     pub bike_log_updated: u32,
+    /// Bytes of raw-log and video blobs transferred (pull and push); a
+    /// resumed transfer counts the whole file.
+    pub blob_bytes: u64,
+    /// Bytes of `data.parquet`, derived channels and `session.json` transferred.
+    pub session_bytes: u64,
+    /// Bytes of workbooks transferred.
+    pub workbook_bytes: u64,
+    /// Bytes of tracks transferred.
+    pub track_bytes: u64,
+    /// Bytes of profiles transferred.
+    pub profile_bytes: u64,
+    /// Bytes of bikes and bike-log entries transferred.
+    pub bike_log_bytes: u64,
+    /// Wall-clock duration of the whole run, milliseconds; with the byte
+    /// fields it gives the run's throughput.
+    pub elapsed_ms: u64,
 }
 
 impl From<idl_transport::sync::SyncRunResult> for SyncResultDto {
@@ -123,6 +145,13 @@ impl From<idl_transport::sync::SyncRunResult> for SyncResultDto {
             tracks_updated: r.tracks_updated,
             profiles_updated: r.profiles_updated,
             bike_log_updated: r.bike_log_updated,
+            blob_bytes: r.blob_bytes,
+            session_bytes: r.session_bytes,
+            workbook_bytes: r.workbook_bytes,
+            track_bytes: r.track_bytes,
+            profile_bytes: r.profile_bytes,
+            bike_log_bytes: r.bike_log_bytes,
+            elapsed_ms: r.elapsed_ms,
         }
     }
 }
@@ -172,6 +201,7 @@ pub(crate) fn peer_status_dto(peer: &Peer, discovered: &HashMap<String, Discover
         online: discovered.contains_key(&peer.peer_id),
         protocol_version: peer.protocol_version,
         paired_at_ms: peer.paired_at_ms,
+        auto_sync: peer.auto_sync,
     }
 }
 
@@ -534,6 +564,193 @@ pub async fn sync_now(
     };
     let result = run_one_sync(&state.running, &state.last_sync, &data_dir.0, &peer, addr, &idl_transport::sync::SyncSelection::everything(), &on_progress).await?;
     Ok(SyncResultDto::from(result))
+}
+
+/// `sync_selection(peer_id, selection, on_progress)` (library tiers spec 4a):
+/// [`run_one_sync`] restricted to `selection` — `{ direction, sessions?,
+/// workbooks?, absent_only }` — with the same running guard, catalog re-index,
+/// `last_sync` bookkeeping and `Progress` forwarding as `sync_now` (which is
+/// this command with `SyncSelection::everything()`).
+#[tauri::command]
+pub async fn sync_selection(
+    peer_id: String,
+    selection: idl_transport::sync::SyncSelection,
+    on_progress: tauri::ipc::Channel<crate::commands::device::Progress>,
+    state: tauri::State<'_, SyncState>,
+    data_dir: tauri::State<'_, DataDir>,
+) -> Result<SyncResultDto, IpcError> {
+    let (peer, addr) = {
+        let peers = state.peers.lock().unwrap_or_else(|e| e.into_inner());
+        let discovered = state.discovered.lock().unwrap_or_else(|e| e.into_inner());
+        resolve_peer_and_addr(&peer_id, &peers, &discovered)?
+    };
+
+    let report = |p: idl_transport::sync::SyncProgress| {
+        let _ = on_progress.send(crate::commands::device::Progress { done: p.done, total: p.total, phase: p.phase.to_string() });
+    };
+    let result = run_one_sync(&state.running, &state.last_sync, &data_dir.0, &peer, addr, &selection, &report).await?;
+    Ok(SyncResultDto::from(result))
+}
+
+/// How a browsed row compares with this device's own copy (library tiers spec 4a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HereStatus {
+    /// This device has no copy.
+    Absent,
+    /// This device has the same content (equal hashes).
+    Same,
+    /// This device has a copy with different content.
+    Differs,
+}
+
+/// One session row of `peer_library`: the peer's summary row (its fields
+/// flattened in: `session_id`, `timestamp_utc_ms`, `duration_ms`,
+/// `venue_name`, `event_name`, `rider`, `bike`, `tag`, `source_format`,
+/// `lap_count`, `size_bytes`) plus `here`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PeerLibrarySessionDto {
+    #[serde(flatten)]
+    pub session: idl_rs::store::library_summary::LibrarySession,
+    /// Against this device's copy: `data.parquet` and `session.json` hashes
+    /// both equal is `same`.
+    pub here: HereStatus,
+}
+
+/// One workbook row of `peer_library`: the peer's summary row (`workbook_id`,
+/// `file_name`, `size_bytes`, `updated_at_ms`) plus `here`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PeerLibraryWorkbookDto {
+    #[serde(flatten)]
+    pub workbook: idl_rs::store::library_summary::LibraryWorkbook,
+    /// Against this device's copy, compared by sha256.
+    pub here: HereStatus,
+}
+
+/// `peer_library`'s return: the peer's library summary with each row's `here` status.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PeerLibraryDto {
+    /// The summary document's `schema_version`.
+    pub schema_version: u32,
+    /// Most recent recording first.
+    pub sessions: Vec<PeerLibrarySessionDto>,
+    /// By display name.
+    pub workbooks: Vec<PeerLibraryWorkbookDto>,
+}
+
+/// Classifies each row of the peer's `summary` against `local` (this device's
+/// manifest), using `remote` (the peer's manifest) for the peer's hashes.
+/// A session is `Absent` with no local entry, `Same` when its `data.parquet`
+/// and `session.json` hashes both equal the peer's (a file missing on both
+/// sides counts as equal), `Differs` otherwise — including when the peer's
+/// manifest no longer lists it. A workbook is compared by sha256 the same way.
+pub(crate) fn peer_library_dto(
+    summary: idl_rs::store::library_summary::LibrarySummary,
+    remote: &idl_rs::store::sync::manifest::Manifest,
+    local: &idl_rs::store::sync::manifest::Manifest,
+) -> PeerLibraryDto {
+    use idl_rs::store::sync::manifest::SessionEntry;
+    let local_sessions: HashMap<&str, &SessionEntry> = local.sessions.iter().map(|s| (s.session_id.as_str(), s)).collect();
+    let remote_sessions: HashMap<&str, &SessionEntry> = remote.sessions.iter().map(|s| (s.session_id.as_str(), s)).collect();
+    let local_workbooks: HashMap<&str, &str> = local.workbooks.iter().map(|w| (w.workbook_id.as_str(), w.sha256.as_str())).collect();
+    let remote_workbooks: HashMap<&str, &str> = remote.workbooks.iter().map(|w| (w.workbook_id.as_str(), w.sha256.as_str())).collect();
+
+    let hashes = |e: &SessionEntry| (e.data_parquet.as_ref().map(|d| d.sha256.clone()), e.session_json.as_ref().map(|j| j.sha256.clone()));
+    let sessions = summary
+        .sessions
+        .into_iter()
+        .map(|session| {
+            let here = match local_sessions.get(session.session_id.as_str()) {
+                None => HereStatus::Absent,
+                Some(mine) => match remote_sessions.get(session.session_id.as_str()) {
+                    Some(theirs) if hashes(mine) == hashes(theirs) => HereStatus::Same,
+                    _ => HereStatus::Differs,
+                },
+            };
+            PeerLibrarySessionDto { session, here }
+        })
+        .collect();
+    let workbooks = summary
+        .workbooks
+        .into_iter()
+        .map(|workbook| {
+            let here = match local_workbooks.get(workbook.workbook_id.as_str()) {
+                None => HereStatus::Absent,
+                Some(mine) if remote_workbooks.get(workbook.workbook_id.as_str()) == Some(mine) => HereStatus::Same,
+                Some(_) => HereStatus::Differs,
+            };
+            PeerLibraryWorkbookDto { workbook, here }
+        })
+        .collect();
+    PeerLibraryDto { schema_version: summary.schema_version, sessions, workbooks }
+}
+
+/// `peer_library(peer_id)` (library tiers spec 4a): the peer's library
+/// (`GET /idl1/v1/library`) with each row's `here` status against this
+/// device. Also fetches the peer's manifest, for the content hashes the
+/// summary does not carry. A peer not currently visible is `not_found`; one
+/// still indexing its library is a `sync` error saying so.
+#[tauri::command]
+pub async fn peer_library(
+    peer_id: String,
+    state: tauri::State<'_, SyncState>,
+    data_dir: tauri::State<'_, DataDir>,
+) -> Result<PeerLibraryDto, IpcError> {
+    let (peer, addr) = {
+        let peers = state.peers.lock().unwrap_or_else(|e| e.into_inner());
+        let discovered = state.discovered.lock().unwrap_or_else(|e| e.into_inner());
+        resolve_peer_and_addr(&peer_id, &peers, &discovered)?
+    };
+
+    let summary = idl_transport::sync::fetch_library(addr, &peer).await.map_err(IpcError::from)?;
+    let remote = idl_transport::sync::fetch_peer_manifest(addr, &peer).await.map_err(IpcError::from)?;
+    let root = data_dir.0.clone();
+    let local = tauri::async_runtime::spawn_blocking(move || idl_rs::store::sync::manifest::build_manifest(&root, now_ms()))
+        .await
+        .map_err(|e| IpcError::new(IpcErrorKind::Internal, format!("building the local manifest: {e}")))?
+        .map_err(|e| IpcError::new(IpcErrorKind::Io, format!("building the local manifest: {}", e.message)))?
+        .0;
+    Ok(peer_library_dto(summary, &remote, &local))
+}
+
+/// Transport-agnostic core of `set_peer_auto_sync`: sets `rule` on `peer_id`
+/// and persists the list to `peers_path` (atomically, as `unpair_peer` does).
+/// An unknown `peer_id` is `not_found` and nothing is written; a failed write
+/// leaves the in-memory rule as it was. Returns the updated peer.
+fn set_peer_auto_sync_via(
+    peers_path: &std::path::Path,
+    peers: &std::sync::Mutex<Vec<Peer>>,
+    peer_id: &str,
+    rule: idl_transport::sync::AutoSync,
+) -> Result<Peer, IpcError> {
+    let mut list = peers.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(peer) = list.iter_mut().find(|p| p.peer_id == peer_id) else {
+        return Err(IpcError::new(IpcErrorKind::NotFound, format!("unknown peer_id: {peer_id}")));
+    };
+    let previous = std::mem::replace(&mut peer.auto_sync, rule);
+    let updated = peer.clone();
+    if let Err(e) = idl_transport::sync::save_peers(peers_path, &list) {
+        if let Some(p) = list.iter_mut().find(|p| p.peer_id == peer_id) {
+            p.auto_sync = previous;
+        }
+        return Err(IpcError::from(e));
+    }
+    Ok(updated)
+}
+
+/// `set_peer_auto_sync(peer_id, rule)` (library tiers spec 4a): what this
+/// device does with `peer_id` on its own — `"off"`, `"send_new"` (push only
+/// what the peer lacks) or `"mirror"` (full two-way sync). Persisted to
+/// `peers.json`. Returns the peer's updated status.
+#[tauri::command]
+pub async fn set_peer_auto_sync(
+    peer_id: String,
+    rule: idl_transport::sync::AutoSync,
+    state: tauri::State<'_, SyncState>,
+) -> Result<PeerStatusDto, IpcError> {
+    let peer = set_peer_auto_sync_via(&state.peers_path, &state.peers, &peer_id, rule)?;
+    let discovered = state.discovered.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(peer_status_dto(&peer, &discovered))
 }
 
 /// The subset of a browsed/paired peer's state
@@ -1104,10 +1321,10 @@ mod tests {
     #[test]
     fn dtos_serialise_with_exactly_c3_3_9s_field_names() {
         // Arrange
-        let peer_status = PeerStatusDto { peer_id: "p1".to_string(), name: "Pit Tablet".to_string(), online: true, protocol_version: 1, paired_at_ms: 42 };
+        let peer_status = PeerStatusDto { peer_id: "p1".to_string(), name: "Pit Tablet".to_string(), online: true, protocol_version: 1, paired_at_ms: 42, auto_sync: idl_transport::sync::AutoSync::Off };
         let this_device = ThisDeviceDto { peer_id: "self".to_string(), name: "idl1".to_string() };
         let sync_status = SyncStatusDto { paired_peers: vec![peer_status.clone()], discovered_peers: Vec::new(), last_sync_utc_ms: Some(7), this_device };
-        let sync_result = SyncResultDto { blobs_transferred: 1, workbooks_merged: 2, conflicts: 3, sessions_updated: 4, tracks_updated: 5, profiles_updated: 6, bike_log_updated: 7 };
+        let sync_result = SyncResultDto { blobs_transferred: 1, workbooks_merged: 2, conflicts: 3, sessions_updated: 4, tracks_updated: 5, profiles_updated: 6, bike_log_updated: 7, blob_bytes: 8, session_bytes: 9, workbook_bytes: 10, track_bytes: 11, profile_bytes: 12, bike_log_bytes: 13, elapsed_ms: 14 };
         let pairing_offer = PairingOfferDto { code: "004200".to_string(), expires_at_ms: 99 };
 
         // Act
@@ -1119,7 +1336,7 @@ mod tests {
         // Assert
         let mut peer_keys: Vec<&str> = peer_json.as_object().unwrap().keys().map(String::as_str).collect();
         peer_keys.sort();
-        assert_eq!(peer_keys, vec!["name", "online", "paired_at_ms", "peer_id", "protocol_version"]);
+        assert_eq!(peer_keys, vec!["auto_sync", "name", "online", "paired_at_ms", "peer_id", "protocol_version"]);
 
         let mut status_keys: Vec<&str> = status_json.as_object().unwrap().keys().map(String::as_str).collect();
         status_keys.sort();
@@ -1129,11 +1346,236 @@ mod tests {
         result_keys.sort();
         assert_eq!(
             result_keys,
-            vec!["bike_log_updated", "blobs_transferred", "conflicts", "profiles_updated", "sessions_updated", "tracks_updated", "workbooks_merged"]
+            vec![
+                "bike_log_bytes", "bike_log_updated", "blob_bytes", "blobs_transferred", "conflicts", "elapsed_ms", "profile_bytes", "profiles_updated",
+                "session_bytes", "sessions_updated", "track_bytes", "tracks_updated", "workbook_bytes", "workbooks_merged"
+            ]
         );
 
         let mut offer_keys: Vec<&str> = offer_json.as_object().unwrap().keys().map(String::as_str).collect();
         offer_keys.sort();
         assert_eq!(offer_keys, vec!["code", "expires_at_ms"]);
+    }
+
+    // -- library tiers: peer_library, sync_selection, set_peer_auto_sync ----
+
+    use idl_rs::store::library_summary::{LibrarySession, LibrarySummary, LibraryWorkbook};
+    use idl_rs::store::sync::manifest::{DataParquetEntry, Manifest, SessionEntry, SessionJsonEntry, WorkbookEntry};
+
+    fn manifest(sessions: Vec<SessionEntry>, workbooks: Vec<WorkbookEntry>) -> Manifest {
+        Manifest { schema_version: 1, generated_at_ms: 0, blobs: Vec::new(), sessions, workbooks, tracks: Vec::new(), profiles: Vec::new(), bikes: Vec::new() }
+    }
+
+    fn session_entry(id: &str, parquet_hash: &str, json_hash: &str) -> SessionEntry {
+        SessionEntry {
+            session_id: id.to_string(),
+            data_parquet: Some(DataParquetEntry {
+                sha256: parquet_hash.to_string(),
+                size_bytes: 1,
+                importer_version: "1.0.0".to_string(),
+                seam_correction_version: "v1".to_string(),
+                engine_version: "1.0.0".to_string(),
+                blob_sha256: None,
+            }),
+            derived: Vec::new(),
+            session_json: Some(SessionJsonEntry { sha256: json_hash.to_string(), size_bytes: 1, updated_at_ms: 0 }),
+        }
+    }
+
+    fn workbook_entry(id: &str, sha: &str) -> WorkbookEntry {
+        WorkbookEntry { workbook_id: id.to_string(), file_name: id.to_string(), sha256: sha.to_string(), size_bytes: 1, updated_at_ms: 0 }
+    }
+
+    fn library_session(id: &str) -> LibrarySession {
+        LibrarySession {
+            session_id: id.to_string(),
+            timestamp_utc_ms: 5,
+            duration_ms: Some(6),
+            venue_name: Some("Hill".to_string()),
+            event_name: None,
+            rider: None,
+            bike: None,
+            tag: None,
+            source_format: "idl0".to_string(),
+            lap_count: None,
+            size_bytes: 7,
+        }
+    }
+
+    #[test]
+    fn peer_library_dto_each_session_is_absent_same_or_differs_against_the_local_manifest() {
+        // Arrange
+        let summary = LibrarySummary {
+            schema_version: 1,
+            sessions: vec![library_session("aa"), library_session("bb"), library_session("cc"), library_session("dd")],
+            workbooks: Vec::new(),
+        };
+        let remote = manifest(
+            vec![session_entry("aa", "p1", "j1"), session_entry("bb", "p2", "j2"), session_entry("cc", "p3", "j3"), session_entry("dd", "p4", "j4")],
+            Vec::new(),
+        );
+        let local = manifest(
+            vec![session_entry("bb", "p2", "j2"), session_entry("cc", "p3", "OTHER-json"), session_entry("dd", "OTHER-parquet", "j4")],
+            Vec::new(),
+        );
+
+        // Act
+        let dto = peer_library_dto(summary, &remote, &local);
+
+        // Assert
+        let status: Vec<(&str, HereStatus)> = dto.sessions.iter().map(|s| (s.session.session_id.as_str(), s.here)).collect();
+        assert_eq!(
+            status,
+            vec![("aa", HereStatus::Absent), ("bb", HereStatus::Same), ("cc", HereStatus::Differs), ("dd", HereStatus::Differs)]
+        );
+    }
+
+    #[test]
+    fn peer_library_dto_a_session_the_peers_manifest_no_longer_lists_differs_when_held_here() {
+        // Arrange
+        let summary = LibrarySummary { schema_version: 1, sessions: vec![library_session("aa")], workbooks: Vec::new() };
+        let remote = manifest(Vec::new(), Vec::new());
+        let local = manifest(vec![session_entry("aa", "p", "j")], Vec::new());
+
+        // Act
+        let dto = peer_library_dto(summary, &remote, &local);
+
+        // Assert
+        assert_eq!(dto.sessions[0].here, HereStatus::Differs);
+    }
+
+    #[test]
+    fn peer_library_dto_each_workbook_is_compared_by_sha256() {
+        // Arrange
+        let workbook = |id: &str| LibraryWorkbook { workbook_id: id.to_string(), file_name: id.to_string(), size_bytes: 1, updated_at_ms: 2 };
+        let summary = LibrarySummary { schema_version: 1, sessions: Vec::new(), workbooks: vec![workbook("w1"), workbook("w2"), workbook("w3")] };
+        let remote = manifest(Vec::new(), vec![workbook_entry("w1", "x"), workbook_entry("w2", "y"), workbook_entry("w3", "z")]);
+        let local = manifest(Vec::new(), vec![workbook_entry("w2", "y"), workbook_entry("w3", "changed")]);
+
+        // Act
+        let dto = peer_library_dto(summary, &remote, &local);
+
+        // Assert
+        let status: Vec<HereStatus> = dto.workbooks.iter().map(|w| w.here).collect();
+        assert_eq!(status, vec![HereStatus::Absent, HereStatus::Same, HereStatus::Differs]);
+    }
+
+    #[test]
+    fn peer_library_dto_serialises_the_summary_row_fields_flat_with_here() {
+        // Arrange
+        let summary = LibrarySummary {
+            schema_version: 1,
+            sessions: vec![library_session("aa")],
+            workbooks: vec![LibraryWorkbook { workbook_id: "w".to_string(), file_name: "f".to_string(), size_bytes: 1, updated_at_ms: 2 }],
+        };
+        let empty = manifest(Vec::new(), Vec::new());
+
+        // Act
+        let json = serde_json::to_value(peer_library_dto(summary, &empty, &empty)).unwrap();
+
+        // Assert
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&json), vec!["schema_version", "sessions", "workbooks"]);
+        assert_eq!(
+            keys(&json["sessions"][0]),
+            vec!["bike", "duration_ms", "event_name", "here", "lap_count", "rider", "session_id", "size_bytes", "source_format", "tag", "timestamp_utc_ms", "venue_name"]
+        );
+        assert_eq!(keys(&json["workbooks"][0]), vec!["file_name", "here", "size_bytes", "updated_at_ms", "workbook_id"]);
+        assert_eq!(json["sessions"][0]["here"], "absent");
+        assert!(json["sessions"][0]["rider"].is_null());
+    }
+
+    #[test]
+    fn set_peer_auto_sync_a_known_peer_persists_the_rule_and_returns_the_updated_peer() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let peers_path = dir.path().join("peers.json");
+        let peers = std::sync::Mutex::new(vec![peer("peer-1"), peer("peer-2")]);
+
+        // Act
+        let updated = set_peer_auto_sync_via(&peers_path, &peers, "peer-2", idl_transport::sync::AutoSync::SendNew).unwrap();
+
+        // Assert
+        assert_eq!(updated.peer_id, "peer-2");
+        assert_eq!(updated.auto_sync, idl_transport::sync::AutoSync::SendNew);
+        let persisted = idl_transport::sync::load_peers(&peers_path).unwrap();
+        let rules: Vec<_> = persisted.iter().map(|p| (p.peer_id.as_str(), p.auto_sync)).collect();
+        assert_eq!(rules, vec![("peer-1", idl_transport::sync::AutoSync::Off), ("peer-2", idl_transport::sync::AutoSync::SendNew)]);
+    }
+
+    #[test]
+    fn set_peer_auto_sync_an_unknown_peer_id_not_found_nothing_written() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let peers_path = dir.path().join("peers.json");
+        let peers = std::sync::Mutex::new(vec![peer("peer-1")]);
+
+        // Act
+        let result = set_peer_auto_sync_via(&peers_path, &peers, "peer-unknown", idl_transport::sync::AutoSync::Mirror);
+
+        // Assert
+        assert_eq!(result.unwrap_err().kind, IpcErrorKind::NotFound);
+        assert!(!peers_path.exists());
+        assert_eq!(peers.lock().unwrap()[0].auto_sync, idl_transport::sync::AutoSync::Off);
+    }
+
+    #[test]
+    fn set_peer_auto_sync_a_failed_write_leaves_the_rule_unchanged() {
+        // Arrange — the peers path is a non-empty directory, so the atomic rename onto it fails.
+        let dir = tempfile::tempdir().unwrap();
+        let peers_path = dir.path().join("peers.json");
+        std::fs::create_dir(&peers_path).unwrap();
+        std::fs::write(peers_path.join("occupied"), b"x").unwrap();
+        let peers = std::sync::Mutex::new(vec![peer("peer-1")]);
+
+        // Act
+        let result = set_peer_auto_sync_via(&peers_path, &peers, "peer-1", idl_transport::sync::AutoSync::Mirror);
+
+        // Assert
+        assert!(result.is_err());
+        assert_eq!(peers.lock().unwrap()[0].auto_sync, idl_transport::sync::AutoSync::Off);
+    }
+
+    #[test]
+    fn sync_selection_the_ipc_argument_shape_deserialises_with_optional_fields_defaulted() {
+        // Arrange
+        let json = serde_json::json!({ "direction": "pull", "sessions": ["aa", "bb"] });
+
+        // Act
+        let selection: idl_transport::sync::SyncSelection = serde_json::from_value(json).unwrap();
+
+        // Assert
+        assert_eq!(selection.direction, idl_transport::sync::SyncDirection::Pull);
+        assert_eq!(selection.sessions.unwrap().len(), 2);
+        assert!(selection.workbooks.is_none());
+        assert!(!selection.absent_only);
+    }
+
+    #[test]
+    fn sync_result_dto_from_a_run_result_carries_the_throughput_fields() {
+        // Arrange
+        let run = idl_transport::sync::SyncRunResult {
+            blob_bytes: 100,
+            session_bytes: 20,
+            workbook_bytes: 3,
+            track_bytes: 4,
+            profile_bytes: 5,
+            bike_log_bytes: 6,
+            elapsed_ms: 700,
+            ..Default::default()
+        };
+
+        // Act
+        let dto = SyncResultDto::from(run);
+
+        // Assert
+        assert_eq!(
+            (dto.blob_bytes, dto.session_bytes, dto.workbook_bytes, dto.track_bytes, dto.profile_bytes, dto.bike_log_bytes, dto.elapsed_ms),
+            (100, 20, 3, 4, 5, 6, 700)
+        );
     }
 }
