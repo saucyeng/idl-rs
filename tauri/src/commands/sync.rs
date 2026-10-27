@@ -376,15 +376,18 @@ fn set_sync_device_name_via(
 
 /// C3 §3.9 `set_sync_device_name(name)` — added post-sign (2026-09-07, lead
 /// ruling R105, L11 Task 13). Renames this device: persists to
-/// `identity.json` and updates the live `SyncState` so `pair_peer`'s
+/// `identity.json`, updates the live `SyncState` so `pair_peer`'s
 /// outgoing `PairRequest.name` reflects it for the rest of the process's
-/// life. Does not retroactively change what an already-paired peer
-/// displays for us — that name was copied into their own peer file at
+/// life, and re-announces it over mDNS so unpaired devices nearby see the
+/// new name at once. Does not retroactively change what an already-paired
+/// peer displays for us — that name was copied into their own peer file at
 /// pairing time, and re-sending it would need a wire message this contract
 /// does not define.
 #[tauri::command]
 pub async fn set_sync_device_name(name: String, state: tauri::State<'_, SyncState>) -> Result<String, IpcError> {
-    set_sync_device_name_via(&state.identity_path, &state.peer_id, &state.name, name)
+    let stored = set_sync_device_name_via(&state.identity_path, &state.peer_id, &state.name, name)?;
+    state.readvertise(&stored);
+    Ok(stored)
 }
 
 /// `true` if `code` is exactly six ASCII digits (design §7, C3 §3.9). Kept

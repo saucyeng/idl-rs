@@ -291,6 +291,12 @@ pub struct SyncState {
     /// auto-trigger decision never starts a second run for a peer already
     /// here (this task's brief, "Key logic").
     pub running: Arc<Mutex<HashSet<String>>>,
+    /// This instance's mDNS announcement (`_idl1._tcp`, IDL0_SPEC §28a),
+    /// without which no other device ever sees this one. Replaced by
+    /// [`Self::readvertise`] on a rename so other devices see the new name
+    /// at once. `None` when it failed to start (no multicast on this
+    /// network): this device still sees others, they just can't see it.
+    pub advertisement: Mutex<Option<idl_transport::sync::Advertisement>>,
     /// Keeps the background mDNS-browse task alive; dropping `SyncState`
     /// aborts it. `None` when `browse()` failed to start (a discovery
     /// failure never blocks startup — this task's brief, "Key logic";
@@ -345,6 +351,7 @@ impl SyncState {
             name: name.clone(),
         };
         let server = idl_transport::sync::SyncServer::start(config, pairing.clone(), peers.clone()).await.map_err(IpcError::from)?;
+        let advertisement = start_advertising(&peer_id, &name, server.local_addr().port());
 
         let discovered = Arc::new(Mutex::new(HashMap::new()));
         let last_sync = Arc::new(Mutex::new(HashMap::new()));
@@ -354,6 +361,7 @@ impl SyncState {
             Ok(rx) => Some(tauri::async_runtime::spawn(run_discovery_loop(
                 app,
                 rx,
+                peer_id.clone(),
                 data_root,
                 peers.clone(),
                 discovered.clone(),
@@ -374,8 +382,32 @@ impl SyncState {
             discovered,
             last_sync,
             running,
+            advertisement: Mutex::new(advertisement),
             browse_task,
         })
+    }
+
+    /// Re-announces this instance under `name` (after `set_sync_device_name`)
+    /// so other devices' "Nearby devices" lists show the new name without a
+    /// restart. The old announcement is dropped first — its `Drop`
+    /// unregisters it — so a peer never holds two records for one id.
+    pub fn readvertise(&self, name: &str) {
+        let mut slot = self.advertisement.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = None;
+        *slot = start_advertising(&self.peer_id, name, self.server.local_addr().port());
+    }
+}
+
+/// Starts this instance's mDNS announcement on `port`, the sync server's.
+/// A failure (no multicast on this network) is logged, never fatal — the
+/// same rule as `browse()` in [`SyncState::start`].
+fn start_advertising(peer_id: &str, name: &str, port: u16) -> Option<idl_transport::sync::Advertisement> {
+    match idl_transport::sync::advertise(peer_id, name, port) {
+        Ok(advertisement) => Some(advertisement),
+        Err(e) => {
+            eprintln!("sync: not advertising on the LAN: {e:?}");
+            None
+        }
     }
 }
 
@@ -421,6 +453,7 @@ fn os_hostname() -> Option<String> {
 async fn run_discovery_loop<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     mut rx: tokio::sync::mpsc::Receiver<idl_transport::sync::DiscoveredPeer>,
+    own_peer_id: String,
     data_root: PathBuf,
     peers: Arc<Mutex<Vec<idl_transport::sync::Peer>>>,
     discovered: Arc<Mutex<HashMap<String, idl_transport::sync::DiscoveredPeer>>>,
@@ -430,6 +463,10 @@ async fn run_discovery_loop<R: tauri::Runtime>(
     use tauri::Emitter;
 
     while let Some(sighting) = rx.recv().await {
+        if is_own_sighting(&sighting, &own_peer_id) {
+            continue;
+        }
+
         let previous = discovered.lock().unwrap_or_else(|e| e.into_inner()).insert(sighting.peer_id.clone(), sighting.clone());
 
         if should_emit_peer_appeared(previous.as_ref(), &sighting) {
@@ -475,6 +512,14 @@ async fn run_discovery_loop<R: tauri::Runtime>(
 /// testable without the mDNS daemon or a Tauri `AppHandle`.
 fn should_emit_peer_appeared(previous: Option<&idl_transport::sync::DiscoveredPeer>, sighting: &idl_transport::sync::DiscoveredPeer) -> bool {
     previous != Some(sighting)
+}
+
+/// Whether `sighting` is this instance's own announcement, which the browse
+/// sees like any other — it must never list itself under "Nearby devices"
+/// or try to sync with itself. Pure, for the same reason as
+/// [`should_emit_peer_appeared`].
+fn is_own_sighting(sighting: &idl_transport::sync::DiscoveredPeer, own_peer_id: &str) -> bool {
+    sighting.peer_id == own_peer_id
 }
 
 #[cfg(test)]
@@ -592,6 +637,32 @@ mod tests {
 
     fn discovered_peer(addr: &str) -> DiscoveredPeer {
         DiscoveredPeer { peer_id: "peer-1".to_string(), name: "Pit Tablet".to_string(), protocol_version: 1, addr: addr.parse().unwrap() }
+    }
+
+    // -- is_own_sighting ---------------------------------------------------
+
+    #[test]
+    fn is_own_sighting_this_instance_s_own_announcement_yes() {
+        // Arrange
+        let sighting = discovered_peer("127.0.0.1:9000");
+
+        // Act
+        let result = is_own_sighting(&sighting, "peer-1");
+
+        // Assert
+        assert!(result);
+    }
+
+    #[test]
+    fn is_own_sighting_another_device_no() {
+        // Arrange
+        let sighting = discovered_peer("127.0.0.1:9000");
+
+        // Act
+        let result = is_own_sighting(&sighting, "peer-self");
+
+        // Assert
+        assert!(!result);
     }
 
     // -- should_emit_peer_appeared (lead ruling R176) --------------------

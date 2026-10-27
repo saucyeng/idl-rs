@@ -97,8 +97,12 @@ pub struct Advertisement {
 }
 
 impl Drop for Advertisement {
+    /// Unregisters (peers get a goodbye) and stops this announcement's own
+    /// daemon thread, which would otherwise outlive the handle — a rename
+    /// replaces the announcement, so this runs more than once per process.
     fn drop(&mut self) {
         let _ = self.daemon.unregister(&self.fullname);
+        let _ = self.daemon.shutdown();
     }
 }
 
