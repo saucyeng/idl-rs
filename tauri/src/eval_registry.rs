@@ -80,6 +80,11 @@ impl Evaluation {
     }
 }
 
+// TODO(idl0): the registry cap (`memory::eval_cache_cap_bytes`) and the bytes
+// `held_bytes` counts are a second budget beside `SessionCache`'s, so the
+// process can hold both in full. Phase 3 of the evaluation-memory spec
+// (2026-10-27-idl1-evaluation-memory-DRAFT.md §4.2.G, one ledger for cache,
+// decodes and evaluations) replaces both with one admission ledger.
 /// Distinct buffer bytes behind `cells`' values: an `Arc` that appears in
 /// several definitions (a shared time axis) is counted once.
 fn held_bytes(cells: &[CellEvalResult]) -> u64 {

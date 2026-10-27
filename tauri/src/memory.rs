@@ -75,6 +75,8 @@ pub fn budget_bytes() -> u64 {
 /// The one place this is decided. It is a stand-in until the machine-aware
 /// budget replaces `budget_bytes` (evaluation-memory spec §4.2.G, Phase 3),
 /// which should change this function and nothing around it.
+// TODO(idl0): this cap is additive to `budget_bytes`, not carved out of it;
+// evaluation-memory spec Phase 3 (§4.2.G) folds both into one ledger.
 pub fn eval_cache_cap_bytes(session_budget_bytes: u64) -> u64 {
     session_budget_bytes / 2
 }

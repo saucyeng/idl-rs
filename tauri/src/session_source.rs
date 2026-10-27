@@ -352,11 +352,32 @@ fn invalid_range_order(session_id: &str, t0_us: i64, t1_us: i64, session_span_us
 /// caring whether the session itself exists, only whether the lap number
 /// resolves.
 pub fn resolve_window(data_root: &Path, window: &WindowDto) -> Result<(f64, f64), IpcError> {
+    let doc = match window.span {
+        SpanDto::Lap { .. } => try_read_session_json(data_root, &window.session_id).ok(),
+        _ => None,
+    };
+    resolve_window_with(data_root, window, doc.as_ref())
+}
+
+/// [`resolve_window`] with `session.json` already read: a `Lap` span looks its
+/// bounds up in `session_json` (`None` reads as an empty document) instead of
+/// opening the file again.
+pub fn resolve_window_with(
+    data_root: &Path,
+    window: &WindowDto,
+    session_json: Option<&SessionJson>,
+) -> Result<(f64, f64), IpcError> {
     match &window.span {
         SpanDto::Session => full_session_span_secs(data_root, &window.session_id),
         SpanDto::Lap { lap_number } => {
-            let doc = try_read_session_json(data_root, &window.session_id)
-                .unwrap_or_else(|_| empty_session_json(&window.session_id));
+            let empty;
+            let doc = match session_json {
+                Some(d) => d,
+                None => {
+                    empty = empty_session_json(&window.session_id);
+                    &empty
+                }
+            };
             let (start, end) = doc
                 .laps
                 .iter()
@@ -464,15 +485,43 @@ pub fn load_window_context(
     window: &WindowDto,
     _handle: &SessionHandle,
 ) -> Result<MathLapContext, IpcError> {
-    let bounds = resolve_window(data_dir, window)?;
+    load_window_context_from(data_dir, window, &read_session_json_once(data_dir, &window.session_id))
+}
+
+/// `session.json` read **once**: the exact bytes (empty when the file is
+/// absent) and what they parse to (`None` when absent or unparseable). The
+/// evaluation key hashes `bytes` and the lap context is built from `doc`, so
+/// a rewrite of the file between two reads cannot pair old results with a
+/// new key.
+#[derive(Debug, Clone)]
+pub struct SessionJsonRead {
+    /// The file's bytes as read; empty if it could not be read.
+    pub bytes: Vec<u8>,
+    /// `bytes` parsed, `None` if they did not parse.
+    pub doc: Option<SessionJson>,
+}
+
+/// Reads `session_id`'s `session.json` once into a [`SessionJsonRead`].
+pub fn read_session_json_once(data_dir: &Path, session_id: &str) -> SessionJsonRead {
+    let path = session_dir(data_dir, session_id).join("session.json");
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let doc = idl_rs::store::session_json::parse_session_json(&bytes).ok();
+    SessionJsonRead { bytes, doc }
+}
+
+/// [`load_window_context`] over a `session.json` already read.
+pub fn load_window_context_from(
+    data_dir: &Path,
+    window: &WindowDto,
+    session_json: &SessionJsonRead,
+) -> Result<MathLapContext, IpcError> {
+    let bounds = resolve_window_with(data_dir, window, session_json.doc.as_ref())?;
     // `laps` is the one part of the context a window does *not* collapse: the
     // `[lap]` axis needs every lap the window covers, each still carrying its
     // own number. Reading it from `session.json` here is what lets a lap
     // progression chart draw under a whole-session window and still know it
     // is looking at laps 1..N rather than one unnumbered span.
-    let laps = try_read_session_json(data_dir, &window.session_id)
-        .map(|doc| laps_in_window(&doc.laps, bounds))
-        .unwrap_or_default();
+    let laps = session_json.doc.as_ref().map(|doc| laps_in_window(&doc.laps, bounds)).unwrap_or_default();
     Ok(MathLapContext {
         main_lap_bounds: vec![bounds],
         main_sectors: Vec::new(),

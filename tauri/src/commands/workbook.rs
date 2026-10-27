@@ -25,7 +25,10 @@ use idl_rs::workbook::v3::{
 
 use crate::error::{IpcError, IpcErrorKind};
 use crate::session_cache::SessionCache;
-use crate::session_source::{load_lap_context, load_lazy_session_handle, load_window_context, session_dir, WindowDto};
+use crate::session_source::{
+    load_lap_context, load_lazy_session_handle, load_window_context, load_window_context_from, read_session_json_once,
+    session_dir, WindowDto,
+};
 use crate::state::{DataDir, Hashes, Watchers};
 use crate::watcher::{ExpectedHashSet, WorkbookWatcher};
 
@@ -689,7 +692,8 @@ fn eval_workbook_v2_via(
                 Ok(h) => h,
                 Err(e) => return WindowEval::Error { error: with_window_index(e, i) },
             };
-            let lap_ctx = match load_window_context(data_dir, window, &handle) {
+            let session_json = read_session_json_once(data_dir, &window.session_id);
+            let lap_ctx = match load_window_context_from(data_dir, window, &session_json) {
                 Ok(c) => c,
                 Err(e) => return WindowEval::Error { error: with_window_index(e, i) },
             };
@@ -697,7 +701,7 @@ fn eval_workbook_v2_via(
             // charts each fetch a definition of this same window): the first
             // runs it, the rest wait for it. The decodes it needs are
             // prefetched only on that first run.
-            let key = evaluation_key(data_dir, &markdown, Some(window));
+            let key = evaluation_key(data_dir, &markdown, Some((window, &session_json.bytes)));
             let evaluation = cache.evals().get_or_evaluate(&key, || {
                 prefetch_document_channels(cache, data_dir, &window.session_id, &doc, &handle);
                 evaluate_checked(&doc, &structural, &handle, Some(&*source), &lap_ctx)
@@ -706,7 +710,15 @@ fn eval_workbook_v2_via(
             // be given is this window's failure, not the whole call's.
             match evaluation {
                 Ok(evaluation) => {
-                    WindowEval::Ok { ok: cell_outputs_from(evaluation.cells(), &doc, &handle, &lap_ctx, true) }
+                    let ok = cell_outputs_from(evaluation.cells(), &doc, &handle, &lap_ctx, true);
+                    // Building the table cells reads channels through this
+                    // window's own source, outside the shared evaluation; a
+                    // decode they could not be given is this window's
+                    // failure too (R121).
+                    match source.take_first_error() {
+                        Some(e) => WindowEval::Error { error: with_window_index(e, i) },
+                        None => WindowEval::Ok { ok },
+                    }
                 }
                 Err(e) => WindowEval::Error { error: with_window_index(e, i) },
             }
@@ -849,12 +861,13 @@ fn fetch_host_channel_v2_via(
     // key: concurrent fetches wait on one run, and a fetch that arrives after
     // the open reads its definition out of the kept result instead of
     // evaluating the whole document again to return one value.
-    let key = evaluation_key(data_dir, &markdown, window);
+    let session_json = window.map(|w| read_session_json_once(data_dir, &w.session_id));
+    let key = evaluation_key(data_dir, &markdown, window.zip(session_json.as_ref().map(|j| j.bytes.as_slice())));
     let evaluation = cache.evals().get_or_evaluate(&key, || {
-        let (handle, source, lap_ctx) = match window {
-            Some(w) => {
+        let (handle, source, lap_ctx) = match window.zip(session_json.as_ref()) {
+            Some((w, json)) => {
                 let (handle, source) = load_lazy_session_handle(data_dir, &w.session_id, cache)?;
-                let lap_ctx = load_window_context(data_dir, w, &handle)?;
+                let lap_ctx = load_window_context_from(data_dir, w, json)?;
                 prefetch_document_channels(cache, data_dir, &w.session_id, &doc, &handle);
                 (handle, Some(source), lap_ctx)
             }
@@ -907,35 +920,40 @@ fn evaluate_checked(
 /// against `window` (evaluation-memory spec §4.2.A): the workbook's bytes, the
 /// window's session and span, the data's identity (`blob_sha256`, importer and
 /// seam-correction versions, read from `data.parquet`'s footer), the bytes of
-/// the session's `session.json` (its laps and sectors reach the evaluator as
-/// the lap context), and the engine version. A change in any of them is a new
+/// the session's `session.json` bytes, passed in with the window so the key and
+/// the lap context come from one read (its laps and sectors reach the
+/// evaluator as the lap context), and the engine version. A change in any of them is a new
 /// key, so the next call evaluates again.
 ///
 /// Never fails: an unreadable footer or a missing `session.json` is hashed as
 /// such, and the evaluation that follows reports the real error (an error is
 /// never kept, so it cannot be served from here later).
-fn evaluation_key(data_dir: &Path, markdown: &str, window: Option<&WindowDto>) -> crate::eval_registry::EvalKey {
+fn evaluation_key(
+    data_dir: &Path,
+    markdown: &str,
+    window: Option<(&WindowDto, &[u8])>,
+) -> crate::eval_registry::EvalKey {
     let (session, span) = match window {
-        Some(w) => (w.session_id.clone(), format!("{:?}", w.span)),
+        Some((w, _)) => (w.session_id.clone(), format!("{:?}", w.span)),
         None => (String::new(), "no session".to_string()),
     };
     let (identity, session_json) = match window {
-        Some(w) => {
+        Some((w, json)) => {
             let dir = session_dir(data_dir, &w.session_id);
             let identity = match idl_rs::store::parquet::read_session_metadata(&dir.join("data.parquet")) {
                 Ok(m) => format!("{}|{}|{}", m.blob_sha256, m.importer_version, m.seam_correction_version),
                 Err(e) => format!("unreadable: {e:?}"),
             };
-            (identity, std::fs::read(dir.join("session.json")).unwrap_or_default())
+            (identity, json)
         }
-        None => (String::new(), Vec::new()),
+        None => (String::new(), &[][..]),
     };
     crate::eval_registry::EvalKey::from_parts(&[
         markdown.as_bytes(),
         session.as_bytes(),
         span.as_bytes(),
         identity.as_bytes(),
-        &session_json,
+        session_json,
         idl_rs::VERSION.as_bytes(),
     ])
 }
@@ -2461,6 +2479,34 @@ version: 3
         let results = value["results"].as_array().unwrap();
         assert_eq!(results.len(), 4);
         assert_eq!(results[2][0]["value"], 1.0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn eval_workbook_v2_via_a_table_cell_whose_channel_decode_is_refused_errors_its_window() {
+        // Arrange — the table reads `ChanA` through the window's own source,
+        // outside the shared evaluation (the document has no `math` cell), and
+        // a one-byte cache budget refuses that decode (R211.2, R121).
+        let root = temp_root();
+        seed_session(&root, "s1", "ChanA", vec![1.0, 2.0], vec![0, 1_000_000]);
+        let table = r#"{"columns":[{"id":"c0","name":"m","template":"mean([ChanA])"}],
+             "rows":[{"id":"r0"}],"cells":[[{}]]}"#;
+        let markdown = format!("---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```table id=bbbbbbbb\n{table}\n```\n");
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let windows = vec![WindowDto {
+            session_id: "s1".to_string(),
+            span: crate::session_source::SpanDto::Session,
+            colour: "--chart-1".to_string(),
+        }];
+
+        // Act
+        let out = eval_workbook_v2_via(&SessionCache::with_budget(1), &root, WB_ID, &windows).unwrap();
+
+        // Assert
+        let WindowEval::Error { error } = &out[0] else { panic!("expected the window to fail, got {:?}", out[0]) };
+        assert_eq!(error.kind, IpcErrorKind::ResourceExhausted);
+        assert_eq!(error.detail.as_ref().unwrap()["window"], 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }
