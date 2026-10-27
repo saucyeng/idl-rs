@@ -212,7 +212,9 @@ impl HostChannelView {
 /// isn't in that session — both surface as "not found", since this
 /// signature carries no separate expected-id to compare against a
 /// mismatch). [`MathEvalErrorKind::NoLapContext`] when `lap` is given but
-/// `lap_ctx.main_lap_bounds` has no matching lap (empty, or `lap` out of
+/// `lap_ctx` has no matching lap (`lap` is the session's **real** lap number
+/// when `lap_ctx.session_laps` is `Some`, so a lap outside the shown window
+/// still resolves; otherwise `index + 1` into `main_lap_bounds`; empty, or `lap` out of
 /// range — both mean "no lap context available for that lap"; the
 /// message names how many laps this session actually has (L3-R34b), so
 /// "lap 7 of a 3-lap session" does not read as a "no laps at all" lie).
@@ -252,11 +254,21 @@ pub fn channel(
         return Ok(to_host_channel(&t_us, &samples, unit, crate::math::ValueAxis::Time));
     };
 
-    let window = (lap_number as usize).checked_sub(1).and_then(|i| lap_ctx.main_lap_bounds.get(i));
-    let &(start_s, end_s) = window.ok_or_else(|| {
+    // `session_laps: Some` carries the real lap numbers (`lap` is the session's
+    // lap `n`, whatever window is shown); `None` is the whole-session shape
+    // where `main_lap_bounds` is the lap table and `lap` is `index + 1`.
+    let (window, lap_count) = match &lap_ctx.session_laps {
+        Some(laps) => {
+            (laps.iter().find(|l| l.lap_number == lap_number).map(|l| (l.start_secs, l.end_secs)), laps.len())
+        }
+        None => (
+            (lap_number as usize).checked_sub(1).and_then(|i| lap_ctx.main_lap_bounds.get(i)).copied(),
+            lap_ctx.main_lap_bounds.len(),
+        ),
+    };
+    let (start_s, end_s) = window.ok_or_else(|| {
         // L3-R34b: name the recorded lap count so "lap 7 of a 3-lap
         // session" reads differently from "no laps recorded at all".
-        let lap_count = lap_ctx.main_lap_bounds.len();
         let laps_recorded =
             if lap_count == 0 { "no laps recorded".to_string() } else { format!("{lap_count} laps recorded") };
         MathEvalError::new(
@@ -294,19 +306,29 @@ pub struct HostLap {
     pub end_t: f64,
 }
 
-/// Maps `lap_ctx.main_lap_bounds` to the JS `laps` host variable (C2
-/// §5.1). Numbers laps `index + 1` — the engine's own 1-based index into
-/// `main_lap_bounds` (`eval.rs:567`'s `.get(n - 1)` convention) — equal to
-/// `Lap.lap_number` only when the caller built `main_lap_bounds` from an
-/// unfiltered ascending lap list (a session with `ignored_lap_numbers` can
-/// make the two diverge, L3-R23).
+/// Maps the laps of the shown window to the JS `laps` host variable (C2
+/// §5.1). With `lap_ctx.session_laps` `Some`, these are the session's laps
+/// that overlap the window (half-open, so the next lap does not join), each
+/// with its **real** lap number: in a lap-3 window `laps[0].number` is 3. With
+/// `None` (whole-session shape) every `main_lap_bounds` entry is listed,
+/// numbered `index + 1` — equal to `Lap.lap_number` only when the caller built
+/// it from an unfiltered ascending lap list (L3-R23).
 pub fn host_laps(lap_ctx: &MathLapContext) -> Vec<HostLap> {
-    lap_ctx
-        .main_lap_bounds
-        .iter()
-        .enumerate()
-        .map(|(i, &(start_t, end_t))| HostLap { number: (i + 1) as u32, start_t, end_t })
-        .collect()
+    match &lap_ctx.session_laps {
+        None => lap_ctx
+            .main_lap_bounds
+            .iter()
+            .enumerate()
+            .map(|(i, &(start_t, end_t))| HostLap { number: (i + 1) as u32, start_t, end_t })
+            .collect(),
+        Some(laps) => {
+            let window = crate::math::eval::main_lap_window(lap_ctx);
+            laps.iter()
+                .filter(|l| window.map_or(true, |(ws, we)| l.start_secs < we && l.end_secs > ws))
+                .map(|l| HostLap { number: l.lap_number, start_t: l.start_secs, end_t: l.end_secs })
+                .collect()
+        }
+    }
 }
 
 /// Active session metadata, as exposed to JS host code (C2 §5.1). Field
@@ -551,6 +573,53 @@ mod tests {
 
         // Assert
         assert_eq!(got.v, vec![20.0, 30.0]);
+    }
+
+    /// Four one-second laps `[n-1, n)` s, shown through the lap-3 window `[2, 3)`.
+    fn lap_three_window_ctx() -> MathLapContext {
+        let spans = (1..=4u32)
+            .map(|n| crate::math::eval::LapSpan {
+                lap_number: n,
+                start_secs: (n - 1) as f64,
+                end_secs: n as f64,
+                lap_time_secs: 1.0,
+                sectors: Vec::new(),
+            })
+            .collect();
+        MathLapContext {
+            main_lap_bounds: vec![(2.0, 3.0)],
+            main_lap_number: Some(1),
+            session_laps: Some(spans),
+            ..MathLapContext::empty()
+        }
+    }
+
+    #[test]
+    fn channel_lap_under_a_window_takes_the_real_session_lap_number() {
+        // Arrange — 1 Hz samples 0..4; the shown window is lap 3.
+        let lookup = MapLookup(HashMap::from([("X", (vec![0.0, 1.0, 2.0, 3.0], 1.0, vec![0, 1_000_000, 2_000_000, 3_000_000]))]));
+        let lap_ctx = lap_three_window_ctx();
+
+        // Act — lap 2 is outside the window but is still session lap 2.
+        let lap2 = channel(&lookup, "X", Some(2), &lap_ctx, None).unwrap();
+        let lap7 = channel(&lookup, "X", Some(7), &lap_ctx, None).unwrap_err();
+
+        // Assert — [1, 2] s inclusive; lap 7 names the 4 recorded laps.
+        assert_eq!(lap2.v, vec![1.0, 2.0]);
+        assert_eq!(lap7.kind, MathEvalErrorKind::NoLapContext);
+        assert!(lap7.message.ends_with("(4 laps recorded)"));
+    }
+
+    #[test]
+    fn host_laps_under_a_window_lists_the_overlapping_laps_with_real_numbers() {
+        // Arrange
+        let lap_ctx = lap_three_window_ctx();
+
+        // Act
+        let got = host_laps(&lap_ctx);
+
+        // Assert — half-open: lap 4 starts where the window ends and is out.
+        assert_eq!(got, vec![HostLap { number: 3, start_t: 2.0, end_t: 3.0 }]);
     }
 
     // ---- Step 3: host_laps / host_session / host_constants (L3-R23) ----

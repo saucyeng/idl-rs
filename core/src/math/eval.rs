@@ -263,48 +263,47 @@ pub struct MathLapContext {
     /// inferred from the length of `laps` — a session with one lap is not a
     /// row context, and guessing from a length is how the two silently swap.
     pub row_lap: Option<u32>,
-    /// Every lap of the **session**, whatever window is shown. Set by
+    /// Every lap of the **session**, whatever window is shown, or `None` when
+    /// the caller supplies no session context. Set by
     /// `load_window_context`, where `main_lap_bounds` is the one-entry window
     /// and so cannot number laps: a windowed value is evaluated over the whole
     /// session and the window only selects afterwards (memory spec §7 Q1).
-    /// When non-empty, `current_lap()`, `sector_number()`, `lap_start_time()`
-    /// and `lap_start_distance()` read it (real lap numbers, per-lap sectors
-    /// flattened in arrival order); when empty they read `main_lap_bounds` /
+    /// `Some(laps)`: `current_lap()`, `sector_number()`, `lap_start_time()`,
+    /// `lap_start_distance()` and the host `channel(.., {lap})` / `laps`
+    /// read it (real lap numbers, per-lap sectors flattened in arrival order);
+    /// `Some(empty)` means the session has no laps, so `current_lap()` is 0
+    /// everywhere, as in the CLI. `None`: they read `main_lap_bounds` /
     /// `main_sectors`, the whole-session CLI shape.
-    pub session_laps: Vec<LapSpan>,
+    pub session_laps: Option<Vec<LapSpan>>,
 }
 
 impl MathLapContext {
     /// 1-based lap number containing session-relative time `t_s` (seconds),
     /// `0` outside every lap.
     fn lap_number_at(&self, t_s: f64) -> u32 {
-        if self.session_laps.is_empty() {
-            crate::variance::current_lap_at(&self.main_lap_bounds, t_s)
-        } else {
-            self.session_laps
-                .iter()
-                .find(|l| t_s >= l.start_secs && t_s < l.end_secs)
-                .map_or(0, |l| l.lap_number)
+        match &self.session_laps {
+            None => crate::variance::current_lap_at(&self.main_lap_bounds, t_s),
+            Some(laps) => {
+                laps.iter().find(|l| t_s >= l.start_secs && t_s < l.end_secs).map_or(0, |l| l.lap_number)
+            }
         }
     }
 
     /// Start (seconds) of lap `n`: by real lap number in [`Self::session_laps`]
-    /// when set, else by position in `main_lap_bounds`. `NaN` when absent.
+    /// when `Some`, else by position in `main_lap_bounds`. `NaN` when absent.
     fn lap_start_secs(&self, n: u32) -> f64 {
-        if self.session_laps.is_empty() {
-            crate::variance::lap_start_time(&self.main_lap_bounds, n)
-        } else {
-            self.session_laps.iter().find(|l| l.lap_number == n).map_or(f64::NAN, |l| l.start_secs)
+        match &self.session_laps {
+            None => crate::variance::lap_start_time(&self.main_lap_bounds, n),
+            Some(laps) => laps.iter().find(|l| l.lap_number == n).map_or(f64::NAN, |l| l.start_secs),
         }
     }
 
     /// Sectors `(start_s, end_s)` flattened across laps in arrival order:
-    /// from [`Self::session_laps`] when set, else `main_sectors`.
+    /// from [`Self::session_laps`] when `Some`, else `main_sectors`.
     fn numbering_sectors(&self) -> Vec<(f64, f64)> {
-        if self.session_laps.is_empty() {
-            self.main_sectors.clone()
-        } else {
-            self.session_laps.iter().flat_map(|l| l.sectors.iter().copied()).collect()
+        match &self.session_laps {
+            None => self.main_sectors.clone(),
+            Some(laps) => laps.iter().flat_map(|l| l.sectors.iter().copied()).collect(),
         }
     }
 
@@ -320,7 +319,7 @@ impl MathLapContext {
             baseline_row: None,
             laps: Vec::new(),
             row_lap: None,
-            session_laps: Vec::new(),
+            session_laps: None,
         }
     }
 }
@@ -1156,7 +1155,7 @@ fn require_ref_channel(v: &Value, ctx: &str) -> Result<(Arc<[f64]>, f64, Arc<[i6
 // is `start < end`) — the live defect this function now closes. A one-entry
 // vec is therefore always read directly, regardless of what
 // `main_lap_number` says; only a longer vec is still indexed by lap number.
-fn main_lap_window(lap_ctx: &MathLapContext) -> Option<(f64, f64)> {
+pub(crate) fn main_lap_window(lap_ctx: &MathLapContext) -> Option<(f64, f64)> {
     match (lap_ctx.main_lap_number, lap_ctx.main_lap_bounds.as_slice()) {
         (Some(_), [only]) => Some(*only),
         (Some(n), bounds) => bounds.get((n as usize).saturating_sub(1)).copied(),

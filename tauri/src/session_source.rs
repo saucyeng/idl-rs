@@ -448,11 +448,14 @@ fn lap_span(lap: &LapJson) -> LapSpan {
     }
 }
 
-/// Every lap of `doc` as a [`LapSpan`], in lap order; empty when `session.json`
-/// is absent or unparseable. The numbering the lap functions use whatever window
-/// is shown ([`MathLapContext::session_laps`]).
-fn session_laps(doc: Option<&SessionJson>) -> Vec<LapSpan> {
-    doc.map(|d| d.laps.iter().map(lap_span).collect()).unwrap_or_default()
+/// Every lap of `doc` as a [`LapSpan`], in lap order, always `Some`: an absent
+/// or unparseable `session.json` is a session with no laps (`Some(empty)`),
+/// which is what the CLI's `lap_context(&[], ..)` makes of it, so
+/// `current_lap()` is 0 rather than the window reading as one lap. The
+/// numbering the lap functions use whatever window is shown
+/// ([`MathLapContext::session_laps`]).
+fn session_laps(doc: Option<&SessionJson>) -> Option<Vec<LapSpan>> {
+    Some(doc.map(|d| d.laps.iter().map(lap_span).collect()).unwrap_or_default())
 }
 
 /// The laps of `laps` that a window `[start, end)` covers, in lap order —
@@ -559,6 +562,12 @@ pub fn load_window_context_from(
 /// `NoLapContext` is the evaluator's own answer for "no lap context", not
 /// this function's job to reject on).
 ///
+/// `selection = Some(lc)` also sets [`MathLapContext::session_laps`] to every
+/// lap of the session (behaviour change, memory spec §7 Q1): a designated main
+/// lap narrows `main_lap_bounds` to that lap, but `current_lap()`,
+/// `sector_number()` and `lap_start_*` still number against the whole session.
+/// `selection = None` leaves it `None` (its `sector_number()` stays NaN).
+///
 /// `selection = Some(lc)` is the per-call UI designation (ledger R41 — not a
 /// property of the file): every lap number named in `lc.main_lap`/
 /// `lc.overlay_laps` must exist in `session.json`'s actual `laps[]`, checked
@@ -650,7 +659,7 @@ pub fn load_lap_context(
         row_lap: None,
         // A designated main lap narrows `main_lap_bounds` to that lap; the lap
         // functions still number against every lap of the session.
-        session_laps: doc.laps.iter().map(lap_span).collect(),
+        session_laps: Some(doc.laps.iter().map(lap_span).collect()),
     })
 }
 
@@ -1512,9 +1521,33 @@ mod tests {
         let handle = seed_four_lap_session(&root);
         let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Lap { lap_number: 3 }, colour: String::new() };
         let app_ctx = load_window_context(&root, &window, &handle).unwrap();
-        let mut cli_ctx = load_lap_context(&root, "s1", &handle, None).unwrap();
-        cli_ctx.main_lap_number = Some(3);
-        cli_ctx.main_sectors = vec![(1.0, 1.5), (1.5, 2.0)];
+        let doc = idl_rs::store::session_json::parse_session_json(&std::fs::read(session_dir(&root, "s1").join("session.json")).unwrap()).unwrap();
+        let laps: Vec<idl_rs::laps::model::Lap> = doc
+            .laps
+            .iter()
+            .map(|l| idl_rs::laps::model::Lap {
+                lap_number: l.lap_number,
+                start_ms: l.start_timestamp_ms,
+                end_ms: l.end_timestamp_ms,
+                start_time_secs: l.start_time_secs,
+                end_time_secs: l.end_time_secs,
+                raw_elapsed_ms: l.raw_elapsed_ms,
+                lap_time_ms: l.lap_time_ms,
+                sectors: l
+                    .sectors
+                    .iter()
+                    .map(|s| idl_rs::laps::model::Sector {
+                        name: s.name.clone(),
+                        start_ms: s.start_ms,
+                        end_ms: s.end_ms,
+                        start_time_secs: s.start_time_secs,
+                        end_time_secs: s.end_time_secs,
+                    })
+                    .collect(),
+                neutral_zone_visits: Vec::new(),
+            })
+            .collect();
+        let cli_ctx = idl_rs::commands::lap_ops::lap_context(&laps, idl_rs::commands::lap_ops::MainLap::Number(3)).unwrap();
 
         // Act / Assert — same numbers from both for every lap function.
         for expr in [
@@ -1530,6 +1563,26 @@ mod tests {
                 assert!((a.is_nan() && c.is_nan()) || a == c, "{expr}: app {a} vs cli {c}");
             }
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_window_context_no_session_json_current_lap_is_zero_as_in_the_cli() {
+        // Arrange — a session with no `session.json`; the CLI's `lap_context(&[], ..)`
+        // has no laps, so `current_lap()` is 0 everywhere.
+        let root = temp_root();
+        seed_session(&root, "s1");
+        let handle = load_lazy_session_handle(&root, "s1", &SessionCache::new()).unwrap().0;
+        let window = WindowDto { session_id: "s1".to_string(), span: SpanDto::Session, colour: String::new() };
+        let ctx = load_window_context(&root, &window, &handle).unwrap();
+
+        // Act
+        let out = idl_rs::math::eval::evaluate("current_lap()", &handle, &ctx).unwrap();
+
+        // Assert
+        assert!(!out.samples.is_empty());
+        assert!(out.samples.iter().all(|&v| v == 0.0));
 
         let _ = std::fs::remove_dir_all(&root);
     }
