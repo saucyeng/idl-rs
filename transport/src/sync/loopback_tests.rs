@@ -574,6 +574,7 @@ async fn two_peers_an_unpaired_client_every_route_401s_and_nothing_changes() {
     let base = format!("http://{}/idl1/v1", a.addr());
     let routes: Vec<(reqwest::Method, String)> = vec![
         (reqwest::Method::GET, format!("{base}/manifest")),
+        (reqwest::Method::GET, format!("{base}/library")),
         (reqwest::Method::GET, format!("{base}/blob/{hash_placeholder}")),
         (reqwest::Method::PUT, format!("{base}/blob/{hash_placeholder}")),
         (reqwest::Method::GET, format!("{base}/session/{session_placeholder}/data.parquet")),
@@ -667,6 +668,112 @@ async fn two_peers_after_every_scenario_neither_tmp_holds_leftovers_and_neither_
             assert!(leftovers.is_empty(), "leftover tmp entries in {}: {leftovers:?}", root.display());
         }
     }
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Library tiers spec 4a: `GET /library` serves the catalogued sessions of the
+/// serving library to a paired peer, through the real client.
+#[tokio::test]
+async fn two_peers_fetch_library_returns_the_servers_catalogued_sessions() {
+    // Arrange
+    let a = start_instance("a").await;
+    let b = start_instance("b").await;
+    pair(&a, &b).await;
+    let session_id = "0123456789abcdef";
+    seed_session(&a.data_root, session_id);
+    idl_rs::store::catalog::rebuild_catalog(&a.data_root).unwrap();
+    let peer = peer_of(&b, &a.peer_id);
+
+    // Act
+    let summary = super::fetch_library(a.addr(), &peer).await.unwrap();
+
+    // Assert
+    assert_eq!(summary.schema_version, 1);
+    assert_eq!(summary.sessions.len(), 1);
+    assert_eq!(summary.sessions[0].session_id, session_id);
+    assert_eq!(summary.sessions[0].rider, None);
+    assert!(summary.sessions[0].size_bytes > 0);
+    assert!(summary.workbooks.is_empty());
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Spec 4a: no catalog is `503` with a typed body, the client says the other
+/// device is still indexing, and serving the request does not create one.
+#[tokio::test]
+async fn two_peers_fetch_library_with_no_catalog_is_503_still_indexing_and_creates_no_catalog() {
+    // Arrange
+    let a = start_instance("a").await;
+    let b = start_instance("b").await;
+    pair(&a, &b).await;
+    let peer = peer_of(&b, &a.peer_id);
+    let raw = reqwest::Client::new()
+        .get(format!("http://{}/idl1/v1/library", a.addr()))
+        .bearer_auth(&peer.token)
+        .send()
+        .await
+        .unwrap();
+    let raw_status = raw.status();
+    let body: super::LibraryUnavailableBody = raw.json().await.unwrap();
+
+    // Act
+    let err = super::fetch_library(a.addr(), &peer).await.unwrap_err();
+
+    // Assert
+    assert_eq!(raw_status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body.error, "catalog_unavailable");
+    assert_eq!(err.kind, crate::TransportErrorKind::Sync);
+    assert!(err.message.contains("still indexing"), "{}", err.message);
+    assert!(!a.data_root.join("catalog.sqlite").exists());
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Spec 4a: bearer-token protected like every other route.
+#[tokio::test]
+async fn two_peers_fetch_library_with_a_wrong_token_is_a_typed_error() {
+    // Arrange
+    let a = start_instance("a").await;
+    let b = start_instance("b").await;
+    pair(&a, &b).await;
+    let mut peer = peer_of(&b, &a.peer_id);
+    peer.token = "not-the-token".to_string();
+
+    // Act
+    let err = super::fetch_library(a.addr(), &peer).await.unwrap_err();
+
+    // Assert
+    assert_eq!(err.kind, crate::TransportErrorKind::Sync);
+    assert!(err.message.contains("401"), "{}", err.message);
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// `fetch_peer_manifest` returns the peer's C4 §6 manifest, session hashes included.
+#[tokio::test]
+async fn two_peers_fetch_peer_manifest_returns_the_servers_session_entries() {
+    // Arrange
+    let a = start_instance("a").await;
+    let b = start_instance("b").await;
+    pair(&a, &b).await;
+    let session_id = "0123456789abcdef";
+    let blob_sha = seed_session(&a.data_root, session_id);
+    let peer = peer_of(&b, &a.peer_id);
+
+    // Act
+    let manifest = super::fetch_peer_manifest(a.addr(), &peer).await.unwrap();
+
+    // Assert
+    assert_eq!(manifest.sessions.len(), 1);
+    let entry = &manifest.sessions[0];
+    assert_eq!(entry.session_id, session_id);
+    assert_eq!(entry.data_parquet.as_ref().unwrap().blob_sha256.as_deref(), Some(blob_sha.as_str()));
+    assert!(entry.session_json.is_some());
 
     a.shutdown().await;
     b.shutdown().await;

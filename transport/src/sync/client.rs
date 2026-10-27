@@ -16,6 +16,7 @@ use tokio::io::AsyncWriteExt;
 
 use idl_rs::store::atomic::sha256_hex;
 use idl_rs::store::blob::blob_path;
+use idl_rs::store::library_summary::LibrarySummary;
 use idl_rs::store::sync::apply::{install, install_blob_file, InstallContext, InstallOutcome};
 use idl_rs::store::sync::diff::{plan_sync, SyncAction, SyncClass, SyncItem};
 use idl_rs::store::sync::ids::{is_valid_id, safe_join, IdClass};
@@ -396,6 +397,49 @@ pub async fn sync_with_peer(
     result.sessions_touched = sessions_touched.into_iter().collect(); // BTreeSet -> already sorted
     result.elapsed_ms = started.elapsed().as_millis() as u64;
     Ok(result)
+}
+
+/// `GET /idl1/v1/library` (library tiers spec 4a): the peer's session and
+/// workbook summary, for browsing what it holds. The body is held to the
+/// same [`MAX_DOCUMENT_BODY_BYTES`] cap as the manifest. A `503` is the peer
+/// still indexing its library, reported as such; any other non-success
+/// status, an over-cap body or malformed JSON is a typed [`TransportError`].
+pub async fn fetch_library(addr: SocketAddr, peer: &Peer) -> Result<LibrarySummary, TransportError> {
+    if peer.protocol_version != PROTOCOL_VERSION {
+        return Err(sync_error(format!(
+            "peer {} speaks protocol {}, this build speaks {PROTOCOL_VERSION}",
+            peer.peer_id, peer.protocol_version
+        )));
+    }
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("http://{addr}/idl1/v1/library"))
+        .bearer_auth(&peer.token)
+        .send()
+        .await
+        .map_err(|e| sync_error(format!("GET /library failed: {e}")))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return Err(sync_error("the other device is still indexing its library"));
+    }
+    if !status.is_success() {
+        return Err(sync_error(format!("GET /library returned status {status}")));
+    }
+    let bytes = bounded_bytes(response, MAX_DOCUMENT_BODY_BYTES, "GET /library").await?;
+    serde_json::from_slice::<LibrarySummary>(&bytes).map_err(|e| sync_error(format!("GET /library returned malformed JSON: {e}")))
+}
+
+/// `GET /idl1/v1/manifest` against `peer` at `addr`, without planning or moving
+/// anything: how a browse compares the peer's content hashes with this
+/// device's own. Same caps and errors as the fetch inside [`sync_with_peer`].
+pub async fn fetch_peer_manifest(addr: SocketAddr, peer: &Peer) -> Result<Manifest, TransportError> {
+    if peer.protocol_version != PROTOCOL_VERSION {
+        return Err(sync_error(format!(
+            "peer {} speaks protocol {}, this build speaks {PROTOCOL_VERSION}",
+            peer.peer_id, peer.protocol_version
+        )));
+    }
+    fetch_manifest(&reqwest::Client::new(), &format!("http://{addr}/idl1/v1"), &peer.token).await
 }
 
 /// `GET /idl1/v1/manifest` (PLAN §3). A non-success status (wrong token,

@@ -15,12 +15,12 @@ pub mod selection;
 pub mod server;
 pub mod wire;
 
-pub use client::{pair_with_peer, sync_with_peer, SyncProgress, SyncRunResult};
+pub use client::{fetch_library, fetch_peer_manifest, pair_with_peer, sync_with_peer, SyncProgress, SyncRunResult};
 pub use discovery::{advertise, browse, build_txt, parse_txt, Advertisement, DiscoveredPeer, SERVICE_TYPE};
 pub use identity::{Identity, DEFAULT_NAME};
 pub use pairing_link::{build_link, lan_addrs, parse_link, PairingLink};
 pub use pairing::{check_protocol_version, load_peers, save_peers, PairingState, MAX_ATTEMPTS, PAIRING_TTL_MS};
 pub use selection::{filter_plan, SyncDirection, SyncSelection};
 pub use range::{parse_range, RangeError, RangeErrorKind};
-pub use server::{SyncServer, SyncServerConfig};
+pub use server::{LibraryUnavailableBody, SyncServer, SyncServerConfig};
 pub use wire::{AutoSync, PairRequest, PairResponse, PairingOffer, Peer, PROTOCOL_VERSION};

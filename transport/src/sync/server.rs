@@ -145,6 +145,7 @@ fn build_router(state: ServerState) -> Router {
     Router::new()
         .route("/idl1/v1/pair", post(handle_pair))
         .route("/idl1/v1/manifest", get(handle_manifest))
+        .route("/idl1/v1/library", get(handle_library))
         .route("/idl1/v1/blob/{hash}", get(handle_blob_get).put(handle_blob_put))
         .route("/idl1/v1/session/{id}/data.parquet", get(handle_data_parquet_get).put(handle_data_parquet_put))
         .route("/idl1/v1/session/{id}/session.json", get(handle_session_json_get).put(handle_session_json_put))
@@ -274,6 +275,32 @@ async fn handle_manifest(State(state): State<ServerState>) -> Response {
     match build_manifest(&state.data_root, now_ms()) {
         Ok((manifest, _skipped)) => axum::Json(manifest).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message).into_response(),
+    }
+}
+
+/// The body of a `503` from `GET /idl1/v1/library`: the serving library's
+/// catalog is not ready (library tiers spec 4a). Typed so a client can tell
+/// "still indexing" from any other failure by `error`, not by prose.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LibraryUnavailableBody {
+    /// Always `"catalog_unavailable"`.
+    pub error: String,
+    /// Human-readable detail from the catalog open.
+    pub message: String,
+}
+
+/// `GET /idl1/v1/library` (library tiers spec 4a): the serving library's
+/// session and workbook summary, from its catalog, read-only. `503` with a
+/// [`LibraryUnavailableBody`] when the catalog is not ready.
+async fn handle_library(State(state): State<ServerState>) -> Response {
+    let root = state.data_root.clone();
+    match tokio::task::spawn_blocking(move || idl_rs::store::library_summary::library_summary(&root)).await {
+        Ok(Ok(summary)) => axum::Json(summary).into_response(),
+        Ok(Err(e)) => {
+            let body = LibraryUnavailableBody { error: "catalog_unavailable".to_string(), message: e.message };
+            (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
