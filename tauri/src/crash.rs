@@ -147,8 +147,8 @@ pub fn format_abnormal_exit_report(marker: &RunMarker, noticed_at_ms: u64) -> St
 /// process's own marker. Called by [`install`]; separate so tests can drive it
 /// against a temporary directory.
 ///
-/// A marker naming this very process, or a process that is still alive, is
-/// not reported (another copy of the app is running; or this is a second call
+/// A marker naming this very process, a process that is still alive, or a
+/// different app version (an update or restart) is not reported (another copy of the app is running; or this is a second call
 /// from the same process). Either way the marker is replaced, so a report is
 /// made **once**. An unreadable marker is dropped silently, and nothing here
 /// returns an error or panics: a failure to write is a lost breadcrumb, not a
@@ -158,7 +158,9 @@ pub fn begin_run(dir: &Path, version: &str) {
     let now = now_ms();
     let own_pid = std::process::id();
     if let Some(old) = std::fs::read(&marker_path).ok().and_then(|b| serde_json::from_slice::<RunMarker>(&b).ok()) {
-        if old.pid != own_pid && !process_alive(old.pid) {
+        // A different app version means an update or a restart, not a crash:
+        // the updater exits the process itself, so the marker survives it.
+        if old.pid != own_pid && old.version == version && !process_alive(old.pid) {
             let text = format_abnormal_exit_report(&old, now);
             let _ = std::fs::write(dir.join(format!("abnormal-{now}.txt")), text);
         }
@@ -340,7 +342,7 @@ mod tests {
     fn crash_marker_left_by_a_dead_pid_reported_once_as_an_abnormal_exit() {
         // Arrange — a marker whose process cannot exist.
         let tmp = tempfile::tempdir().unwrap();
-        let dead = RunMarker { pid: u32::MAX - 1, version: "0.3.0".to_string(), started_at_ms: 1000 };
+        let dead = RunMarker { pid: u32::MAX - 1, version: "0.4.0".to_string(), started_at_ms: 1000 };
         std::fs::write(tmp.path().join(MARKER_FILE), serde_json::to_vec(&dead).unwrap()).unwrap();
 
         // Act — two launches in a row.
@@ -354,6 +356,22 @@ mod tests {
         assert!(reports[0].text.contains(&format!("pid {}", u32::MAX - 1)));
         let marker: RunMarker = serde_json::from_slice(&std::fs::read(tmp.path().join(MARKER_FILE)).unwrap()).unwrap();
         assert_eq!(marker.pid, std::process::id());
+        assert_eq!(marker.version, "0.4.0");
+    }
+
+    #[test]
+    fn crash_marker_left_by_a_dead_pid_of_another_version_is_an_update_not_a_crash() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let old = RunMarker { pid: u32::MAX - 1, version: "0.3.0".to_string(), started_at_ms: 1000 };
+        std::fs::write(tmp.path().join(MARKER_FILE), serde_json::to_vec(&old).unwrap()).unwrap();
+
+        // Act
+        begin_run(tmp.path(), "0.4.0");
+
+        // Assert
+        assert!(pending(tmp.path()).unwrap().is_empty());
+        let marker: RunMarker = serde_json::from_slice(&std::fs::read(tmp.path().join(MARKER_FILE)).unwrap()).unwrap();
         assert_eq!(marker.version, "0.4.0");
     }
 
