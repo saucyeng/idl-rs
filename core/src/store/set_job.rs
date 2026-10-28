@@ -25,12 +25,17 @@ use std::sync::{Arc, Mutex};
 use crate::session::handle::{ChannelSource, SessionHandle, SessionMetaInput};
 use crate::session::{Channel, ChannelSamples};
 use crate::store::eval_cache::{catalog_identity, open_catalog_read_only, EvalCache, PRUNE_ABOVE_BYTES};
-use crate::store::parquet::{open_session_lazy_with, read_channel, read_session_metadata, ParquetStoreErrorKind};
+use crate::store::index_job::{MemoryBudget, NeverFits};
+use crate::store::parquet::{
+    open_session_lazy_with, read_channel, read_channel_index, read_session_metadata, ParquetStoreErrorKind,
+};
+use crate::workbook::v3::plan::PlanInputs;
+use crate::workbook::v3::EvalObserver;
 use crate::store::session_context::{whole_session_bounds, whole_session_context_without_data, window_lap_context};
 use crate::store::session_json::{parse_session_json, SessionJson};
 use crate::workbook::v3::session_set::{default_member_label, SessionSet};
 use crate::workbook::v3::set_eval::{
-    evaluate_member, laps_identity, member_key, plan_set, set_tables, CombineMember, MemberAbsence, MemberResults,
+    evaluate_member, evaluate_member_planned, laps_identity, member_eval_plan, member_key, plan_set, set_tables, CombineMember, MemberAbsence, MemberResults,
     PlanScope, SetPlan, SetTable, SetWarning,
 };
 use crate::workbook::v3::WorkbookDoc;
@@ -44,7 +49,7 @@ pub fn engine_identity() -> Option<&'static str> {
 }
 
 /// What one run does.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct SetJobOptions<'a> {
     /// Read and write `<data>/cache/eval/results.sqlite`. `false` reads
     /// nothing from it and writes nothing to the data directory (the CLI's
@@ -55,8 +60,16 @@ pub struct SetJobOptions<'a> {
     pub engine_identity: Option<&'a str>,
     /// Which definitions each member evaluates.
     pub scope: PlanScope,
-    /// Polled between members; set, the run stops at the next boundary.
+    /// Polled between members, while a member waits for memory, and
+    /// between a member's definitions; set, the run stops there and the
+    /// member in flight is discarded (members already finished stay cached).
     pub cancel: Option<&'a AtomicBool>,
+    /// The memory ledger each member is admitted against before it decodes
+    /// (evaluation-memory spec §4.2.G): its planned estimate is held for the
+    /// member's evaluation and released when the member ends. The app passes
+    /// its `SessionCache`, the CLI a [`crate::store::index_job::ByteBudget`];
+    /// `None` admits everything (tests).
+    pub budget: Option<&'a dyn MemoryBudget>,
 }
 
 /// One member's outcome.
@@ -352,9 +365,16 @@ pub fn run_session_set(
             Ok(evaluate_member(&plan, &doc.constants, &no_data_handle(&member.id), &ctx))
         } else {
             progress(&SetProgress { done, total, session_id: member.id.clone(), phase: SetPhase::Decoding });
-            evaluate_with_data(&dir, &plan, doc, json.as_ref(), &mut report, |phase| {
+            match evaluate_with_data(&dir, &plan, doc, json.as_ref(), &options, &mut report, |phase| {
                 progress(&SetProgress { done, total, session_id: member.id.clone(), phase })
-            })
+            }) {
+                Ok(r) => Ok(r),
+                Err(MemberRunError::Failed(e)) => Err(e),
+                Err(MemberRunError::Cancelled) => {
+                    cancelled = true;
+                    break;
+                }
+            }
         };
 
         match evaluated {
@@ -408,18 +428,71 @@ pub fn run_session_set(
     SetJobReport { set_key, plan, members, results, tables, warnings, cancelled, cache_error }
 }
 
-/// Opens one member's `data.parquet` through its own [`MemberSource`],
-/// evaluates the plan in its whole-session window, and drops every decoded
-/// channel before returning.
+/// Why [`evaluate_with_data`] produced no results.
+enum MemberRunError {
+    /// The member could not be evaluated (reported on the member).
+    Failed(SetMemberError),
+    /// The run was cancelled while the member waited or evaluated.
+    Cancelled,
+}
+
+/// The run's cancel flag as an [`EvalObserver`].
+struct CancelFlag<'a>(Option<&'a AtomicBool>);
+
+impl EvalObserver for CancelFlag<'_> {
+    fn cancelled(&self) -> bool {
+        self.0.is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+}
+
+/// How often a cancellable admission asks again, ms.
+const ADMIT_POLL_MS: u64 = 50;
+
+/// Opens one member's `data.parquet` through its own [`MemberSource`], plans
+/// its evaluation against the file's channel index, admits the plan's
+/// estimate against `options.budget` (every input counts as not resident:
+/// this source shares no cache), evaluates in the whole-session window, and
+/// drops every decoded channel and the admission before returning.
 fn evaluate_with_data(
     dir: &Path,
     plan: &SetPlan,
     doc: &WorkbookDoc,
     json: Option<&SessionJson>,
+    options: &SetJobOptions,
     report: &mut MemberReport,
     mut phase: impl FnMut(SetPhase),
-) -> Result<MemberResults, SetMemberError> {
-    let io = |message: String| SetMemberError { kind: SetMemberErrorKind::Io, message };
+) -> Result<MemberResults, MemberRunError> {
+    let io = |message: String| MemberRunError::Failed(SetMemberError { kind: SetMemberErrorKind::Io, message });
+    let inputs = read_channel_index(dir)
+        .map(|index| PlanInputs::from_channel_index(&index))
+        .map_err(|e| io(format!("reading {}: {}", dir.join("data.parquet").display(), e.message)))?;
+    let eval_plan = member_eval_plan(plan, &doc.constants, &inputs);
+    let needed = eval_plan.estimate_with_missing_inputs(|_| true);
+    let hint = format!("evaluate session-set member '{}'", report.session_id);
+    let observer = CancelFlag(options.cancel);
+
+    let _admission = match options.budget {
+        None => None,
+        Some(budget) => {
+            let exhausted = |e: NeverFits| {
+                MemberRunError::Failed(SetMemberError { kind: SetMemberErrorKind::ResourceExhausted, message: e.to_string() })
+            };
+            if options.cancel.is_none() {
+                Some(budget.acquire(needed, &hint).map_err(exhausted)?)
+            } else {
+                loop {
+                    if observer.cancelled() {
+                        return Err(MemberRunError::Cancelled);
+                    }
+                    if let Some(guard) = budget.try_acquire(needed, &hint).map_err(exhausted)? {
+                        break Some(guard);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(ADMIT_POLL_MS));
+                }
+            }
+        }
+    };
+
     let source = Arc::new(MemberSource {
         session_dir: dir.to_path_buf(),
         decodes: AtomicUsize::new(0),
@@ -430,12 +503,13 @@ fn evaluate_with_data(
     let bounds = whole_session_bounds(dir).map_err(|e| io(e.message))?;
     let ctx = window_lap_context(json, bounds);
     phase(SetPhase::Evaluating);
-    let results = evaluate_member(plan, &doc.constants, &handle, &ctx);
+    let results = evaluate_member_planned(plan, &doc.constants, &handle, &ctx, &eval_plan, Some(&observer));
     drop(handle);
     report.decoded_channels = source.decodes.load(Ordering::Relaxed);
+    let results = results.map_err(|_| MemberRunError::Cancelled)?;
     let failure = source.first_error.lock().unwrap_or_else(|p| p.into_inner()).take();
     match failure {
-        Some(e) => Err(e),
+        Some(e) => Err(MemberRunError::Failed(e)),
         None => Ok(results),
     }
 }
@@ -495,7 +569,7 @@ mod tests {
     const MD: &str = "---\nid: 9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d\nname: Set\nsessions:\n  - group: G\n    members:\n      - { id: s1 }\n      - { id: s2 }\n      - { id: s3 }\n---\n\n```math id=aaaaaaaa\npeak = max([Fork])\nlt = sum(lap_time())\n```\n\n```table id=bbbbbbbb\n{\"rowSource\":\"sessions\",\"columns\":[{\"id\":\"c0\",\"template\":\"[peak]\"}],\"rows\":[],\"cells\":[]}\n```\n\n```table id=cccccccc\n{\"rowSource\":\"sessions\",\"columns\":[{\"id\":\"c0\",\"template\":\"[lt]\"}],\"rows\":[],\"cells\":[]}\n```\n";
 
     fn options<'a>(use_cache: bool) -> SetJobOptions<'a> {
-        SetJobOptions { use_cache, engine_identity: Some("test-engine"), scope: PlanScope::Tables, cancel: None }
+        SetJobOptions { use_cache, engine_identity: Some("test-engine"), scope: PlanScope::Tables, cancel: None, budget: None }
     }
 
     fn run(root: &Path, md: &str, opts: SetJobOptions) -> SetJobReport {
@@ -620,6 +694,39 @@ mod tests {
         // Assert
         assert!(report.cancelled);
         assert!(report.members.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_job_a_member_larger_than_the_budget_ceiling_is_resource_exhausted_and_the_rest_still_run() {
+        // Arrange
+        let root = temp_root();
+        seed(&root, "s1", vec![1.0; 4], 10.0);
+        let tiny = crate::store::index_job::ByteBudget::new(1);
+
+        // Act
+        let report = run(&root, MD, SetJobOptions { budget: Some(&tiny), ..options(false) });
+
+        // Assert
+        assert_eq!(report.members[0].status, MemberStatus::Error);
+        assert_eq!(report.members[0].error.as_ref().map(|e| e.kind), Some(SetMemberErrorKind::ResourceExhausted));
+        assert_eq!(report.members[1].status, MemberStatus::NotFound);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_job_admitted_against_a_budget_that_fits_computes_and_releases_the_budget() {
+        // Arrange
+        let root = temp_root();
+        seed(&root, "s1", vec![1.0, 4.0], 10.0);
+        let budget = crate::store::index_job::ByteBudget::new(1 << 30);
+
+        // Act
+        let report = run(&root, MD, SetJobOptions { budget: Some(&budget), ..options(false) });
+
+        // Assert
+        assert_eq!(report.members[0].status, MemberStatus::Computed);
+        assert_eq!(budget.in_flight_bytes(), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 

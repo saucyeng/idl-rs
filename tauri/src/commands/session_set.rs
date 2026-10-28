@@ -7,7 +7,8 @@
 //! evicts the session the user is looking at (spec §6.2).
 //!
 //! **Supersession.** A newer call for the same workbook sets the running
-//! call's cancel flag; the running call stops at its next member boundary
+//! call's cancel flag; the running call stops while its member waits for
+//! memory, between that member's definitions, or at the next member boundary,
 //! and resolves with `cancelled: true` (the caller ignores it — a newer
 //! answer is on its way). Members already finished stay in the cache.
 
@@ -187,6 +188,7 @@ fn result_from(report: SetJobReport, groups: Vec<SetGroupDto>) -> SessionSetResu
 /// no session set. Everything per member is in `members`.
 pub fn eval_session_set_via(
     data_dir: &Path,
+    budget: &dyn idl_rs::store::index_job::MemoryBudget,
     runs: &SetRuns,
     workbook_id: &str,
     progress: &mut dyn FnMut(&SetProgress),
@@ -206,6 +208,7 @@ pub fn eval_session_set_via(
         engine_identity: engine_identity(),
         scope: PlanScope::Tables,
         cancel: Some(&cancel),
+        budget: Some(budget),
     };
     let report = run_session_set(data_dir, &doc, &set, options, progress);
     runs.end(workbook_id, &cancel);
@@ -220,8 +223,11 @@ pub fn eval_session_set(
     on_progress: tauri::ipc::Channel<SetProgressDto>,
     data_dir: tauri::State<'_, DataDir>,
     runs: tauri::State<'_, SetRuns>,
+    cache: tauri::State<'_, crate::session_cache::SessionCache>,
 ) -> Result<SessionSetResult, IpcError> {
-    eval_session_set_via(&data_dir.0, &runs, &workbook_id, &mut |p| {
+    // Each member is admitted against the app's one memory ledger, the same
+    // budget its own evaluations, decodes and cache count against.
+    eval_session_set_via(&data_dir.0, &*cache, &runs, &workbook_id, &mut |p| {
         let _ = on_progress.send(SetProgressDto::from(p));
     })
 }
@@ -277,7 +283,7 @@ mod tests {
         let mut phases = Vec::new();
 
         // Act
-        let result = eval_session_set_via(&root, &SetRuns::default(), "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d", &mut |p| {
+        let result = eval_session_set_via(&root, &crate::session_cache::SessionCache::new(), &SetRuns::default(), "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d", &mut |p| {
             phases.push((p.done, p.session_id.clone()))
         })
         .unwrap();
@@ -296,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn eval_session_set_via_superseded_by_a_newer_call_stops_at_a_member_boundary() {
+    fn eval_session_set_via_superseded_by_a_newer_call_stops_the_member_in_flight_and_the_rest() {
         // Arrange
         let root = temp_root();
         std::fs::write(root.join("workbooks/set.idl1wb"), WB).unwrap();
@@ -308,7 +314,7 @@ mod tests {
 
         // Act — a second call starts while the first is in its first member.
         let mut started_second = false;
-        let first = eval_session_set_via(&root, &runs, id, &mut |p| {
+        let first = eval_session_set_via(&root, &crate::session_cache::SessionCache::new(), &runs, id, &mut |p| {
             if p.done == 0 && !started_second {
                 started_second = true;
                 runs.begin(id);
@@ -318,7 +324,8 @@ mod tests {
 
         // Assert
         assert!(first.cancelled);
-        assert_eq!(first.members.len(), 1);
+        assert!(first.members.is_empty());
+        assert!(first.tables.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -329,7 +336,7 @@ mod tests {
         std::fs::write(root.join("workbooks/x.idl1wb"), "---\nid: 9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d\nname: X\n---\n").unwrap();
 
         // Act
-        let err = eval_session_set_via(&root, &SetRuns::default(), "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d", &mut |_| {})
+        let err = eval_session_set_via(&root, &crate::session_cache::SessionCache::new(), &SetRuns::default(), "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d", &mut |_| {})
             .unwrap_err();
 
         // Assert
@@ -345,7 +352,7 @@ mod tests {
         std::fs::write(root.join("workbooks/set.idl1wb"), md).unwrap();
 
         // Act
-        let err = eval_session_set_via(&root, &SetRuns::default(), "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d", &mut |_| {})
+        let err = eval_session_set_via(&root, &crate::session_cache::SessionCache::new(), &SetRuns::default(), "9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d", &mut |_| {})
             .unwrap_err();
 
         // Assert

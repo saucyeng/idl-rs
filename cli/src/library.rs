@@ -697,7 +697,7 @@ fn stale_json(rows: &[StaleSession]) -> Value {
 /// no physical-memory query (CLAUDE.md §2), and because a shell tool with no
 /// webview alongside it can afford the ceiling on any machine that can run
 /// an import.
-const CLI_INDEX_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const CLI_INDEX_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Runs the lap/track index job, printing one line per session when
 /// `verbose`.

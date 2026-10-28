@@ -25,7 +25,9 @@ use crate::math::units::UnitLabel;
 use crate::math::{channel_refs, MathEvalError, ValueAxis};
 use crate::table::{evaluate_table_rows, Addr, CellResult, Row, RowBinding, RowContext, RowSource, TableModel};
 
-use super::resolve::{resolve_workbook_defs, resolve_workbook_units};
+use super::eval::{EvalCancelled, EvalObserver};
+use super::plan::{Demand, EvalPlan, PlanInputs};
+use super::resolve::{resolve_planned, resolve_workbook_units, ResolvedValue};
 use super::session_set::SessionSet;
 use super::{CellKindToken, MathCellDef, WorkbookDoc};
 
@@ -272,20 +274,35 @@ pub struct MemberResult {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MemberResults(pub BTreeMap<String, MemberResult>);
 
+/// The evaluation plan of one member (evaluation-memory spec §4.2.B): the
+/// set plan's definitions scheduled against that member's stored channels
+/// (`inputs`, from its `data.parquet` index), keeping **no** full-rate value
+/// beyond its last reader ([`Demand::reductions`]). Its estimate is what the
+/// member is admitted against.
+pub fn member_eval_plan(plan: &SetPlan, constants: &HashMap<String, f64>, inputs: &PlanInputs) -> EvalPlan {
+    EvalPlan::new(&plan.defs, constants, inputs, &Demand::reductions(plan.defs.iter().map(|d| d.name.clone())))
+}
+
 /// Evaluates `plan`'s definitions in one member session (`lookup` is that
-/// session's channels, `lap_ctx` its whole-session lap context) and keeps
-/// only reduced results (spec §4.1). Definitions resolve exactly as in a
-/// math cell (definitions first, then channels — ruling Q6).
-pub fn evaluate_member(
+/// session's channels, `lap_ctx` its whole-session lap context) following
+/// `eval_plan` ([`member_eval_plan`]), and keeps only reduced results (spec
+/// §4.1): every full-rate buffer is released after its last reader, so the
+/// member's peak is the planner's, not the sum of its values. Definitions
+/// resolve exactly as in a math cell (definitions first, then channels —
+/// ruling Q6).
+///
+/// # Errors
+/// [`EvalCancelled`] when `observer` cancels between two definitions.
+pub fn evaluate_member_planned(
     plan: &SetPlan,
     constants: &HashMap<String, f64>,
     lookup: &dyn ChannelLookup,
     lap_ctx: &MathLapContext,
-) -> MemberResults {
-    // TODO(idl0): admit via MemoryBudget (mem-p23) — this is the one place a
-    // member's evaluation starts; phase 1 runs members one at a time.
+    eval_plan: &EvalPlan,
+    observer: Option<&dyn EvalObserver>,
+) -> Result<MemberResults, EvalCancelled> {
+    let mut values = resolve_planned(&plan.defs, constants, lookup, lap_ctx, eval_plan, observer)?;
     let mut units = resolve_workbook_units(&plan.defs, constants, lookup);
-    let mut values = resolve_workbook_defs(&plan.defs, constants, lookup, lap_ctx);
     let mut out = MemberResults::default();
     for def in &plan.defs {
         let key = (def.cell_id.clone(), def.name.clone());
@@ -295,22 +312,36 @@ pub fn evaluate_member(
             Some(Err(e)) => MemberValue::Error(e),
             None => continue,
         };
-        // The full-rate buffers behind `v` are released here, one definition
-        // at a time; `values` holds only what is not yet converted.
         out.0.insert(def.name.clone(), MemberResult { value, unit });
     }
-    out
+    Ok(out)
+}
+
+/// [`evaluate_member_planned`] with a plan that knows no channel sizes and no
+/// observer — for a member with no data and for tests.
+pub fn evaluate_member(
+    plan: &SetPlan,
+    constants: &HashMap<String, f64>,
+    lookup: &dyn ChannelLookup,
+    lap_ctx: &MathLapContext,
+) -> MemberResults {
+    let eval_plan = member_eval_plan(plan, constants, &PlanInputs::default());
+    evaluate_member_planned(plan, constants, lookup, lap_ctx, &eval_plan, None).unwrap_or_default()
 }
 
 /// The kept form of one evaluated value: rank 0 is `evaluate_scalar`'s rule
-/// (one sample, rate 0, on no lap axis).
-fn reduce(v: &crate::math::eval::SharedEvalOutput) -> MemberValue {
-    match v.axis {
+/// (one sample, rate 0, on no lap axis); a released or longer time-axis
+/// value is [`MemberValue::FullRate`].
+fn reduce(v: &ResolvedValue) -> MemberValue {
+    let out = &v.out;
+    match out.axis {
         ValueAxis::Lap => MemberValue::Laps {
-            laps: v.t_us.iter().map(|&n| n.max(0) as u32).collect(),
-            values: v.samples.to_vec(),
+            laps: out.t_us.iter().map(|&n| n.max(0) as u32).collect(),
+            values: out.samples.to_vec(),
         },
-        ValueAxis::Time if v.samples.len() == 1 && v.sample_rate_hz == 0.0 => MemberValue::Scalar(v.samples[0]),
+        ValueAxis::Time if !v.released && out.samples.len() == 1 && out.sample_rate_hz == 0.0 => {
+            MemberValue::Scalar(out.samples[0])
+        }
         ValueAxis::Time => MemberValue::FullRate,
     }
 }

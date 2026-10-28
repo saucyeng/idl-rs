@@ -469,11 +469,15 @@ fn run_set(
     values: bool,
 ) -> Result<SetJobReport, CliError> {
     let data_dir = ctx.data_dir()?;
+    // The same fixed ceiling the CLI's indexing pool uses (core has no
+    // physical-memory query); members are admitted one at a time against it.
+    let budget = idl_rs::store::index_job::ByteBudget::new(crate::library::CLI_INDEX_BUDGET_BYTES);
     let options = SetJobOptions {
         use_cache: !m.try_get_one::<bool>("no-cache").ok().flatten().copied().unwrap_or(false),
         engine_identity: engine_identity(),
         scope: if values { PlanScope::AllDefinitions } else { PlanScope::Tables },
         cancel: None,
+        budget: Some(&budget),
     };
     Ok(run_session_set(data_dir, doc, set, options, &mut |p| {
         eprintln!("[{}/{}] {} {}", p.done + 1, p.total, &p.session_id, p.phase.as_str());
