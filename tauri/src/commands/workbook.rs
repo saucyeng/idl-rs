@@ -17,7 +17,6 @@ use std::time::SystemTime;
 use idl_rs::math::MathLapContext;
 use idl_rs::session::handle::{SessionHandle, SessionMetaInput};
 use idl_rs::store::atomic::{sha256_hex, write_atomic, AtomicWriteErrorKind};
-use idl_rs::table::{evaluate_table_multi, plan_rows, resolve_baseline_row, WindowLaps};
 use idl_rs::workbook::v3::front_matter::{parse_front_matter, render_front_matter, FrontMatter};
 use idl_rs::workbook::v3::{
     parse_workbook, render_prose_html, render_workbook, CellDoc, CellError, CellKindToken, Demand, EvalObserver, EvalPlan,
@@ -56,11 +55,18 @@ pub struct HostChannelRef {
     pub length: u32,
     /// Whether the channel carries a recorded time axis (`!HostChannel.t.is_empty()`).
     pub has_t: bool,
+    /// The value itself when it is rank 0 (one value on no axis), so a
+    /// reduced definition binds without a `fetch_host_channel_v2` call
+    /// (session-sets spec §5.2). Absent for every other shape, so a
+    /// non-scalar marker's bytes are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scalar: Option<f64>,
 }
 
 impl From<&idl_rs::workbook::v3::HostChannelView> for HostChannelRef {
     fn from(h: &idl_rs::workbook::v3::HostChannelView) -> Self {
-        Self { length: h.length as u32, has_t: h.has_t() }
+        let scalar = (h.length == 1 && h.axis == idl_rs::workbook::v3::AxisKind::None).then(|| h.v[0]);
+        Self { length: h.length as u32, has_t: h.has_t(), scalar }
     }
 }
 
@@ -303,7 +309,7 @@ fn cell_kind_str(k: CellKindToken) -> &'static str {
 
 /// Maps `parse_workbook`'s `Err` arm (the two document-fatal kinds, fact 3
 /// of this task's brief) to the matching `workbook_*` `IpcErrorKind`.
-fn fatal_parse_error(errs: Vec<WorkbookError>) -> IpcError {
+pub(crate) fn fatal_parse_error(errs: Vec<WorkbookError>) -> IpcError {
     match errs.first() {
         Some(e) => IpcError::from(e),
         None => IpcError::new(IpcErrorKind::Internal, "workbook front matter failed to parse"),
@@ -318,7 +324,7 @@ fn fatal_parse_error(errs: Vec<WorkbookError>) -> IpcError {
 /// index, never read for truth).
 // TODO(idl0): the scan is O(workbooks) per call — acceptable at wave-1
 // scale, not addressed here.
-fn resolve_workbook_path(data_dir: &Path, id_or_path: &str) -> Result<PathBuf, IpcError> {
+pub(crate) fn resolve_workbook_path(data_dir: &Path, id_or_path: &str) -> Result<PathBuf, IpcError> {
     let as_path = Path::new(id_or_path);
     if as_path.is_file() {
         return Ok(as_path.to_path_buf());
@@ -563,6 +569,9 @@ fn cell_outputs_from(
     lap_ctx: &MathLapContext,
     session_bound: bool,
 ) -> Vec<CellOutput> {
+    // A table's `[name]` reads these definitions before the session's
+    // channels (C2 §4, ruling Q6 of 2026-10-28).
+    let definitions = idl_rs::workbook::v3::table_value::definition_values(cell_results);
     cell_results
         .iter()
         .zip(doc.cells.iter())
@@ -590,7 +599,7 @@ fn cell_outputs_from(
                 })
                 .collect();
 
-            let value = table_cell_value(cell_eval.kind, cell_doc, session_bound, handle, lap_ctx);
+            let value = table_cell_value(cell_eval.kind, cell_doc, session_bound, handle, lap_ctx, &definitions);
 
             let before = cell_doc
                 .prose_before
@@ -1057,23 +1066,29 @@ fn evaluation_key(
 /// `eval_workbook_v2` already evaluates once per selected window and returns
 /// one `CellOutput[]` for each (C2 §4, "No new wire"), so a two-window
 /// selection yields two derived tables, each over its own window's laps.
+///
+/// `[name]` resolves to `definitions` (this window's evaluated definitions)
+/// before a stored channel (C2 §4, ruling Q6 of 2026-10-28). A `rowSource:
+/// "sessions"` table is `null` here: it belongs to `eval_session_set`.
 fn table_cell_value(
     kind: CellKindToken,
     cell_doc: &CellDoc,
     session_bound: bool,
     handle: &SessionHandle,
     lap_ctx: &MathLapContext,
+    definitions: &idl_rs::table::DefinitionValues,
 ) -> Option<serde_json::Value> {
     if kind != CellKindToken::Table || !session_bound {
         return None;
     }
     let model = cell_doc.table.as_ref()?;
-    let windows =
-        [WindowLaps { session_id: handle.metadata().session_id, laps: lap_ctx.laps.clone() }];
-    let (planned, bindings) = plan_rows(model, &lap_ctx.laps, &windows);
-    let baseline = resolve_baseline_row(&planned, &bindings);
-    let row_handles = vec![0usize; planned.rows.len()];
-    let results = evaluate_table_multi(&[handle], &row_handles, &planned, &bindings, baseline);
+    // A session-row table is a set table: `eval_session_set` evaluates it
+    // over the workbook's session set, never over one window.
+    if model.row_source == idl_rs::table::RowSource::Sessions {
+        return None;
+    }
+    let (planned, results) =
+        idl_rs::workbook::v3::table_value::evaluate_table_in_window(model, definitions, handle, lap_ctx);
     Some(serde_json::json!({ "model": planned, "results": results }))
 }
 

@@ -20,6 +20,7 @@ pub mod rebuild;
 pub mod gps;
 pub mod scatter;
 pub mod seams;
+pub mod session_set;
 pub mod sync;
 pub mod tiles;
 /// Linked video (C3 §3.12).

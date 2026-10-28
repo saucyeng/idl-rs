@@ -100,6 +100,7 @@ pub fn handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         commands::workbook::read_workbook,
         commands::workbook::eval_workbook,
         commands::workbook::eval_workbook_v2,
+        commands::session_set::eval_session_set,
         commands::workbook::save_workbook,
         commands::workbook::create_workbook,
         commands::workbook::fetch_host_channel,

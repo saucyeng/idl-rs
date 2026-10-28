@@ -56,6 +56,12 @@ pub enum IpcErrorKind {
     WorkbookUnsupportedVersion,
     /// `WorkbookErrorKind::InvalidTableJson` — workbook: `eval_workbook` (per cell only, C2 §4).
     WorkbookInvalidTableJson,
+    /// `WorkbookErrorKind::DuplicateSetMember` — workbook: `eval_session_set`
+    /// (a session listed twice in the front-matter `sessions` set, C2 §1).
+    WorkbookDuplicateSetMember,
+    /// `WorkbookErrorKind::InvalidSessionSet` — workbook: `eval_session_set`
+    /// (a malformed front-matter `sessions` key, C2 §1).
+    WorkbookInvalidSessionSet,
     /// `MathEvalErrorKind::Parse` — workbook: `eval_workbook` (per definition).
     MathParse,
     /// `MathEvalErrorKind::UnknownFunction` — workbook: `eval_workbook` (per definition).
@@ -319,6 +325,8 @@ impl From<&idl_rs::workbook::v3::WorkbookError> for IpcError {
             WorkbookErrorKind::MissingFrontMatterId => IpcErrorKind::WorkbookMissingFrontMatterId,
             WorkbookErrorKind::UnsupportedWorkbookVersion => IpcErrorKind::WorkbookUnsupportedVersion,
             WorkbookErrorKind::InvalidTableJson => IpcErrorKind::WorkbookInvalidTableJson,
+            WorkbookErrorKind::DuplicateSetMember => IpcErrorKind::WorkbookDuplicateSetMember,
+            WorkbookErrorKind::InvalidSessionSet => IpcErrorKind::WorkbookInvalidSessionSet,
         };
         IpcError::new(kind, e.message.clone())
     }
