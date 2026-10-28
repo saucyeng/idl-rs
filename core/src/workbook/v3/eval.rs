@@ -17,10 +17,38 @@ use std::collections::HashMap;
 use crate::math::MathEvalError;
 
 use super::host::HostChannelView;
-use super::resolve::resolve_workbook_defs;
+use super::plan::{Demand, EvalPlan, PlanInputs};
+use super::resolve::{resolve_planned, ResolvedValue};
 use super::{CellDoc, CellKindToken, WorkbookDoc, WorkbookError};
 
 use crate::math::eval::{ChannelLookup, MathLapContext};
+
+/// What a running evaluation asks of whoever started it (the progress
+/// spec's `EvalObserver`, `2026-09-20-idl1-evaluation-progress-DRAFT.md`
+/// §4). Synchronous and called on the evaluating thread, so an
+/// implementation must answer at once.
+pub trait EvalObserver {
+    /// `true` when nobody wants the result any more: the evaluation stops
+    /// before its next definition and returns [`EvalCancelled`]
+    /// (evaluation-memory spec §4.2.A, cancellation at zero subscribers).
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// An evaluation stopped at a definition boundary because its
+/// [`EvalObserver`] cancelled it. Carries nothing: the caller that cancelled
+/// already knows why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvalCancelled;
+
+impl std::fmt::Display for EvalCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the evaluation was cancelled")
+    }
+}
+
+impl std::error::Error for EvalCancelled {}
 
 /// One `math`-cell definition's evaluated result, in `def_line` source order
 /// within its cell ([`super::MathCellDef::order`]). Exactly one of `value`/
@@ -117,7 +145,30 @@ pub fn eval_cells(
     lookup: &dyn ChannelLookup,
     lap_ctx: &MathLapContext,
 ) -> Vec<CellEvalResult> {
-    let mut resolved = resolve_workbook_defs(&doc.defs, &doc.constants, lookup, lap_ctx);
+    let plan = EvalPlan::new(&doc.defs, &doc.constants, &PlanInputs::default(), &Demand::everything());
+    // No observer, so nothing can cancel it.
+    eval_cells_planned(doc, structural, lookup, lap_ctx, &plan, None).unwrap_or_default()
+}
+
+/// [`eval_cells`] following `plan` (built from this `doc`'s definitions and
+/// constants; evaluation-memory spec §4.2.B): definitions run in the plan's
+/// schedule, a full-rate value the plan does not retain keeps only its
+/// metadata once its last consumer has run (its [`CellDefResult::value`] is
+/// then [`HostChannelView::released`]), and when the plan's scope is a
+/// closure, a cell's `defs` lists only its in-scope definitions.
+///
+/// # Errors
+/// [`EvalCancelled`] when `observer` cancels it, checked before every
+/// definition.
+pub fn eval_cells_planned(
+    doc: &WorkbookDoc,
+    structural: &[WorkbookError],
+    lookup: &dyn ChannelLookup,
+    lap_ctx: &MathLapContext,
+    plan: &EvalPlan,
+    observer: Option<&dyn EvalObserver>,
+) -> Result<Vec<CellEvalResult>, EvalCancelled> {
+    let mut resolved = resolve_planned(&doc.defs, &doc.constants, lookup, lap_ctx, plan, observer)?;
     let mut resolved_units = super::resolve::resolve_workbook_units(&doc.defs, &doc.constants, lookup);
 
     // Step 2: group structural errors by owning cell_id up front, dropping
@@ -131,7 +182,8 @@ pub fn eval_cells(
         errors_by_cell.entry(err.cell_id.as_str()).or_default().push(CellError::Structural(err.clone()));
     }
 
-    doc.cells
+    Ok(doc
+        .cells
         .iter()
         .map(|cell| {
             let defs = match cell.kind_token {
@@ -141,7 +193,7 @@ pub fn eval_cells(
             let errors = errors_by_cell.remove(cell.id.as_str()).unwrap_or_default();
             CellEvalResult { cell_id: cell.id.clone(), kind: cell.kind_token, defs, errors }
         })
-        .collect()
+        .collect())
 }
 
 /// Step 1: this `math` cell's own [`super::MathCellDef`]s, in `def_line`
@@ -156,7 +208,7 @@ pub fn eval_cells(
 fn math_cell_defs(
     doc: &WorkbookDoc,
     cell: &CellDoc,
-    resolved: &mut HashMap<super::resolve::DefKey, Result<crate::math::eval::SharedEvalOutput, MathEvalError>>,
+    resolved: &mut HashMap<super::resolve::DefKey, Result<ResolvedValue, MathEvalError>>,
     resolved_units: &mut HashMap<
         super::resolve::DefKey,
         (crate::math::units::Unit, Vec<crate::math::units::UnitNote>),
@@ -166,33 +218,38 @@ fn math_cell_defs(
     own.sort_by_key(|d| d.order);
 
     own.into_iter()
-        .map(|def| {
-            // resolve_workbook_defs stores an entry for every (cell_id, name)
-            // key it is handed, Ok or Err, regardless of whether anything
-            // references it (its own doc comment) — a missing entry here is
-            // that invariant broken, not a value this function can recover
-            // from (never reachable for a def actually present in
-            // `doc.defs`, since `key` is built from that same def). Same
-            // invariant holds for `resolve_workbook_units`.
+        .filter_map(|def| {
+            // `resolve_planned` stores an entry for every in-scope (cell_id,
+            // name) key, Ok or Err; a missing one is a definition outside a
+            // closure plan's scope, which is left out of the cell.
+            // `resolve_workbook_units` covers every key.
             let key = (def.cell_id.clone(), def.name.clone());
-            let result = resolved.remove(&key).expect("resolve_workbook_defs stores an entry for every (cell_id, name) key");
+            let result = resolved.remove(&key)?;
             let (unit, unit_notes) = resolved_units
                 .remove(&key)
                 .expect("resolve_workbook_units stores an entry for every (cell_id, name) key");
             let unit = crate::math::units::UnitLabel::from(&unit);
-            match result {
-                Ok(out) => CellDefResult {
-                    name: def.name.clone(),
-                    label: def.label.clone(),
-                    value: Some(HostChannelView::new(out.t_us, out.samples, unit.clone(), out.axis)),
-                    // 0.0 is EvalOutput::sample_rate_hz's own "scalar-as-channel /
-                    // no rate" marker — normalize it to None so this field means
-                    // "not applicable" the same way for a scalar as for a failure.
-                    sample_rate_hz: if out.sample_rate_hz == 0.0 { None } else { Some(out.sample_rate_hz) },
-                    unit,
-                    unit_notes,
-                    error: None,
-                },
+            Some(match result {
+                Ok(value) => {
+                    let out = value.out;
+                    let view = if value.released {
+                        HostChannelView::released(value.length, value.has_t, unit.clone(), out.axis)
+                    } else {
+                        HostChannelView::new(out.t_us, out.samples, unit.clone(), out.axis)
+                    };
+                    CellDefResult {
+                        name: def.name.clone(),
+                        label: def.label.clone(),
+                        value: Some(view),
+                        // 0.0 is EvalOutput::sample_rate_hz's own "scalar-as-channel /
+                        // no rate" marker — normalize it to None so this field means
+                        // "not applicable" the same way for a scalar as for a failure.
+                        sample_rate_hz: if out.sample_rate_hz == 0.0 { None } else { Some(out.sample_rate_hz) },
+                        unit,
+                        unit_notes,
+                        error: None,
+                    }
+                }
                 Err(err) => CellDefResult {
                     name: def.name.clone(),
                     label: def.label.clone(),
@@ -202,7 +259,7 @@ fn math_cell_defs(
                     unit_notes,
                     error: Some(err),
                 },
-            }
+            })
         })
         .collect()
 }
@@ -211,6 +268,7 @@ fn math_cell_defs(
 mod tests {
     use super::*;
     use crate::math::MathEvalErrorKind;
+    use crate::workbook::v3::plan::{Demand, EvalPlan, PlanInputs};
     use crate::workbook::v3::error::WorkbookErrorKind;
     use crate::workbook::v3::{ConstLine, MathCellDef, UnitsPref};
 
@@ -471,10 +529,7 @@ mod tests {
         // read by the next. Today every value is stored four times (32 B per
         // sample); shared, each is stored once (8 B per sample).
         const N: usize = 1_000_000;
-        let lookup = LongChannel {
-            samples: (0..N).map(|i| i as f64).collect(),
-            t_us: (0..N as i64).map(|i| i * 1000).collect(),
-        };
+        let lookup = long_channel(N);
         let ops = ["* 2", "+ 1", "* 0.5", "- 3", "* 1.5", "+ 2", "* 0.25", "- 1", "* 3", "+ 4"];
         let defs: Vec<MathCellDef> = ops
             .iter()
@@ -494,5 +549,96 @@ mod tests {
         assert!(got[0].defs.iter().all(|r| r.value.as_ref().map(|v| v.length) == Some(N)));
         let bound = 8 * N * 12 + 1_000_000;
         assert!(peak < bound, "peak {peak} B is not under {bound} B");
+    }
+
+    fn long_channel(n: usize) -> LongChannel {
+        LongChannel { samples: (0..n).map(|i| i as f64).collect(), t_us: (0..n as i64).map(|i| i * 1000).collect() }
+    }
+
+    #[test]
+    fn liveness_a_full_rate_def_with_no_dependents_and_not_demanded_buffer_released_metadata_kept() {
+        // Arrange — nothing reads `y` and no consumer names it; `kept` is named.
+        const N: usize = 1000;
+        let lookup = long_channel(N);
+        let d = doc(vec![math_cell("aaaaaaaa")], vec![def("aaaaaaaa", "y", "[x] * 2", 0), def("aaaaaaaa", "kept", "[x] + 1", 1)]);
+        let demand = Demand { scope: None, retain: super::super::Retain::Names(["kept".to_string()].into()) };
+        let plan = EvalPlan::new(&d.defs, &d.constants, &PlanInputs::default(), &demand);
+
+        // Act
+        let got = eval_cells_planned(&d, &[], &lookup, &no_laps(), &plan, None).unwrap();
+
+        // Assert
+        let y = got[0].defs[0].value.as_ref().unwrap();
+        assert!(y.released);
+        assert!(y.v.is_empty() && y.t_us.is_empty());
+        assert_eq!(y.length, N);
+        assert!(y.has_t());
+        assert_eq!(got[0].defs[0].sample_rate_hz, Some(1000.0));
+        let kept = got[0].defs[1].value.as_ref().unwrap();
+        assert!(!kept.released);
+        assert_eq!(kept.v.len(), N);
+    }
+
+    #[test]
+    fn eval_cells_planned_a_value_still_read_later_is_kept_until_its_last_reader_runs() {
+        // Arrange — `a` is read by `b`; neither is named by a consumer.
+        let lookup = long_channel(100);
+        let d = doc(vec![math_cell("aaaaaaaa")], vec![def("aaaaaaaa", "a", "[x] * 2", 0), def("aaaaaaaa", "b", "sum([a])", 1)]);
+        let plan = EvalPlan::new(&d.defs, &d.constants, &PlanInputs::default(), &Demand::document(&d));
+
+        // Act
+        let got = eval_cells_planned(&d, &[], &lookup, &no_laps(), &plan, None).unwrap();
+
+        // Assert — `b` saw all of `a` (sum of 2·i over 0..100), then `a` went.
+        assert_eq!(got[0].defs[1].value.as_ref().unwrap().v.to_vec(), vec![9900.0]);
+        assert!(got[0].defs[0].value.as_ref().unwrap().released);
+    }
+
+    #[test]
+    fn eval_cells_planned_a_closure_demand_a_cell_lists_only_its_in_scope_definitions() {
+        // Arrange
+        let lookup = long_channel(10);
+        let d = doc(
+            vec![math_cell("aaaaaaaa")],
+            vec![def("aaaaaaaa", "a", "[x] * 2", 0), def("aaaaaaaa", "other", "[x] + 1", 1), def("aaaaaaaa", "b", "[a] - 1", 2)],
+        );
+        let plan = EvalPlan::new(&d.defs, &d.constants, &PlanInputs::default(), &Demand::closure(["b".to_string()]));
+
+        // Act
+        let got = eval_cells_planned(&d, &[], &lookup, &no_laps(), &plan, None).unwrap();
+
+        // Assert
+        let names: Vec<&str> = got[0].defs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+        assert_eq!(got[0].defs[1].value.as_ref().unwrap().v[3], 5.0);
+    }
+
+    /// Cancels from the `cancel_at`-th question on, counting every question.
+    struct CancelAt {
+        asked: std::cell::Cell<usize>,
+        cancel_at: usize,
+    }
+
+    impl EvalObserver for CancelAt {
+        fn cancelled(&self) -> bool {
+            let n = self.asked.get() + 1;
+            self.asked.set(n);
+            n >= self.cancel_at
+        }
+    }
+
+    #[test]
+    fn eval_cells_planned_an_observer_that_cancels_at_the_second_definition_stops_there_and_returns_cancelled() {
+        // Arrange
+        let d = doc(vec![math_cell("aaaaaaaa")], vec![def("aaaaaaaa", "a", "1", 0), def("aaaaaaaa", "b", "2", 1), def("aaaaaaaa", "c", "3", 2)]);
+        let plan = EvalPlan::new(&d.defs, &d.constants, &PlanInputs::default(), &Demand::everything());
+        let observer = CancelAt { asked: std::cell::Cell::new(0), cancel_at: 2 };
+
+        // Act
+        let got = eval_cells_planned(&d, &[], &EmptyLookup, &no_laps(), &plan, Some(&observer));
+
+        // Assert — asked before `a` (go on) and before `b` (stop); never again.
+        assert_eq!(got, Err(EvalCancelled));
+        assert_eq!(observer.asked.get(), 2);
     }
 }

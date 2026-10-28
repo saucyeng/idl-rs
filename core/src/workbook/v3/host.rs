@@ -127,6 +127,11 @@ pub struct HostChannelView {
     /// What [`Self::t_us`] measures; [`AxisKind::None`] whenever no `t` would
     /// be produced, exactly as [`HostChannel::axis`].
     pub axis: super::AxisKind,
+    /// `true` when the evaluator released this value's buffers after its last
+    /// consumer because nothing outside the maths reads it
+    /// (evaluation-memory spec §4.2.B): `v` and `t_us` are then empty, and
+    /// only `length`, `unit`, `axis` and [`Self::has_t`] describe the value.
+    pub released: bool,
 }
 
 impl HostChannelView {
@@ -140,7 +145,19 @@ impl HostChannelView {
         axis: crate::math::ValueAxis,
     ) -> Self {
         let kind = if t_us.len().min(v.len()) == 0 { super::AxisKind::None } else { super::AxisKind::from(axis) };
-        HostChannelView { length: v.len(), v, t_us, unit, axis: kind }
+        HostChannelView { length: v.len(), v, t_us, unit, axis: kind, released: false }
+    }
+
+    /// The metadata of a value whose buffers were released: `length`
+    /// samples, with or without a recorded time axis (`has_t`), and no data.
+    pub fn released(
+        length: usize,
+        has_t: bool,
+        unit: crate::math::units::UnitLabel,
+        axis: crate::math::ValueAxis,
+    ) -> Self {
+        let kind = if has_t && length > 0 { super::AxisKind::from(axis) } else { super::AxisKind::None };
+        HostChannelView { length, v: Arc::from(&[] as &[f64]), t_us: Arc::from(&[] as &[i64]), unit, axis: kind, released: true }
     }
 
     /// Number of time-axis points the equivalent [`HostChannel::t`] has:
@@ -150,8 +167,12 @@ impl HostChannelView {
     }
 
     /// Whether the channel carries a recorded time axis
-    /// (`!HostChannel::t.is_empty()`).
+    /// (`!HostChannel::t.is_empty()`); for a [`Self::released`] value, whether
+    /// it did.
     pub fn has_t(&self) -> bool {
+        if self.released {
+            return self.axis != super::AxisKind::None;
+        }
         self.t_len() > 0
     }
 

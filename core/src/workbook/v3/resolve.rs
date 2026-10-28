@@ -30,6 +30,8 @@ use crate::math::eval::{evaluate_shared, ChannelLookup, LookupChannel, MathLapCo
 use crate::math::resolve::channel_refs;
 use crate::math::{MathEvalError, MathEvalErrorKind};
 
+use super::eval::{EvalCancelled, EvalObserver};
+use super::plan::{Demand, EvalPlan, PlanInputs};
 use super::MathCellDef;
 
 /// Overlay lookup layering a fixed-point pass's already-resolved definitions
@@ -121,129 +123,195 @@ pub type DefKey = (String, String);
 /// Dependency edges come from [`channel_refs`] filtered to names present in
 /// `defs` — a `[Name]` reference to a name *not* in `defs` is a base/session
 /// channel and falls through to `lookup` unchanged, exactly as v2's resolver
-/// already does. Evaluation is fixed-point: every definition whose
-/// dependencies (edges within `defs`) are already resolved gets evaluated
-/// via [`evaluate_with_constants`] (never `parse` + [`crate::math::eval::eval`]
-/// by hand — that would bypass the private per-pass `MemoLookup`, G6.3)
-/// against an [`OverlayLookup`] of everything resolved so far, layered over
-/// `lookup` (L3-R18a: definitions win). Anything left over once a pass makes
-/// no further progress — a cycle, or a dependent of a definition whose own
-/// evaluation failed — gets [`MathEvalErrorKind::UnknownChannel`] (C2 §3.5.A
+/// already does. Evaluation follows the planner's schedule
+/// ([`EvalPlan::schedule`], dependencies first, document order breaking
+/// ties): every definition whose dependencies (edges within `defs`) resolved
+/// gets evaluated via [`evaluate_shared`] (never `parse` +
+/// [`crate::math::eval::eval`] by hand — that would bypass the private
+/// per-pass `MemoLookup`, G6.3) against an [`OverlayLookup`] of everything
+/// resolved so far, layered over `lookup` (L3-R18a: definitions win). Every
+/// value is kept ([`Demand::everything`]); [`resolve_planned`] is the form
+/// that releases. A definition that cannot run — a cycle member, or a
+/// dependent of a definition whose own evaluation failed — gets
+/// [`MathEvalErrorKind::UnknownChannel`] (C2 §3.5.A
 /// has no dedicated cycle kind), the message naming the one unresolved
 /// dependency that blocked it. A definition that references itself under a
 /// base channel's own name is one such cycle (L3-R18/R21 addition): because
 /// definitions win over session channels, its own name always resolves to
-/// *itself* first, so it can never read the base channel — it simply never
-/// leaves the leftover set.
+/// *itself* first, so it can never read the base channel — it is never
+/// ready to run.
 pub fn resolve_workbook_defs(
     defs: &[MathCellDef],
     constants: &HashMap<String, f64>,
     lookup: &dyn ChannelLookup,
     lap_ctx: &MathLapContext,
 ) -> HashMap<DefKey, Result<SharedEvalOutput, MathEvalError>> {
+    let plan = EvalPlan::new(defs, constants, &PlanInputs::default(), &Demand::everything());
+    match resolve_planned(defs, constants, lookup, lap_ctx, &plan, None) {
+        Ok(resolved) => resolved.into_iter().map(|(k, v)| (k, v.map(|r| r.out))).collect(),
+        // No observer, so nothing can cancel it.
+        Err(EvalCancelled) => HashMap::new(),
+    }
+}
+
+/// One definition's value after a planned resolution: the evaluator's output,
+/// or — once its last consumer has run and nothing retains it — only what
+/// the value was (evaluation-memory spec §4.2.B, liveness release).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedValue {
+    /// The evaluator's output. Its `samples` and `t_us` are empty when
+    /// [`Self::released`]; `sample_rate_hz` and `axis` are always the
+    /// value's own.
+    pub out: SharedEvalOutput,
+    /// Number of samples the value has (kept when its buffer is released).
+    pub length: usize,
+    /// Whether the value carries a recorded time axis (kept when released).
+    pub has_t: bool,
+    /// `true` when the full-rate buffers were released after the value's
+    /// last consumer because nothing outside the maths reads it.
+    pub released: bool,
+}
+
+/// [`resolve_workbook_defs`] following `plan` (built from these same `defs`
+/// and `constants`): definitions run in [`EvalPlan::schedule`] order, only
+/// those in scope get an entry, and a full-rate value the plan does not
+/// retain is released once its last consumer has run (or at once, when
+/// nothing reads it), keeping its metadata ([`ResolvedValue`]).
+///
+/// The results are those of [`resolve_workbook_defs`]'s former fixed-point
+/// pass: the schedule is a topological order, so every definition sees
+/// exactly the dependencies it saw before, R49's first-wins rule is kept by
+/// identity, and a definition caught in or behind a cycle, or behind a
+/// failed dependency, gets the same `UnknownChannel` naming its first
+/// unresolved dependency.
+///
+/// # Errors
+/// [`EvalCancelled`] when `observer` reports [`EvalObserver::cancelled`],
+/// which is asked before each definition starts. Nothing partial is
+/// returned.
+pub fn resolve_planned(
+    defs: &[MathCellDef],
+    constants: &HashMap<String, f64>,
+    lookup: &dyn ChannelLookup,
+    lap_ctx: &MathLapContext,
+    plan: &EvalPlan,
+    observer: Option<&dyn EvalObserver>,
+) -> Result<HashMap<DefKey, Result<ResolvedValue, MathEvalError>>, EvalCancelled> {
     let def_names: std::collections::HashSet<&str> = defs.iter().map(|d| d.name.as_str()).collect();
 
-    // Each def's within-defs dependency names, computed once up front. Keyed
-    // by `DefKey` (ledger R47), not bare name — two defs sharing a name
-    // would otherwise collapse to one `deps` entry here too, and a def could
-    // end up reading a sibling duplicate's dependency list instead of its
-    // own.
-    let deps: HashMap<DefKey, Vec<String>> = defs
+    // Each def's within-defs dependency names, in `channel_refs` order (the
+    // order the blocked-dependency message picks from). Indexed like `defs`,
+    // so two defs sharing a name keep their own lists (ledger R47).
+    let deps: Vec<Vec<String>> = defs
         .iter()
         .map(|d| {
-            let names = channel_refs(&d.expr_text)
-                .into_iter()
-                .filter(|n| def_names.contains(n.as_str()))
-                .collect();
-            ((d.cell_id.clone(), d.name.clone()), names)
+            let mut names: Vec<String> = Vec::new();
+            for n in channel_refs(&d.expr_text) {
+                if def_names.contains(n.as_str()) && !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+            names
         })
         .collect();
 
     // R47/R49: for a duplicated name, the *first* declaration in document
-    // order (`defs`'s own order) is the one cross-references see — pinned
-    // here, by identity, independent of which duplicate's evaluation
-    // happens to finish first in the fixed-point loop below (`.entry(...)
-    // .or_insert(d)` keeps only the first occurrence per name, since `defs`
-    // is iterated in document order).
-    let primary_for_name: HashMap<&str, &MathCellDef> =
-        defs.iter().fold(HashMap::new(), |mut m, d| {
-            m.entry(d.name.as_str()).or_insert(d);
-            m
-        });
+    // order is the one cross-references see — pinned by identity.
+    let primary_for_name: HashMap<&str, usize> = defs.iter().enumerate().fold(HashMap::new(), |mut m, (i, d)| {
+        m.entry(d.name.as_str()).or_insert(i);
+        m
+    });
 
-    let mut resolved: HashMap<String, (Arc<[f64]>, f64, Arc<[i64]>)> = HashMap::new();
-    let mut results: HashMap<DefKey, Result<SharedEvalOutput, MathEvalError>> = HashMap::new();
-    let mut remaining: Vec<&MathCellDef> = defs.iter().collect();
+    // The cross-reference overlay holds the same `Arc` pair as `results` (one
+    // copy per value). `settled` is every name that resolved: a released
+    // name leaves the overlay but stays settled.
+    let mut overlay: HashMap<String, (Arc<[f64]>, f64, Arc<[i64]>)> = HashMap::new();
+    let mut settled: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut results: HashMap<DefKey, Result<ResolvedValue, MathEvalError>> = HashMap::new();
+    let mut remaining: Vec<usize> = plan.consumers.clone();
 
-    loop {
-        let mut made_progress = false;
-        let mut still_remaining = Vec::new();
-
-        for def in remaining {
-            let key = (def.cell_id.clone(), def.name.clone());
-            let ready = deps[&key].iter().all(|dep| resolved.contains_key(dep));
-            if !ready {
-                still_remaining.push(def);
-                continue;
-            }
-
-            let overlay = OverlayLookup { base: lookup, resolved: &resolved };
-            let out = evaluate_shared(&def.expr_text, constants, &overlay, lap_ctx);
-            match &out {
-                Ok(eval_out) => {
-                    // Cross-referencing overlay: still name-keyed (see this
-                    // function's doc comment) — but only the name's `primary`
-                    // (first-in-document-order) definition ever writes here
-                    // (R49), regardless of fixed-point pass timing. A
-                    // non-primary duplicate still gets its own `results`
-                    // entry below (so its own cell shows a real value, not a
-                    // suppressed one) — it just never becomes what a third
-                    // cell's `[Name]` reference sees.
-                    if std::ptr::eq(primary_for_name[def.name.as_str()], def) {
-                        resolved.insert(
-                            def.name.clone(),
-                            // Shared with `results`: one `Arc` pair per value,
-                            // not a second copy (8 B + 8 B per sample).
-                            (eval_out.samples.clone(), eval_out.sample_rate_hz, eval_out.t_us.clone()),
-                        );
-                    }
-                }
-                Err(_) => {
-                    // A failed definition still counts as "settled" for the
-                    // fixed point — its dependents fall through to the
-                    // leftover sweep below rather than looping forever.
-                }
-            }
-            results.insert(key, out);
-            made_progress = true;
+    for &i in &plan.schedule {
+        if observer.is_some_and(|o| o.cancelled()) {
+            return Err(EvalCancelled);
         }
-
-        remaining = still_remaining;
-        if !made_progress || remaining.is_empty() {
-            break;
-        }
-    }
-
-    // Leftovers: cycle members, and dependents of a def whose own evaluation
-    // never inserted into `resolved` (either it errored, or it is itself
-    // stuck in a cycle). Each gets UnknownChannel naming one blocking dep.
-    for def in remaining {
-        let key = (def.cell_id.clone(), def.name.clone());
-        let blocking = deps[&key]
-            .iter()
-            .find(|dep| !resolved.contains_key(dep.as_str()))
-            .cloned()
-            .unwrap_or_else(|| def.name.clone());
-        results.insert(
-            key,
-            Err(MathEvalError::new(
+        let def = &defs[i];
+        let blocking = deps[i].iter().find(|dep| !settled.contains(dep.as_str())).cloned();
+        let result = match blocking {
+            // A cycle member, or a dependent of a definition that failed or
+            // is itself blocked: nothing to evaluate.
+            Some(dep) => Err(MathEvalError::new(
                 MathEvalErrorKind::UnknownChannel,
-                format!("Channel '[{blocking}]' not in this session"),
+                format!("Channel '[{dep}]' not in this session"),
             )),
-        );
+            None => {
+                let view = OverlayLookup { base: lookup, resolved: &overlay };
+                evaluate_shared(&def.expr_text, constants, &view, lap_ctx).map(|out| {
+                    let length = out.samples.len();
+                    let has_t = out.t_us.len().min(length) > 0;
+                    ResolvedValue { out, length, has_t, released: false }
+                })
+            }
+        };
+        if let Ok(value) = &result {
+            // Only the name's primary (first-in-document-order) definition
+            // ever becomes what a `[Name]` reference sees (R49).
+            if primary_for_name[def.name.as_str()] == i {
+                overlay.insert(
+                    def.name.clone(),
+                    (value.out.samples.clone(), value.out.sample_rate_hz, value.out.t_us.clone()),
+                );
+                settled.insert(def.name.clone());
+            }
+        }
+        results.insert((def.cell_id.clone(), def.name.clone()), result);
+
+        // Liveness: this definition has read its dependencies for the last
+        // time; any whose last reader it was can go, and so can this one if
+        // nothing reads it at all.
+        for dep in &deps[i] {
+            let p = primary_for_name[dep.as_str()];
+            remaining[p] = remaining[p].saturating_sub(1);
+            if remaining[p] == 0 {
+                release(defs, p, true, plan, &mut overlay, &mut results);
+            }
+        }
+        if remaining[i] == 0 {
+            let primary = primary_for_name[def.name.as_str()] == i;
+            release(defs, i, primary, plan, &mut overlay, &mut results);
+        }
     }
 
-    results
+    Ok(results)
+}
+
+/// Drops definition `i`'s full-rate buffers from the overlay and from its
+/// result, keeping the metadata — unless the plan retains it, or it is not a
+/// full-rate time series (a scalar, a `[lap]` vector, an error). The
+/// overlay entry under its name is dropped only when `primary` (it is this
+/// definition's own, not a duplicate's, R49).
+fn release(
+    defs: &[MathCellDef],
+    i: usize,
+    primary: bool,
+    plan: &EvalPlan,
+    overlay: &mut HashMap<String, (Arc<[f64]>, f64, Arc<[i64]>)>,
+    results: &mut HashMap<DefKey, Result<ResolvedValue, MathEvalError>>,
+) {
+    let def = &defs[i];
+    if plan.retain.keeps(&def.name) {
+        return;
+    }
+    let key = (def.cell_id.clone(), def.name.clone());
+    let Some(Ok(value)) = results.get_mut(&key) else { return };
+    if value.released || value.length <= 1 || value.out.axis != crate::math::ValueAxis::Time {
+        return;
+    }
+    value.out.samples = Arc::from(&[] as &[f64]);
+    value.out.t_us = Arc::from(&[] as &[i64]);
+    value.released = true;
+    if primary {
+        overlay.remove(&def.name);
+    }
 }
 
 /// A [`ChannelLookup`] layering already-inferred sibling-definition units

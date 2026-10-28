@@ -16,6 +16,7 @@ pub mod host;
 pub mod host_channel_wire;
 pub mod js_cell;
 pub mod math_cell;
+pub mod plan;
 pub mod prose;
 pub mod resolve;
 pub mod table_cell;
@@ -23,14 +24,15 @@ pub mod table_cell;
 pub use cell::{CellDoc, CellKindToken};
 pub use constants::merge_constants;
 pub use error::{WorkbookError, WorkbookErrorKind};
-pub use eval::{eval_cells, CellDefResult, CellError, CellEvalResult};
+pub use eval::{eval_cells, eval_cells_planned, CellDefResult, CellError, CellEvalResult, EvalCancelled, EvalObserver};
 pub use front_matter::{ConstantRaw, FrontMatter, UnitsPref};
 pub use host::{channel, host_constants, host_laps, host_session, to_host_channel, HostChannel, HostChannelView, HostLap, HostSession};
 pub use host_channel_wire::{encode_host_channel_idlh, encode_host_channel_view_idlh, AxisKind};
 pub use js_cell::{find_inline_exprs, InlineExpr};
 pub use math_cell::{parse_math_cell_body, rewrite_math_cell_body, MathCellLine};
 pub use prose::{render_prose_html, ProseSpanRef, RenderedProse};
-pub use resolve::resolve_workbook_defs;
+pub use plan::{consumer_names, Demand, EvalPlan, MemoryEstimate, PlanInputs, Retain};
+pub use resolve::{resolve_planned, resolve_workbook_defs, ResolvedValue};
 pub use table_cell::parse_table_cell;
 
 /// One `const` line collected from any `math` cell (C2 §3.1), flattened

@@ -871,9 +871,14 @@ pub struct ChannelColumnInfo {
     /// (`Float64`).
     pub sample_bytes: usize,
     /// Rows in the file. An **upper bound** on this channel's own sample
-    /// count — the exact count is the column's non-null rows, which needs a
-    /// data read (C1 §4.5).
+    /// count — see [`Self::sample_count`] for the count itself.
     pub file_rows: usize,
+    /// This channel's own samples: the column's non-null values, summed over
+    /// the row groups' footer statistics (`num_values − null_count`), so no
+    /// data is read (evaluation-memory spec §4.2.B). Falls back to
+    /// [`Self::file_rows`] for a row group whose statistics carry no null
+    /// count, which keeps it an upper bound rather than a guess.
+    pub sample_count: usize,
 }
 
 /// Opens `<session_dir>/data.parquet` for reading, or a
@@ -918,6 +923,7 @@ pub fn read_channel_index(session_dir: &Path) -> Result<Vec<ChannelColumnInfo>, 
     let builder = open_data_parquet(session_dir)?;
     let file_rows = builder.metadata().file_metadata().num_rows().max(0) as usize;
     let schema = builder.schema().clone();
+    let row_groups = builder.metadata().row_groups().to_vec();
 
     let mut out = Vec::new();
     for field in schema.fields() {
@@ -952,9 +958,24 @@ pub fn read_channel_index(session_dir: &Path) -> Result<Vec<ChannelColumnInfo>, 
             source_kind: get("source_kind")?,
             sample_bytes,
             file_rows,
+            sample_count: column_sample_count(&row_groups, field.name()).unwrap_or(file_rows),
         });
     }
     Ok(out)
+}
+
+/// Non-null values of column `name`, summed over `row_groups`' footer
+/// statistics (`num_values − null_count` per row group). `None` when the
+/// column is missing from a row group or a row group records no null count,
+/// so the caller falls back to an upper bound instead of under-counting.
+fn column_sample_count(row_groups: &[parquet::file::metadata::RowGroupMetaData], name: &str) -> Option<usize> {
+    let mut total: u64 = 0;
+    for rg in row_groups {
+        let col = rg.columns().iter().find(|c| c.column_path().string() == name)?;
+        let nulls = col.statistics()?.null_count_opt()?;
+        total += (col.num_values().max(0) as u64).saturating_sub(nulls);
+    }
+    Some(total as usize)
 }
 
 /// Reads only the named columns of `<session_dir>/data.parquet` into one
@@ -2765,6 +2786,25 @@ mod channel_read_tests {
         assert_eq!(index[0].nominal_rate_hz, 800.0);
         assert_eq!(index[0].source_kind, "imu0");
         assert_eq!(index[1].sample_bytes, 8);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_channel_index_a_sparse_gps_column_among_imu_rows_sample_count_is_its_own_non_null_count() {
+        // Arrange
+        let session = session_with_gps_speed();
+        let (root, dir) = seed(&session);
+        let imu_len = session.channels[0].len();
+
+        // Act
+        let index = read_channel_index(&dir).unwrap();
+
+        // Assert — counted from the footer, not the file's row count.
+        let speed = index.iter().find(|c| c.channel_id == "GPS_SpeedKmh").unwrap();
+        assert_eq!(speed.sample_count, 2);
+        assert!(speed.file_rows > 2);
+        assert_eq!(index[0].sample_count, imu_len);
 
         let _ = std::fs::remove_dir_all(&root);
     }
