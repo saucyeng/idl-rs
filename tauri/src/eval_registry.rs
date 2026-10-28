@@ -14,11 +14,20 @@
 //! about the machine's state right now, and the next caller deserves a fresh
 //! attempt. The callers already waiting on the failed flight do receive that
 //! same error, once.
+//!
+//! Every caller attached to a flight is a **subscriber** (spec §4.2.A,
+//! Phase 3). A flight started with [`EvalRegistry::subscribe`] runs on its own
+//! thread, and when its last subscriber drops its [`Subscription`] the
+//! evaluation is cancelled at the next definition boundary (its observer's
+//! [`EvalObserver::cancelled`] turns true). A flight started with
+//! [`EvalRegistry::get_or_evaluate`] runs on its caller's thread, which stays
+//! subscribed until it returns, so it always runs to the end.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use idl_rs::workbook::v3::CellEvalResult;
+use idl_rs::workbook::v3::{CellEvalResult, EvalObserver};
 use sha2::{Digest, Sha256};
 
 use crate::error::{IpcError, IpcErrorKind};
@@ -80,11 +89,6 @@ impl Evaluation {
     }
 }
 
-// TODO(idl0): the registry cap (`memory::eval_cache_cap_bytes`) and the bytes
-// `held_bytes` counts are a second budget beside `SessionCache`'s, so the
-// process can hold both in full. Phase 3 of the evaluation-memory spec
-// (2026-10-27-idl1-evaluation-memory-DRAFT.md §4.2.G, one ledger for cache,
-// decodes and evaluations) replaces both with one admission ledger.
 /// Distinct buffer bytes behind `cells`' values: an `Arc` that appears in
 /// several definitions (a shared time axis) is counted once.
 fn held_bytes(cells: &[CellEvalResult]) -> u64 {
@@ -106,6 +110,65 @@ fn held_bytes(cells: &[CellEvalResult]) -> u64 {
 struct Flight {
     result: Mutex<Option<Result<Arc<Evaluation>, IpcError>>>,
     done: Condvar,
+    /// Callers attached to this flight: the inline leader while it runs,
+    /// every waiter while it waits, and every live [`Subscription`].
+    subscribers: AtomicUsize,
+}
+
+impl Flight {
+    fn new() -> Arc<Self> {
+        Arc::new(Flight { result: Mutex::new(None), done: Condvar::new(), subscribers: AtomicUsize::new(0) })
+    }
+}
+
+/// The observer a flight's evaluation runs under: cancelled once nobody is
+/// subscribed.
+struct FlightObserver<'a>(&'a Flight);
+
+impl EvalObserver for FlightObserver<'_> {
+    fn cancelled(&self) -> bool {
+        self.0.subscribers.load(Ordering::SeqCst) == 0
+    }
+}
+
+/// The work a [`EvalRegistry::subscribe`] flight runs on its own thread.
+pub type EvaluateFn = Box<dyn FnOnce(&dyn EvalObserver) -> Result<Vec<CellEvalResult>, IpcError> + Send>;
+
+/// One caller's interest in an evaluation ([`EvalRegistry::subscribe`]).
+/// Dropping it before the result arrives withdraws the interest; when no
+/// interest is left the evaluation stops at its next definition boundary.
+pub struct Subscription {
+    /// The flight this caller is attached to; `None` for a kept result.
+    flight: Option<Arc<Flight>>,
+    /// The result, when it was already kept.
+    ready: Option<Result<Arc<Evaluation>, IpcError>>,
+}
+
+impl std::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscription").field("attached", &self.flight.is_some()).finish_non_exhaustive()
+    }
+}
+
+impl Subscription {
+    /// Waits for the evaluation's result.
+    pub fn wait(mut self) -> Result<Arc<Evaluation>, IpcError> {
+        if let Some(ready) = self.ready.take() {
+            return ready;
+        }
+        match &self.flight {
+            Some(flight) => EvalRegistry::wait(flight),
+            None => Err(IpcError::new(IpcErrorKind::Internal, "a subscription with neither a flight nor a result")),
+        }
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if let Some(flight) = &self.flight {
+            flight.subscribers.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 struct Inner {
@@ -168,9 +231,21 @@ impl Drop for Leader<'_> {
     }
 }
 
+/// What [`EvalRegistry::attach`] found.
+enum Attach {
+    /// A kept result.
+    Kept(Arc<Evaluation>),
+    /// A flight already running, now with this caller subscribed.
+    Running(Arc<Flight>),
+    /// A new flight this caller must run, subscribed once.
+    Lead(Arc<Flight>),
+}
+
 impl EvalRegistry {
-    /// A registry keeping at most `cap_bytes` of finished evaluations. See
-    /// [`crate::memory::eval_cache_cap_bytes`] for how the app sizes it.
+    /// A registry keeping at most `cap_bytes` of finished evaluations. The
+    /// app passes its budget's ceiling: kept evaluations are part of the
+    /// session cache's one ledger, which evicts them as it needs room
+    /// ([`Self::evict_oldest`]).
     pub fn with_cap(cap_bytes: u64) -> Self {
         EvalRegistry {
             cap_bytes,
@@ -210,39 +285,99 @@ impl EvalRegistry {
     /// running for it, or — for the first caller — whatever `evaluate` makes.
     ///
     /// `evaluate` runs on the calling thread, with no lock held, and at most
-    /// once per key at a time. An `Err` from it reaches every caller waiting on
-    /// that flight and is not kept.
+    /// once per key at a time, under an observer that never cancels (its
+    /// caller is subscribed until it returns). An `Err` from it reaches every
+    /// caller waiting on that flight and is not kept.
     pub fn get_or_evaluate(
         &self,
         key: &EvalKey,
-        evaluate: impl FnOnce() -> Result<Vec<CellEvalResult>, IpcError>,
+        evaluate: impl FnOnce(&dyn EvalObserver) -> Result<Vec<CellEvalResult>, IpcError>,
     ) -> Result<Arc<Evaluation>, IpcError> {
-        let flight = {
-            let mut inner = self.lock();
-            if let Some(hit) = inner.done.get(key).cloned() {
-                if let Some(at) = inner.order.iter().position(|k| k == key) {
-                    let k = inner.order.remove(at);
-                    inner.order.push(k);
-                }
-                return Ok(hit);
+        let flight = match self.attach(key) {
+            Attach::Kept(hit) => return Ok(hit),
+            Attach::Running(running) => {
+                let got = Self::wait(&running);
+                running.subscribers.fetch_sub(1, Ordering::SeqCst);
+                return got;
             }
-            if let Some(running) = inner.flights.get(key) {
-                let running = Arc::clone(running);
-                drop(inner);
-                return Self::wait(&running);
-            }
-            let flight = Arc::new(Flight { result: Mutex::new(None), done: Condvar::new() });
-            inner.flights.insert(key.clone(), Arc::clone(&flight));
-            inner.runs += 1;
-            flight
+            Attach::Lead(flight) => flight,
         };
 
         let mut leader = Leader { registry: self, key: key.clone(), flight, finished: false };
-        let result = evaluate().map(|cells| Arc::new(Evaluation::new(cells)));
+        let result = evaluate(&FlightObserver(&leader.flight)).map(|cells| Arc::new(Evaluation::new(cells)));
+        leader.flight.subscribers.fetch_sub(1, Ordering::SeqCst);
         leader.finish(result.clone());
         result
     }
 
+    /// Attaches to `key`'s evaluation as a [`Subscription`]: a kept result, the
+    /// flight already running, or a new flight running `evaluate` on its own
+    /// thread. Dropping every subscription to a flight before it finishes
+    /// cancels it at its next definition boundary; a cancelled flight ends
+    /// with [`crate::session_cache::evaluation_cancelled`] and is not kept.
+    pub fn subscribe(self: &Arc<Self>, key: &EvalKey, evaluate: EvaluateFn) -> Subscription {
+        match self.attach(key) {
+            Attach::Kept(hit) => Subscription { flight: None, ready: Some(Ok(hit)) },
+            Attach::Running(running) => Subscription { flight: Some(running), ready: None },
+            Attach::Lead(flight) => {
+                let registry = Arc::clone(self);
+                let thread_key = key.clone();
+                let lead = Arc::clone(&flight);
+                let spawned = std::thread::Builder::new().name("idl1-eval".to_string()).spawn(move || {
+                    let mut leader = Leader { registry: &registry, key: thread_key, flight: lead, finished: false };
+                    let result = {
+                        let observer = FlightObserver(&leader.flight);
+                        evaluate(&observer).map(|cells| Arc::new(Evaluation::new(cells)))
+                    };
+                    leader.finish(result);
+                });
+                if spawned.is_err() {
+                    // No thread for it: the flight is finished with an error
+                    // so the caller is told rather than left waiting.
+                    let mut leader = Leader { registry: self, key: key.clone(), flight: Arc::clone(&flight), finished: false };
+                    leader.finish(Err(IpcError::new(IpcErrorKind::ResourceExhausted, "no thread to evaluate on")));
+                }
+                Subscription { flight: Some(flight), ready: None }
+            }
+        }
+    }
+
+    /// Finds or starts `key`'s flight, subscribing the caller to it.
+    fn attach(&self, key: &EvalKey) -> Attach {
+        let mut inner = self.lock();
+        if let Some(hit) = inner.done.get(key).cloned() {
+            if let Some(at) = inner.order.iter().position(|k| k == key) {
+                let k = inner.order.remove(at);
+                inner.order.push(k);
+            }
+            return Attach::Kept(hit);
+        }
+        if let Some(running) = inner.flights.get(key) {
+            running.subscribers.fetch_add(1, Ordering::SeqCst);
+            return Attach::Running(Arc::clone(running));
+        }
+        let flight = Flight::new();
+        flight.subscribers.store(1, Ordering::SeqCst);
+        inner.flights.insert(key.clone(), Arc::clone(&flight));
+        inner.runs += 1;
+        Attach::Lead(flight)
+    }
+
+    /// Drops the least recently used kept evaluation, giving its bytes back
+    /// to the ledger. `false` when nothing is kept.
+    pub fn evict_oldest(&self) -> bool {
+        let mut inner = self.lock();
+        if inner.order.is_empty() {
+            return false;
+        }
+        let oldest = inner.order.remove(0);
+        if let Some(gone) = inner.done.remove(&oldest) {
+            inner.resident_bytes -= gone.bytes();
+        }
+        true
+    }
+
+    /// Waits for `flight`'s result.
     fn wait(flight: &Flight) -> Result<Arc<Evaluation>, IpcError> {
         let mut slot = flight.result.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -287,6 +422,7 @@ mod tests {
             t_us: vec![0i64; n].into(),
             unit: idl_rs::math::units::UnitLabel::Dimensionless,
             axis: AxisKind::Time,
+            released: false,
         };
         vec![CellEvalResult {
             cell_id: "aaaaaaaa".to_string(),
@@ -323,10 +459,10 @@ mod tests {
     fn get_or_evaluate_a_key_seen_before_returns_the_kept_evaluation_without_running_again() {
         // Arrange
         let registry = EvalRegistry::with_cap(1 << 20);
-        let first = registry.get_or_evaluate(&key("k"), || Ok(cell_with_values(4))).unwrap();
+        let first = registry.get_or_evaluate(&key("k"), |_| Ok(cell_with_values(4))).unwrap();
 
         // Act
-        let second = registry.get_or_evaluate(&key("k"), || panic!("must not run")).unwrap();
+        let second = registry.get_or_evaluate(&key("k"), |_| panic!("must not run")).unwrap();
 
         // Assert
         assert!(Arc::ptr_eq(&first, &second));
@@ -347,7 +483,7 @@ mod tests {
                 std::thread::spawn(move || {
                     started.wait();
                     registry
-                        .get_or_evaluate(&key("k"), || {
+                        .get_or_evaluate(&key("k"), |_| {
                             std::thread::sleep(std::time::Duration::from_millis(100));
                             Ok(cell_with_values(4))
                         })
@@ -369,8 +505,8 @@ mod tests {
         let refused = IpcError::new(IpcErrorKind::ResourceExhausted, "busy");
 
         // Act
-        let first = registry.get_or_evaluate(&key("k"), || Err(refused.clone()));
-        let second = registry.get_or_evaluate(&key("k"), || Ok(cell_with_values(4)));
+        let first = registry.get_or_evaluate(&key("k"), |_| Err(refused.clone()));
+        let second = registry.get_or_evaluate(&key("k"), |_| Ok(cell_with_values(4)));
 
         // Assert
         assert_eq!(first.unwrap_err().kind, IpcErrorKind::ResourceExhausted);
@@ -382,18 +518,18 @@ mod tests {
     fn get_or_evaluate_past_the_cap_the_least_recently_used_evaluation_is_evicted() {
         // Arrange — each evaluation holds 2 buffers x 100 x 8 B = 1600 B.
         let registry = EvalRegistry::with_cap(3500);
-        registry.get_or_evaluate(&key("a"), || Ok(cell_with_values(100))).unwrap();
-        registry.get_or_evaluate(&key("b"), || Ok(cell_with_values(100))).unwrap();
-        registry.get_or_evaluate(&key("a"), || panic!("a is kept")).unwrap();
+        registry.get_or_evaluate(&key("a"), |_| Ok(cell_with_values(100))).unwrap();
+        registry.get_or_evaluate(&key("b"), |_| Ok(cell_with_values(100))).unwrap();
+        registry.get_or_evaluate(&key("a"), |_| panic!("a is kept")).unwrap();
 
         // Act — a third pushes the oldest-used ("b") out.
-        registry.get_or_evaluate(&key("c"), || Ok(cell_with_values(100))).unwrap();
+        registry.get_or_evaluate(&key("c"), |_| Ok(cell_with_values(100))).unwrap();
 
         // Assert
         assert_eq!(registry.len(), 2);
         assert_eq!(registry.resident_bytes(), 3200);
-        registry.get_or_evaluate(&key("a"), || panic!("a is still kept")).unwrap();
-        registry.get_or_evaluate(&key("b"), || Ok(cell_with_values(100))).unwrap();
+        registry.get_or_evaluate(&key("a"), |_| panic!("a is still kept")).unwrap();
+        registry.get_or_evaluate(&key("b"), |_| Ok(cell_with_values(100))).unwrap();
         assert_eq!(registry.runs(), 4);
     }
 
@@ -403,10 +539,94 @@ mod tests {
         let registry = EvalRegistry::with_cap(100);
 
         // Act
-        let got = registry.get_or_evaluate(&key("big"), || Ok(cell_with_values(1000))).unwrap();
+        let got = registry.get_or_evaluate(&key("big"), |_| Ok(cell_with_values(1000))).unwrap();
 
         // Assert
         assert_eq!(got.bytes(), 16_000);
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn cancel_last_subscriber_drops_evaluation_stops_at_the_next_definition_boundary() {
+        // Arrange — an "evaluation" of 1,000 definitions that asks its
+        // observer before each one, as `resolve_planned` does.
+        let registry = Arc::new(EvalRegistry::with_cap(1 << 20));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), ()>>();
+        let counter = Arc::clone(&ran);
+        let subscription = registry.subscribe(
+            &key("k"),
+            Box::new(move |observer: &dyn EvalObserver| {
+                let mut started = Some(started_tx);
+                for _ in 0..1000 {
+                    if observer.cancelled() {
+                        let _ = done_tx.send(Err(()));
+                        return Err(crate::session_cache::evaluation_cancelled());
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    if let Some(tx) = started.take() {
+                        let _ = tx.send(());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                let _ = done_tx.send(Ok(()));
+                Ok(cell_with_values(4))
+            }),
+        );
+        started_rx.recv().unwrap();
+
+        // Act
+        drop(subscription);
+        let outcome = done_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+
+        // Assert — stopped well short of the end, and nothing was kept.
+        assert_eq!(outcome, Err(()));
+        assert!(ran.load(Ordering::SeqCst) < 1000);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn subscribe_a_second_subscriber_keeps_the_evaluation_alive_after_the_first_drops() {
+        // Arrange
+        let registry = Arc::new(EvalRegistry::with_cap(1 << 20));
+        let first = registry.subscribe(
+            &key("k"),
+            Box::new(|observer: &dyn EvalObserver| {
+                for _ in 0..20 {
+                    if observer.cancelled() {
+                        return Err(crate::session_cache::evaluation_cancelled());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Ok(cell_with_values(4))
+            }),
+        );
+        let second = registry.subscribe(&key("k"), Box::new(|_: &dyn EvalObserver| panic!("must not run twice")));
+
+        // Act
+        drop(first);
+        let got = second.wait();
+
+        // Assert
+        assert!(got.is_ok());
+        assert_eq!(registry.runs(), 1);
+    }
+
+    #[test]
+    fn evict_oldest_drops_the_least_recently_used_kept_evaluation() {
+        // Arrange
+        let registry = EvalRegistry::with_cap(1 << 20);
+        registry.get_or_evaluate(&key("a"), |_| Ok(cell_with_values(100))).unwrap();
+        registry.get_or_evaluate(&key("b"), |_| Ok(cell_with_values(100))).unwrap();
+
+        // Act
+        let dropped = registry.evict_oldest();
+
+        // Assert
+        assert!(dropped);
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.resident_bytes(), 1600);
+        registry.get_or_evaluate(&key("b"), |_| panic!("b is kept")).unwrap();
     }
 }

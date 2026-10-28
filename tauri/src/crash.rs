@@ -10,7 +10,9 @@
 //! found still in place, naming a dead process, by the next launch, which
 //! reports it once as an abnormal exit (evaluation-memory spec §4.2.H).
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -106,6 +108,7 @@ pub fn install(dir: PathBuf, version: String) {
     }
     let _ = std::fs::create_dir_all(&dir);
     begin_run(&dir, &version);
+    open_breadcrumb(&dir);
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let at_ms = now_ms();
@@ -119,6 +122,143 @@ pub fn install(dir: PathBuf, version: String) {
         mark_clean_exit(&dir);
         previous(info);
     }));
+}
+
+// ── the allocation breadcrumb (evaluation-memory spec §4.2.H) ────────────
+
+/// Prefix of the file the allocator writes when an allocation fails
+/// (`alloc-<pid>.log`). Not a report name (`<kind>-<ms>.txt`), so [`pending`]
+/// never lists it; [`begin_run`] folds it into the abnormal-exit report of
+/// the run that wrote it.
+const BREADCRUMB_PREFIX: &str = "alloc-";
+
+/// Bytes the Rust heap holds right now, kept by [`BreadcrumbAllocator`].
+static LIVE_HEAP_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The open breadcrumb file, set once by [`open_breadcrumb`]. Opened ahead
+/// of time because writing to it must not allocate.
+static BREADCRUMB: OnceLock<std::fs::File> = OnceLock::new();
+
+/// Bytes the Rust heap holds right now, as [`BreadcrumbAllocator`] counts
+/// them; `0` when it is not the process's global allocator (tests, the CLI).
+/// The memory budget credits this as the process's own commit.
+pub fn live_heap_bytes() -> u64 {
+    LIVE_HEAP_BYTES.load(Ordering::Relaxed)
+}
+
+/// The app's global allocator: the system allocator, counting live bytes,
+/// and leaving a breadcrumb when an allocation fails.
+///
+/// A failed allocation does not panic, so the panic hook never sees it:
+/// Rust aborts the process. Before returning the null that causes that
+/// abort, this writes `alloc of N bytes failed, live=M` to the breadcrumb
+/// file opened at startup, with a stack buffer and no allocation, so the
+/// next launch's abnormal-exit report can say what killed the run. The
+/// `static` lives in the app crate (`#[global_allocator]`).
+pub struct BreadcrumbAllocator;
+
+// SAFETY: every call forwards to `System` unchanged; the counter only
+// observes sizes, and the failure path writes from a stack buffer to a file
+// opened earlier, never allocating.
+unsafe impl GlobalAlloc for BreadcrumbAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc(layout);
+        record(p, layout.size());
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc_zeroed(layout);
+        record(p, layout.size());
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout);
+        LIVE_HEAP_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = System.realloc(ptr, layout, new_size);
+        if p.is_null() {
+            write_breadcrumb(new_size);
+        } else {
+            LIVE_HEAP_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+            LIVE_HEAP_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        }
+        p
+    }
+}
+
+/// Counts a successful allocation of `size` bytes, or leaves the breadcrumb
+/// for a failed one.
+fn record(p: *mut u8, size: usize) {
+    if p.is_null() {
+        write_breadcrumb(size);
+    } else {
+        LIVE_HEAP_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+    }
+}
+
+/// Writes `alloc of <size> bytes failed, live=<live>\n` to the breadcrumb
+/// file, if one is open. Allocation-free.
+fn write_breadcrumb(size: usize) {
+    use std::io::Write;
+    let Some(mut file) = BREADCRUMB.get() else { return };
+    let mut buf = [0u8; 96];
+    let n = format_breadcrumb(&mut buf, size as u64, live_heap_bytes());
+    let _ = file.write_all(&buf[..n]);
+}
+
+/// The breadcrumb line for a failed allocation of `size` bytes with `live`
+/// bytes held, into `buf`; returns its length. Allocation-free.
+fn format_breadcrumb(buf: &mut [u8; 96], size: u64, live: u64) -> usize {
+    let mut n = 0;
+    for part in [Part::Text(b"alloc of "), Part::Num(size), Part::Text(b" bytes failed, live="), Part::Num(live), Part::Text(b"\n")] {
+        match part {
+            Part::Text(t) => {
+                buf[n..n + t.len()].copy_from_slice(t);
+                n += t.len();
+            }
+            Part::Num(mut v) => {
+                let mut digits = [0u8; 20];
+                let mut d = 0;
+                loop {
+                    digits[d] = b'0' + (v % 10) as u8;
+                    d += 1;
+                    v /= 10;
+                    if v == 0 {
+                        break;
+                    }
+                }
+                for i in (0..d).rev() {
+                    buf[n] = digits[i];
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// One piece of [`format_breadcrumb`]'s line.
+enum Part {
+    Text(&'static [u8]),
+    Num(u64),
+}
+
+/// The breadcrumb file for process `pid`.
+fn breadcrumb_path(dir: &Path, pid: u32) -> PathBuf {
+    dir.join(format!("{BREADCRUMB_PREFIX}{pid}.log"))
+}
+
+/// Opens this process's breadcrumb file for [`BreadcrumbAllocator`] to write
+/// to. Called by [`install`]; a failure to open leaves the allocator without
+/// a breadcrumb, never stops the app.
+fn open_breadcrumb(dir: &Path) {
+    if let Ok(file) = std::fs::File::create(breadcrumb_path(dir, std::process::id())) {
+        let _ = BREADCRUMB.set(file);
+    }
 }
 
 /// Whether a process with id `pid` exists right now.
@@ -183,9 +323,15 @@ pub fn begin_run(dir: &Path, version: &str) {
                     continue;
                 }
                 if old.version == version {
-                    let text = format_abnormal_exit_report(&old, now);
+                    let mut text = format_abnormal_exit_report(&old, now);
+                    if let Ok(crumb) = std::fs::read_to_string(breadcrumb_path(dir, old.pid)) {
+                        if !crumb.is_empty() {
+                            text.push_str(&format!("\nThe allocator's last word: {crumb}"));
+                        }
+                    }
                     let _ = std::fs::write(dir.join(format!("abnormal{}-{now}.txt", old.pid)), text);
                 }
+                let _ = std::fs::remove_file(breadcrumb_path(dir, old.pid));
             }
             let _ = std::fs::remove_file(&path);
         }
@@ -206,6 +352,7 @@ pub fn begin_run(dir: &Path, version: &str) {
 /// missing marker is not an error.
 pub fn mark_clean_exit(dir: &Path) {
     let _ = std::fs::remove_file(marker_path(dir, std::process::id()));
+    let _ = std::fs::remove_file(breadcrumb_path(dir, std::process::id()));
 }
 
 /// The ms timestamp in a report's file name (`<kind>-<ms>.txt`).
@@ -460,5 +607,39 @@ mod tests {
         assert!(text.contains("panic: boom"));
         assert!(text.contains("at: src/x.rs:7"));
         assert!(text.contains("backtrace:\n0: frame"));
+    }
+
+    #[test]
+    fn format_breadcrumb_a_failed_allocation_names_its_size_and_the_live_heap() {
+        // Arrange
+        let mut buf = [0u8; 96];
+
+        // Act
+        let n = format_breadcrumb(&mut buf, 1_694_793_000, 0);
+
+        // Assert
+        assert_eq!(&buf[..n], b"alloc of 1694793000 bytes failed, live=0\n");
+    }
+
+    #[test]
+    fn begin_run_a_dead_runs_breadcrumb_is_folded_into_its_abnormal_exit_report() {
+        // Arrange
+        let dir = std::env::temp_dir().join(format!("idl1-crumb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dead = RunMarker { pid: u32::MAX - 7, version: "9.9.9".to_string(), started_at_ms: 1 };
+        std::fs::write(marker_path(&dir, dead.pid), serde_json::to_vec(&dead).unwrap()).unwrap();
+        std::fs::write(breadcrumb_path(&dir, dead.pid), "alloc of 4096 bytes failed, live=123\n").unwrap();
+
+        // Act
+        begin_run(&dir, "9.9.9");
+
+        // Assert
+        let reports = pending(&dir).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].text.contains("alloc of 4096 bytes failed, live=123"));
+        assert!(!breadcrumb_path(&dir, dead.pid).exists());
+
+        mark_clean_exit(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -33,6 +33,12 @@ uuid = { version = "1", features = ["v4"] }
 # collectors, and their platform dependencies, out of the build.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
+# How far the page file may grow (evaluation-memory spec §4.2.G, Isaac's Q3
+# answer: count page-file growth): the `PagingFiles` registry value. Already in
+# the lock through Tauri, so no new crate is built.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
 # Android only (SPEC §14b.2): GATT payloads cross the Kotlin plugin boundary
 # as base64 strings.
 [target.'cfg(target_os = "android")'.dependencies]

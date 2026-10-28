@@ -150,6 +150,97 @@ impl Drop for ByteGuard<'_> {
     }
 }
 
+/// A [`MemoryBudget`] request that can never be granted: it is larger than
+/// the most the budget will ever hand out, so waiting cannot help
+/// (evaluation-memory spec §4.2.G, Isaac's Q3 answer: "refuse only if it
+/// could never fit").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeverFits {
+    /// Bytes asked for.
+    pub needed_bytes: u64,
+    /// The most the budget can ever grant, bytes.
+    pub ceiling_bytes: u64,
+    /// What was being sized, as the caller named it.
+    pub hint: String,
+}
+
+impl fmt::Display for NeverFits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: {:.1} GB needed, more than the {:.1} GB this machine's budget can ever grant",
+            self.hint,
+            self.needed_bytes as f64 / 1e9,
+            self.ceiling_bytes as f64 / 1e9
+        )
+    }
+}
+
+impl std::error::Error for NeverFits {}
+
+/// The process's one memory ledger, as an evaluation sees it
+/// (evaluation-memory spec §4.2.G): an evaluation reserves its planned
+/// estimate ([`crate::workbook::v3::EvalPlan`]) before it starts and gives it
+/// back by dropping the guard.
+///
+/// Callable per unit of work from any thread — one workbook evaluation, or
+/// one member of a session set — and shared by every caller, so N workers
+/// can never hold more than one budget between them. The app implements it
+/// over `idl-rs-tauri`'s `SessionCache` (the ledger that also counts decoded
+/// channels, decodes in flight and kept evaluations, and is sized from the
+/// machine); the CLI uses [`ByteBudget`].
+pub trait MemoryBudget: Sync {
+    /// Waits until `bytes` fit, then holds them until the guard is dropped.
+    ///
+    /// # Errors
+    /// [`NeverFits`] at once, without waiting, when `bytes` exceeds
+    /// [`Self::ceiling_bytes`].
+    fn acquire<'a>(&'a self, bytes: u64, hint: &str) -> Result<Box<dyn BudgetGuard + 'a>, NeverFits>;
+
+    /// [`Self::acquire`] without waiting: `Ok(None)` when `bytes` does not fit
+    /// right now.
+    ///
+    /// # Errors
+    /// [`NeverFits`] exactly as [`Self::acquire`].
+    fn try_acquire<'a>(&'a self, bytes: u64, hint: &str) -> Result<Option<Box<dyn BudgetGuard + 'a>>, NeverFits>;
+
+    /// The most this budget can ever grant at once, bytes.
+    fn ceiling_bytes(&self) -> u64;
+}
+
+impl ByteBudget {
+    fn never_fits(&self, bytes: u64, hint: &str) -> Result<(), NeverFits> {
+        if bytes > self.budget_bytes {
+            return Err(NeverFits { needed_bytes: bytes, ceiling_bytes: self.budget_bytes, hint: hint.to_string() });
+        }
+        Ok(())
+    }
+}
+
+/// Unlike its [`DecodeBudget`] side, which grants an oversized request when
+/// nothing else holds the budget, this side refuses one: an evaluation the
+/// budget can never hold is reported, not run.
+impl MemoryBudget for ByteBudget {
+    fn acquire<'a>(&'a self, bytes: u64, hint: &str) -> Result<Box<dyn BudgetGuard + 'a>, NeverFits> {
+        self.never_fits(bytes, hint)?;
+        Ok(DecodeBudget::acquire(self, bytes, hint))
+    }
+
+    fn try_acquire<'a>(&'a self, bytes: u64, hint: &str) -> Result<Option<Box<dyn BudgetGuard + 'a>>, NeverFits> {
+        self.never_fits(bytes, hint)?;
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if in_flight.saturating_add(bytes) > self.budget_bytes {
+            return Ok(None);
+        }
+        *in_flight = in_flight.saturating_add(bytes);
+        Ok(Some(Box::new(ByteGuard { budget: self, bytes })))
+    }
+
+    fn ceiling_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+}
+
 // ── progress, reports, errors ────────────────────────────────────────────
 
 /// Which half of one session's indexing is running (C3 §3.2
@@ -621,6 +712,36 @@ mod tests {
     }
 
     // ── the budget ───────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_budget_a_request_past_the_ceiling_never_fits_and_does_not_wait() {
+        // Arrange
+        let budget = ByteBudget::new(1000);
+        let _held = DecodeBudget::acquire(&budget, 900, "busy");
+
+        // Act
+        let err = MemoryBudget::acquire(&budget, 1001, "evaluate wb").err().unwrap();
+
+        // Assert
+        assert_eq!(err, NeverFits { needed_bytes: 1001, ceiling_bytes: 1000, hint: "evaluate wb".to_string() });
+    }
+
+    #[test]
+    fn memory_budget_try_acquire_not_now_then_granted_once_the_holder_drops() {
+        // Arrange
+        let budget = ByteBudget::new(1000);
+        let held = MemoryBudget::acquire(&budget, 600, "first").unwrap();
+
+        // Act
+        let busy = budget.try_acquire(600, "second").unwrap().is_none();
+        drop(held);
+        let granted = budget.try_acquire(600, "second").unwrap();
+
+        // Assert
+        assert!(busy);
+        assert!(granted.is_some());
+        assert_eq!(budget.in_flight_bytes(), 600);
+    }
 
     #[test]
     fn byte_budget_two_requests_that_do_not_both_fit_never_overlap() {

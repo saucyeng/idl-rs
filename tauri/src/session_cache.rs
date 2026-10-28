@@ -66,7 +66,7 @@ use idl_rs::store::parquet::{
 
 use crate::error::{IpcError, IpcErrorKind};
 use crate::eval_registry::EvalRegistry;
-use crate::memory::{budget_bytes, eval_cache_cap_bytes, resource_exhausted, with_estimate_margin};
+use crate::memory::{budget_bytes, resource_exhausted, with_estimate_margin, MachineBudget, SystemProbe, PROBE_REFRESH};
 
 /// How long a decode waits for the budget to free up before giving up
 /// (ruling R211.2). Long enough that a notebook full of cells binding at
@@ -193,6 +193,10 @@ struct Inner {
     /// decode may only begin when its own estimate still fits under
     /// `budget_bytes` alongside both.
     in_flight_bytes: u64,
+    /// Bytes reserved by workbook evaluations running now
+    /// ([`SessionCache::admit_evaluation`], evaluation-memory spec §4.2.G):
+    /// each holds its planned estimate for as long as it runs.
+    eval_reserved_bytes: u64,
 }
 
 /// Everything a cache is, behind one `Arc` — see [`SessionCache`]'s note on
@@ -211,7 +215,12 @@ struct Shared {
     /// The workbook evaluations that read this cache's channels, shared and
     /// single-flight per key (evaluation-memory spec §4.2.A). Here so the
     /// app's one managed `SessionCache` carries it: no extra managed state.
-    evals: EvalRegistry,
+    /// Its kept evaluations are part of this cache's ledger.
+    evals: Arc<EvalRegistry>,
+    /// The machine-aware budget (spec §4.2.G): `None` for a cache built with
+    /// a fixed budget ([`SessionCache::with_budget`]), whose budget is then
+    /// that number however the machine stands.
+    machine: Option<MachineBudget>,
 }
 
 /// The decode-progress reporting settings — see
@@ -265,19 +274,29 @@ pub struct SessionCache {
 
 impl Default for SessionCache {
     fn default() -> Self {
-        Self::with_budget(budget_bytes())
+        Self::with_machine(MachineBudget::new(Box::new(SystemProbe)))
     }
 }
 
 impl SessionCache {
-    /// A cache budgeted at [`crate::memory::budget_bytes`] — `min(2 GiB,
-    /// 25 % of physical RAM)`, read once.
+    /// A cache budgeted by this machine (evaluation-memory spec §4.2.G):
+    /// at most [`crate::memory::budget_bytes`] (half of physical RAM, no
+    /// absolute cap), and never more than the commit the machine can still
+    /// grant less the headroom.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A cache with an explicit byte budget. Exists for tests, which need a
-    /// budget small enough to force eviction deterministically.
+    /// A cache budgeted by `machine`: its ceiling bounds residency and every
+    /// single request; [`MachineBudget::budget_now`] bounds what is admitted.
+    pub fn with_machine(machine: MachineBudget) -> Self {
+        let mut cache = Self::with_budget(machine.ceiling_bytes());
+        Arc::get_mut(&mut cache.shared).expect("a cache just built has one owner").machine = Some(machine);
+        cache
+    }
+
+    /// A cache with an explicit, fixed byte budget. Exists for tests, which
+    /// need a budget small enough to force eviction deterministically.
     pub fn with_budget(budget_bytes: u64) -> Self {
         SessionCache {
             shared: Arc::new(Shared {
@@ -291,18 +310,126 @@ impl SessionCache {
                     resident_bytes: 0,
                     budget_bytes,
                     in_flight_bytes: 0,
+                    eval_reserved_bytes: 0,
                 }),
                 released: Condvar::new(),
                 decoded: Condvar::new(),
                 progress: Mutex::new(Progress::default()),
-                evals: EvalRegistry::with_cap(eval_cache_cap_bytes(budget_bytes)),
+                evals: Arc::new(EvalRegistry::with_cap(budget_bytes)),
+                machine: None,
             }),
         }
     }
 
     /// The workbook evaluations sharing this cache — see [`EvalRegistry`].
-    pub fn evals(&self) -> &EvalRegistry {
+    pub fn evals(&self) -> &Arc<EvalRegistry> {
         &self.shared.evals
+    }
+
+    /// `true` when `channel` of `session_id` is decoded and resident.
+    pub fn is_resident(&self, session_id: &str, channel: &str) -> bool {
+        self.lock().entries.contains_key(&(session_id.to_string(), channel.to_string()))
+    }
+
+    /// Bytes reserved by evaluations running now.
+    pub fn eval_reserved_bytes(&self) -> u64 {
+        self.lock().eval_reserved_bytes
+    }
+
+    /// Everything the ledger holds: resident channels and axes, kept
+    /// evaluations, decodes in flight and evaluations running.
+    fn accounted(&self, inner: &Inner) -> u64 {
+        inner.resident_bytes + self.shared.evals.resident_bytes() + inner.in_flight_bytes + inner.eval_reserved_bytes
+    }
+
+    /// The budget `B` right now (spec §4.2.G): the machine's
+    /// [`MachineBudget::budget_now`] for what this ledger holds, or the fixed
+    /// budget.
+    fn budget_now(&self, inner: &Inner) -> u64 {
+        match &self.shared.machine {
+            Some(machine) => machine.budget_now(self.accounted(inner)),
+            None => inner.budget_bytes,
+        }
+    }
+
+    /// Admits one workbook evaluation that will hold `needed_bytes` (its
+    /// planned estimate, margin included) while it runs (evaluation-memory
+    /// spec §4.2.G): the one ledger — resident channels, kept evaluations,
+    /// decodes in flight and running evaluations — must have room for it
+    /// under `B`. When it does not, the coldest cached channels and then the
+    /// least recently used kept evaluations are dropped; when it still does
+    /// not, the evaluation **waits** (re-reading the machine every
+    /// [`PROBE_REFRESH`]) until it does or `cancelled()` says nobody wants it.
+    ///
+    /// # Errors
+    /// [`IpcErrorKind::ResourceExhausted`] at once, before anything is
+    /// waited for, when `needed_bytes` exceeds the budget's ceiling `B_max`
+    /// — it could never fit (Isaac's Q3 answer). [`IpcErrorKind::Internal`]
+    /// ("cancelled") when `cancelled()` turns true while it waits.
+    pub fn admit_evaluation(
+        &self,
+        needed_bytes: u64,
+        hint: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<EvalAdmission<'_>, IpcError> {
+        let mut inner = self.lock();
+        if needed_bytes > inner.budget_bytes {
+            return Err(resource_exhausted(needed_bytes, inner.budget_bytes, hint));
+        }
+        loop {
+            if self.make_room(&mut inner, needed_bytes) {
+                inner.eval_reserved_bytes += needed_bytes;
+                return Ok(EvalAdmission { cache: self, bytes: needed_bytes });
+            }
+            if cancelled() {
+                return Err(evaluation_cancelled());
+            }
+            let (guard, _) = self.shared.released.wait_timeout(inner, PROBE_REFRESH).unwrap_or_else(|e| e.into_inner());
+            inner = guard;
+        }
+    }
+
+    /// One non-waiting [`Self::admit_evaluation`]: `Ok(None)` when it does
+    /// not fit right now, even after evicting.
+    ///
+    /// # Errors
+    /// As [`Self::admit_evaluation`]'s "could never fit".
+    pub fn try_admit_evaluation(&self, needed_bytes: u64, hint: &str) -> Result<Option<EvalAdmission<'_>>, IpcError> {
+        let mut inner = self.lock();
+        if needed_bytes > inner.budget_bytes {
+            return Err(resource_exhausted(needed_bytes, inner.budget_bytes, hint));
+        }
+        if self.make_room(&mut inner, needed_bytes) {
+            inner.eval_reserved_bytes += needed_bytes;
+            return Ok(Some(EvalAdmission { cache: self, bytes: needed_bytes }));
+        }
+        Ok(None)
+    }
+
+    /// `true` when `needed_bytes` more fits the ledger under `B`, after
+    /// dropping as many cold cached channels, then kept evaluations, as that
+    /// takes. Nothing is dropped when it cannot be made to fit by dropping.
+    fn make_room(&self, inner: &mut Inner, needed_bytes: u64) -> bool {
+        loop {
+            let budget = self.budget_now(inner);
+            let accounted = self.accounted(inner);
+            if accounted.saturating_add(needed_bytes) <= budget {
+                return true;
+            }
+            let pinned = inner.in_flight_bytes + inner.eval_reserved_bytes;
+            if pinned.saturating_add(needed_bytes) > budget {
+                // Even an empty cache would not make room: wait instead of
+                // flushing it for nothing.
+                return false;
+            }
+            if inner.evict_coldest() {
+                continue;
+            }
+            if self.shared.evals.evict_oldest() {
+                continue;
+            }
+            return false;
+        }
     }
 
     /// Installs the sink every later decode reports progress to (ruling
@@ -426,7 +553,10 @@ impl SessionCache {
 
         let deadline = Instant::now() + timeout;
         loop {
-            if inner.in_flight_bytes + needed <= budget {
+            // Decodes and running evaluations share the in-flight half of
+            // the ledger, under `B` as the machine stands now.
+            let now = self.budget_now(&inner);
+            if inner.in_flight_bytes + inner.eval_reserved_bytes + needed <= now {
                 inner.in_flight_bytes += needed;
                 return Ok(Reservation { cache: self, bytes: needed });
             }
@@ -438,7 +568,7 @@ impl SessionCache {
             let (guard, _) = self
                 .shared
                 .released
-                .wait_timeout(inner, remaining)
+                .wait_timeout(inner, remaining.min(PROBE_REFRESH))
                 .unwrap_or_else(|e| e.into_inner());
             inner = guard;
         }
@@ -867,6 +997,77 @@ impl Drop for Reservation<'_> {
     }
 }
 
+/// One running evaluation's hold on the ledger
+/// ([`SessionCache::admit_evaluation`]), released when it is dropped.
+#[derive(Debug)]
+pub struct EvalAdmission<'a> {
+    cache: &'a SessionCache,
+    bytes: u64,
+}
+
+impl EvalAdmission<'_> {
+    /// Bytes this admission holds.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for EvalAdmission<'_> {
+    fn drop(&mut self) {
+        {
+            let mut inner = self.cache.lock();
+            inner.eval_reserved_bytes = inner.eval_reserved_bytes.saturating_sub(self.bytes);
+        }
+        self.cache.shared.released.notify_all();
+    }
+}
+
+impl idl_rs::store::index_job::BudgetGuard for EvalAdmission<'_> {}
+
+/// The core-level [`idl_rs::store::index_job::MemoryBudget`] over this
+/// cache's ledger, for a runner in core (a session set's members) to admit
+/// each unit of work against the same budget the app's own evaluations,
+/// decodes and cache use. `acquire` waits and never cancels; a runner that
+/// can be cancelled polls `try_acquire` instead.
+impl idl_rs::store::index_job::MemoryBudget for SessionCache {
+    fn acquire<'a>(
+        &'a self,
+        bytes: u64,
+        hint: &str,
+    ) -> Result<Box<dyn idl_rs::store::index_job::BudgetGuard + 'a>, idl_rs::store::index_job::NeverFits> {
+        self.admit_evaluation(bytes, hint, &|| false)
+            .map(|a| Box::new(a) as Box<dyn idl_rs::store::index_job::BudgetGuard + 'a>)
+            .map_err(|_| self.never_fits(bytes, hint))
+    }
+
+    fn try_acquire<'a>(
+        &'a self,
+        bytes: u64,
+        hint: &str,
+    ) -> Result<Option<Box<dyn idl_rs::store::index_job::BudgetGuard + 'a>>, idl_rs::store::index_job::NeverFits> {
+        self.try_admit_evaluation(bytes, hint)
+            .map(|a| a.map(|a| Box::new(a) as Box<dyn idl_rs::store::index_job::BudgetGuard + 'a>))
+            .map_err(|_| self.never_fits(bytes, hint))
+    }
+
+    fn ceiling_bytes(&self) -> u64 {
+        self.budget_bytes()
+    }
+}
+
+impl SessionCache {
+    fn never_fits(&self, bytes: u64, hint: &str) -> idl_rs::store::index_job::NeverFits {
+        idl_rs::store::index_job::NeverFits { needed_bytes: bytes, ceiling_bytes: self.budget_bytes(), hint: hint.to_string() }
+    }
+}
+
+/// The error a cancelled evaluation ends with: nobody is waiting for it any
+/// more, so it reaches no one but the log. `internal`, because C3 §2 has no
+/// cancelled kind and adding one is a contract change.
+pub fn evaluation_cancelled() -> IpcError {
+    IpcError::new(IpcErrorKind::Internal, "the evaluation was cancelled: nobody is waiting for it")
+}
+
 /// The fraction of the budget one indexing worker's reservation is clamped
 /// to, as `(numerator, denominator)` — 4/5, chosen so that
 /// [`crate::memory::with_estimate_margin`]'s own 5/4 lifts it back to
@@ -1026,6 +1227,20 @@ impl Inner {
             self.resident_bytes = self.resident_bytes.saturating_sub(axis.resident_bytes() as u64);
         }
         self.axis_order.retain(|k| k != key);
+    }
+
+    /// Drops the coldest resident channel, then any axis no resident channel
+    /// borrows any more. `false` when there was no channel to drop.
+    fn evict_coldest(&mut self) -> bool {
+        if self.order.is_empty() {
+            return false;
+        }
+        let coldest = self.order.remove(0);
+        if let Some(dropped) = self.entries.remove(&coldest) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(dropped.resident_bytes() as u64);
+        }
+        self.evict_unborrowed_axes();
+        true
     }
 
     /// Drops coldest-first until `resident_bytes <= budget_bytes`.
@@ -1812,5 +2027,90 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
-}
 
+    #[test]
+    fn admission_two_evaluations_whose_estimates_sum_past_b_second_waits_both_succeed() {
+        // Arrange — 700 kB each against a 1 MB budget: one at a time.
+        let cache = SessionCache::with_budget(1_000_000);
+        let first = cache.admit_evaluation(700_000, "first", &|| false).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<u64>();
+        let other = cache.clone();
+        let second = std::thread::spawn(move || {
+            let admitted = other.admit_evaluation(700_000, "second", &|| false).unwrap();
+            tx.send(other.eval_reserved_bytes()).unwrap();
+            drop(admitted);
+        });
+
+        // Act
+        std::thread::sleep(Duration::from_millis(150));
+        let waited = rx.try_recv().is_err();
+        drop(first);
+        let reserved_while_second_ran = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        second.join().unwrap();
+
+        // Assert — it waited for the first, then ran alone; nothing left held.
+        assert!(waited);
+        assert_eq!(reserved_while_second_ran, 700_000);
+        assert_eq!(cache.eval_reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn admission_an_estimate_past_b_max_is_refused_at_once_as_resource_exhausted() {
+        // Arrange
+        let cache = SessionCache::with_budget(1_000_000);
+
+        // Act
+        let started = Instant::now();
+        let err = cache.admit_evaluation(1_000_001, "evaluate workbook 'wb'", &|| false).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::ResourceExhausted);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(err.detail.unwrap()["hint"], "evaluate workbook 'wb'");
+        assert_eq!(cache.eval_reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn admission_cold_cached_channels_are_evicted_to_make_room_before_waiting() {
+        // Arrange — two channels resident, then an evaluation that only fits
+        // once the colder of them is gone.
+        let root = temp_root();
+        seed(&root, "s1", 1000);
+        let dir = session_dir(&root, "s1");
+        let probe = SessionCache::with_budget(1 << 30);
+        probe.channel(&dir, "s1", "A").unwrap();
+        let with_a = probe.resident_bytes();
+        let cache = SessionCache::with_budget(with_a * 4);
+        cache.channel(&dir, "s1", "A").unwrap();
+        cache.channel(&dir, "s1", "B").unwrap();
+        let resident = cache.resident_bytes();
+
+        // Act
+        let admitted = cache.try_admit_evaluation(with_a * 4 - resident + 1, "evaluate").unwrap();
+
+        // Assert
+        assert!(admitted.is_some());
+        assert!(!cache.is_resident("s1", "A"));
+        assert!(cache.is_resident("s1", "B"));
+
+        drop(admitted);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn admission_a_waiting_evaluation_whose_caller_cancels_gives_up_with_nothing_held() {
+        // Arrange
+        let cache = SessionCache::with_budget(1_000_000);
+        let _held = cache.admit_evaluation(700_000, "first", &|| false).unwrap();
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+
+        // Act
+        let err = cache
+            .admit_evaluation(700_000, "second", &|| asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1)
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::Internal);
+        assert_eq!(cache.eval_reserved_bytes(), 700_000);
+    }
+}

@@ -20,7 +20,8 @@ use idl_rs::store::atomic::{sha256_hex, write_atomic, AtomicWriteErrorKind};
 use idl_rs::table::{evaluate_table_multi, plan_rows, resolve_baseline_row, WindowLaps};
 use idl_rs::workbook::v3::front_matter::{parse_front_matter, render_front_matter, FrontMatter};
 use idl_rs::workbook::v3::{
-    parse_workbook, render_prose_html, render_workbook, CellDoc, CellError, CellKindToken, WorkbookError,
+    parse_workbook, render_prose_html, render_workbook, CellDoc, CellError, CellKindToken, Demand, EvalObserver, EvalPlan,
+    PlanInputs, WorkbookError,
 };
 
 use crate::error::{IpcError, IpcErrorKind};
@@ -702,9 +703,10 @@ fn eval_workbook_v2_via(
             // runs it, the rest wait for it. The decodes it needs are
             // prefetched only on that first run.
             let key = evaluation_key(data_dir, &markdown, Some((window, &session_json.bytes)));
-            let evaluation = cache.evals().get_or_evaluate(&key, || {
-                prefetch_document_channels(cache, data_dir, &window.session_id, &doc, &handle);
-                evaluate_checked(&doc, &structural, &handle, Some(&*source), &lap_ctx)
+            let evaluation = cache.evals().get_or_evaluate(&key, |observer| {
+                let demand = Demand::document(&doc);
+                let sid = Some(window.session_id.as_str());
+                evaluate_planned(cache, data_dir, &doc, &structural, sid, &handle, Some(&*source), &lap_ctx, demand, observer)
             });
             // Per-window attribution (R121): a decode this window could not
             // be given is this window's failure, not the whole call's.
@@ -863,24 +865,42 @@ fn fetch_host_channel_v2_via(
     // evaluating the whole document again to return one value.
     let session_json = window.map(|w| read_session_json_once(data_dir, &w.session_id));
     let key = evaluation_key(data_dir, &markdown, window.zip(session_json.as_ref().map(|j| j.bytes.as_slice())));
-    let evaluation = cache.evals().get_or_evaluate(&key, || {
+    let evaluate_window = |demand: Demand, observer: &dyn EvalObserver| {
         let (handle, source, lap_ctx) = match window.zip(session_json.as_ref()) {
             Some((w, json)) => {
                 let (handle, source) = load_lazy_session_handle(data_dir, &w.session_id, cache)?;
                 let lap_ctx = load_window_context_from(data_dir, w, json)?;
-                prefetch_document_channels(cache, data_dir, &w.session_id, &doc, &handle);
                 (handle, Some(source), lap_ctx)
             }
             None => (empty_session_handle(), None, MathLapContext::empty()),
         };
+        let sid = window.map(|w| w.session_id.as_str());
         // A refused decode is the caller's answer, not a missing definition
-        // (R211.2): `evaluate_checked` returns it ahead of any cell.
-        evaluate_checked(&doc, &structural, &handle, source.as_deref(), &lap_ctx)
-    })?;
+        // (R211.2): `evaluate_planned` returns it ahead of any cell.
+        evaluate_planned(cache, data_dir, &doc, &structural, sid, &handle, source.as_deref(), &lap_ctx, demand, observer)
+    };
+    let evaluation = cache.evals().get_or_evaluate(&key, |observer| evaluate_window(Demand::document(&doc), observer))?;
 
     let def = evaluation.def(def_name).ok_or_else(|| {
         IpcError::new(IpcErrorKind::NotFound, format!("no definition named '{def_name}' in workbook '{id}'"))
     })?;
+
+    // The shared evaluation kept only the values the document's consumers
+    // name (evaluation-memory spec §4.2.B). A definition it released — asked
+    // for by a name the lexical scan did not see — is evaluated again on its
+    // own: only its closure, keyed apart so concurrent fetches of it share.
+    let closure;
+    let def = if def.value.as_ref().is_some_and(|v| v.released) {
+        let closure_key = crate::eval_registry::EvalKey::from_parts(&[key.as_hex().as_bytes(), b"closure", def_name.as_bytes()]);
+        closure = cache
+            .evals()
+            .get_or_evaluate(&closure_key, |observer| evaluate_window(Demand::closure([def_name.to_string()]), observer))?;
+        closure.def(def_name).ok_or_else(|| {
+            IpcError::new(IpcErrorKind::NotFound, format!("no definition named '{def_name}' in workbook '{id}'"))
+        })?
+    } else {
+        def
+    };
 
     if let Some(err) = &def.error {
         return Err(IpcError::from(err.clone()));
@@ -898,18 +918,60 @@ fn fetch_host_channel_v2_via(
     Ok(idl_rs::workbook::v3::encode_host_channel_view_idlh(hc, budget))
 }
 
-/// Runs `eval_cells` and then, as [`eval_workbook_via`] does, surfaces the
-/// first decode failure `source` recorded (a channel refused for memory or
-/// unreadable) ahead of the cells: the document is fine, the machine is busy,
+/// One planned, admitted evaluation (evaluation-memory spec §4.2.B and
+/// §4.2.G): plans `doc` for `demand` from the session's footer counts,
+/// refuses at once — before any decode — when its estimate (inputs not yet
+/// cached included) could never fit the budget, decodes the channels it
+/// names, then waits for room in the ledger for its own peak and runs. The
+/// admission is held while it runs and given back when it returns.
+///
+/// `session_id` is the window's session, `None` for no session (`handle` is
+/// then [`empty_session_handle`]).
+/// Like [`eval_workbook_via`], it surfaces the first decode failure `source`
+/// recorded ahead of the cells: the document is fine, the machine is busy,
 /// and per-cell `math_unknown_channel` would say otherwise (R211.2).
-fn evaluate_checked(
+///
+/// # Errors
+/// `resource_exhausted` when the evaluation could never fit, naming the
+/// workbook and its largest definition; a decode's own failure; the
+/// cancelled error when `observer` cancels it.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_planned(
+    cache: &SessionCache,
+    data_dir: &Path,
     doc: &idl_rs::workbook::v3::WorkbookDoc,
     structural: &[WorkbookError],
+    session_id: Option<&str>,
     handle: &SessionHandle,
     source: Option<&crate::session_source::CachedChannelSource>,
     lap_ctx: &MathLapContext,
+    demand: Demand,
+    observer: &dyn EvalObserver,
 ) -> Result<Vec<idl_rs::workbook::v3::CellEvalResult>, IpcError> {
-    let cells = idl_rs::workbook::v3::eval_cells(doc, structural, handle, lap_ctx);
+    let inputs = session_id
+        .and_then(|sid| idl_rs::store::parquet::read_channel_index(&session_dir(data_dir, sid)).ok())
+        .map(|index| PlanInputs::from_channel_index(&index))
+        .unwrap_or_default();
+    let plan = EvalPlan::new(&doc.defs, &doc.constants, &inputs, &demand);
+    let largest = plan
+        .shapes
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, shape)| shape.bytes())
+        .map(|(i, _)| doc.defs[i].name.as_str())
+        .unwrap_or("");
+    let hint = format!("evaluate workbook '{}' (largest definition '{largest}')", doc.name);
+
+    let needed = plan.estimate_with_missing_inputs(|c| session_id.is_some_and(|sid| !cache.is_resident(sid, c)));
+    if needed > cache.budget_bytes() {
+        return Err(crate::memory::resource_exhausted(needed, cache.budget_bytes(), &hint));
+    }
+    if let Some(sid) = session_id {
+        prefetch_document_channels(cache, data_dir, sid, doc, handle);
+    }
+    let _admission = cache.admit_evaluation(plan.estimate_with_missing_inputs(|_| false), &hint, &|| observer.cancelled())?;
+    let cells = idl_rs::workbook::v3::eval_cells_planned(doc, structural, handle, lap_ctx, &plan, Some(observer))
+        .map_err(|_| crate::session_cache::evaluation_cancelled())?;
     match source.and_then(|s| s.take_first_error()) {
         Some(err) => Err(err),
         None => Ok(cells),
@@ -2509,6 +2571,63 @@ version: 3
         let WindowEval::Error { error } = &out[0] else { panic!("expected the window to fail, got {:?}", out[0]) };
         assert_eq!(error.kind, IpcErrorKind::ResourceExhausted);
         assert_eq!(error.detail.as_ref().unwrap()["window"], 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn admission_an_estimate_past_b_max_resource_exhausted_before_any_decode() {
+        // Arrange — a budget smaller than the two channels' cached size alone.
+        let root = temp_root();
+        seed_multi_channel_session(&root, "s1", &["ChanA", "ChanB"]);
+        let markdown =
+            format!("---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nw = [ChanA] * 2\nx = [ChanB] + 1\n```\n");
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let windows = vec![WindowDto {
+            session_id: "s1".to_string(),
+            span: crate::session_source::SpanDto::Session,
+            colour: "--chart-1".to_string(),
+        }];
+        let cache = SessionCache::with_budget(64);
+
+        // Act
+        let out = eval_workbook_v2_via(&cache, &root, WB_ID, &windows).unwrap();
+
+        // Assert — refused, and nothing was decoded first.
+        let WindowEval::Error { error } = &out[0] else { panic!("expected the window to fail, got {:?}", out[0]) };
+        assert_eq!(error.kind, IpcErrorKind::ResourceExhausted);
+        assert!(error.detail.as_ref().unwrap()["hint"].as_str().unwrap().contains("evaluate workbook 'Test'"));
+        assert!(cache.is_empty());
+        assert_eq!(cache.axis_decodes(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_host_channel_v2_via_a_definition_no_consumer_names_is_evaluated_on_its_own_and_returned_whole() {
+        // Arrange — `x` is released by the shared evaluation (no js cell or
+        // span names it), so the fetch evaluates its closure instead.
+        let root = temp_root();
+        seed_multi_channel_session(&root, "s1", &["ChanA"]);
+        let markdown = format!("---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [ChanA] * 2\n```\n");
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: crate::session_source::SpanDto::Session,
+            colour: "--chart-1".to_string(),
+        };
+        let cache = SessionCache::with_budget(1 << 30);
+        let opened = eval_workbook_v2_via(&cache, &root, WB_ID, std::slice::from_ref(&window)).unwrap();
+
+        // Act
+        let bytes = fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 100).unwrap();
+
+        // Assert — the open kept only its length; the fetch got the values.
+        let WindowEval::Ok { ok } = &opened[0] else { panic!("open failed: {:?}", opened[0]) };
+        assert_eq!(ok[0].defs[0].value.as_ref().unwrap().length, 3);
+        let v_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(v_len, 3);
+        assert_eq!(cache.evals().runs(), 2);
 
         let _ = std::fs::remove_dir_all(&root);
     }
