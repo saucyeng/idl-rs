@@ -128,6 +128,11 @@ mod tests {
         // exit. Never touches a crash report or anything in the library.
         ("tauri/src/crash.rs", "begin_run"),
         ("tauri/src/crash.rs", "mark_clean_exit"),
+        // `sweep_orphan_breadcrumbs` (memory phase 3, 2026-10-28): only
+        // `alloc-<pid>.log` allocation breadcrumbs in the same `crash/` dir,
+        // only for a pid that is not this process, is not alive, and has no
+        // run marker left to report it. Never a crash report, never `<data>`.
+        ("tauri/src/crash.rs", "sweep_orphan_breadcrumbs"),
     ];
 
     /// The idl-rs workspace root (`tauri/`'s parent).
