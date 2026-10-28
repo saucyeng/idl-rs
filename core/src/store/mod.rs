@@ -14,6 +14,8 @@ pub mod blob;
 pub mod catalog;
 pub mod catalog_read;
 pub mod derived;
+pub mod engine_identity;
+pub mod eval_cache;
 pub mod import;
 /// The read-only library summary served to paired peers (library tiers Phase 1).
 pub mod library_summary;
@@ -26,7 +28,6 @@ pub mod scan;
 pub mod session_context;
 pub mod session_json;
 pub mod set_job;
-pub mod eval_cache;
 pub mod settings;
 pub mod sync;
 pub mod verify;

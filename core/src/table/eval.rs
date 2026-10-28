@@ -225,9 +225,12 @@ pub struct DefinitionValue {
 /// The workbook definitions a table's `[name]` resolves to before a stored
 /// channel (C2 §4, ruling Q6 of 2026-10-28: a table cell resolves names the
 /// way a math cell does). Keyed by definition name; the first definition of
-/// a duplicated name is the one kept (R49).
+/// a duplicated name is the one kept (R49), whether or not it succeeded. A
+/// definition that failed is `Err(its message)`: it still shadows a stored
+/// channel of the same name, and a cell that reads it is that error, never
+/// the raw channel.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct DefinitionValues(pub HashMap<String, DefinitionValue>);
+pub struct DefinitionValues(pub HashMap<String, Result<DefinitionValue, String>>);
 
 /// [`DefinitionValues`] layered over a row's channels. A `[t]` definition is
 /// sliced to the row's window by its own recorded times (inclusive, as
@@ -241,8 +244,12 @@ struct DefinitionsOverRow<'a> {
 
 impl ChannelLookup for DefinitionsOverRow<'_> {
     fn lookup(&self, name: &str) -> Option<LookupChannel> {
-        let Some(def) = self.defs.0.get(name) else {
-            return self.base.lookup(name);
+        let def = match self.defs.0.get(name) {
+            None => return self.base.lookup(name),
+            // Shadowed by a failed definition: never the channel. The cell
+            // is preset to the definition's error before it evaluates.
+            Some(Err(_)) => return None,
+            Some(Ok(def)) => def,
         };
         let timed = def.axis == ValueAxis::Time && !def.t_us.is_empty() && def.t_us.len() == def.samples.len();
         match self.window {
@@ -484,7 +491,23 @@ pub fn evaluate_table_with_definitions(
         .map(|w| DefinitionsOverRow { defs: definitions, window: w.window, base: w })
         .collect();
     let rows: Vec<&dyn ChannelLookup> = layered.iter().map(|l| l as &dyn ChannelLookup).collect();
-    evaluate_table_rows(&rows, table, bindings, baseline_row, &HashMap::new())
+    // A cell reading a definition that failed is that failure.
+    let mut preset: HashMap<Addr, CellResult> = HashMap::new();
+    for r in 0..table.rows.len() {
+        for c in 0..table.columns.len() {
+            let Some(formula) = effective_formula(table, r, c) else { continue };
+            let failed = crate::math::channel_refs(formula)
+                .into_iter()
+                .find_map(|name| match definitions.0.get(&name) {
+                    Some(Err(message)) => Some(format!("[{name}] failed: {message}")),
+                    _ => None,
+                });
+            if let Some(error) = failed {
+                preset.insert((r, c), CellResult { value: None, error: Some(error) });
+            }
+        }
+    }
+    evaluate_table_rows(&rows, table, bindings, baseline_row, &preset)
 }
 
 /// The table evaluator itself: row `r` resolves `[Name]` through

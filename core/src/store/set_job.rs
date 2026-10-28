@@ -310,7 +310,11 @@ pub fn run_session_set(
                 None
             }
         },
-        _ => None,
+        (true, None) => {
+            cache_error = Some("result cache off: this engine build has no clean git commit to key results by".into());
+            None
+        }
+        (false, _) => None,
     };
     let catalog = open_catalog_read_only(data_dir);
 
@@ -330,11 +334,18 @@ pub fn run_session_set(
         let has_data = parquet.exists();
 
         let catalog_row = catalog.as_ref().and_then(|c| catalog_identity(c, &member.id));
-        let identity = catalog_row.as_ref().map(|(i, _)| i.clone()).or_else(|| {
-            has_data.then(|| read_session_metadata(&parquet).ok()).flatten().map(|m| {
-                format!("{}|{}|{}", m.blob_sha256, m.importer_version, m.seam_correction_version)
-            })
-        });
+        // The data's identity comes from the file itself whenever the file is
+        // here: the catalog is a deletable index that can lag a re-import, and
+        // a lagging row would key a stale result. The catalog row speaks only
+        // for a member whose data is elsewhere. An unreadable footer is no
+        // identity at all (no cache), never the catalog's.
+        let identity = if has_data {
+            read_session_metadata(&parquet)
+                .ok()
+                .map(|m| format!("{}|{}|{}", m.blob_sha256, m.importer_version, m.seam_correction_version))
+        } else {
+            catalog_row.as_ref().map(|(i, _)| i.clone())
+        };
         let start_utc_ms = catalog_row.as_ref().map(|(_, t)| *t);
         let label = member
             .label
@@ -781,6 +792,69 @@ mod tests {
         // Assert
         assert_eq!(report.members[0].status, MemberStatus::Computed);
         assert_eq!(budget.in_flight_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn result_cache_a_narrower_run_cached_then_every_definition_asked_for_all_of_them_served() {
+        // Arrange — a Tables run stores the table's closure only.
+        let root = temp_root();
+        seed(&root, "s1", vec![1.0, 4.0], 10.0);
+        seed(&root, "s2", vec![3.0], 10.0);
+        seed(&root, "s3", vec![2.0, 9.0], 12.0);
+        let md = MD.replace("lt = sum(lap_time())", "lt = sum(lap_time())\nextra = min([Fork])");
+        let narrow = run(&root, &md, options(true));
+
+        // Act
+        let wide = run(&root, &md, SetJobOptions { scope: PlanScope::AllDefinitions, ..options(true) });
+
+        // Assert
+        assert!(narrow.members.iter().all(|m| m.status == MemberStatus::Computed));
+        assert!(wide.members.iter().all(|m| m.status == MemberStatus::Computed));
+        for r in wide.results.iter().flatten() {
+            assert!(r.0.contains_key("extra"), "{:?}", r.0.keys());
+        }
+        let again = run(&root, &md, SetJobOptions { scope: PlanScope::AllDefinitions, ..options(true) });
+        assert!(again.members.iter().all(|m| m.status == MemberStatus::Cached));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn data_identity_data_parquet_present_and_a_stale_catalog_row_the_footer_keys_the_result() {
+        // Arrange — cache a run, then a catalog row claiming other data
+        // appears. The file did not change, so the cached result still holds.
+        let root = temp_root();
+        seed(&root, "s1", vec![1.0], 10.0);
+        let first = run(&root, MD, options(true));
+        let conn = rusqlite::Connection::open(root.join("catalog.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (session_id TEXT, blob_sha256 TEXT, importer_version TEXT, seam_correction_version TEXT, timestamp_utc_ms INTEGER);
+             INSERT INTO sessions VALUES ('s1', 'stale-blob', '0.0.1', 'v0', 0);",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Act
+        let second = run(&root, MD, options(true));
+
+        // Assert
+        assert_eq!(first.members[0].status, MemberStatus::Computed);
+        assert_eq!(second.members[0].status, MemberStatus::Cached);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_job_no_engine_identity_cache_off_and_said_so() {
+        // Arrange
+        let root = temp_root();
+        seed(&root, "s1", vec![1.0], 10.0);
+
+        // Act
+        let report = run(&root, MD, SetJobOptions { engine_identity: None, ..options(true) });
+
+        // Assert
+        assert!(report.cache_error.as_deref().unwrap_or("").contains("result cache off"));
+        assert!(!root.join("cache").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

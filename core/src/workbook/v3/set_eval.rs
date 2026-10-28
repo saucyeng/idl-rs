@@ -68,11 +68,12 @@ pub struct SetPlan {
     pub defs: Vec<MathCellDef>,
     /// The templates evaluated inside members.
     pub templates: Vec<MemberTemplate>,
-    /// Every name the combine step reads from a member: each template's
-    /// anonymous definition, and each workbook definition a `{…}` template
-    /// names (those templates are evaluated at combine time, over the
-    /// members' kept results). A member whose cached results hold all of
-    /// these needs no evaluation.
+    /// Every name a member's results must hold for this plan: every entry of
+    /// [`Self::defs`], once each (the anonymous templates, the workbook
+    /// definitions `{…}` templates read at combine time, their closure, and
+    /// under [`PlanScope::AllDefinitions`] every definition). A cache hit must
+    /// hold all of them, so a run never serves a narrower earlier run's
+    /// subset.
     pub needed: Vec<String>,
     /// Whether any demanded definition reads a stored channel. `false` means
     /// a member can be evaluated from `session.json` alone (lap and sector
@@ -105,7 +106,6 @@ pub fn plan_set(doc: &WorkbookDoc, scope: PlanScope) -> SetPlan {
     let mut templates = Vec::new();
     let mut template_defs = Vec::new();
     let mut roots: Vec<String> = Vec::new();
-    let mut needed: Vec<String> = Vec::new();
     let mut template_text = Vec::new();
     for cell in doc.cells.iter().filter(|c| c.kind_token == CellKindToken::Table) {
         let Some(table) = &cell.table else { continue };
@@ -117,11 +117,6 @@ pub fn plan_set(doc: &WorkbookDoc, scope: PlanScope) -> SetPlan {
             template_text.push(format!("{}:{}={}", cell.id, col.id, template));
             let refs = channel_refs(template);
             if reads_cells(template) {
-                for r in refs.iter().filter(|r| first_def.contains_key(r.as_str())) {
-                    if !needed.contains(r) {
-                        needed.push(r.clone());
-                    }
-                }
             } else {
                 let def_name = format!("{TEMPLATE_DEF_PREFIX}{}:{}", cell.id, col.id);
                 template_defs.push(MathCellDef {
@@ -132,7 +127,6 @@ pub fn plan_set(doc: &WorkbookDoc, scope: PlanScope) -> SetPlan {
                     unit_annotation: None,
                     order: ci,
                 });
-                needed.push(def_name.clone());
                 templates.push(MemberTemplate { cell_id: cell.id.clone(), column: ci, def_name });
             }
             roots.extend(refs);
@@ -176,6 +170,12 @@ pub fn plan_set(doc: &WorkbookDoc, scope: PlanScope) -> SetPlan {
         )
         .any(|r| !first_def.contains_key(r.as_str()));
     defs.extend(template_defs);
+    let mut needed: Vec<String> = Vec::new();
+    for d in &defs {
+        if !needed.contains(&d.name) {
+            needed.push(d.name.clone());
+        }
+    }
 
     SetPlan { defs, templates, needed, reads_channels, maths_text: maths_text(doc, &template_text) }
 }
@@ -184,10 +184,19 @@ pub fn plan_set(doc: &WorkbookDoc, scope: PlanScope) -> SetPlan {
 /// lines sorted by name (`name = expr # unit: u`), constants sorted by name
 /// with their exact bits, then the session-row templates sorted.
 fn maths_text(doc: &WorkbookDoc, templates: &[String]) -> String {
+    // Sorted by name, but a repeated name keeps its document-order position
+    // among its own duplicates (`name#k`): the first definition of a name is
+    // the one every reference reads (R49), so swapping two duplicates changes
+    // results and must change the key.
+    let mut seen: HashMap<&str, usize> = HashMap::new();
     let mut defs: Vec<String> = doc
         .defs
         .iter()
-        .map(|d| format!("{}={}#{}", d.name, d.expr_text, d.unit_annotation.as_deref().unwrap_or("")))
+        .map(|d| {
+            let k = seen.entry(d.name.as_str()).or_insert(0);
+            *k += 1;
+            format!("{}#{}={}#{}", d.name, *k - 1, d.expr_text, d.unit_annotation.as_deref().unwrap_or(""))
+        })
         .collect();
     defs.sort();
     let mut constants: Vec<String> =
@@ -516,49 +525,95 @@ pub fn set_tables(
         let bindings = vec![RowBinding::default(); row_members.len()];
         let results = evaluate_table_rows(&row_lookups, &model, &bindings, None, &preset);
 
-        let gathers = table.columns.iter().filter_map(|c| c.template.as_deref()).any(|t| t.contains("[]}"));
-        let missing: Vec<String> = row_members
+        // Q3: a `{col[]}` total runs over the rows that have a value. Every
+        // row it leaves out is named, with its reason — not only members
+        // missing from this device.
+        let gathered: Vec<usize> = table
+            .columns
             .iter()
-            .filter(|&&i| matches!(members[i].results, Err(MemberAbsence::Missing)))
-            .map(|&i| members[i].session_id.to_string())
+            .filter_map(|c| c.template.as_deref())
+            .flat_map(gathered_columns)
+            .filter_map(|name| table.columns.iter().position(|c| c.name.as_deref() == Some(name.as_str())))
             .collect();
-        if gathers && !missing.is_empty() {
+        let mut left_out: Vec<(usize, String)> = Vec::new();
+        for (r, &i) in row_members.iter().enumerate() {
+            let reason = gathered.iter().find_map(|&c| {
+                let cell = &results[r][c];
+                cell.value.is_none().then(|| cell.error.clone().unwrap_or_else(|| "no value".into()))
+            });
+            if let Some(reason) = reason {
+                left_out.push((i, reason));
+            }
+        }
+        if !left_out.is_empty() {
+            let missing = left_out
+                .iter()
+                .filter(|(i, _)| matches!(members[*i].results, Err(MemberAbsence::Missing)))
+                .map(|(i, _)| members[*i].session_id.to_string())
+                .collect();
+            let named: Vec<String> =
+                left_out.iter().map(|(i, reason)| format!("{} ({reason})", members[*i].label)).collect();
             warnings.push(SetWarning {
                 cell_id: Some(cell.id.clone()),
-                message: format!(
-                    "Column totals in this table leave out {} session(s) not on this device: {}",
-                    missing.len(),
-                    labels_of(members, &missing)
-                ),
+                message: format!("Column totals in this table leave out {} session(s): {}", left_out.len(), named.join(", ")),
                 missing,
+            });
+        }
+        if matches!(group, Some(None)) {
+            warnings.push(SetWarning {
+                cell_id: Some(cell.id.clone()),
+                missing: Vec::new(),
+                message: format!(
+                    "rowGroup '{}' names no group of the workbook's sessions, so this table has no rows",
+                    table.row_group.as_deref().unwrap_or("")
+                ),
             });
         }
         tables.push(SetTable { cell_id: cell.id.clone(), model, results, row_members });
     }
 
-    let missing: Vec<String> = members
+    // The whole set: every member that has no results, with its reason.
+    let absent: Vec<(&CombineMember, String)> = members
         .iter()
-        .filter(|m| matches!(m.results, Err(MemberAbsence::Missing)))
-        .map(|m| m.session_id.to_string())
+        .filter_map(|m| match &m.results {
+            Ok(_) => None,
+            Err(MemberAbsence::Missing) => Some((m, "not on this device".to_string())),
+            Err(MemberAbsence::NotFound) => Some((m, "no such session".to_string())),
+            Err(MemberAbsence::Failed(e)) => Some((m, e.clone())),
+        })
         .collect();
-    if !missing.is_empty() {
+    if !absent.is_empty() {
         warnings.push(SetWarning {
             cell_id: None,
+            missing: absent
+                .iter()
+                .filter(|(m, _)| matches!(m.results, Err(MemberAbsence::Missing)))
+                .map(|(m, _)| m.session_id.to_string())
+                .collect(),
             message: format!(
-                "{} of {} sessions are not on this device and are left out: {}",
-                missing.len(),
+                "{} of {} sessions have no results and are left out: {}",
+                absent.len(),
                 members.len(),
-                labels_of(members, &missing)
+                absent.iter().map(|(m, r)| format!("{} ({r})", m.label)).collect::<Vec<_>>().join(", ")
             ),
-            missing,
         });
     }
     (tables, warnings)
 }
 
-/// `a, b, c` — the labels of the members whose ids are in `ids`.
-fn labels_of(members: &[CombineMember], ids: &[String]) -> String {
-    members.iter().filter(|m| ids.iter().any(|id| id == m.session_id)).map(|m| m.label).collect::<Vec<_>>().join(", ")
+/// The column names a template gathers whole (`{name[]}`).
+fn gathered_columns(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = template;
+    while let Some(o) = rest.find('{') {
+        rest = &rest[o + 1..];
+        let Some(close) = rest.find('}') else { break };
+        if let Some(name) = rest[..close].strip_suffix("[]") {
+            out.push(name.to_string());
+        }
+        rest = &rest[close + 1..];
+    }
+    out
 }
 
 /// The lookup of a row that has nothing to resolve against.
@@ -709,6 +764,87 @@ mod tests {
         assert_eq!(warnings[0].cell_id.as_deref(), Some("bbbbbbbb"));
         assert_eq!(warnings[0].missing, vec!["s2".to_string()]);
         assert_eq!(warnings.last().unwrap().cell_id, None);
+    }
+
+    #[test]
+    fn session_row_table_a_failed_member_and_a_member_whose_definition_errored_both_named_in_the_totals_warning() {
+        // Arrange — s1 fine, s2 failed (resource_exhausted), s3's `med` errors.
+        let doc = workbook(
+            "med = median([Fork])",
+            r#"{"rowSource":"sessions","columns":[{"id":"c0","name":"med","template":"[med]"},{"id":"c1","name":"tot","template":"sum({med[]})"}],"rows":[],"cells":[]}"#,
+        );
+        let set = parse_session_set(&doc.front_matter_unknown).unwrap().unwrap();
+        let mut evaluated = evaluate(&doc, &[session("s1", vec![1.0])]).into_iter();
+        let mut broken = MemberResults::default();
+        broken.0.insert("table:bbbbbbbb:c0".into(), MemberResult {
+            value: MemberValue::Error(MathEvalError::new(crate::math::MathEvalErrorKind::UnknownChannel, "no Fork")),
+            unit: UnitLabel::Dimensionless,
+        });
+        let results = vec![
+            Ok(evaluated.next().unwrap()),
+            Err(MemberAbsence::Failed("needs 3.0 GB, budget 2.0 GB".into())),
+            Ok(broken),
+        ];
+        let plan = plan_set(&doc, PlanScope::Tables);
+
+        // Act
+        let (tables, warnings) = set_tables(&doc, &set, &plan, &combine(&set, &results));
+
+        // Assert
+        assert_eq!(tables[0].results[0][1].value, Some(1.0));
+        let table_warning = &warnings[0];
+        assert_eq!(table_warning.cell_id.as_deref(), Some("bbbbbbbb"));
+        assert!(table_warning.message.contains("B (") && table_warning.message.contains("C (no Fork)"), "{}", table_warning.message);
+        assert!(table_warning.missing.is_empty());
+        assert!(warnings.last().unwrap().message.contains("needs 3.0 GB"));
+    }
+
+    #[test]
+    fn session_row_table_row_group_naming_no_group_no_rows_and_a_warning() {
+        // Arrange
+        let doc = workbook(
+            "med = median([Fork])",
+            r#"{"rowSource":"sessions","rowGroup":"Day 9","columns":[{"id":"c0","template":"[med]"}],"rows":[],"cells":[]}"#,
+        );
+        let set = parse_session_set(&doc.front_matter_unknown).unwrap().unwrap();
+        let results: Vec<Result<MemberResults, MemberAbsence>> =
+            evaluate(&doc, &[session("s1", vec![1.0]), session("s2", vec![2.0]), session("s3", vec![3.0])])
+                .into_iter()
+                .map(Ok)
+                .collect();
+        let plan = plan_set(&doc, PlanScope::Tables);
+
+        // Act
+        let (tables, warnings) = set_tables(&doc, &set, &plan, &combine(&set, &results));
+
+        // Assert
+        assert!(tables[0].model.rows.is_empty());
+        assert!(warnings.iter().any(|w| w.message.contains("rowGroup 'Day 9'")));
+    }
+
+    #[test]
+    fn member_key_two_duplicate_definitions_swapped_key_changes() {
+        // Act
+        let a = key_of("x = 1\nx = 2", "", TABLE);
+        let b = key_of("x = 2\nx = 1", "", TABLE);
+
+        // Assert
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn plan_needed_lists_every_planned_definition() {
+        // Arrange
+        let doc = workbook("dbl = [Fork] * 2\npeak = max([dbl])\nother = 3", TABLE.replace("[med]", "[peak]").as_str());
+
+        // Act
+        let plan = plan_set(&doc, PlanScope::AllDefinitions);
+
+        // Assert
+        for d in &plan.defs {
+            assert!(plan.needed.contains(&d.name), "{}", d.name);
+        }
+        assert!(plan.needed.contains(&"other".to_string()));
     }
 
     #[test]

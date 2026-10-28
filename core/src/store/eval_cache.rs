@@ -110,9 +110,21 @@ impl EvalCache {
             };
             out.0.insert(name.clone(), result);
         }
-        let mut touch = self.conn.prepare_cached("UPDATE results SET last_used_ms = ?2 WHERE key = ?1")?;
-        for name in names {
-            touch.execute(params![&result_key(member_key, name)[..], now_ms])?;
+        // One transaction for every touch: one fsync per member, not per row.
+        self.conn.execute_batch("BEGIN")?;
+        let touched = (|| -> Result<(), rusqlite::Error> {
+            let mut touch = self.conn.prepare_cached("UPDATE results SET last_used_ms = ?2 WHERE key = ?1")?;
+            for name in names {
+                touch.execute(params![&result_key(member_key, name)[..], now_ms])?;
+            }
+            Ok(())
+        })();
+        match touched {
+            Ok(()) => self.conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(e.into());
+            }
         }
         Ok(Some(out))
     }

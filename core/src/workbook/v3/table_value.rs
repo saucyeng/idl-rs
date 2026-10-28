@@ -25,22 +25,28 @@ use crate::table::{
 use super::host_channel_wire::AxisKind;
 use super::CellEvalResult;
 
-/// Every successfully evaluated definition in `cells`, by name, as a table
-/// cell reads it. A name defined twice keeps its first definition in
-/// document order (R49), as a math cell's `[name]` does.
+/// Every evaluated definition in `cells`, by name, as a table cell reads it:
+/// its value, or its error message when it failed. A name defined twice
+/// keeps its first definition in document order (R49) whatever that one's
+/// outcome, as a math cell's `[name]` does — a failed first definition is
+/// never replaced by a later one, nor by a channel.
 pub fn definition_values(cells: &[CellEvalResult]) -> DefinitionValues {
     let mut out = DefinitionValues::default();
     for def in cells.iter().flat_map(|c| c.defs.iter()) {
-        let Some(view) = &def.value else { continue };
         if out.0.contains_key(&def.name) {
             continue;
         }
-        out.0.insert(def.name.clone(), DefinitionValue {
-            samples: view.v.clone(),
-            sample_rate_hz: def.sample_rate_hz.unwrap_or(0.0),
-            t_us: view.t_us.clone(),
-            axis: if view.axis == AxisKind::Lap { ValueAxis::Lap } else { ValueAxis::Time },
-        });
+        let entry = match (&def.value, &def.error) {
+            (Some(view), _) => Ok(DefinitionValue {
+                samples: view.v.clone(),
+                sample_rate_hz: def.sample_rate_hz.unwrap_or(0.0),
+                t_us: view.t_us.clone(),
+                axis: if view.axis == AxisKind::Lap { ValueAxis::Lap } else { ValueAxis::Time },
+            }),
+            (None, Some(e)) => Err(e.message.clone()),
+            (None, None) => Err("no value".to_string()),
+        };
+        out.0.insert(def.name.clone(), entry);
     }
     out
 }
@@ -139,6 +145,38 @@ mod tests {
 
         // Assert
         assert_eq!(results[0][0].value, Some(42.0));
+    }
+
+    #[test]
+    fn table_template_a_failed_definition_named_like_a_channel_is_its_error_never_the_channel() {
+        // Arrange — `Speed` fails (unknown function), and a `Speed` channel exists.
+        let md = MD.replace("Speed = 42", "Speed = nosuchfn(1)");
+        let h = handle(vec![1.0, 5.0, 3.0]);
+        let (doc, structural) = parse_workbook(&md).unwrap();
+        let cells = eval_cells(&doc, &structural, &h, &MathLapContext::empty());
+
+        // Act
+        let (_, results) =
+            evaluate_table_in_window(&one_row_table("max([Speed])"), &definition_values(&cells), &h, &MathLapContext::empty());
+
+        // Assert
+        assert_eq!(results[0][0].value, None);
+        assert!(results[0][0].error.as_deref().unwrap().starts_with("[Speed] failed:"), "{:?}", results[0][0]);
+    }
+
+    #[test]
+    fn definition_values_a_duplicated_name_whose_first_definition_failed_keeps_the_failure() {
+        // Arrange
+        let md = "---\nid: 9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d\nname: T\n---\n\n```math id=aaaaaaaa\nSpeed = nosuchfn(1)\n```\n\n```math id=bbbbbbbb\nSpeed = 7\n```\n";
+        let h = handle(vec![1.0]);
+        let (doc, structural) = parse_workbook(md).unwrap();
+        let cells = eval_cells(&doc, &structural, &h, &MathLapContext::empty());
+
+        // Act
+        let defs = definition_values(&cells);
+
+        // Assert
+        assert!(defs.0["Speed"].is_err());
     }
 
     #[test]

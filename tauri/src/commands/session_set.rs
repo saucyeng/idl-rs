@@ -203,6 +203,14 @@ pub fn eval_session_set_via(
     let groups = set.groups.iter().map(|g| SetGroupDto { name: g.name.clone() }).collect();
 
     let cancel = runs.begin(workbook_id);
+    // Forgets this run however the call ends, a panic included.
+    struct EndRun<'a>(&'a SetRuns, &'a str, Arc<AtomicBool>);
+    impl Drop for EndRun<'_> {
+        fn drop(&mut self) {
+            self.0.end(self.1, &self.2);
+        }
+    }
+    let _end = EndRun(runs, workbook_id, cancel.clone());
     let options = SetJobOptions {
         use_cache: true,
         engine_identity: engine_identity(),
@@ -211,7 +219,6 @@ pub fn eval_session_set_via(
         budget: Some(budget),
     };
     let report = run_session_set(data_dir, &doc, &set, options, progress);
-    runs.end(workbook_id, &cancel);
     Ok(result_from(report, groups))
 }
 
