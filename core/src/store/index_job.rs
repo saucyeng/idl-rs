@@ -756,7 +756,7 @@ mod tests {
                 let budget = budget.clone();
                 let peak = peak.clone();
                 scope.spawn(move || {
-                    let guard = budget.acquire(600_000, "test");
+                    let guard = DecodeBudget::acquire(&*budget, 600_000, "test");
                     let seen = budget.in_flight_bytes();
                     let mut peak = peak.lock().unwrap();
                     *peak = (*peak).max(seen);
@@ -778,7 +778,7 @@ mod tests {
         let budget = ByteBudget::new(1_000);
 
         // Act
-        let guard = budget.acquire(50_000, "one oversized decode");
+        let guard = DecodeBudget::acquire(&budget, 50_000, "one oversized decode");
 
         // Assert
         assert_eq!(budget.in_flight_bytes(), 50_000);
