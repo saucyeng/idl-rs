@@ -366,11 +366,24 @@ const WORKBOOK_FILE_ARG: Arg = Arg {
 };
 
 /// `--session`, where a workbook command needs data to evaluate against.
-const SESSION_PATH_FLAG: Flag = Flag::value(
-    "session",
-    ValueKind::Path,
-    "Session to evaluate against: an `.idl0` file, or a session id inside --data-dir",
-);
+const SESSION_PATH_FLAG: Flag = Flag {
+    long: "session",
+    kind: Some(ValueKind::Path),
+    repeatable: true,
+    choices: &[],
+    default: None,
+    help: "Session to evaluate against: an `.idl0` file, or a session id inside --data-dir (its data.parquet, laps from session.json); repeat it to evaluate the workbook's session tables over those sessions",
+};
+
+/// `--values` on `workbook eval` (engine-gaps N7): print every rank-0 and
+/// `[lap]` result as `name  value  unit`, per session.
+const VALUES_FLAG: Flag =
+    Flag::switch("values", "Print every reduced (rank-0) and per-lap result as `name  value  unit`");
+
+/// `--no-cache` on `workbook eval`: neither read nor write the session-set
+/// result cache under `<data>/cache/eval/`.
+const NO_CACHE_FLAG: Flag =
+    Flag::switch("no-cache", "Do not read or write the session-set result cache (writes nothing to the data directory)");
 
 /// `--track`, where lap-bound rows need a track artifact.
 const TRACK_PATH_FLAG: Flag = Flag::value(
@@ -647,7 +660,7 @@ pub const COMMANDS: &[CommandRow] = &[
         // id `workbook.new`, so the tier is that ruling's, not this row's.
         tier: Tier::Occasional,
         status: Status::Current,
-        data_dir: false,
+        data_dir: true,
         writer: true,
     },
     CommandRow {
@@ -660,7 +673,7 @@ pub const COMMANDS: &[CommandRow] = &[
         help: "Parse a workbook and report every structural problem",
         tier: Tier::Occasional,
         status: Status::Current,
-        data_dir: false,
+        data_dir: true,
         writer: false,
     },
     CommandRow {
@@ -673,20 +686,20 @@ pub const COMMANDS: &[CommandRow] = &[
         help: "List a workbook's cells in document order",
         tier: Tier::Occasional,
         status: Status::Current,
-        data_dir: false,
+        data_dir: true,
         writer: false,
     },
     CommandRow {
         noun: "workbook",
         verb: "eval",
         args: &[WORKBOOK_FILE_ARG],
-        flags: &[SESSION_PATH_FLAG, TRACK_PATH_FLAG, MAIN_LAP_FLAG],
+        flags: &[SESSION_PATH_FLAG, TRACK_PATH_FLAG, MAIN_LAP_FLAG, VALUES_FLAG, NO_CACHE_FLAG],
         core_fn: "workbook::v3::eval_cells",
         json_shape: Some("WorkbookEvalReport"),
-        help: "Evaluate a workbook's math and table cells against a session",
+        help: "Evaluate a workbook against a session, or its session tables over its `sessions` set",
         tier: Tier::Core,
         status: Status::Current,
-        data_dir: false,
+        data_dir: true,
         writer: false,
     },
     CommandRow {
@@ -709,7 +722,7 @@ pub const COMMANDS: &[CommandRow] = &[
         help: "Print one cell's evaluated series or table",
         tier: Tier::Occasional,
         status: Status::Current,
-        data_dir: false,
+        data_dir: true,
         writer: false,
     },
     CommandRow {
@@ -735,7 +748,7 @@ pub const COMMANDS: &[CommandRow] = &[
         help: "Write a workbook out as Markdown or as evaluated JSON",
         tier: Tier::Occasional,
         status: Status::Current,
-        data_dir: false,
+        data_dir: true,
         writer: true,
     },
     // --- track ------------------------------------------------------------
