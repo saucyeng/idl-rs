@@ -37,12 +37,19 @@ pub struct Row {
 /// reader unable to tell whether `1` meant the first lap or the second; the
 /// old key is still **accepted on read** (`serde(alias)`), so no stored table
 /// fails to parse, and the writer emits the new one.
+///
+/// **`lap_number` is absent on a session row** (C2 §4, `rowSource:
+/// "sessions"`): such a row is a whole session, not a lap of one, so its
+/// context is `{ sessionId }` alone. An authored row with no `lapNumber`
+/// binds no window.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RowContext {
+    /// The session the row reads (C4 `<data>/sessions/<id>`).
     pub session_id: String,
-    #[serde(alias = "lapIndex")]
-    pub lap_number: u32,
+    /// The 1-based lap the row is a row of; `None` for a whole-session row.
+    #[serde(alias = "lapIndex", default, skip_serializing_if = "Option::is_none")]
+    pub lap_number: Option<u32>,
 }
 
 /// Where a table's rows come from (C2 §4, ruling R217 item 2.1).
@@ -58,6 +65,13 @@ pub enum RowSource {
     /// order. [`TableModel::rows`] is ignored and every cell evaluates its
     /// column's `template`.
     WindowLaps,
+    /// One row per member of the workbook's session set (C2 §1 `sessions`),
+    /// in set order, optionally restricted to one group by
+    /// [`TableModel::row_group`] (C2 §4, session-sets spec §5.1). Each
+    /// row's templates are evaluated in that member's whole session, with
+    /// `[name]` resolving to a workbook definition first. Evaluated by
+    /// [`crate::workbook::v3::set_eval`], never by the per-window path.
+    Sessions,
 }
 
 /// One cell. A `literal` short-circuits evaluation; otherwise the effective
@@ -90,6 +104,11 @@ pub struct TableModel {
     /// [`RowSource::WindowLaps`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main_row_id: Option<String>,
+    /// Under [`RowSource::Sessions`], the name of the one set group whose
+    /// members are the rows; `None` means every member (C2 §4). Ignored
+    /// under the other row sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_group: Option<String>,
 }
 
 /// The reserved [`TableModel::main_row_id`] naming the fastest derived row

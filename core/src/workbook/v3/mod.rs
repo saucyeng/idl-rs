@@ -19,7 +19,10 @@ pub mod math_cell;
 pub mod plan;
 pub mod prose;
 pub mod resolve;
+pub mod session_set;
+pub mod set_eval;
 pub mod table_cell;
+pub mod table_value;
 
 pub use cell::{CellDoc, CellKindToken};
 pub use constants::merge_constants;
@@ -231,6 +234,13 @@ pub fn parse_workbook(markdown: &str) -> Result<(WorkbookDoc, Vec<WorkbookError>
     // WorkbookDoc.constants (Task 8's host_constants source).
     let (constants, constant_errors) = merge_constants(&front_matter.constants, &const_lines);
     errors.extend(constant_errors);
+
+    // C2 §1's `sessions` key stays in `front_matter_unknown` (R135); only its
+    // shape is checked here, as a front-matter-scoped structural error, so a
+    // malformed set never stops the per-session cells from evaluating.
+    if let Err(e) = session_set::parse_session_set(&front_matter.unknown) {
+        errors.push(e);
+    }
 
     let doc = WorkbookDoc {
         id: front_matter.id,

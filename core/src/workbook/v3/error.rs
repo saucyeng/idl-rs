@@ -44,6 +44,13 @@ pub enum WorkbookErrorKind {
     /// `InvalidFrontMatter`/`InvalidCellId` and L3-R4's `workbook_*` C3
     /// kinds — this lane codes it now, the lead lands the spec text.
     InvalidTableJson,
+    /// A session id appears more than once in the front-matter `sessions`
+    /// set (C2 §1, session-sets spec §2.2). Scoped to `"front-matter"`.
+    DuplicateSetMember,
+    /// The front-matter `sessions` key does not have the C2 §1 shape (a list
+    /// of groups or of members, unique group names). Scoped to
+    /// `"front-matter"`.
+    InvalidSessionSet,
 }
 
 /// Names a `math`-cell definition or a `const` declaration may not use (C2
@@ -157,6 +164,24 @@ pub fn unsupported_workbook_version(n: u32) -> WorkbookError {
 /// `table` cell; `detail` is the `serde_json::Error`'s `Display` text.
 pub fn invalid_table_json(cell_id: &str, detail: impl std::fmt::Display) -> WorkbookError {
     WorkbookError::new(cell_id, WorkbookErrorKind::InvalidTableJson, format!("Table cell JSON is malformed: {detail}"))
+}
+
+/// `DuplicateSetMember` (C2 §1) — `session_id` is listed twice in the
+/// front-matter `sessions` set.
+pub fn duplicate_set_member(session_id: &str) -> WorkbookError {
+    WorkbookError::front_matter(
+        WorkbookErrorKind::DuplicateSetMember,
+        format!("Session '{session_id}' is listed more than once in the workbook's sessions"),
+    )
+}
+
+/// `InvalidSessionSet` (C2 §1) — `detail` says what is wrong with the
+/// front-matter `sessions` key.
+pub fn invalid_session_set(detail: impl std::fmt::Display) -> WorkbookError {
+    WorkbookError::front_matter(
+        WorkbookErrorKind::InvalidSessionSet,
+        format!("The workbook's sessions list is malformed: {detail}"),
+    )
 }
 
 #[cfg(test)]

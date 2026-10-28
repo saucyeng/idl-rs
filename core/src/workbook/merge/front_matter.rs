@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::workbook::v3::front_matter::{ConstantRaw, FrontMatter, UnitsPref};
+use crate::workbook::v3::session_set::{merge_session_sets, parse_session_set_value, SESSIONS_KEY};
 
 use super::{MergeError, MergeWarning};
 
@@ -149,6 +150,21 @@ fn merge_unknown(
 
     let mut merged = BTreeMap::new();
     for key in keys {
+        // C2 §7.1's `sessions` rule (session-sets spec §2.2): merged per group
+        // and per member, never a conflict. A side whose value does not parse
+        // falls through to the whole-value rule below.
+        if key == SESSIONS_KEY {
+            let parsed = |m: &BTreeMap<String, serde_yaml_ng::Value>| match m.get(key) {
+                None => Ok(None),
+                Some(v) => parse_session_set_value(v).map(Some),
+            };
+            if let (Ok(l), Ok(p), Ok(b)) = (parsed(local), parsed(peer), parsed(base)) {
+                if let Some(set) = merge_session_sets(l.as_ref(), p.as_ref(), b.as_ref()) {
+                    merged.insert(key.clone(), set.to_yaml());
+                }
+                continue;
+            }
+        }
         let base_value = base.get(key).cloned();
         let local_value = local.get(key).cloned();
         let peer_value = peer.get(key).cloned();

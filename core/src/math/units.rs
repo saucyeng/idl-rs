@@ -439,7 +439,7 @@ impl UnknownReason {
 // `CellDefResult`'s own `UnitLabel` mirror (`tauri/src/commands/workbook.rs`)
 // has. Same shape as that mirror (`tag = "state"`) so the two paths render
 // identically JS-side.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum UnitLabel {
     /// A determined, non-empty unit, rendered from [`UnitExpr`] — `"mm"`,

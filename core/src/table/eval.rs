@@ -5,10 +5,11 @@
 //! values and `[Channel]` references to the row's lap-windowed samples.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::math::eval::LapSpan;
 use crate::math::parse::parse;
-use crate::math::{evaluate_scalar, ChannelLookup, LookupChannel, MathLapContext};
+use crate::math::{evaluate_scalar, ChannelLookup, LookupChannel, MathLapContext, ValueAxis};
 use crate::session::handle::SessionHandle;
 use crate::table::model::{Cell, CellResult, Row, RowContext, RowSource, TableModel, TableProblem, MAIN_ROW_FASTEST};
 
@@ -135,12 +136,14 @@ pub(crate) fn topo_order(t: &TableModel) -> Result<Vec<Addr>, Vec<Addr>> {
     Ok(order)
 }
 
-/// Lookup for one cell: cell values from already-evaluated cells, plus channels
-/// sliced to this row's window. `[Channel]` → row-windowed samples; `{cell}` →
-/// a prior result; `{col[]}` → a whole column's prior results.
+/// Lookup for one cell: cell values from already-evaluated cells, plus the
+/// row's own `[Name]` resolution. `[Name]` → whatever `row_source` resolves
+/// (row-windowed channels, and workbook definitions first when the caller
+/// layered them on, ruling Q6); `{cell}` → a prior result; `{col[]}` → a
+/// whole column's prior results.
 struct CellLookup<'a> {
-    handle: &'a SessionHandle,
-    window: Option<(f64, f64)>,
+    /// This row's `[Name]` resolution.
+    row_source: &'a dyn ChannelLookup,
     /// Resolved scalar per evaluated cell address.
     values: &'a HashMap<Addr, f64>,
     /// Column index by name (for `{name}` same-row and `{name[]}`).
@@ -152,6 +155,31 @@ struct CellLookup<'a> {
 }
 
 impl ChannelLookup for CellLookup<'_> {
+    fn lookup(&self, name: &str) -> Option<LookupChannel> {
+        self.row_source.lookup(name)
+    }
+    fn estimator_channel(&self, channel_id: &str) -> Option<LookupChannel> {
+        self.row_source.estimator_channel(channel_id)
+    }
+
+    fn lookup_cell(&self, body: &str) -> Option<f64> {
+        let addr = single_addr(self, body)?;
+        self.values.get(&addr).copied()
+    }
+    fn lookup_cell_column(&self, name: &str) -> Option<Vec<f64>> {
+        let ci = *self.col_by_name.get(name)?;
+        Some((0..self.rows).filter_map(|ri| self.values.get(&(ri, ci)).copied()).collect())
+    }
+}
+
+/// A session's channels sliced to one row's window: `[Channel]` →
+/// row-windowed samples.
+struct WindowedHandle<'a> {
+    handle: &'a SessionHandle,
+    window: Option<(f64, f64)>,
+}
+
+impl ChannelLookup for WindowedHandle<'_> {
     fn lookup(&self, name: &str) -> Option<LookupChannel> {
         let samples = match self.window {
             Some((t0, t1)) => self.handle.slice_by_time(name, t0, t1),
@@ -178,14 +206,68 @@ impl ChannelLookup for CellLookup<'_> {
         self.handle.estimator_channel(channel_id)?;
         self.lookup(channel_id)
     }
+}
 
-    fn lookup_cell(&self, body: &str) -> Option<f64> {
-        let addr = single_addr(self, body)?;
-        self.values.get(&addr).copied()
+/// One evaluated workbook definition, as a table cell reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DefinitionValue {
+    /// The values (8 B each).
+    pub samples: Arc<[f64]>,
+    /// Sample rate, Hz; `0.0` for a reduced value.
+    pub sample_rate_hz: f64,
+    /// Per-sample time, microseconds since the session's first sample; lap
+    /// numbers on a [`ValueAxis::Lap`] value; empty for a scalar.
+    pub t_us: Arc<[i64]>,
+    /// What `t_us` measures.
+    pub axis: ValueAxis,
+}
+
+/// The workbook definitions a table's `[name]` resolves to before a stored
+/// channel (C2 §4, ruling Q6 of 2026-10-28: a table cell resolves names the
+/// way a math cell does). Keyed by definition name; the first definition of
+/// a duplicated name is the one kept (R49).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DefinitionValues(pub HashMap<String, DefinitionValue>);
+
+/// [`DefinitionValues`] layered over a row's channels. A `[t]` definition is
+/// sliced to the row's window by its own recorded times (inclusive, as
+/// [`SessionHandle::slice_by_time`] slices a channel); a reduced or `[lap]`
+/// definition is read as it is.
+struct DefinitionsOverRow<'a> {
+    defs: &'a DefinitionValues,
+    window: Option<(f64, f64)>,
+    base: &'a dyn ChannelLookup,
+}
+
+impl ChannelLookup for DefinitionsOverRow<'_> {
+    fn lookup(&self, name: &str) -> Option<LookupChannel> {
+        let Some(def) = self.defs.0.get(name) else {
+            return self.base.lookup(name);
+        };
+        let timed = def.axis == ValueAxis::Time && !def.t_us.is_empty() && def.t_us.len() == def.samples.len();
+        match self.window {
+            Some((t0, t1)) if timed => {
+                let (lo, hi) = ((t0 * 1e6).ceil() as i64, (t1 * 1e6).floor() as i64);
+                let start = def.t_us.partition_point(|&t| t < lo);
+                let end = def.t_us.partition_point(|&t| t <= hi);
+                if start >= end {
+                    return None;
+                }
+                Some(LookupChannel {
+                    samples: Arc::from(&def.samples[start..end]),
+                    sample_rate_hz: def.sample_rate_hz,
+                    t_us: Arc::from(&def.t_us[start..end]),
+                })
+            }
+            _ => Some(LookupChannel {
+                samples: def.samples.clone(),
+                sample_rate_hz: def.sample_rate_hz,
+                t_us: def.t_us.clone(),
+            }),
+        }
     }
-    fn lookup_cell_column(&self, name: &str) -> Option<Vec<f64>> {
-        let ci = *self.col_by_name.get(name)?;
-        Some((0..self.rows).filter_map(|ri| self.values.get(&(ri, ci)).copied()).collect())
+    fn estimator_channel(&self, channel_id: &str) -> Option<LookupChannel> {
+        self.base.estimator_channel(channel_id)
     }
 }
 
@@ -271,7 +353,7 @@ pub fn plan_rows(
                         // also survives an ignored or renumbered lap, where a
                         // position quietly slides to a neighbour instead of
                         // resolving to nothing.
-                        match session_laps.iter().find(|l| l.lap_number == ctx.lap_number) {
+                        match ctx.lap_number.and_then(|n| session_laps.iter().find(|l| l.lap_number == n)) {
                             Some(lap) => RowBinding {
                                 window: Some((lap.start_secs, lap.end_secs)),
                                 lap: Some(lap.clone()),
@@ -296,7 +378,7 @@ pub fn plan_rows(
                         id: format!("{}#{}", window.session_id, lap.lap_number),
                         context: Some(RowContext {
                             session_id: window.session_id.clone(),
-                            lap_number: lap.lap_number,
+                            lap_number: Some(lap.lap_number),
                         }),
                     });
                     bindings.push(RowBinding {
@@ -307,6 +389,12 @@ pub fn plan_rows(
             }
             let cells = vec![vec![Cell::default(); table.columns.len()]; rows.len()];
             (TableModel { columns: table.columns.clone(), rows, cells, ..table.clone() }, bindings)
+        }
+        // A session-row table is a function of the workbook's session set, not
+        // of a window: `workbook::v3::set_eval` plans and evaluates it. On the
+        // per-window path it has no rows.
+        RowSource::Sessions => {
+            (TableModel { rows: Vec::new(), cells: Vec::new(), ..table.clone() }, Vec::new())
         }
     }
 }
@@ -367,6 +455,51 @@ pub fn evaluate_table_multi(
     bindings: &[RowBinding],
     baseline_row: Option<usize>,
 ) -> Vec<Vec<CellResult>> {
+    let windowed: Vec<WindowedHandle> = (0..table.rows.len())
+        .map(|r| WindowedHandle {
+            handle: handles[row_handles.get(r).copied().unwrap_or(0)],
+            window: bindings.get(r).and_then(|b| b.window),
+        })
+        .collect();
+    let rows: Vec<&dyn ChannelLookup> = windowed.iter().map(|w| w as &dyn ChannelLookup).collect();
+    evaluate_table_rows(&rows, table, bindings, baseline_row, &HashMap::new())
+}
+
+/// [`evaluate_table_multi`] over one session, with `[name]` resolving to the
+/// workbook's evaluated definitions first and the session's channels second
+/// (C2 §4, ruling Q6 of 2026-10-28) — the resolution a math cell uses. A `[t]`
+/// definition is sliced to each row's window; a reduced one reads as it is.
+pub fn evaluate_table_with_definitions(
+    handle: &SessionHandle,
+    definitions: &DefinitionValues,
+    table: &TableModel,
+    bindings: &[RowBinding],
+    baseline_row: Option<usize>,
+) -> Vec<Vec<CellResult>> {
+    let windowed: Vec<WindowedHandle> = (0..table.rows.len())
+        .map(|r| WindowedHandle { handle, window: bindings.get(r).and_then(|b| b.window) })
+        .collect();
+    let layered: Vec<DefinitionsOverRow> = windowed
+        .iter()
+        .map(|w| DefinitionsOverRow { defs: definitions, window: w.window, base: w })
+        .collect();
+    let rows: Vec<&dyn ChannelLookup> = layered.iter().map(|l| l as &dyn ChannelLookup).collect();
+    evaluate_table_rows(&rows, table, bindings, baseline_row, &HashMap::new())
+}
+
+/// The table evaluator itself: row `r` resolves `[Name]` through
+/// `row_lookups[r]`, and `{cell}`/`{col[]}` through the cells evaluated so
+/// far. `preset` holds cells whose result is already known (a session-row
+/// template evaluated inside its member, `workbook::v3::set_eval`): they are
+/// not evaluated again, and their values feed `{…}` references like any
+/// other cell's. A row with no entry in `row_lookups` evaluates nothing.
+pub fn evaluate_table_rows(
+    row_lookups: &[&dyn ChannelLookup],
+    table: &TableModel,
+    bindings: &[RowBinding],
+    baseline_row: Option<usize>,
+    preset: &HashMap<Addr, CellResult>,
+) -> Vec<Vec<CellResult>> {
     let cols = table.columns.len();
     let mut out: Vec<Vec<CellResult>> =
         table.rows.iter().map(|_| vec![CellResult { value: None, error: None }; cols]).collect();
@@ -392,9 +525,9 @@ pub fn evaluate_table_multi(
     // One context per row, not one per table: a row bound to a lap makes the
     // lap-shaped builtins scalars *for that row* (ruling R217 item 3), and the
     // lap they speak for differs row to row. `main_lap_bounds` stays empty —
-    // the row's window narrows channels in `CellLookup` (which reports rate 0,
-    // so `window_index_range` never narrows again) and setting it here would
-    // window an already-windowed slice a second time.
+    // the row's window narrows channels in `WindowedHandle` (which reports
+    // rate 0, so `window_index_range` never narrows again) and setting it here
+    // would window an already-windowed slice a second time.
     let row_ctx = |binding: &RowBinding| MathLapContext {
         baseline_row,
         laps: binding.lap.clone().into_iter().collect(),
@@ -402,6 +535,13 @@ pub fn evaluate_table_multi(
         ..MathLapContext::empty()
     };
     for (r, c) in order {
+        if let Some(known) = preset.get(&(r, c)) {
+            if let Some(v) = known.value {
+                values.insert((r, c), v);
+            }
+            out[r][c] = known.clone();
+            continue;
+        }
         // Literal short-circuit.
         if let Some(v) = table.cells[r][c].literal {
             values.insert((r, c), v);
@@ -411,13 +551,13 @@ pub fn evaluate_table_multi(
         let Some(formula) = effective_formula(table, r, c) else {
             continue; // blank cell
         };
-        // Row r resolves `[Channel]` against its own session handle.
-        let handle = handles[row_handles.get(r).copied().unwrap_or(0)];
+        let Some(row_source) = row_lookups.get(r).copied() else {
+            continue;
+        };
         let binding = bindings.get(r).cloned().unwrap_or_default();
         let lap_ctx = row_ctx(&binding);
         let lookup = CellLookup {
-            handle,
-            window: binding.window,
+            row_source,
             values: &values,
             col_by_name: &col_by_name,
             row: r,
@@ -565,13 +705,14 @@ mod tests {
         let t = TableModel {
             columns: vec![],
             rows: vec![
-                Row { id: "r0".into(), context: Some(RowContext { session_id: "s".into(), lap_number: 1 }) },
+                Row { id: "r0".into(), context: Some(RowContext { session_id: "s".into(), lap_number: Some(1) }) },
                 Row { id: "r1".into(), context: None },
-                Row { id: "r2".into(), context: Some(RowContext { session_id: "s".into(), lap_number: 9 }) },
+                Row { id: "r2".into(), context: Some(RowContext { session_id: "s".into(), lap_number: Some(9) }) },
             ],
             cells: vec![vec![], vec![], vec![]],
             row_source: RowSource::Authored,
             main_row_id: None,
+            row_group: None,
         };
 
         // Act
@@ -595,6 +736,7 @@ mod tests {
             cells: vec![],
             row_source: RowSource::Authored,
             main_row_id: None,
+            row_group: None,
         };
 
         // Act + Assert
@@ -610,6 +752,7 @@ mod tests {
             cells: vec![vec![Cell { formula: Some("max([Fork)".into()), ..Default::default() }]],
             row_source: RowSource::Authored,
             main_row_id: None,
+            row_group: None,
         };
 
         // Act + Assert
@@ -625,6 +768,7 @@ mod tests {
             cells: vec![vec![Cell { formula: Some("{nope}".into()), ..Default::default() }]],
             row_source: RowSource::Authored,
             main_row_id: None,
+            row_group: None,
         };
 
         // Act + Assert
@@ -643,6 +787,7 @@ mod tests {
             ],
             row_source: RowSource::Authored,
             main_row_id: None,
+            row_group: None,
         };
 
         // Act + Assert
@@ -658,6 +803,7 @@ mod tests {
             cells: vec![vec![Cell { literal: Some(1.0), ..Default::default() }]],
             row_source: RowSource::Authored,
             main_row_id: None,
+            row_group: None,
         };
 
         // Act + Assert
@@ -683,6 +829,7 @@ mod tests {
             ],
             row_source: RowSource::Authored,
             main_row_id: None,
+            row_group: None,
         };
         let order = topo_order(&t).unwrap();
         let p0 = order.iter().position(|&a| a == (0, 0)).unwrap();
@@ -705,6 +852,7 @@ mod tests {
             ],
             row_source: RowSource::Authored,
             main_row_id: None,
+            row_group: None,
         };
         assert!(matches!(topo_order(&t), Err(ref c) if !c.is_empty()));
     }
@@ -742,6 +890,7 @@ mod tests {
             cells: vec![vec![Cell::default(), Cell::default()]],
             row_source: RowSource::Authored,
             main_row_id: None,
+            row_group: None,
         };
         let res = evaluate_table(&h, &t, &[windowed(0.0, 1.0)]);
         assert_eq!(res[0][0].value, Some(9.0)); // max over [0..9]
@@ -762,6 +911,7 @@ mod tests {
             ],
             row_source: RowSource::Authored,
             main_row_id: None,
+            row_group: None,
         };
         // No channels needed — cycle short-circuits before evaluation.
         let meta = SessionMetaInput {
@@ -820,6 +970,7 @@ mod tests {
             ],
             row_source: RowSource::Authored,
             main_row_id: None,
+            row_group: None,
         };
 
         // Act — full-channel windows; Main row = 0 (session A, fmax 9).
@@ -861,6 +1012,7 @@ mod tests {
             cells: vec![vec![Cell::default()]],
             row_source: RowSource::Authored,
             main_row_id: None,
+            row_group: None,
         };
 
         // Act
@@ -885,6 +1037,7 @@ mod tests {
             cells: vec![vec![Cell::default()]],
             row_source: RowSource::WindowLaps,
             main_row_id: main_row_id.map(str::to_string),
+            row_group: None,
         }
     }
 
@@ -905,7 +1058,7 @@ mod tests {
         assert_eq!(ids, vec!["s1#2", "s1#3", "s2#1"]);
         assert_eq!(
             planned.rows[2].context,
-            Some(RowContext { session_id: "s2".into(), lap_number: 1 })
+            Some(RowContext { session_id: "s2".into(), lap_number: Some(1) })
         );
         assert_eq!(bindings[1].window, Some((90.0, 175.0)));
         assert_eq!(bindings.len(), 3);
@@ -959,6 +1112,7 @@ mod tests {
         let t = TableModel {
             row_source: RowSource::Authored,
             main_row_id: Some("r1".into()),
+            row_group: None,
             rows: vec![Row { id: "r0".into(), context: None }, Row { id: "r1".into(), context: None }],
             cells: vec![vec![Cell::default()], vec![Cell::default()]],
             ..derived_table(None)

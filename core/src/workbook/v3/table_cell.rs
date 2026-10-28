@@ -53,7 +53,7 @@ mod tests {
 
         // Assert
         assert_eq!(table.columns[0].template, None);
-        assert_eq!(table.rows[0].context, Some(RowContext { session_id: "s1".to_string(), lap_number: 1 }));
+        assert_eq!(table.rows[0].context, Some(RowContext { session_id: "s1".to_string(), lap_number: Some(1) }));
         assert_eq!(table.cells[0][1], Cell::default());
     }
 
@@ -69,7 +69,7 @@ mod tests {
 
         // Assert — the rename fixed the name, not the numbers (C2 §4, R217 item 2.4).
         assert_eq!(from_old.rows[0].context, from_new.rows[0].context);
-        assert_eq!(from_old.rows[0].context.as_ref().unwrap().lap_number, 4);
+        assert_eq!(from_old.rows[0].context.as_ref().unwrap().lap_number, Some(4));
     }
 
     #[test]

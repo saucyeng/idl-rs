@@ -268,12 +268,12 @@ fn cmd_eval(
                 // Matched by lap *number*, the way `plan_rows` resolves it
                 // (C2 §4, ruling R217 item 2.4) — a count comparison would
                 // still pass for a number no lap carries after a renumber.
-                if !laps.iter().any(|l| l.lap_number == ctx.lap_number) {
+                if let Some(n) = ctx.lap_number.filter(|n| !laps.iter().any(|l| l.lap_number == *n)) {
                     warnings.push(Warning {
                         kind: "lap_out_of_range".into(),
                         message: format!(
-                            "table '{}' row {r} lap {} matches none of the {} detected laps",
-                            wt.block_id, ctx.lap_number, laps.len()
+                            "table '{}' row {r} lap {n} matches none of the {} detected laps",
+                            wt.block_id, laps.len()
                         ),
                     });
                 }
@@ -486,6 +486,7 @@ mod tests {
                 cells: (0..rows).map(|_| vec![]).collect(),
                 row_source: idl_rs::table::RowSource::Authored,
                 main_row_id: None,
+                row_group: None,
             },
         }
     }
