@@ -169,7 +169,12 @@ pub fn eval_cells_planned(
     observer: Option<&dyn EvalObserver>,
 ) -> Result<Vec<CellEvalResult>, EvalCancelled> {
     let mut resolved = resolve_planned(&doc.defs, &doc.constants, lookup, lap_ctx, plan, observer)?;
-    let mut resolved_units = super::resolve::resolve_workbook_units(&doc.defs, &doc.constants, lookup);
+    // Units only for the definitions in scope: inferring one asks the lookup
+    // for its channels' units, which a lazy session answers by decoding them,
+    // and a closure must not decode channels it does not read.
+    let scoped: Vec<super::MathCellDef> =
+        doc.defs.iter().zip(&plan.in_scope).filter(|(_, &on)| on).map(|(d, _)| d.clone()).collect();
+    let mut resolved_units = super::resolve::resolve_workbook_units(&scoped, &doc.constants, lookup);
 
     // Step 2: group structural errors by owning cell_id up front, dropping
     // the front-matter-scoped ones (G9.1) — a single pass over `structural`
@@ -227,7 +232,7 @@ fn math_cell_defs(
             let result = resolved.remove(&key)?;
             let (unit, unit_notes) = resolved_units
                 .remove(&key)
-                .expect("resolve_workbook_units stores an entry for every (cell_id, name) key");
+                .expect("resolve_workbook_units stores an entry for every in-scope (cell_id, name) key");
             let unit = crate::math::units::UnitLabel::from(&unit);
             Some(match result {
                 Ok(value) => {

@@ -52,7 +52,7 @@
 //! each worker reserving through the same byte semaphore, so they queue on
 //! memory rather than failing on it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -197,6 +197,14 @@ struct Inner {
     /// ([`SessionCache::admit_evaluation`], evaluation-memory spec §4.2.G):
     /// each holds its planned estimate for as long as it runs.
     eval_reserved_bytes: u64,
+    /// Channels pinned by running evaluations ([`SessionCache::pin_inputs`]),
+    /// with how many pins each has: never evicted while pinned.
+    pins: HashMap<Key, usize>,
+    /// Tickets of the evaluations waiting for admission, oldest first: only
+    /// the front one may be admitted (first come, first served).
+    admit_queue: VecDeque<u64>,
+    /// The next admission ticket.
+    next_ticket: u64,
 }
 
 /// Everything a cache is, behind one `Arc` — see [`SessionCache`]'s note on
@@ -311,6 +319,9 @@ impl SessionCache {
                     budget_bytes,
                     in_flight_bytes: 0,
                     eval_reserved_bytes: 0,
+                    pins: HashMap::new(),
+                    admit_queue: VecDeque::new(),
+                    next_ticket: 0,
                 }),
                 released: Condvar::new(),
                 decoded: Condvar::new(),
@@ -353,44 +364,92 @@ impl SessionCache {
     }
 
     /// Admits one workbook evaluation that will hold `needed_bytes` (its
-    /// planned estimate, margin included) while it runs (evaluation-memory
-    /// spec §4.2.G): the one ledger — resident channels, kept evaluations,
-    /// decodes in flight and running evaluations — must have room for it
-    /// under `B`. When it does not, the coldest cached channels and then the
-    /// least recently used kept evaluations are dropped; when it still does
-    /// not, the evaluation **waits** (re-reading the machine every
-    /// [`PROBE_REFRESH`]) until it does or `cancelled()` says nobody wants it.
+    /// planned peak, margin included) while it runs (evaluation-memory spec
+    /// §4.2.G): the one ledger — resident channels, kept evaluations, decodes
+    /// in flight and running evaluations — must have room for it under `B`.
+    /// When it does not, the coldest unpinned cached channels and then the
+    /// least recently used unpinned kept evaluations are dropped; when it
+    /// still does not, the evaluation **waits**, re-reading the machine every
+    /// [`PROBE_REFRESH`].
+    ///
+    /// The inputs the evaluation reads are pinned beforehand
+    /// ([`Self::pin_inputs`]) and so are counted, resident, beside
+    /// `needed_bytes` and never evicted to make room for it.
+    ///
+    /// Waiters are served first come, first served: once one is waiting, a
+    /// later request waits behind it even if it would fit, so a large
+    /// evaluation cannot starve behind a stream of small ones.
     ///
     /// # Errors
-    /// [`IpcErrorKind::ResourceExhausted`] at once, before anything is
-    /// waited for, when `needed_bytes` exceeds the budget's ceiling `B_max`
-    /// — it could never fit (Isaac's Q3 answer). [`IpcErrorKind::Internal`]
-    /// ("cancelled") when `cancelled()` turns true while it waits.
+    /// [`IpcErrorKind::ResourceExhausted`]:
+    /// - at once, before anything is waited for, when `needed_bytes` exceeds
+    ///   the budget's ceiling `B_max` — it could never fit (Isaac's Q3 answer);
+    /// - after [`RESERVE_TIMEOUT`] spent waiting while nothing of this
+    ///   process's could free memory (no decode or evaluation running, and
+    ///   evicting cannot make room): what holds the machine's commit, or the
+    ///   pinned inputs it needs beside its peak, will not shrink by waiting. `detail` carries the live
+    ///   budget and `waited_ms`.
+    ///
+    /// [`IpcErrorKind::Internal`] ("cancelled") when `cancelled()` turns true
+    /// while it waits.
     pub fn admit_evaluation(
         &self,
         needed_bytes: u64,
         hint: &str,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<EvalAdmission<'_>, IpcError> {
+        self.admit_evaluation_with_timeout(needed_bytes, hint, cancelled, RESERVE_TIMEOUT)
+    }
+
+    /// [`Self::admit_evaluation`] with an explicit bound on the wait while
+    /// nothing of ours can free memory. Exists so tests can pin it in
+    /// milliseconds; production always uses `admit_evaluation`.
+    pub fn admit_evaluation_with_timeout(
+        &self,
+        needed_bytes: u64,
+        hint: &str,
+        cancelled: &dyn Fn() -> bool,
+        stuck_timeout: Duration,
+    ) -> Result<EvalAdmission<'_>, IpcError> {
         let mut inner = self.lock();
         if needed_bytes > inner.budget_bytes {
             return Err(resource_exhausted(needed_bytes, inner.budget_bytes, hint));
         }
-        loop {
-            if self.make_room(&mut inner, needed_bytes) {
+        let ticket = inner.next_ticket;
+        inner.next_ticket += 1;
+        inner.admit_queue.push_back(ticket);
+        let mut stuck_since: Option<Instant> = None;
+        let started = Instant::now();
+        let outcome = loop {
+            if inner.admit_queue.front() == Some(&ticket) && self.make_room(&mut inner, needed_bytes) {
                 inner.eval_reserved_bytes += needed_bytes;
-                return Ok(EvalAdmission { cache: self, bytes: needed_bytes });
+                break Ok(());
             }
             if cancelled() {
-                return Err(evaluation_cancelled());
+                break Err(evaluation_cancelled());
+            }
+            if self.nothing_of_ours_can_free(&inner) {
+                let since = *stuck_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= stuck_timeout {
+                    let budget = self.budget_now(&inner);
+                    break Err(admission_timed_out(needed_bytes, budget, hint, started.elapsed()));
+                }
+            } else {
+                stuck_since = None;
             }
             let (guard, _) = self.shared.released.wait_timeout(inner, PROBE_REFRESH).unwrap_or_else(|e| e.into_inner());
             inner = guard;
-        }
+        };
+        inner.admit_queue.retain(|t| *t != ticket);
+        drop(inner);
+        // The next waiter in line may now be at the front.
+        self.shared.released.notify_all();
+        outcome.map(|()| EvalAdmission { cache: self, bytes: needed_bytes })
     }
 
     /// One non-waiting [`Self::admit_evaluation`]: `Ok(None)` when it does
-    /// not fit right now, even after evicting.
+    /// not fit right now, even after evicting, or when an earlier request is
+    /// already waiting (it is not overtaken).
     ///
     /// # Errors
     /// As [`Self::admit_evaluation`]'s "could never fit".
@@ -399,16 +458,27 @@ impl SessionCache {
         if needed_bytes > inner.budget_bytes {
             return Err(resource_exhausted(needed_bytes, inner.budget_bytes, hint));
         }
-        if self.make_room(&mut inner, needed_bytes) {
+        if inner.admit_queue.is_empty() && self.make_room(&mut inner, needed_bytes) {
             inner.eval_reserved_bytes += needed_bytes;
             return Ok(Some(EvalAdmission { cache: self, bytes: needed_bytes }));
         }
         Ok(None)
     }
 
+    /// `true` when nothing this process holds will ever be released while
+    /// this request waits: no decode in flight and no evaluation running.
+    /// Whatever is evictable, [`Self::make_room`] has already evicted or found
+    /// useless to evict, and cached channels, kept evaluations and other
+    /// waiters' pins do not go away on their own — so waiting then waits on
+    /// other programs only.
+    fn nothing_of_ours_can_free(&self, inner: &Inner) -> bool {
+        inner.in_flight_bytes == 0 && inner.eval_reserved_bytes == 0
+    }
+
     /// `true` when `needed_bytes` more fits the ledger under `B`, after
-    /// dropping as many cold cached channels, then kept evaluations, as that
-    /// takes. Nothing is dropped when it cannot be made to fit by dropping.
+    /// dropping as many unpinned cold cached channels, then unpinned kept
+    /// evaluations, as that takes. Nothing is dropped when dropping
+    /// everything droppable would still not make room.
     fn make_room(&self, inner: &mut Inner, needed_bytes: u64) -> bool {
         loop {
             let budget = self.budget_now(inner);
@@ -416,10 +486,13 @@ impl SessionCache {
             if accounted.saturating_add(needed_bytes) <= budget {
                 return true;
             }
-            let pinned = inner.in_flight_bytes + inner.eval_reserved_bytes;
-            if pinned.saturating_add(needed_bytes) > budget {
-                // Even an empty cache would not make room: wait instead of
-                // flushing it for nothing.
+            let fixed = inner.in_flight_bytes
+                + inner.eval_reserved_bytes
+                + inner.pinned_resident_bytes()
+                + self.shared.evals.pinned_bytes();
+            if fixed.saturating_add(needed_bytes) > budget {
+                // Even a cache emptied of everything droppable would not make
+                // room: wait instead of flushing it for nothing.
                 return false;
             }
             if inner.evict_coldest() {
@@ -430,6 +503,19 @@ impl SessionCache {
             }
             return false;
         }
+    }
+
+    /// Pins `channels` of `session_id` for as long as the returned guard
+    /// lives: they are never evicted, by the LRU or to make room for an
+    /// evaluation, so an evaluation's own inputs stay resident while it runs.
+    /// A channel not yet decoded is pinned from the moment it lands.
+    pub fn pin_inputs(&self, session_id: &str, channels: &[String]) -> InputPins<'_> {
+        let keys: Vec<Key> = channels.iter().map(|c| (session_id.to_string(), c.clone())).collect();
+        let mut inner = self.lock();
+        for key in &keys {
+            *inner.pins.entry(key.clone()).or_insert(0) += 1;
+        }
+        InputPins { cache: self, keys }
     }
 
     /// Installs the sink every later decode reports progress to (ruling
@@ -997,6 +1083,53 @@ impl Drop for Reservation<'_> {
     }
 }
 
+/// The pins [`SessionCache::pin_inputs`] took, released when dropped.
+#[derive(Debug)]
+pub struct InputPins<'a> {
+    cache: &'a SessionCache,
+    keys: Vec<Key>,
+}
+
+impl Drop for InputPins<'_> {
+    fn drop(&mut self) {
+        {
+            let mut inner = self.cache.lock();
+            for key in &self.keys {
+                if let Some(n) = inner.pins.get_mut(key) {
+                    *n -= 1;
+                    if *n == 0 {
+                        inner.pins.remove(key);
+                    }
+                }
+            }
+            // Residency may have run over while everything was pinned.
+            inner.evict_to_budget();
+        }
+        self.cache.shared.released.notify_all();
+    }
+}
+
+/// The C3 §1 `resource_exhausted` error for an evaluation that waited
+/// [`RESERVE_TIMEOUT`] with nothing of this process's left to free: the
+/// machine's commit is held elsewhere. `detail` adds `waited_ms` to C3 §1's
+/// three keys; `budget_bytes` is the live budget `B`, not the ceiling.
+fn admission_timed_out(needed_bytes: u64, budget: u64, hint: &str, waited: Duration) -> IpcError {
+    IpcError::with_detail(
+        IpcErrorKind::ResourceExhausted,
+        format!(
+            "Not enough memory free on this machine: {:.1} GB needed, {:.1} GB available to idl1",
+            needed_bytes as f64 / 1e9,
+            budget as f64 / 1e9
+        ),
+        serde_json::json!({
+            "needed_bytes": needed_bytes,
+            "budget_bytes": budget,
+            "hint": hint,
+            "waited_ms": waited.as_millis() as u64,
+        }),
+    )
+}
+
 /// One running evaluation's hold on the ledger
 /// ([`SessionCache::admit_evaluation`]), released when it is dropped.
 #[derive(Debug)]
@@ -1229,13 +1362,13 @@ impl Inner {
         self.axis_order.retain(|k| k != key);
     }
 
-    /// Drops the coldest resident channel, then any axis no resident channel
-    /// borrows any more. `false` when there was no channel to drop.
+    /// Drops the coldest unpinned resident channel, then any axis no resident
+    /// channel borrows any more. `false` when there was no such channel.
     fn evict_coldest(&mut self) -> bool {
-        if self.order.is_empty() {
+        let Some(at) = self.order.iter().position(|k| !self.pins.contains_key(k)) else {
             return false;
-        }
-        let coldest = self.order.remove(0);
+        };
+        let coldest = self.order.remove(at);
         if let Some(dropped) = self.entries.remove(&coldest) {
             self.resident_bytes = self.resident_bytes.saturating_sub(dropped.resident_bytes() as u64);
         }
@@ -1243,7 +1376,13 @@ impl Inner {
         true
     }
 
-    /// Drops coldest-first until `resident_bytes <= budget_bytes`.
+    /// Bytes of resident channels some running evaluation has pinned.
+    fn pinned_resident_bytes(&self) -> u64 {
+        self.pins.keys().filter_map(|k| self.entries.get(k)).map(|c| c.resident_bytes() as u64).sum()
+    }
+
+    /// Drops coldest-first until `resident_bytes <= budget_bytes`, never a
+    /// pinned channel.
     ///
     /// Evicting only stops the cache *counting* those bytes: a channel a
     /// command is still holding an `Arc` to keeps its memory until that
@@ -1256,13 +1395,7 @@ impl Inner {
     /// whose channels are all resident keeps its axis however tight the
     /// budget gets.
     fn evict_to_budget(&mut self) {
-        while self.resident_bytes > self.budget_bytes && !self.order.is_empty() {
-            let coldest = self.order.remove(0);
-            if let Some(dropped) = self.entries.remove(&coldest) {
-                self.resident_bytes = self.resident_bytes.saturating_sub(dropped.resident_bytes() as u64);
-            }
-            self.evict_unborrowed_axes();
-        }
+        while self.resident_bytes > self.budget_bytes && self.evict_coldest() {}
         if self.resident_bytes > self.budget_bytes {
             self.evict_unborrowed_axes();
         }
@@ -2112,5 +2245,106 @@ mod tests {
         // Assert
         assert_eq!(err.kind, IpcErrorKind::Internal);
         assert_eq!(cache.eval_reserved_bytes(), 700_000);
+    }
+
+    /// A machine with no commit to spare, ever.
+    struct FullMachine;
+
+    impl crate::memory::MemoryProbe for FullMachine {
+        fn physical_bytes(&self) -> u64 {
+            16 << 30
+        }
+
+        fn commit(&self) -> crate::memory::CommitSample {
+            crate::memory::CommitSample { own_commit_bytes: 0, available_commit_bytes: 0 }
+        }
+    }
+
+    #[test]
+    fn admission_commit_held_by_other_programs_and_nothing_of_ours_to_free_refused_after_a_bounded_wait() {
+        // Arrange — under the ceiling, but the machine has nothing to give and
+        // this process holds nothing it could release.
+        let cache = SessionCache::with_machine(MachineBudget::new(Box::new(FullMachine)));
+
+        // Act
+        let started = Instant::now();
+        let err = cache
+            .admit_evaluation_with_timeout(1_000_000, "evaluate wb", &|| false, Duration::from_millis(100))
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::ResourceExhausted);
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        let detail = err.detail.unwrap();
+        assert!(detail["waited_ms"].as_u64().unwrap() >= 100);
+        assert_eq!(detail["budget_bytes"], 0u64);
+        assert_eq!(cache.eval_reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn admission_the_evaluations_own_pinned_inputs_are_never_evicted_to_make_room() {
+        // Arrange — A and B are this evaluation's inputs, C is not; the peak
+        // only fits if two of the three go.
+        let root = temp_root();
+        seed(&root, "s1", 1000);
+        let dir = session_dir(&root, "s1");
+        let probe = SessionCache::with_budget(1 << 30);
+        probe.channel(&dir, "s1", "A").unwrap();
+        let one = probe.resident_bytes();
+        let cache = SessionCache::with_budget(one * 4);
+        for c in ["A", "B", "C"] {
+            cache.channel(&dir, "s1", c).unwrap();
+        }
+        let _pins = cache.pin_inputs("s1", &["A".to_string(), "B".to_string()]);
+        let budget = cache.budget_bytes();
+        let (pinned, resident, c_bytes) = {
+            let inner = cache.lock();
+            let c = inner.entries[&("s1".to_string(), "C".to_string())].resident_bytes() as u64;
+            (inner.pinned_resident_bytes(), inner.resident_bytes, c)
+        };
+
+        // Act — first a peak that only evicting A or B could make room for,
+        // then one that evicting C alone makes room for.
+        let err = cache
+            .admit_evaluation_with_timeout(budget - pinned + 1, "evaluate", &|| false, Duration::from_millis(50))
+            .unwrap_err();
+        let fits = cache.try_admit_evaluation(budget - (resident - c_bytes), "evaluate").unwrap();
+
+        // Assert — the inputs stayed; only C could go, and only for a peak it
+        // could actually make room for.
+        assert_eq!(err.kind, IpcErrorKind::ResourceExhausted);
+        assert!(fits.is_some());
+        assert!(cache.is_resident("s1", "A"));
+        assert!(cache.is_resident("s1", "B"));
+        assert!(!cache.is_resident("s1", "C"));
+
+        drop(fits);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn admission_a_waiting_large_evaluation_is_not_overtaken_by_a_later_small_one() {
+        // Arrange — 600 kB held of 1 MB; a 700 kB evaluation queues.
+        let cache = SessionCache::with_budget(1_000_000);
+        let held = cache.admit_evaluation(600_000, "first", &|| false).unwrap();
+        let other = cache.clone();
+        let large = std::thread::spawn(move || {
+            let admitted = other.admit_evaluation(700_000, "large", &|| false).unwrap();
+            let bytes = other.eval_reserved_bytes();
+            drop(admitted);
+            bytes
+        });
+        while cache.lock().admit_queue.is_empty() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Act — 100 kB would fit beside the held 600 kB.
+        let small = cache.try_admit_evaluation(100_000, "small").unwrap();
+        drop(held);
+        let large_ran_with = large.join().unwrap();
+
+        // Assert
+        assert!(small.is_none());
+        assert_eq!(large_ran_with, 700_000);
     }
 }

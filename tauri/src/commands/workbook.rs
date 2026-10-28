@@ -706,7 +706,7 @@ fn eval_workbook_v2_via(
             let evaluation = cache.evals().get_or_evaluate(&key, |observer| {
                 let demand = Demand::document(&doc);
                 let sid = Some(window.session_id.as_str());
-                evaluate_planned(cache, data_dir, &doc, &structural, sid, &handle, Some(&*source), &lap_ctx, demand, observer)
+                evaluate_planned(cache, data_dir, &doc, &structural, sid, &handle, Some(&*source), &lap_ctx, demand, None, observer)
             });
             // Per-window attribution (R121): a decode this window could not
             // be given is this window's failure, not the whole call's.
@@ -865,7 +865,7 @@ fn fetch_host_channel_v2_via(
     // evaluating the whole document again to return one value.
     let session_json = window.map(|w| read_session_json_once(data_dir, &w.session_id));
     let key = evaluation_key(data_dir, &markdown, window.zip(session_json.as_ref().map(|j| j.bytes.as_slice())));
-    let evaluate_window = |demand: Demand, observer: &dyn EvalObserver| {
+    let evaluate_window = |demand: Demand, keep: Option<&crate::eval_registry::EvalKey>, observer: &dyn EvalObserver| {
         let (handle, source, lap_ctx) = match window.zip(session_json.as_ref()) {
             Some((w, json)) => {
                 let (handle, source) = load_lazy_session_handle(data_dir, &w.session_id, cache)?;
@@ -877,9 +877,9 @@ fn fetch_host_channel_v2_via(
         let sid = window.map(|w| w.session_id.as_str());
         // A refused decode is the caller's answer, not a missing definition
         // (R211.2): `evaluate_planned` returns it ahead of any cell.
-        evaluate_planned(cache, data_dir, &doc, &structural, sid, &handle, source.as_deref(), &lap_ctx, demand, observer)
+        evaluate_planned(cache, data_dir, &doc, &structural, sid, &handle, source.as_deref(), &lap_ctx, demand, keep, observer)
     };
-    let evaluation = cache.evals().get_or_evaluate(&key, |observer| evaluate_window(Demand::document(&doc), observer))?;
+    let evaluation = cache.evals().get_or_evaluate(&key, |observer| evaluate_window(Demand::document(&doc), None, observer))?;
 
     let def = evaluation.def(def_name).ok_or_else(|| {
         IpcError::new(IpcErrorKind::NotFound, format!("no definition named '{def_name}' in workbook '{id}'"))
@@ -894,7 +894,9 @@ fn fetch_host_channel_v2_via(
         let closure_key = crate::eval_registry::EvalKey::from_parts(&[key.as_hex().as_bytes(), b"closure", def_name.as_bytes()]);
         closure = cache
             .evals()
-            .get_or_evaluate(&closure_key, |observer| evaluate_window(Demand::closure([def_name.to_string()]), observer))?;
+            .get_or_evaluate(&closure_key, |observer| {
+                evaluate_window(Demand::closure([def_name.to_string()]), Some(&key), observer)
+            })?;
         closure.def(def_name).ok_or_else(|| {
             IpcError::new(IpcErrorKind::NotFound, format!("no definition named '{def_name}' in workbook '{id}'"))
         })?
@@ -920,10 +922,12 @@ fn fetch_host_channel_v2_via(
 
 /// One planned, admitted evaluation (evaluation-memory spec §4.2.B and
 /// §4.2.G): plans `doc` for `demand` from the session's footer counts,
-/// refuses at once — before any decode — when its estimate (inputs not yet
-/// cached included) could never fit the budget, decodes the channels it
-/// names, then waits for room in the ledger for its own peak and runs. The
-/// admission is held while it runs and given back when it returns.
+/// refuses at once — before any decode — when its estimate (every input plus
+/// its peak) could never fit the budget, pins and decodes exactly the plan's
+/// inputs, then waits for room in the ledger for its own peak and runs. The
+/// pins and the admission are held while it runs and given back when it
+/// returns. `keep` names a kept evaluation the admission must not evict (the
+/// document evaluation, while a fetch evaluates one released definition).
 ///
 /// `session_id` is the window's session, `None` for no session (`handle` is
 /// then [`empty_session_handle`]).
@@ -946,6 +950,7 @@ fn evaluate_planned(
     source: Option<&crate::session_source::CachedChannelSource>,
     lap_ctx: &MathLapContext,
     demand: Demand,
+    keep: Option<&crate::eval_registry::EvalKey>,
     observer: &dyn EvalObserver,
 ) -> Result<Vec<idl_rs::workbook::v3::CellEvalResult>, IpcError> {
     let inputs = session_id
@@ -962,13 +967,22 @@ fn evaluate_planned(
         .unwrap_or("");
     let hint = format!("evaluate workbook '{}' (largest definition '{largest}')", doc.name);
 
-    let needed = plan.estimate_with_missing_inputs(|c| session_id.is_some_and(|sid| !cache.is_resident(sid, c)));
+    // Every input and the peak together: an evaluation whose inputs alone
+    // are resident but could not be held beside its peak can never run.
+    let needed = plan.estimate.with_margin();
     if needed > cache.budget_bytes() {
         return Err(crate::memory::resource_exhausted(needed, cache.budget_bytes(), &hint));
     }
+    // The inputs are pinned before they are decoded, so nothing — the LRU,
+    // or another evaluation's admission — evicts them while this one runs.
+    let input_names: Vec<String> = plan.inputs.iter().map(|i| i.channel.clone()).collect();
+    let _pins = session_id.map(|sid| cache.pin_inputs(sid, &input_names));
     if let Some(sid) = session_id {
-        prefetch_document_channels(cache, data_dir, sid, doc, handle);
+        // Exactly the plan's inputs: a closure decodes only what it reads.
+        let refs: Vec<&str> = input_names.iter().map(|c| c.as_str()).collect();
+        cache.prefetch(&session_dir(data_dir, sid), sid, &refs);
     }
+    let _kept = keep.map(|k| cache.evals().pin(k));
     let _admission = cache.admit_evaluation(plan.estimate_with_missing_inputs(|_| false), &hint, &|| observer.cancelled())?;
     let cells = idl_rs::workbook::v3::eval_cells_planned(doc, structural, handle, lap_ctx, &plan, Some(observer))
         .map_err(|_| crate::session_cache::evaluation_cancelled())?;
@@ -2628,6 +2642,35 @@ version: 3
         let v_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         assert_eq!(v_len, 3);
         assert_eq!(cache.evals().runs(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_host_channel_v2_via_a_released_definitions_closure_decodes_only_its_own_inputs_and_keeps_the_document_evaluation() {
+        // Arrange — `x` reads ChanA only; the document also names ChanB.
+        let root = temp_root();
+        seed_multi_channel_session(&root, "s1", &["ChanA", "ChanB"]);
+        let markdown = format!(
+            "---\nid: {WB_ID}\nname: Test\nversion: 3\n---\n\n```math id=aaaaaaaa\nx = [ChanA] * 2\ny = [ChanB] + 1\n```\n"
+        );
+        write_workbook(&root, "test.idl1wb", &markdown);
+        let window = WindowDto {
+            session_id: "s1".to_string(),
+            span: crate::session_source::SpanDto::Session,
+            colour: "--chart-1".to_string(),
+        };
+        let cache = SessionCache::with_budget(1 << 30);
+        eval_workbook_v2_via(&cache, &root, WB_ID, std::slice::from_ref(&window)).unwrap();
+        cache.invalidate_all();
+
+        // Act
+        fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 100).unwrap();
+
+        // Assert — only ChanA decoded for the closure; both evaluations kept.
+        assert!(cache.is_resident("s1", "ChanA"));
+        assert!(!cache.is_resident("s1", "ChanB"));
+        assert_eq!(cache.evals().len(), 2);
 
         let _ = std::fs::remove_dir_all(&root);
     }

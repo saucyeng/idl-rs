@@ -44,8 +44,9 @@ pub const PROBE_REFRESH: Duration = Duration::from_millis(250);
 /// 5/4. The estimates are already ceilings, but a decode's transient peak
 /// is not perfectly predictable (allocator slack, an Arrow buffer's growth
 /// doubling), and being refused one session early is a far better failure
-/// than an abort mid-pan.
-pub const ESTIMATE_MARGIN: (u64, u64) = (5, 4);
+/// than an abort mid-pan. The planner's own constant, so the evaluation
+/// estimates and the decode reservations cannot drift apart.
+pub const ESTIMATE_MARGIN: (u64, u64) = idl_rs::workbook::v3::plan::ESTIMATE_MARGIN;
 
 /// Physical RAM, bytes, read once per process.
 static PHYSICAL_MEMORY_BYTES: OnceLock<u64> = OnceLock::new();
@@ -105,11 +106,17 @@ pub trait MemoryProbe: Send + Sync {
     fn commit(&self) -> CommitSample;
 }
 
-/// The real machine: `sysinfo` for RAM and commit (on Windows its swap
-/// figures are the commit limit and the commit total less physical RAM, so
-/// `free_swap` is exactly the commit still available), the registry for how
-/// far the page file may grow, and the counting allocator for this process's
-/// own heap.
+/// The real machine: `sysinfo` for RAM and commit, the registry for how far
+/// the page file may grow, and the counting allocator for this process's own
+/// heap.
+///
+/// On Windows `sysinfo` 0.33 reports swap as the commit limit and the commit
+/// total each less physical RAM, saturating at zero, so `free_swap` is the
+/// commit still available only once the commit total is past physical RAM.
+/// Below that it reads low by `RAM − commit total`: admission is then
+/// stricter than it need be, never looser.
+// TODO(idl0): read `CommitLimit − CommitTotal` directly
+// (`K32GetPerformanceInfo`) to remove that bias.
 #[derive(Debug, Default)]
 pub struct SystemProbe;
 
@@ -375,13 +382,10 @@ mod tests {
     }
 
     #[test]
-    fn budget_bytes_on_this_machine_is_half_its_physical_memory() {
-        // Arrange + Act
-        let budget = budget_bytes();
-
-        // Assert
-        assert!(budget >= MIN_BUDGET_BYTES);
-        assert_eq!(budget, ceiling_for(physical_memory_bytes()));
+    fn ceiling_for_a_16_gb_machine_half_and_a_tiny_one_the_floor() {
+        // Arrange + Act + Assert
+        assert_eq!(ceiling_for(16 * GB), 8 * GB);
+        assert_eq!(ceiling_for(100 << 20), MIN_BUDGET_BYTES);
     }
 
     #[test]

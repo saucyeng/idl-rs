@@ -182,6 +182,9 @@ struct Inner {
     resident_bytes: u64,
     /// Evaluations the closure of a first caller has actually run.
     runs: u64,
+    /// Kept evaluations that must not be evicted, with their pin counts
+    /// ([`EvalRegistry::pin`]).
+    pinned: HashMap<EvalKey, usize>,
 }
 
 /// The process's evaluations, single-flight per [`EvalKey`], LRU by bytes.
@@ -231,6 +234,31 @@ impl Drop for Leader<'_> {
     }
 }
 
+/// A pin on a kept evaluation ([`EvalRegistry::pin`]), released when
+/// dropped.
+pub struct EvalPin<'a> {
+    registry: &'a EvalRegistry,
+    key: EvalKey,
+}
+
+impl std::fmt::Debug for EvalPin<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvalPin").field("key", &self.key).finish_non_exhaustive()
+    }
+}
+
+impl Drop for EvalPin<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.registry.lock();
+        if let Some(n) = inner.pinned.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                inner.pinned.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// What [`EvalRegistry::attach`] found.
 enum Attach {
     /// A kept result.
@@ -255,6 +283,7 @@ impl EvalRegistry {
                 order: Vec::new(),
                 resident_bytes: 0,
                 runs: 0,
+                pinned: HashMap::new(),
             }),
         }
     }
@@ -270,10 +299,12 @@ impl EvalRegistry {
         if evaluation.bytes() > self.cap_bytes {
             return;
         }
-        while inner.resident_bytes + evaluation.bytes() > self.cap_bytes && !inner.order.is_empty() {
-            let oldest = inner.order.remove(0);
+        while inner.resident_bytes + evaluation.bytes() > self.cap_bytes {
+            // Pinned evaluations stay, even past the cap.
+            let Some(at) = inner.order.iter().position(|k| !inner.pinned.contains_key(k)) else { break };
+            let oldest = inner.order.remove(at);
             if let Some(gone) = inner.done.remove(&oldest) {
-                inner.resident_bytes -= gone.bytes();
+                inner.resident_bytes = inner.resident_bytes.saturating_sub(gone.bytes());
             }
         }
         inner.resident_bytes += evaluation.bytes();
@@ -363,18 +394,39 @@ impl EvalRegistry {
         Attach::Lead(flight)
     }
 
-    /// Drops the least recently used kept evaluation, giving its bytes back
-    /// to the ledger. `false` when nothing is kept.
+    /// Drops the least recently used unpinned kept evaluation, giving its
+    /// bytes back to the ledger. `false` when there is none.
     pub fn evict_oldest(&self) -> bool {
         let mut inner = self.lock();
-        if inner.order.is_empty() {
+        let Some(at) = inner.order.iter().position(|k| !inner.pinned.contains_key(k)) else {
             return false;
-        }
-        let oldest = inner.order.remove(0);
+        };
+        let oldest = inner.order.remove(at);
         if let Some(gone) = inner.done.remove(&oldest) {
-            inner.resident_bytes -= gone.bytes();
+            inner.resident_bytes = inner.resident_bytes.saturating_sub(gone.bytes());
         }
         true
+    }
+
+    /// Keeps `key`'s evaluation, if kept, safe from [`Self::evict_oldest`]
+    /// for as long as the returned guard lives: a fetch evaluating a
+    /// released definition on its own pins the document evaluation its
+    /// sibling charts still read.
+    pub fn pin(&self, key: &EvalKey) -> EvalPin<'_> {
+        *self.lock().pinned.entry(key.clone()).or_insert(0) += 1;
+        EvalPin { registry: self, key: key.clone() }
+    }
+
+    /// `true` when some kept evaluation could be evicted.
+    pub fn has_evictable(&self) -> bool {
+        let inner = self.lock();
+        inner.order.iter().any(|k| !inner.pinned.contains_key(k))
+    }
+
+    /// Bytes of kept evaluations that are pinned.
+    pub fn pinned_bytes(&self) -> u64 {
+        let inner = self.lock();
+        inner.pinned.keys().filter_map(|k| inner.done.get(k)).map(|e| e.bytes()).sum()
     }
 
     /// Waits for `flight`'s result.
@@ -628,5 +680,25 @@ mod tests {
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.resident_bytes(), 1600);
         registry.get_or_evaluate(&key("b"), |_| panic!("b is kept")).unwrap();
+    }
+
+    #[test]
+    fn evict_oldest_a_pinned_evaluation_is_skipped_and_the_next_one_goes() {
+        // Arrange
+        let registry = EvalRegistry::with_cap(1 << 20);
+        registry.get_or_evaluate(&key("doc"), |_| Ok(cell_with_values(100))).unwrap();
+        registry.get_or_evaluate(&key("closure"), |_| Ok(cell_with_values(100))).unwrap();
+        let _pin = registry.pin(&key("doc"));
+
+        // Act
+        let first = registry.evict_oldest();
+        let second = registry.evict_oldest();
+
+        // Assert
+        assert!(first);
+        assert!(!second);
+        assert!(!registry.has_evictable());
+        assert_eq!(registry.pinned_bytes(), 1600);
+        registry.get_or_evaluate(&key("doc"), |_| panic!("doc is pinned")).unwrap();
     }
 }

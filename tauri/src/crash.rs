@@ -12,7 +12,8 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -133,17 +134,48 @@ pub fn install(dir: PathBuf, version: String) {
 const BREADCRUMB_PREFIX: &str = "alloc-";
 
 /// Bytes the Rust heap holds right now, kept by [`BreadcrumbAllocator`].
-static LIVE_HEAP_BYTES: AtomicU64 = AtomicU64::new(0);
+static LIVE_HEAP_BYTES: AtomicI64 = AtomicI64::new(0);
+
+/// How far one thread's own count may drift before it is folded into
+/// [`LIVE_HEAP_BYTES`]: 1 MiB either way. Every allocation touches only its
+/// thread's counter; the shared one is touched once per MiB. A shared atomic
+/// on every allocation cost +49 % on a four-thread small-allocation
+/// microbenchmark (release build); this costs +0.2 %, and the evaluator-shaped
+/// benchmark moves within run-to-run noise (2026-10-28, see spec §6.1).
+const FLUSH_BYTES: i64 = 1 << 20;
+
+thread_local! {
+    /// This thread's allocations less its frees since its last flush, bytes.
+    /// `const` and destructor-free, so the allocator may touch it.
+    static PENDING_BYTES: Cell<i64> = const { Cell::new(0) };
+}
 
 /// The open breadcrumb file, set once by [`open_breadcrumb`]. Opened ahead
 /// of time because writing to it must not allocate.
 static BREADCRUMB: OnceLock<std::fs::File> = OnceLock::new();
 
 /// Bytes the Rust heap holds right now, as [`BreadcrumbAllocator`] counts
-/// them; `0` when it is not the process's global allocator (tests, the CLI).
-/// The memory budget credits this as the process's own commit.
+/// them, to within 1 MiB per thread ([`FLUSH_BYTES`]; a thread that exits
+/// takes its unflushed remainder with it); `0` when it is not the process's
+/// global allocator (tests, the CLI). The memory budget credits this as the
+/// process's own commit, never more than its ledger holds.
 pub fn live_heap_bytes() -> u64 {
-    LIVE_HEAP_BYTES.load(Ordering::Relaxed)
+    LIVE_HEAP_BYTES.load(Ordering::Relaxed).max(0) as u64
+}
+
+/// Adds `delta` bytes to this thread's count, folding it into the shared
+/// count once it passes [`FLUSH_BYTES`].
+#[inline]
+fn count(delta: i64) {
+    let _ = PENDING_BYTES.try_with(|pending| {
+        let now = pending.get() + delta;
+        if now >= FLUSH_BYTES || now <= -FLUSH_BYTES {
+            LIVE_HEAP_BYTES.fetch_add(now, Ordering::Relaxed);
+            pending.set(0);
+        } else {
+            pending.set(now);
+        }
+    });
 }
 
 /// The app's global allocator: the system allocator, counting live bytes,
@@ -175,7 +207,7 @@ unsafe impl GlobalAlloc for BreadcrumbAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         System.dealloc(ptr, layout);
-        LIVE_HEAP_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        count(-(layout.size() as i64));
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -183,8 +215,7 @@ unsafe impl GlobalAlloc for BreadcrumbAllocator {
         if p.is_null() {
             write_breadcrumb(new_size);
         } else {
-            LIVE_HEAP_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
-            LIVE_HEAP_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+            count(new_size as i64 - layout.size() as i64);
         }
         p
     }
@@ -196,7 +227,7 @@ fn record(p: *mut u8, size: usize) {
     if p.is_null() {
         write_breadcrumb(size);
     } else {
-        LIVE_HEAP_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+        count(size as i64);
     }
 }
 
@@ -250,6 +281,23 @@ enum Part {
 /// The breadcrumb file for process `pid`.
 fn breadcrumb_path(dir: &Path, pid: u32) -> PathBuf {
     dir.join(format!("{BREADCRUMB_PREFIX}{pid}.log"))
+}
+
+/// Deletes every `alloc-<pid>.log` in `dir` whose process is gone and whose
+/// run marker was not there to report it (a run killed before it wrote one,
+/// or one of another version), so they do not pile up.
+fn sweep_orphan_breadcrumbs(dir: &Path, own_pid: u32) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix(BREADCRUMB_PREFIX).and_then(|r| r.strip_suffix(".log")).and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != own_pid && !process_alive(pid) && !marker_path(dir, pid).exists() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Opens this process's breadcrumb file for [`BreadcrumbAllocator`] to write
@@ -336,6 +384,7 @@ pub fn begin_run(dir: &Path, version: &str) {
             let _ = std::fs::remove_file(&path);
         }
     }
+    sweep_orphan_breadcrumbs(dir, own_pid);
     let marker = RunMarker { pid: own_pid, version: version.to_string(), started_at_ms: now };
     if let Ok(bytes) = serde_json::to_vec(&marker) {
         let target = marker_path(dir, own_pid);
@@ -638,6 +687,24 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert!(reports[0].text.contains("alloc of 4096 bytes failed, live=123"));
         assert!(!breadcrumb_path(&dir, dead.pid).exists());
+
+        mark_clean_exit(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn begin_run_an_orphan_breadcrumb_of_a_dead_process_with_no_marker_is_deleted() {
+        // Arrange
+        let dir = std::env::temp_dir().join(format!("idl1-orphan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let orphan = breadcrumb_path(&dir, u32::MAX - 9);
+        std::fs::write(&orphan, "").unwrap();
+
+        // Act
+        begin_run(&dir, "9.9.9");
+
+        // Assert
+        assert!(!orphan.exists());
 
         mark_clean_exit(&dir);
         let _ = std::fs::remove_dir_all(&dir);
