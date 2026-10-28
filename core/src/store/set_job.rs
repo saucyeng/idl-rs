@@ -141,6 +141,25 @@ pub struct MemberReport {
     /// Channel decodes this member performed (0 when served from the cache
     /// or from `session.json` alone).
     pub decoded_channels: usize,
+    /// Where this member's time went, for profiling.
+    pub timing: MemberTiming,
+}
+
+/// Wall-clock time one member spent in each step, ms. Decoding happens
+/// lazily inside the evaluation, so `evaluate_ms` excludes `decode_ms`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MemberTiming {
+    /// Opening `data.parquet`, planning, and waiting for admission.
+    pub open_ms: f64,
+    /// Channel decodes (`read_channel`), summed.
+    pub decode_ms: f64,
+    /// The evaluation itself, decodes excluded (unit inference included).
+    pub evaluate_ms: f64,
+    /// Writing the member's rows to the result cache.
+    pub cache_write_ms: f64,
+    /// The five slowest definitions, `(name, ms)`, slowest first; each
+    /// includes the channel decodes it triggered.
+    pub slowest: Vec<(String, f64)>,
 }
 
 /// Which step a member is in, for progress.
@@ -210,6 +229,8 @@ pub struct SetJobReport {
 struct MemberSource {
     session_dir: PathBuf,
     decodes: AtomicUsize,
+    /// Time spent in `read_channel`, µs, summed.
+    decode_us: std::sync::atomic::AtomicU64,
     first_error: Mutex<Option<SetMemberError>>,
 }
 
@@ -220,7 +241,10 @@ impl ChannelSource for MemberSource {
 
     fn channel_samples(&self, channel_id: &str) -> Option<Arc<ChannelSamples>> {
         self.decodes.fetch_add(1, Ordering::Relaxed);
-        match read_channel(&self.session_dir, channel_id) {
+        let started = std::time::Instant::now();
+        let read = read_channel(&self.session_dir, channel_id);
+        self.decode_us.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        match read {
             Ok(s) => Some(Arc::new(s)),
             Err(e) if e.kind == ParquetStoreErrorKind::NotFound => None,
             Err(e) => {
@@ -324,6 +348,7 @@ pub fn run_session_set(
             status: MemberStatus::Computed,
             error: None,
             decoded_channels: 0,
+            timing: MemberTiming::default(),
         };
 
         if json.is_none() && !has_data {
@@ -380,9 +405,11 @@ pub fn run_session_set(
         match evaluated {
             Ok(member_results) => {
                 if let (Some(c), Some(k)) = (&mut cache, &key) {
+                    let started = std::time::Instant::now();
                     if let Err(e) = c.put_member(&member.id, k, &member_results, now_ms()) {
                         cache_error.get_or_insert(e.message);
                     }
+                    report.timing.cache_write_ms = started.elapsed().as_secs_f64() * 1e3;
                 }
                 members.push(report);
                 results.push(Some(member_results));
@@ -436,12 +463,18 @@ enum MemberRunError {
     Cancelled,
 }
 
-/// The run's cancel flag as an [`EvalObserver`].
-struct CancelFlag<'a>(Option<&'a AtomicBool>);
+/// The run's cancel flag as an [`EvalObserver`]. It is asked before each
+/// scheduled definition starts, so it also stamps the time of each ask: the
+/// gap between two asks is one definition's time.
+struct CancelFlag<'a> {
+    cancel: Option<&'a AtomicBool>,
+    marks: Mutex<Vec<std::time::Instant>>,
+}
 
 impl EvalObserver for CancelFlag<'_> {
     fn cancelled(&self) -> bool {
-        self.0.is_some_and(|c| c.load(Ordering::Relaxed))
+        self.marks.lock().unwrap_or_else(|p| p.into_inner()).push(std::time::Instant::now());
+        self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
     }
 }
 
@@ -463,13 +496,14 @@ fn evaluate_with_data(
     mut phase: impl FnMut(SetPhase),
 ) -> Result<MemberResults, MemberRunError> {
     let io = |message: String| MemberRunError::Failed(SetMemberError { kind: SetMemberErrorKind::Io, message });
+    let opened = std::time::Instant::now();
     let inputs = read_channel_index(dir)
         .map(|index| PlanInputs::from_channel_index(&index))
         .map_err(|e| io(format!("reading {}: {}", dir.join("data.parquet").display(), e.message)))?;
     let eval_plan = member_eval_plan(plan, &doc.constants, &inputs);
     let needed = eval_plan.estimate_with_missing_inputs(|_| true);
     let hint = format!("evaluate session-set member '{}'", report.session_id);
-    let observer = CancelFlag(options.cancel);
+    let observer = CancelFlag { cancel: options.cancel, marks: Mutex::new(Vec::new()) };
 
     let _admission = match options.budget {
         None => None,
@@ -496,15 +530,35 @@ fn evaluate_with_data(
     let source = Arc::new(MemberSource {
         session_dir: dir.to_path_buf(),
         decodes: AtomicUsize::new(0),
+        decode_us: std::sync::atomic::AtomicU64::new(0),
         first_error: Mutex::new(None),
     });
     let handle = open_session_lazy_with(dir, source.clone() as Arc<dyn ChannelSource>)
         .map_err(|e| io(format!("reading {}: {}", dir.join("data.parquet").display(), e.message)))?;
     let bounds = whole_session_bounds(dir).map_err(|e| io(e.message))?;
     let ctx = window_lap_context(json, bounds);
+    report.timing.open_ms = opened.elapsed().as_secs_f64() * 1e3;
     phase(SetPhase::Evaluating);
+    observer.marks.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    let evaluating = std::time::Instant::now();
     let results = evaluate_member_planned(plan, &doc.constants, &handle, &ctx, &eval_plan, Some(&observer));
     drop(handle);
+    let finished = std::time::Instant::now();
+    let marks = std::mem::take(&mut *observer.marks.lock().unwrap_or_else(|p| p.into_inner()));
+    let mut per_def: Vec<(String, f64)> = marks
+        .iter()
+        .enumerate()
+        .filter_map(|(k, start)| {
+            let end = marks.get(k + 1).copied().unwrap_or(finished);
+            let name = plan.defs.get(*eval_plan.schedule.get(k)?)?.name.clone();
+            Some((name, (end - *start).as_secs_f64() * 1e3))
+        })
+        .collect();
+    per_def.sort_by(|a, b| b.1.total_cmp(&a.1));
+    per_def.truncate(5);
+    report.timing.slowest = per_def;
+    report.timing.decode_ms = source.decode_us.load(Ordering::Relaxed) as f64 / 1e3;
+    report.timing.evaluate_ms = evaluating.elapsed().as_secs_f64() * 1e3 - report.timing.decode_ms;
     report.decoded_channels = source.decodes.load(Ordering::Relaxed);
     let results = results.map_err(|_| MemberRunError::Cancelled)?;
     let failure = source.first_error.lock().unwrap_or_else(|p| p.into_inner()).take();
