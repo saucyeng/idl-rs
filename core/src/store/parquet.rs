@@ -2480,89 +2480,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Every channel of the session at `dir`, read through a reader in the
-    /// given channel order, equals an independent [`read_channel`] -- both time
-    /// axes and the values, and for the synthesized channels the whole channel.
-    fn assert_reader_equals_independent_reads(dir: &Path, reverse: bool) {
-        let reader = SessionColumnReader::open(dir).unwrap();
-        let mut ids: Vec<String> = reader.index().iter().map(|c| c.channel_id.clone()).collect();
-        if reverse {
-            ids.reverse();
-        }
-        for id in &ids {
-            let got = reader.read_channel(id).unwrap();
-            let alone = read_channel(dir, id).unwrap();
-            assert_eq!(got.t_us, alone.t_us, "{id}");
-            assert_eq!(got.t_recorded_us, alone.t_recorded_us, "{id}");
-            let (g, a) = (got.materialize(), alone.materialize());
-            assert_eq!(g.len(), a.len(), "{id}");
-            for (x, y) in g.iter().zip(&a) {
-                assert_eq!(x.to_bits(), y.to_bits(), "{id}");
-            }
-        }
-        for synthesized in ["Time", "Distance"] {
-            match read_channel(dir, synthesized) {
-                Ok(alone) => assert_eq!(reader.read_channel(synthesized).unwrap().to_channel(), alone.to_channel()),
-                Err(e) => assert_eq!(reader.read_channel(synthesized).unwrap_err().kind, e.kind),
-            }
-        }
-    }
-
-    #[test]
-    fn session_column_reader_sparse_gps_and_a_source_with_no_recorded_companion_equal_independent_reads() {
-        // Arrange -- the GPS columns sample 2 of the 4 union rows and `gps`
-        // has no `gps_t_recorded_us`; `imu0` has one.
-        let (root, dir) = seed(&session_with_gps_speed());
-
-        // Act / Assert -- in schema order and in reverse, so the axes are
-        // first decoded by different channels.
-        assert_reader_equals_independent_reads(&dir, false);
-        assert_reader_equals_independent_reads(&dir, true);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn session_column_reader_duplicate_timestamp_candidates_equal_independent_reads_and_elect_the_same_time() {
-        // Arrange -- the election fixture of the whole-file comparison below:
-        // `noisy` has more raw samples than `clean` but fewer distinct rows.
-        let mut session = sample_session();
-        session.channels = vec![
-            Channel {
-                channel_id: "noisy".to_string(),
-                t_us: vec![0, 1000, 1000, 2000, 2000, 3000],
-                t_recorded_us: None,
-                nominal_rate_hz: 0.0,
-                column: RawColumn::F64(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-                source_kind: "hr".to_string(),
-                unit: "ms".to_string(),
-                gaps: Vec::new(),
-            },
-            Channel {
-                channel_id: "clean".to_string(),
-                t_us: vec![0, 1000, 2000, 3000, 4000],
-                t_recorded_us: None,
-                nominal_rate_hz: 0.0,
-                column: RawColumn::F64(vec![10.0, 20.0, 30.0, 40.0, 50.0]),
-                source_kind: "gps".to_string(),
-                unit: "m".to_string(),
-                gaps: Vec::new(),
-            },
-        ];
-        let (root, dir) = seed(&session);
-        let expected = whole_file(&dir);
-        let reader = SessionColumnReader::open(&dir).unwrap();
-
-        // Act
-        let time = reader.read_channel("Time").unwrap();
-
-        // Assert
-        let want = expected.channels.iter().find(|c| c.channel_id == "Time").unwrap();
-        assert_eq!(&time.to_channel(), want);
-        assert_reader_equals_independent_reads(&dir, false);
-        assert_reader_equals_independent_reads(&dir, true);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     #[test]
     fn read_channel_sharing_axes_an_axis_from_a_different_file_is_a_schema_error_not_a_wrong_answer() {
         // Arrange -- a second, shorter session's `t` handed to the first's
@@ -3546,6 +3463,89 @@ mod channel_read_tests {
         assert!(one > 0);
         assert!(one < all, "one channel ({one} B) must estimate below the whole session ({all} B)");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every channel of the session at `dir`, read through a reader in the
+    /// given channel order, equals an independent [`read_channel`] -- both time
+    /// axes and the values, and for the synthesized channels the whole channel.
+    fn assert_reader_equals_independent_reads(dir: &Path, reverse: bool) {
+        let reader = SessionColumnReader::open(dir).unwrap();
+        let mut ids: Vec<String> = reader.index().iter().map(|c| c.channel_id.clone()).collect();
+        if reverse {
+            ids.reverse();
+        }
+        for id in &ids {
+            let got = reader.read_channel(id).unwrap();
+            let alone = read_channel(dir, id).unwrap();
+            assert_eq!(got.t_us, alone.t_us, "{id}");
+            assert_eq!(got.t_recorded_us, alone.t_recorded_us, "{id}");
+            let (g, a) = (got.materialize(), alone.materialize());
+            assert_eq!(g.len(), a.len(), "{id}");
+            for (x, y) in g.iter().zip(&a) {
+                assert_eq!(x.to_bits(), y.to_bits(), "{id}");
+            }
+        }
+        for synthesized in ["Time", "Distance"] {
+            match read_channel(dir, synthesized) {
+                Ok(alone) => assert_eq!(reader.read_channel(synthesized).unwrap().to_channel(), alone.to_channel()),
+                Err(e) => assert_eq!(reader.read_channel(synthesized).unwrap_err().kind, e.kind),
+            }
+        }
+    }
+
+    #[test]
+    fn session_column_reader_sparse_gps_and_a_source_with_no_recorded_companion_equal_independent_reads() {
+        // Arrange -- the GPS columns sample 2 of the 4 union rows and `gps`
+        // has no `gps_t_recorded_us`; `imu0` has one.
+        let (root, dir) = seed(&session_with_gps_speed());
+
+        // Act / Assert -- in schema order and in reverse, so the axes are
+        // first decoded by different channels.
+        assert_reader_equals_independent_reads(&dir, false);
+        assert_reader_equals_independent_reads(&dir, true);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_column_reader_duplicate_timestamp_candidates_equal_independent_reads_and_elect_the_same_time() {
+        // Arrange -- the election fixture of the whole-file comparison below:
+        // `noisy` has more raw samples than `clean` but fewer distinct rows.
+        let mut session = sample_session();
+        session.channels = vec![
+            Channel {
+                channel_id: "noisy".to_string(),
+                t_us: vec![0, 1000, 1000, 2000, 2000, 3000],
+                t_recorded_us: None,
+                nominal_rate_hz: 0.0,
+                column: RawColumn::F64(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                source_kind: "hr".to_string(),
+                unit: "ms".to_string(),
+                gaps: Vec::new(),
+            },
+            Channel {
+                channel_id: "clean".to_string(),
+                t_us: vec![0, 1000, 2000, 3000, 4000],
+                t_recorded_us: None,
+                nominal_rate_hz: 0.0,
+                column: RawColumn::F64(vec![10.0, 20.0, 30.0, 40.0, 50.0]),
+                source_kind: "gps".to_string(),
+                unit: "m".to_string(),
+                gaps: Vec::new(),
+            },
+        ];
+        let (root, dir) = seed(&session);
+        let expected = whole_file(&dir);
+        let reader = SessionColumnReader::open(&dir).unwrap();
+
+        // Act
+        let time = reader.read_channel("Time").unwrap();
+
+        // Assert
+        let want = expected.channels.iter().find(|c| c.channel_id == "Time").unwrap();
+        assert_eq!(&time.to_channel(), want);
+        assert_reader_equals_independent_reads(&dir, false);
+        assert_reader_equals_independent_reads(&dir, true);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
