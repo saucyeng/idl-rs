@@ -134,6 +134,21 @@ fn rms_non_finite(nf: &NonFinite) -> f64 {
 /// the window width, so the rebuild stays O(1) amortised per sample).
 const ROLLING_REBUILD_EVERY: usize = 4096;
 
+/// How far (as a ratio) the window's total magnitude may fall below the
+/// largest it has been since the last rebuild before the running sums are
+/// rebuilt (2^30).
+///
+/// A compensated sum is accurate to a few ulp of its *largest* intermediate
+/// value, squared: while a huge sample (a corrupt `f32` squared, say) sits in
+/// the window, its rounding error is folded into the compensation term and
+/// every ordinary sample added beside it is lost. When the huge sample leaves
+/// the sum comes back, but the lost samples do not, and the result stays wrong
+/// until the next periodic rebuild. The error is about `eps^2 * peak`, so
+/// bounding `peak / magnitude` by 2^30 keeps it below `2.4e-7 * eps` of the
+/// true magnitude -- far below the 1e-12 relative agreement the rolling
+/// windows promise.
+const ROLLING_MAX_DECAY: f64 = 1_073_741_824.0;
+
 #[cfg(test)]
 thread_local! {
     /// Samples visited by whole-window scans on this thread -- the test seam
@@ -182,6 +197,9 @@ fn window_std(window: &[f64]) -> f64 {
 /// `finish(sum, count)`. NaN / inf samples are counted, not summed, and a
 /// window holding any is answered by `non_finite` from the counts.
 ///
+/// A window whose magnitude has fallen by more than [`ROLLING_MAX_DECAY`] from
+/// its recent peak is rebuilt (a huge sample just left; see the constant).
+///
 /// A sum that overflows poisons the running state; until a periodic rebuild
 /// finds it finite again, windows are computed directly by `direct` (the
 /// per-window definition), at most the cost the old code paid on every
@@ -197,32 +215,53 @@ fn rolling_running_sum(
     let n = data.len();
     let width = w.max(1);
     let rebuild_every = ROLLING_REBUILD_EVERY.max(width);
+    // The window's compensated sum and its total magnitude, from scratch.
     let rebuild = |window: &[f64]| {
         note_scan(window.len());
         let mut acc = CompensatedSum::default();
+        let mut magnitude = 0.0;
         for &v in window {
             if v.is_finite() {
-                acc.add(term(v));
+                let t = term(v);
+                acc.add(t);
+                magnitude += t.abs();
             }
         }
-        acc
+        (acc, magnitude)
     };
     let mut result = vec![0.0; n];
     let mut acc = CompensatedSum::default();
+    // Plain sum of |term| over the window's finite samples, and the largest
+    // it has been since the last rebuild: the dynamic-range guard's inputs.
+    let (mut magnitude, mut peak) = (0.0_f64, 0.0_f64);
     let mut counts = NonFinite::default();
     let mut since_rebuild = 0usize;
     let mut poisoned = false;
     for i in 0..n {
         match counts.slot(data[i]) {
             Some(c) => *c += 1,
-            None => acc.add(term(data[i])),
+            None => {
+                let t = term(data[i]);
+                acc.add(t);
+                magnitude += t.abs();
+            }
         }
+        peak = peak.max(magnitude);
         if i >= width {
             let old = data[i - width];
             match counts.slot(old) {
                 Some(c) => *c -= 1,
-                None => acc.add(-term(old)),
+                None => {
+                    let t = term(old);
+                    acc.add(-t);
+                    magnitude -= t.abs();
+                }
             }
+        }
+        if !poisoned && peak > ROLLING_MAX_DECAY * magnitude {
+            (acc, magnitude) = rebuild(&data[window_start(i, w)..=i]);
+            peak = magnitude;
+            since_rebuild = 0;
         }
         if counts.any() {
             result[i] = non_finite(&counts);
@@ -233,14 +272,16 @@ fn rolling_running_sum(
         if poisoned {
             result[i] = direct(window);
             if since_rebuild >= width {
-                acc = rebuild(window);
+                (acc, magnitude) = rebuild(window);
+                peak = magnitude;
                 poisoned = !acc.value().is_finite();
                 since_rebuild = 0;
             }
             continue;
         }
         if since_rebuild >= rebuild_every || !acc.value().is_finite() {
-            acc = rebuild(window);
+            (acc, magnitude) = rebuild(window);
+            peak = magnitude;
             since_rebuild = 0;
             if !acc.value().is_finite() {
                 poisoned = true;
@@ -295,17 +336,21 @@ pub fn rolling_std(data: &[f64], w: usize) -> Vec<f64> {
     let n = data.len();
     let width = w.max(1);
     let rebuild_every = ROLLING_REBUILD_EVERY.max(width);
-    // Re-centres on the window mean and recomputes both sums from scratch.
-    let recentre = |window: &[f64]| -> (f64, CompensatedSum, CompensatedSum) {
+    // Re-centres on the mean of the window's finite samples and recomputes
+    // both sums, and `s2`'s plain magnitude, from scratch.
+    let recentre = |window: &[f64], old_k: f64| -> (f64, CompensatedSum, CompensatedSum, f64) {
         note_scan(window.len());
-        let k = window.iter().sum::<f64>() / window.len() as f64;
+        let (sum, finite) = window.iter().filter(|v| v.is_finite()).fold((0.0_f64, 0usize), |(s, c), v| (s + *v, c + 1));
+        let k = if finite > 0 { sum / finite as f64 } else { old_k };
         let (mut s1, mut s2) = (CompensatedSum::default(), CompensatedSum::default());
-        for &v in window {
+        let mut magnitude = 0.0;
+        for &v in window.iter().filter(|v| v.is_finite()) {
             let d = v - k;
             s1.add(d);
             s2.add(d * d);
+            magnitude += d * d;
         }
-        (k, s1, s2)
+        (k, s1, s2, magnitude)
     };
     let mut result = vec![0.0; n];
     let mut k = match data.first() {
@@ -313,6 +358,10 @@ pub fn rolling_std(data: &[f64], w: usize) -> Vec<f64> {
         _ => 0.0,
     };
     let (mut s1, mut s2) = (CompensatedSum::default(), CompensatedSum::default());
+    // Plain sum of the window's (v - K)^2, and the largest it has been since
+    // the last re-centre: the dynamic-range guard's inputs (s2 is >= 0, so it
+    // is its own magnitude).
+    let (mut magnitude, mut peak) = (0.0_f64, 0.0_f64);
     let mut counts = NonFinite::default();
     let mut since_rebuild = 0usize;
     let mut poisoned = false;
@@ -323,8 +372,10 @@ pub fn rolling_std(data: &[f64], w: usize) -> Vec<f64> {
                 let d = data[i] - k;
                 s1.add(d);
                 s2.add(d * d);
+                magnitude += d * d;
             }
         }
+        peak = peak.max(magnitude);
         if i >= width {
             let old = data[i - width];
             match counts.slot(old) {
@@ -333,8 +384,14 @@ pub fn rolling_std(data: &[f64], w: usize) -> Vec<f64> {
                     let d = old - k;
                     s1.add(-d);
                     s2.add(-(d * d));
+                    magnitude -= d * d;
                 }
             }
+        }
+        if !poisoned && peak > ROLLING_MAX_DECAY * magnitude {
+            (k, s1, s2, magnitude) = recentre(&data[window_start(i, w)..=i], k);
+            peak = magnitude;
+            since_rebuild = 0;
         }
         if counts.any() {
             result[i] = f64::NAN;
@@ -346,7 +403,8 @@ pub fn rolling_std(data: &[f64], w: usize) -> Vec<f64> {
         if poisoned {
             result[i] = window_std(window);
             if since_rebuild >= width {
-                (k, s1, s2) = recentre(window);
+                (k, s1, s2, magnitude) = recentre(window, k);
+                peak = magnitude;
                 poisoned = !shifted_moments(&s1, &s2, count).1.is_finite();
                 since_rebuild = 0;
             }
@@ -355,7 +413,8 @@ pub fn rolling_std(data: &[f64], w: usize) -> Vec<f64> {
         let (m, mut var) = shifted_moments(&s1, &s2, count);
         let stale = m * m > 64.0 * var.max(0.0) && m * m > 1e-20 * k * k + f64::MIN_POSITIVE;
         if since_rebuild >= rebuild_every || stale || !var.is_finite() {
-            (k, s1, s2) = recentre(window);
+            (k, s1, s2, magnitude) = recentre(window, k);
+            peak = magnitude;
             since_rebuild = 0;
             (_, var) = shifted_moments(&s1, &s2, count);
             if !var.is_finite() {
@@ -715,6 +774,10 @@ mod tests {
         // partial sum is ~1e6. A plain running sum loses ~1e-10 here.
         let data: Vec<f64> = (0..20_000).map(|i| if i % 2 == 0 { 1e6 } else { -1e6 } + 1e-3).collect();
         let w = 100;
+        // 1e6 + 1e-3 and -1e6 + 1e-3 each round at ulp(1e6), so the stored
+        // pair's mean is not 1e-3; the pair sums exactly, so this is the true
+        // mean of every full window.
+        let true_mean = (data[0] + data[1]) / 2.0;
 
         // Act
         let mean = rolling_mean(&data, w);
@@ -722,7 +785,7 @@ mod tests {
 
         // Assert
         for i in w - 1..data.len() {
-            assert!((mean[i] - 1e-3).abs() <= 1e-12, "mean[{i}] = {}", mean[i]);
+            assert!((mean[i] - true_mean).abs() <= 1e-12, "mean[{i}] = {}", mean[i]);
             assert!((std[i] - 1e6).abs() <= 1e-12 * 1e6, "std[{i}] = {}", std[i]);
         }
     }
@@ -768,6 +831,72 @@ mod tests {
         for w in [3, 50, 600] {
             assert_all_three_agree(&data, w, "overflow");
         }
+    }
+
+    /// Scans made by one `rolling_mean` + `rolling_rms` + `rolling_std` run.
+    fn scans_of_all_three(data: &[f64], w: usize) -> usize {
+        let before = WINDOW_SCANNED.with(|c| c.get());
+        let _ = (rolling_mean(data, w), rolling_rms(data, w), rolling_std(data, w));
+        WINDOW_SCANNED.with(|c| c.get()) - before
+    }
+
+    #[test]
+    fn rolling_running_sums_the_window_after_a_huge_sample_leaves_equals_the_definition() {
+        // Arrange -- one corrupt f32-range sample (3e38; 9e76 squared) in calm data.
+        let mut data = noise(3_000, 31);
+        data[1_000] = 3.0e38;
+
+        // Act / Assert -- including the first window the spike is absent from.
+        for w in [2, 50, 700] {
+            assert_all_three_agree(&data, w, "spike left");
+        }
+    }
+
+    #[test]
+    fn rolling_running_sums_a_nan_in_the_window_when_a_huge_sample_leaves_still_recovers() {
+        // Arrange -- a NaN enters 10 samples after the spike and outlives it
+        // (w = 50), so the spike leaves a window that holds a NaN.
+        let mut data = noise(3_000, 32);
+        data[1_000] = 3.0e38;
+        data[1_010] = f64::NAN;
+
+        // Act / Assert -- windows after the NaN leaves too (1_060..).
+        for w in [50, 200] {
+            assert_all_three_agree(&data, w, "spike left under nan");
+        }
+    }
+
+    #[test]
+    fn rolling_running_sums_a_huge_sample_every_window_and_a_half_is_linear_and_equals_the_definition() {
+        // Arrange
+        let w = 100;
+        let mut data = noise(20_000, 33);
+        for i in (50..data.len()).step_by(w + w / 2) {
+            data[i] = 3.0e38;
+        }
+
+        // Act
+        let scanned = scans_of_all_three(&data, w);
+
+        // Assert -- about one rebuild per spike, not one per sample.
+        assert!(scanned <= 3 * 3 * data.len(), "scanned {scanned} samples");
+        assert_all_three_agree(&data, w, "spike per window");
+    }
+
+    #[test]
+    fn rolling_running_sums_steady_alternating_huge_terms_trigger_no_range_rebuilds() {
+        // Arrange -- near-zero mean, huge terms: the case a naive "window sum
+        // fell" test would trip on every sample.
+        let w = 100;
+        let data: Vec<f64> = (0..40_000).map(|i| if i % 2 == 0 { 1e6 } else { -1e6 } + 1e-3).collect();
+
+        // Act
+        let scanned = scans_of_all_three(&data, w);
+
+        // Assert -- only the periodic rebuilds (every 4096 samples, three
+        // functions, w samples each) plus a handful of start-up ones.
+        let periodic = 3 * (data.len() / ROLLING_REBUILD_EVERY + 1) * w;
+        assert!(scanned <= 4 * periodic, "scanned {scanned} samples, periodic budget {periodic}");
     }
 
     #[test]
