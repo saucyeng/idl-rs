@@ -78,9 +78,76 @@ impl CompensatedSum {
     }
 }
 
+/// How many NaN, `+inf` and `-inf` samples a window holds. The running sums
+/// only ever see finite samples; a window with any of these is answered from
+/// the counts, in O(1), exactly as summing it would have been.
+#[derive(Clone, Copy, Default)]
+struct NonFinite {
+    nan: usize,
+    pos_inf: usize,
+    neg_inf: usize,
+}
+
+impl NonFinite {
+    /// The counter `v` belongs to, or `None` for a finite sample.
+    fn slot(&mut self, v: f64) -> Option<&mut usize> {
+        if v.is_nan() {
+            Some(&mut self.nan)
+        } else if v == f64::INFINITY {
+            Some(&mut self.pos_inf)
+        } else if v == f64::NEG_INFINITY {
+            Some(&mut self.neg_inf)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the window holds any NaN or infinity.
+    fn any(&self) -> bool {
+        self.nan + self.pos_inf + self.neg_inf > 0
+    }
+}
+
+/// A window's mean given its non-finite samples (at least one): NaN if it has
+/// a NaN or both infinities, else the infinity it has.
+fn mean_non_finite(nf: &NonFinite) -> f64 {
+    if nf.nan > 0 || (nf.pos_inf > 0 && nf.neg_inf > 0) {
+        f64::NAN
+    } else if nf.pos_inf > 0 {
+        f64::INFINITY
+    } else {
+        f64::NEG_INFINITY
+    }
+}
+
+/// A window's RMS given its non-finite samples (at least one): NaN if it has
+/// a NaN, else `+inf` (an infinity squares to `+inf`).
+fn rms_non_finite(nf: &NonFinite) -> f64 {
+    if nf.nan > 0 {
+        f64::NAN
+    } else {
+        f64::INFINITY
+    }
+}
+
 /// Samples between from-scratch rebuilds of a running window sum (floored at
 /// the window width, so the rebuild stays O(1) amortised per sample).
 const ROLLING_REBUILD_EVERY: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    /// Samples visited by whole-window scans on this thread -- the test seam
+    /// behind "the rolling windows are O(N), also around NaN".
+    static WINDOW_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts `n` samples of a whole-window scan for the test seam.
+fn note_scan(n: usize) {
+    #[cfg(test)]
+    WINDOW_SCANNED.with(|c| c.set(c.get() + n));
+    #[cfg(not(test))]
+    let _ = n;
+}
 
 /// Start index of the causal window ending at `i` for a `w`-sample window
 /// (`w = 0` behaves as `w = 1`).
@@ -89,10 +156,12 @@ fn window_start(i: usize, w: usize) -> usize {
 }
 
 fn window_mean(window: &[f64]) -> f64 {
+    note_scan(window.len());
     window.iter().sum::<f64>() / window.len() as f64
 }
 
 fn window_rms(window: &[f64]) -> f64 {
+    note_scan(window.len());
     let mut sum_sq = 0.0;
     for v in window {
         sum_sq += v * v;
@@ -101,6 +170,7 @@ fn window_rms(window: &[f64]) -> f64 {
 }
 
 fn window_std(window: &[f64]) -> f64 {
+    note_scan(window.len());
     let count = window.len() as f64;
     let mean = window.iter().sum::<f64>() / count;
     let var_sum: f64 = window.iter().map(|v| (v - mean).powi(2)).sum();
@@ -108,57 +178,77 @@ fn window_std(window: &[f64]) -> f64 {
 }
 
 /// Shared O(N) driver for [`rolling_mean`] / [`rolling_rms`]: a compensated
-/// running sum of `term(v)` over the window, finished by `finish(sum, count)`.
-/// A window holding any non-finite sample, or whose sum overflows, is computed
-/// directly by `direct` so NaN / inf propagate exactly as in the per-window
-/// definition (a NaN never poisons the running state, because only finite
-/// samples are ever added to it).
+/// running sum of `term(v)` over the window's finite samples, finished by
+/// `finish(sum, count)`. NaN / inf samples are counted, not summed, and a
+/// window holding any is answered by `non_finite` from the counts.
+///
+/// A sum that overflows poisons the running state; until a periodic rebuild
+/// finds it finite again, windows are computed directly by `direct` (the
+/// per-window definition), at most the cost the old code paid on every
+/// window.
 fn rolling_running_sum(
     data: &[f64],
     w: usize,
     term: fn(f64) -> f64,
     finish: fn(f64, f64) -> f64,
     direct: fn(&[f64]) -> f64,
+    non_finite: fn(&NonFinite) -> f64,
 ) -> Vec<f64> {
     let n = data.len();
     let width = w.max(1);
     let rebuild_every = ROLLING_REBUILD_EVERY.max(width);
     let rebuild = |window: &[f64]| {
+        note_scan(window.len());
         let mut acc = CompensatedSum::default();
-        for &v in window.iter().filter(|v| v.is_finite()) {
-            acc.add(term(v));
+        for &v in window {
+            if v.is_finite() {
+                acc.add(term(v));
+            }
         }
         acc
     };
     let mut result = vec![0.0; n];
     let mut acc = CompensatedSum::default();
-    let mut non_finite = 0usize;
+    let mut counts = NonFinite::default();
     let mut since_rebuild = 0usize;
+    let mut poisoned = false;
     for i in 0..n {
-        if data[i].is_finite() {
-            acc.add(term(data[i]));
-        } else {
-            non_finite += 1;
+        match counts.slot(data[i]) {
+            Some(c) => *c += 1,
+            None => acc.add(term(data[i])),
         }
         if i >= width {
             let old = data[i - width];
-            if old.is_finite() {
-                acc.add(-term(old));
-            } else {
-                non_finite -= 1;
+            match counts.slot(old) {
+                Some(c) => *c -= 1,
+                None => acc.add(-term(old)),
             }
         }
-        let window = &data[window_start(i, w)..=i];
-        if non_finite > 0 {
-            result[i] = direct(window);
+        if counts.any() {
+            result[i] = non_finite(&counts);
             continue;
         }
+        let window = &data[window_start(i, w)..=i];
         since_rebuild += 1;
+        if poisoned {
+            result[i] = direct(window);
+            if since_rebuild >= width {
+                acc = rebuild(window);
+                poisoned = !acc.value().is_finite();
+                since_rebuild = 0;
+            }
+            continue;
+        }
         if since_rebuild >= rebuild_every || !acc.value().is_finite() {
             acc = rebuild(window);
             since_rebuild = 0;
+            if !acc.value().is_finite() {
+                poisoned = true;
+                result[i] = direct(window);
+                continue;
+            }
         }
-        result[i] = if acc.value().is_finite() { finish(acc.value(), window.len() as f64) } else { direct(window) };
+        result[i] = finish(acc.value(), window.len() as f64);
     }
     result
 }
@@ -166,19 +256,28 @@ fn rolling_running_sum(
 /// Rolling RMS over a causal window of `w` samples (shortened at the left edge).
 ///
 /// O(N): a compensated running sum of squares (rebuilt from scratch every few
-/// thousand samples). A window containing NaN / inf is computed directly, so
-/// it yields exactly what the per-window definition yields.
+/// thousand samples). NaN / inf samples are counted, so a window holding one
+/// costs no more than any other. Equal to the per-window definition to a few
+/// ulp, not bit for bit.
 pub fn rolling_rms(data: &[f64], w: usize) -> Vec<f64> {
-    rolling_running_sum(data, w, |v| v * v, |sum, count| (sum.max(0.0) / count).sqrt(), window_rms)
+    rolling_running_sum(data, w, |v| v * v, |sum, count| (sum.max(0.0) / count).sqrt(), window_rms, rms_non_finite)
 }
 
 /// Rolling mean over a causal window of `w` samples (shortened at the left edge).
 ///
 /// O(N): a compensated running sum (rebuilt from scratch every few thousand
-/// samples). A window containing NaN / inf is computed directly, so it yields
-/// exactly what the per-window definition yields.
+/// samples). NaN / inf samples are counted, so a window holding one costs no
+/// more than any other. Equal to the per-window definition to a few ulp, not
+/// bit for bit.
 pub fn rolling_mean(data: &[f64], w: usize) -> Vec<f64> {
-    rolling_running_sum(data, w, |v| v, |sum, count| sum / count, window_mean)
+    rolling_running_sum(data, w, |v| v, |sum, count| sum / count, window_mean, mean_non_finite)
+}
+
+/// Mean and population variance of a window from its sums about the shift:
+/// `(s1 / count, s2 / count - (s1 / count)²)`.
+fn shifted_moments(s1: &CompensatedSum, s2: &CompensatedSum, count: f64) -> (f64, f64) {
+    let m = s1.value() / count;
+    (m, s2.value() / count - m * m)
 }
 
 /// Rolling population standard deviation over a causal window of `w` samples
@@ -188,15 +287,18 @@ pub fn rolling_mean(data: &[f64], w: usize) -> Vec<f64> {
 /// near the window mean, so large offsets (1e6 ± noise) do not cancel. `K` is
 /// re-centred (an O(w) rebuild) whenever the window mean drifts more than 8σ
 /// from it, and every few thousand samples. Never negative or NaN from
-/// cancellation (variance is clamped at zero); a window containing NaN / inf
-/// is computed directly, exactly as the per-window definition.
+/// cancellation (variance is clamped at zero). A window holding NaN or inf is
+/// NaN, from counts; one whose sums overflow is computed directly until a
+/// re-centre finds them finite. Equal to the per-window definition to a few
+/// ulp, not bit for bit.
 pub fn rolling_std(data: &[f64], w: usize) -> Vec<f64> {
     let n = data.len();
     let width = w.max(1);
     let rebuild_every = ROLLING_REBUILD_EVERY.max(width);
     // Re-centres on the window mean and recomputes both sums from scratch.
     let recentre = |window: &[f64]| -> (f64, CompensatedSum, CompensatedSum) {
-        let k = window_mean(window);
+        note_scan(window.len());
+        let k = window.iter().sum::<f64>() / window.len() as f64;
         let (mut s1, mut s2) = (CompensatedSum::default(), CompensatedSum::default());
         for &v in window {
             let d = v - k;
@@ -211,43 +313,58 @@ pub fn rolling_std(data: &[f64], w: usize) -> Vec<f64> {
         _ => 0.0,
     };
     let (mut s1, mut s2) = (CompensatedSum::default(), CompensatedSum::default());
-    let mut non_finite = 0usize;
+    let mut counts = NonFinite::default();
     let mut since_rebuild = 0usize;
+    let mut poisoned = false;
     for i in 0..n {
-        if data[i].is_finite() {
-            let d = data[i] - k;
-            s1.add(d);
-            s2.add(d * d);
-        } else {
-            non_finite += 1;
+        match counts.slot(data[i]) {
+            Some(c) => *c += 1,
+            None => {
+                let d = data[i] - k;
+                s1.add(d);
+                s2.add(d * d);
+            }
         }
         if i >= width {
             let old = data[i - width];
-            if old.is_finite() {
-                let d = old - k;
-                s1.add(-d);
-                s2.add(-(d * d));
-            } else {
-                non_finite -= 1;
+            match counts.slot(old) {
+                Some(c) => *c -= 1,
+                None => {
+                    let d = old - k;
+                    s1.add(-d);
+                    s2.add(-(d * d));
+                }
             }
         }
-        let window = &data[window_start(i, w)..=i];
-        if non_finite > 0 {
-            result[i] = window_std(window);
+        if counts.any() {
+            result[i] = f64::NAN;
             continue;
         }
+        let window = &data[window_start(i, w)..=i];
         let count = window.len() as f64;
         since_rebuild += 1;
-        let mut m = s1.value() / count;
-        let mut var = s2.value() / count - m * m;
+        if poisoned {
+            result[i] = window_std(window);
+            if since_rebuild >= width {
+                (k, s1, s2) = recentre(window);
+                poisoned = !shifted_moments(&s1, &s2, count).1.is_finite();
+                since_rebuild = 0;
+            }
+            continue;
+        }
+        let (m, mut var) = shifted_moments(&s1, &s2, count);
         let stale = m * m > 64.0 * var.max(0.0) && m * m > 1e-20 * k * k + f64::MIN_POSITIVE;
         if since_rebuild >= rebuild_every || stale || !var.is_finite() {
             (k, s1, s2) = recentre(window);
             since_rebuild = 0;
-            m = s1.value() / count;
-            var = s2.value() / count - m * m;
+            (_, var) = shifted_moments(&s1, &s2, count);
+            if !var.is_finite() {
+                poisoned = true;
+                result[i] = window_std(window);
+                continue;
+            }
         }
-        result[i] = if var.is_finite() { var.max(0.0).sqrt() } else { window_std(window) };
+        result[i] = var.max(0.0).sqrt();
     }
     result
 }
@@ -580,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_std_constant_large_offset_is_exactly_zero_not_negative_or_nan() {
+    fn rolling_std_constant_large_offset_is_zero_to_rounding_never_negative_or_nan() {
         // Arrange
         let data = vec![1.0e6 + 0.1; 10_000];
 
@@ -589,6 +706,68 @@ mod tests {
 
         // Assert
         assert!(s.iter().all(|v| *v >= 0.0 && v.is_finite() && *v < 1e-6));
+    }
+
+    #[test]
+    fn rolling_running_sums_near_zero_mean_of_huge_terms_stays_absolutely_accurate() {
+        // Arrange -- alternating +-1e6 around a 1e-3 offset: every full window of
+        // even width has mean exactly 1e-3 and std exactly 1e6, though each
+        // partial sum is ~1e6. A plain running sum loses ~1e-10 here.
+        let data: Vec<f64> = (0..20_000).map(|i| if i % 2 == 0 { 1e6 } else { -1e6 } + 1e-3).collect();
+        let w = 100;
+
+        // Act
+        let mean = rolling_mean(&data, w);
+        let std = rolling_std(&data, w);
+
+        // Assert
+        for i in w - 1..data.len() {
+            assert!((mean[i] - 1e-3).abs() <= 1e-12, "mean[{i}] = {}", mean[i]);
+            assert!((std[i] - 1e6).abs() <= 1e-12 * 1e6, "std[{i}] = {}", std[i]);
+        }
+    }
+
+    #[test]
+    fn rolling_running_sums_a_nan_in_every_window_is_still_linear_and_equals_the_definition() {
+        // Arrange -- a NaN dropout every 997 samples with a 2000-sample window
+        // puts a NaN in every window; plus an infinity pair to cover the signs.
+        let mut data = noise(10_000, 99);
+        for i in (0..data.len()).step_by(997) {
+            data[i] = f64::NAN;
+        }
+        data[3_001] = f64::INFINITY;
+        data[3_002] = f64::NEG_INFINITY;
+        data[6_345] = f64::INFINITY;
+        let w = 2_000;
+        let clean = noise(10_000, 99);
+
+        // Act
+        let scanned_before = WINDOW_SCANNED.with(|c| c.get());
+        let _ = (rolling_mean(&data, w), rolling_rms(&data, w), rolling_std(&data, w));
+        let scanned = WINDOW_SCANNED.with(|c| c.get()) - scanned_before;
+
+        // Assert -- whole-window scans (rebuilds) touch O(N) samples in all,
+        // not O(N * w); and the answers are the definition's.
+        assert!(scanned <= 3 * 4 * data.len(), "scanned {scanned} samples");
+        assert_all_three_agree(&data, w, "nan every window");
+        assert_all_three_agree(&clean, w, "clean");
+    }
+
+    #[test]
+    fn rolling_running_sums_overflowing_sums_match_the_definition_and_recover() {
+        // Arrange -- finite values whose squares and sums overflow, in the middle of a calm signal.
+        let mut data = noise(12_000, 5);
+        for v in &mut data[4_000..4_010] {
+            *v = 1e200;
+        }
+        data[7_000] = -1e308;
+        data[7_001] = -1e308;
+        data[7_002] = -1e308;
+
+        // Act / Assert
+        for w in [3, 50, 600] {
+            assert_all_three_agree(&data, w, "overflow");
+        }
     }
 
     #[test]
