@@ -1,10 +1,10 @@
 //! `data.parquet` Arrow schema, writer, and reader (contract C1 §4). One
 //! wide file per session, row-indexed by the union time axis `t`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::{
     Array, ArrayRef, BooleanBufferBuilder, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, PrimitiveArray,
@@ -13,7 +13,7 @@ use arrow::array::{
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::arrow_writer::{compute_leaves, ArrowColumnWriter};
 use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::basic::Encoding;
@@ -883,18 +883,69 @@ pub struct ChannelColumnInfo {
 
 /// Opens `<session_dir>/data.parquet` for reading, or a
 /// [`ParquetStoreErrorKind::NotFound`] naming the path when it is absent.
-fn open_data_parquet(session_dir: &Path) -> Result<ParquetRecordBatchReaderBuilder<std::fs::File>, ParquetStoreError> {
+fn open_data_file(session_dir: &Path) -> Result<std::fs::File, ParquetStoreError> {
     let path = session_dir.join("data.parquet");
-    let file = std::fs::File::open(&path).map_err(|e| {
+    std::fs::File::open(&path).map_err(|e| {
         let kind = if e.kind() == std::io::ErrorKind::NotFound {
             ParquetStoreErrorKind::NotFound
         } else {
             ParquetStoreErrorKind::Io
         };
         ParquetStoreError::new(kind, format!("open {}: {e}", path.display()))
-    })?;
-    ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| ParquetStoreError::new(ParquetStoreErrorKind::Schema, format!("{}: {e}", path.display())))
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Footers parsed on this thread -- the test seam behind "the footer is
+    /// read once per session, not once per channel".
+    static FOOTER_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Footers of `data.parquet` parsed on the calling thread so far (tests only).
+#[cfg(test)]
+pub(crate) fn footer_loads_on_this_thread() -> usize {
+    FOOTER_LOADS.with(|c| c.get())
+}
+
+/// Counts one footer parse for [`footer_loads_on_this_thread`].
+fn note_footer_load() {
+    #[cfg(test)]
+    FOOTER_LOADS.with(|c| c.set(c.get() + 1));
+}
+
+/// Opens `<session_dir>/data.parquet` for reading and parses its footer.
+fn open_data_parquet(session_dir: &Path) -> Result<ParquetRecordBatchReaderBuilder<std::fs::File>, ParquetStoreError> {
+    let file = open_data_file(session_dir)?;
+    note_footer_load();
+    ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+        ParquetStoreError::new(
+            ParquetStoreErrorKind::Schema,
+            format!("{}: {e}", session_dir.join("data.parquet").display()),
+        )
+    })
+}
+
+/// The parsed footer of `<session_dir>/data.parquet`, for a reader that
+/// serves many channels from one parse ([`SessionColumnReader`]).
+fn load_footer(session_dir: &Path) -> Result<ArrowReaderMetadata, ParquetStoreError> {
+    let file = open_data_file(session_dir)?;
+    note_footer_load();
+    ArrowReaderMetadata::load(&file, ArrowReaderOptions::default()).map_err(|e| {
+        ParquetStoreError::new(
+            ParquetStoreErrorKind::Schema,
+            format!("{}: {e}", session_dir.join("data.parquet").display()),
+        )
+    })
+}
+
+/// A reader over `<session_dir>/data.parquet` that reuses an already-parsed
+/// footer: opens the file but does not parse it again.
+fn open_data_parquet_with(
+    session_dir: &Path,
+    footer: &ArrowReaderMetadata,
+) -> Result<ParquetRecordBatchReaderBuilder<std::fs::File>, ParquetStoreError> {
+    Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(open_data_file(session_dir)?, footer.clone()))
 }
 
 /// `true` for the column names that are not channels: the shared `t` axis
@@ -921,9 +972,16 @@ fn sample_bytes_of(dt: &DataType) -> Option<usize> {
 /// are never columns (C1 §2).
 pub fn read_channel_index(session_dir: &Path) -> Result<Vec<ChannelColumnInfo>, ParquetStoreError> {
     let builder = open_data_parquet(session_dir)?;
-    let file_rows = builder.metadata().file_metadata().num_rows().max(0) as usize;
-    let schema = builder.schema().clone();
-    let row_groups = builder.metadata().row_groups().to_vec();
+    channel_index_of(builder.metadata(), builder.schema())
+}
+
+/// [`read_channel_index`] from an already-parsed footer.
+fn channel_index_of(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    schema: &Schema,
+) -> Result<Vec<ChannelColumnInfo>, ParquetStoreError> {
+    let file_rows = metadata.file_metadata().num_rows().max(0) as usize;
+    let row_groups = metadata.row_groups().to_vec();
 
     let mut out = Vec::new();
     for field in schema.fields() {
@@ -1011,7 +1069,16 @@ fn read_projected_batch_with_progress(
     wanted: &[&str],
     on_progress: &mut dyn FnMut(usize, usize),
 ) -> Result<RecordBatch, ParquetStoreError> {
-    let builder = open_data_parquet(session_dir)?;
+    read_projected_batch_from(open_data_parquet(session_dir)?, wanted, on_progress)
+}
+
+/// [`read_projected_batch_with_progress`] over a reader the caller opened --
+/// from a fresh footer parse, or one a [`SessionColumnReader`] already holds.
+fn read_projected_batch_from(
+    builder: ParquetRecordBatchReaderBuilder<std::fs::File>,
+    wanted: &[&str],
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> Result<RecordBatch, ParquetStoreError> {
     let total_rows = builder.metadata().file_metadata().num_rows().max(0) as usize;
     let schema = builder.schema().clone();
     let roots: Vec<usize> = schema
@@ -1259,6 +1326,20 @@ pub fn read_channel_sharing_axes(
     on_progress: &mut dyn FnMut(usize, usize),
 ) -> Result<DecodedChannel, ParquetStoreError> {
     let index = read_channel_index(session_dir)?;
+    decode_sharing_axes(session_dir, &index, None, channel, have, on_progress)
+}
+
+/// [`read_channel_sharing_axes`] against an index the caller already read,
+/// and (when `footer` is given) a footer it already parsed -- the one body
+/// both that function and [`SessionColumnReader::read_channel`] run.
+fn decode_sharing_axes(
+    session_dir: &Path,
+    index: &[ChannelColumnInfo],
+    footer: Option<&ArrowReaderMetadata>,
+    channel: &str,
+    have: BorrowedAxes<'_>,
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> Result<DecodedChannel, ParquetStoreError> {
     let Some(info) = index.iter().find(|c| c.channel_id == channel) else {
         let samples = read_channel_with_progress(session_dir, channel, on_progress)?;
         return Ok(DecodedChannel { samples, t: None, recorded: None });
@@ -1272,7 +1353,10 @@ pub fn read_channel_sharing_axes(
     if have.recorded.is_none() {
         wanted.push(recorded_name.as_str());
     }
-    let batch = read_projected_batch_with_progress(session_dir, &wanted, on_progress)?;
+    let batch = match footer {
+        Some(footer) => read_projected_batch_from(open_data_parquet_with(session_dir, footer)?, &wanted, on_progress)?,
+        None => read_projected_batch_with_progress(session_dir, &wanted, on_progress)?,
+    };
 
     let column = batch
         .column_by_name(channel)
@@ -1346,6 +1430,111 @@ pub fn read_channel_sharing_axes(
         t: read_t,
         recorded: read_recorded,
     })
+}
+
+/// The timestamp columns a [`SessionColumnReader`] has decoded so far.
+#[derive(Debug, Default)]
+struct HeldAxes {
+    /// The union `t` axis.
+    t: Option<Arc<AxisColumn>>,
+    /// Each source kind's `<source>_t_recorded_us` companion, by source kind.
+    recorded: HashMap<String, Arc<AxisColumn>>,
+}
+
+/// One session's `data.parquet`, opened once and read many times: the
+/// footer is parsed on [`Self::open`] and never again, and the union `t`
+/// axis and each source's recorded-time companion are decompressed by the
+/// first channel that needs them and borrowed by every later one
+/// ([`read_channel_sharing_axes`]'s sharing, held for the reader's life).
+///
+/// Each [`Self::read_channel`] is value-for-value what [`read_channel`]
+/// returns; only the repeated footer parse and axis decompression are gone.
+/// A reader reflects the file as it was at [`Self::open`]: a caller that can
+/// outlive a rewrite of the file must open a new one.
+///
+/// **Memory:** the held axes are file-row-indexed `i64` columns, 8 bytes
+/// per file row each, one for `t` plus one per source kind read, resident
+/// until the reader drops. [`Self::held_axis_bytes`] reports them;
+/// [`axis_bytes_ceiling`] bounds them from the footer alone, for admission.
+#[derive(Debug)]
+pub struct SessionColumnReader {
+    session_dir: PathBuf,
+    footer: ArrowReaderMetadata,
+    index: Vec<ChannelColumnInfo>,
+    axes: Mutex<HeldAxes>,
+}
+
+impl SessionColumnReader {
+    /// Parses `<session_dir>/data.parquet`'s footer, once.
+    pub fn open(session_dir: &Path) -> Result<Self, ParquetStoreError> {
+        let footer = load_footer(session_dir)?;
+        let index = channel_index_of(footer.metadata(), footer.schema())?;
+        Ok(SessionColumnReader { session_dir: session_dir.to_path_buf(), footer, index, axes: Mutex::new(HeldAxes::default()) })
+    }
+
+    /// Every stored channel column, as [`read_channel_index`] lists them.
+    pub fn index(&self) -> &[ChannelColumnInfo] {
+        &self.index
+    }
+
+    /// One channel, exactly as [`read_channel`] returns it, borrowing the
+    /// axes an earlier read decoded and keeping any this read had to decode.
+    ///
+    /// A synthesized `Time`/`Distance`, and a name the file does not carry,
+    /// take [`read_channel`]'s own path (they borrow nothing).
+    pub fn read_channel(&self, channel: &str) -> Result<ChannelSamples, ParquetStoreError> {
+        let Some(info) = self.index.iter().find(|c| c.channel_id == channel) else {
+            return read_channel(&self.session_dir, channel);
+        };
+        let (held_t, held_recorded) = {
+            let held = self.axes.lock().unwrap_or_else(|p| p.into_inner());
+            (held.t.clone(), held.recorded.get(&info.source_kind).cloned())
+        };
+        let decoded = decode_sharing_axes(
+            &self.session_dir,
+            &self.index,
+            Some(&self.footer),
+            channel,
+            BorrowedAxes { t: held_t.as_deref(), recorded: held_recorded.as_deref() },
+            &mut |_, _| {},
+        )?;
+        if decoded.t.is_some() || decoded.recorded.is_some() {
+            let mut held = self.axes.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(t) = decoded.t {
+                held.t.get_or_insert_with(|| Arc::new(t));
+            }
+            if let Some(recorded) = decoded.recorded {
+                held.recorded.entry(info.source_kind.clone()).or_insert_with(|| Arc::new(recorded));
+            }
+        }
+        Ok(decoded.samples)
+    }
+
+    /// Heap bytes of the axis columns held now, each counted once.
+    pub fn held_axis_bytes(&self) -> usize {
+        let held = self.axes.lock().unwrap_or_else(|p| p.into_inner());
+        held.t.iter().chain(held.recorded.values()).map(|a| a.resident_bytes()).sum()
+    }
+}
+
+/// Ceiling, bytes, on the axis columns a [`SessionColumnReader`] holds after
+/// reading `channels`: one `t` column plus one recorded companion per
+/// distinct source kind among them, 8 bytes per file row each. Zero when no
+/// listed channel is a stored column (nothing is decoded, nothing is held).
+/// A ceiling, as [`estimate_channel_bytes`] is: it charges a recorded
+/// companion a source may not have.
+pub fn axis_bytes_ceiling<'a>(index: &[ChannelColumnInfo], channels: impl IntoIterator<Item = &'a str>) -> u64 {
+    let mut kinds: BTreeSet<&str> = BTreeSet::new();
+    for name in channels {
+        if let Some(info) = index.iter().find(|c| c.channel_id == name) {
+            kinds.insert(info.source_kind.as_str());
+        }
+    }
+    if kinds.is_empty() {
+        return 0;
+    }
+    let rows = index.first().map_or(0, |c| c.file_rows) as u64;
+    rows.saturating_mul(8).saturating_mul(1 + kinds.len() as u64)
 }
 
 /// One Int64 column of `batch` as an [`AxisColumn`].
@@ -1683,12 +1872,43 @@ pub fn read_channel_sample_counts(session_dir: &Path) -> Result<Vec<(String, usi
 #[derive(Debug, Clone)]
 pub struct ParquetChannelSource {
     session_dir: PathBuf,
+    /// The open reader and the file stamp it was opened against; clones of
+    /// the source share it.
+    reader: Arc<Mutex<Option<(FileStamp, Arc<SessionColumnReader>)>>>,
+}
+
+/// `data.parquet`'s size (bytes) and modification time: what a held footer is
+/// valid for.
+type FileStamp = (u64, Option<std::time::SystemTime>);
+
+fn file_stamp(session_dir: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(session_dir.join("data.parquet")).ok()?;
+    Some((meta.len(), meta.modified().ok()))
 }
 
 impl ParquetChannelSource {
     /// A source over `<data>/sessions/<session_id>` (C4 §2).
     pub fn new(session_dir: impl Into<PathBuf>) -> Self {
-        ParquetChannelSource { session_dir: session_dir.into() }
+        ParquetChannelSource { session_dir: session_dir.into(), reader: Arc::new(Mutex::new(None)) }
+    }
+
+    /// The reader for the file as it is now: the held one while the file's
+    /// size and modification time are unchanged, a fresh one otherwise.
+    fn reader(&self) -> Result<Arc<SessionColumnReader>, ParquetStoreError> {
+        let stamp = file_stamp(&self.session_dir);
+        let mut held = self.reader.lock().unwrap_or_else(|p| p.into_inner());
+        if let (Some((held_stamp, reader)), Some(now)) = (held.as_ref(), stamp) {
+            if *held_stamp == now {
+                return Ok(reader.clone());
+            }
+        }
+        let reader = Arc::new(SessionColumnReader::open(&self.session_dir)?);
+        *held = stamp.map(|s| (s, reader.clone()));
+        Ok(reader)
+    }
+
+    fn read(&self, channel_id: &str) -> Result<ChannelSamples, ParquetStoreError> {
+        self.reader()?.read_channel(channel_id)
     }
 }
 
@@ -1698,13 +1918,13 @@ impl ChannelSource for ParquetChannelSource {
     /// its docs): a failed decode degrades that one channel to absent
     /// rather than failing a whole import or evaluation.
     fn channel(&self, channel_id: &str) -> Option<Channel> {
-        read_channel(&self.session_dir, channel_id).ok().map(ChannelSamples::into_channel)
+        self.read(channel_id).ok().map(ChannelSamples::into_channel)
     }
 
     /// The decode as the `Arc` the handle keeps, with no `into_channel` /
     /// `from_channel` round trip (which copies both time axes twice).
     fn channel_samples(&self, channel_id: &str) -> Option<std::sync::Arc<ChannelSamples>> {
-        read_channel(&self.session_dir, channel_id).ok().map(std::sync::Arc::new)
+        self.read(channel_id).ok().map(std::sync::Arc::new)
     }
 }
 
@@ -1961,6 +2181,131 @@ mod tests {
             assert_eq!(got.materialize(), alone.materialize());
         }
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Eight channels over two source kinds, written to a fresh session
+    /// directory; returns `(root, dir)`.
+    fn two_source_session() -> (PathBuf, PathBuf) {
+        let root = temp_root();
+        let mut session = sample_session();
+        let base = session.channels[0].clone();
+        session.channels = (0..6).map(|i| Channel { channel_id: format!("IMU0_C{i}"), ..base.clone() }).collect();
+        session.channels.extend((0..2).map(|i| Channel {
+            channel_id: format!("WHEEL_C{i}"),
+            source_kind: "wheel".to_string(),
+            ..base.clone()
+        }));
+        let path = write_session_parquet(&root, &session, "0.1.0").unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+        (root, dir)
+    }
+
+    #[test]
+    fn session_column_reader_every_channel_is_identical_to_an_independent_read() {
+        // Arrange
+        let (root, dir) = two_source_session();
+        let reader = SessionColumnReader::open(&dir).unwrap();
+
+        // Act
+        let shared: Vec<(String, ChannelSamples)> = reader
+            .index()
+            .iter()
+            .map(|c| (c.channel_id.clone(), reader.read_channel(&c.channel_id).unwrap()))
+            .collect();
+
+        // Assert -- bit-identical, including both time axes.
+        assert_eq!(shared.len(), 8);
+        for (id, got) in &shared {
+            let alone = read_channel(&dir, id).unwrap();
+            assert_eq!(got.t_us, alone.t_us, "{id}");
+            assert_eq!(got.t_recorded_us, alone.t_recorded_us, "{id}");
+            assert_eq!(got.materialize(), alone.materialize(), "{id}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_column_reader_many_channels_parse_the_footer_once() {
+        // Arrange
+        let (root, dir) = two_source_session();
+        let before = footer_loads_on_this_thread();
+
+        // Act
+        let reader = SessionColumnReader::open(&dir).unwrap();
+        for c in reader.index() {
+            reader.read_channel(&c.channel_id).unwrap();
+        }
+
+        // Assert -- one parse for eight channels; the independent path pays
+        // two per channel (index + projected read).
+        assert_eq!(footer_loads_on_this_thread() - before, 1);
+        let before_alone = footer_loads_on_this_thread();
+        read_channel(&dir, "IMU0_C0").unwrap();
+        read_channel(&dir, "IMU0_C1").unwrap();
+        assert_eq!(footer_loads_on_this_thread() - before_alone, 4);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_column_reader_holds_one_t_axis_and_one_recorded_axis_per_source_kind() {
+        // Arrange
+        let (root, dir) = two_source_session();
+        let reader = SessionColumnReader::open(&dir).unwrap();
+        let rows = reader.index()[0].file_rows;
+        assert_eq!(reader.held_axis_bytes(), 0);
+
+        // Act
+        for c in reader.index() {
+            reader.read_channel(&c.channel_id).unwrap();
+        }
+
+        // Assert -- t once, plus the imu0 and wheel companions once each (the
+        // sample channels carry recorded times), not once per channel.
+        let held = reader.held_axis_bytes();
+        let one_axis = rows * 8;
+        assert!(held >= 2 * one_axis && held <= 3 * (one_axis + 256), "held {held} for {rows} rows");
+        let ceiling = axis_bytes_ceiling(reader.index(), reader.index().iter().map(|c| c.channel_id.as_str()));
+        assert_eq!(ceiling, rows as u64 * 8 * 3);
+        assert!(held as u64 <= ceiling + 3 * 256);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn axis_bytes_ceiling_no_stored_channel_listed_holds_nothing() {
+        // Arrange
+        let (root, dir) = two_source_session();
+        let index = read_channel_index(&dir).unwrap();
+
+        // Act / Assert
+        assert_eq!(axis_bytes_ceiling(&index, ["Time", "NoSuchChannel"]), 0);
+        assert_eq!(axis_bytes_ceiling(&index, ["IMU0_C0", "IMU0_C1"]), index[0].file_rows as u64 * 16);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parquet_channel_source_a_rewritten_file_is_read_fresh_not_through_the_old_footer() {
+        // Arrange -- read once, then replace data.parquet with a different session.
+        let root = temp_root();
+        let session = sample_session();
+        let path = write_session_parquet(&root, &session, "0.1.0").unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+        let source = ParquetChannelSource::new(&dir);
+        let id = session.channels[0].channel_id.clone();
+        let first = source.channel(&id).unwrap();
+        let mut longer = session.clone();
+        longer.channels[0].t_us.push(9000);
+        longer.channels[0].t_recorded_us.as_mut().unwrap().push(9000);
+        if let RawColumn::I16 { data, .. } = &mut longer.channels[0].column {
+            data.push(500);
+        }
+        write_session_parquet(&root, &longer, "0.1.0").unwrap();
+
+        // Act
+        let second = source.channel(&id).unwrap();
+
+        // Assert
+        assert_eq!(second.t_us.len(), first.t_us.len() + 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 

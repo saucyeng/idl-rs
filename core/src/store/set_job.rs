@@ -18,7 +18,7 @@
 //! Members are independent, so a member that cannot be evaluated is reported
 //! and the run continues. Cancellation is checked at member boundaries.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -27,9 +27,9 @@ use crate::session::{Channel, ChannelSamples};
 use crate::store::eval_cache::{catalog_identity, open_catalog_read_only, EvalCache, PRUNE_ABOVE_BYTES};
 use crate::store::index_job::{MemoryBudget, NeverFits};
 use crate::store::parquet::{
-    open_session_lazy_with, read_channel, read_channel_index, read_session_metadata, ParquetStoreErrorKind,
+    axis_bytes_ceiling, open_session_lazy_with, read_session_metadata, ParquetStoreErrorKind, SessionColumnReader,
 };
-use crate::workbook::v3::plan::PlanInputs;
+use crate::workbook::v3::plan::{PlanInputs, ESTIMATE_MARGIN};
 use crate::workbook::v3::EvalObserver;
 use crate::store::session_context::{whole_session_bounds, whole_session_context_without_data, window_lap_context};
 use crate::store::session_json::{parse_session_json, SessionJson};
@@ -222,14 +222,15 @@ pub struct SetJobReport {
 }
 
 /// A member's channels, read straight from its `data.parquet` (no shared
-/// cache), counting decodes and keeping the first failure that is not "no
+/// cache) through one [`SessionColumnReader`] -- the footer parsed once, the
+/// time axes decoded once -- counting decodes and keeping the first failure that is not "no
 /// such channel" — a [`ChannelSource`] cannot return an error, and a refused
 /// decode must not read as an unknown channel (R211.2), nor be cached.
 #[derive(Debug)]
 struct MemberSource {
-    session_dir: PathBuf,
+    reader: SessionColumnReader,
     decodes: AtomicUsize,
-    /// Time spent in `read_channel`, µs, summed.
+    /// Time spent in `SessionColumnReader::read_channel`, µs, summed.
     decode_us: std::sync::atomic::AtomicU64,
     first_error: Mutex<Option<SetMemberError>>,
 }
@@ -242,7 +243,7 @@ impl ChannelSource for MemberSource {
     fn channel_samples(&self, channel_id: &str) -> Option<Arc<ChannelSamples>> {
         self.decodes.fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
-        let read = read_channel(&self.session_dir, channel_id);
+        let read = self.reader.read_channel(channel_id);
         self.decode_us.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         match read {
             Ok(s) => Some(Arc::new(s)),
@@ -508,11 +509,17 @@ fn evaluate_with_data(
 ) -> Result<MemberResults, MemberRunError> {
     let io = |message: String| MemberRunError::Failed(SetMemberError { kind: SetMemberErrorKind::Io, message });
     let opened = std::time::Instant::now();
-    let inputs = read_channel_index(dir)
-        .map(|index| PlanInputs::from_channel_index(&index))
+    let reader = SessionColumnReader::open(dir)
         .map_err(|e| io(format!("reading {}: {}", dir.join("data.parquet").display(), e.message)))?;
+    let inputs = PlanInputs::from_channel_index(reader.index());
     let eval_plan = member_eval_plan(plan, &doc.constants, &inputs);
-    let needed = eval_plan.estimate_with_missing_inputs(|_| true);
+    // The reader keeps the session's time axes for the member's life, so they
+    // are charged once, here, on top of the plan's per-channel inputs.
+    let axes = axis_bytes_ceiling(reader.index(), eval_plan.inputs.iter().map(|i| i.channel.as_str()));
+    let (margin_num, margin_den) = ESTIMATE_MARGIN;
+    let needed = eval_plan
+        .estimate_with_missing_inputs(|_| true)
+        .saturating_add(axes.saturating_mul(margin_num) / margin_den);
     let hint = format!("evaluate session-set member '{}'", report.session_id);
     let observer = CancelFlag { cancel: options.cancel, marks: Mutex::new(Vec::new()) };
 
@@ -539,7 +546,7 @@ fn evaluate_with_data(
     };
 
     let source = Arc::new(MemberSource {
-        session_dir: dir.to_path_buf(),
+        reader,
         decodes: AtomicUsize::new(0),
         decode_us: std::sync::atomic::AtomicU64::new(0),
         first_error: Mutex::new(None),
@@ -582,6 +589,7 @@ fn evaluate_with_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use crate::workbook::v3::parse_workbook;
     use crate::workbook::v3::session_set::parse_session_set;
 
