@@ -223,9 +223,10 @@ pub struct SetJobReport {
 
 /// A member's channels, read straight from its `data.parquet` (no shared
 /// cache) through one [`SessionColumnReader`] -- the footer parsed once, the
-/// time axes decoded once -- counting decodes and keeping the first failure that is not "no
-/// such channel" — a [`ChannelSource`] cannot return an error, and a refused
-/// decode must not read as an unknown channel (R211.2), nor be cached.
+/// time axes decoded once -- counting decodes and keeping the first failure
+/// that is not "no such channel" — a [`ChannelSource`] cannot return an
+/// error, and a refused decode must not read as an unknown channel (R211.2),
+/// nor be cached.
 #[derive(Debug)]
 struct MemberSource {
     reader: SessionColumnReader,
