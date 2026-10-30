@@ -53,47 +53,201 @@ pub fn gradient(data: &[f64], sample_rate_hz: f64) -> Vec<f64> {
     result
 }
 
-/// Rolling RMS over a causal window of `w` samples (shortened at the left edge).
-pub fn rolling_rms(data: &[f64], w: usize) -> Vec<f64> {
-    let n = data.len();
-    let mut result = vec![0.0; n];
-    for i in 0..n {
-        let start = i.saturating_sub(w.saturating_sub(1));
-        let mut sum_sq = 0.0;
-        for v in &data[start..=i] {
-            sum_sq += v * v;
+/// Neumaier (improved Kahan) compensated running sum. Adding then subtracting
+/// the same term leaves the total accurate to a few ulp of the *result*, not of
+/// the largest term that ever passed through it — what a sliding window needs.
+#[derive(Clone, Copy, Default)]
+struct CompensatedSum {
+    sum: f64,
+    comp: f64,
+}
+
+impl CompensatedSum {
+    fn add(&mut self, x: f64) {
+        let t = self.sum + x;
+        if self.sum.abs() >= x.abs() {
+            self.comp += (self.sum - t) + x;
+        } else {
+            self.comp += (x - t) + self.sum;
         }
-        let count = (i - start + 1) as f64;
-        result[i] = (sum_sq / count).sqrt();
+        self.sum = t;
+    }
+
+    fn value(&self) -> f64 {
+        self.sum + self.comp
+    }
+}
+
+/// Samples between from-scratch rebuilds of a running window sum (floored at
+/// the window width, so the rebuild stays O(1) amortised per sample).
+const ROLLING_REBUILD_EVERY: usize = 4096;
+
+/// Start index of the causal window ending at `i` for a `w`-sample window
+/// (`w = 0` behaves as `w = 1`).
+fn window_start(i: usize, w: usize) -> usize {
+    i.saturating_sub(w.saturating_sub(1))
+}
+
+fn window_mean(window: &[f64]) -> f64 {
+    window.iter().sum::<f64>() / window.len() as f64
+}
+
+fn window_rms(window: &[f64]) -> f64 {
+    let mut sum_sq = 0.0;
+    for v in window {
+        sum_sq += v * v;
+    }
+    (sum_sq / window.len() as f64).sqrt()
+}
+
+fn window_std(window: &[f64]) -> f64 {
+    let count = window.len() as f64;
+    let mean = window.iter().sum::<f64>() / count;
+    let var_sum: f64 = window.iter().map(|v| (v - mean).powi(2)).sum();
+    (var_sum / count).sqrt()
+}
+
+/// Shared O(N) driver for [`rolling_mean`] / [`rolling_rms`]: a compensated
+/// running sum of `term(v)` over the window, finished by `finish(sum, count)`.
+/// A window holding any non-finite sample, or whose sum overflows, is computed
+/// directly by `direct` so NaN / inf propagate exactly as in the per-window
+/// definition (a NaN never poisons the running state, because only finite
+/// samples are ever added to it).
+fn rolling_running_sum(
+    data: &[f64],
+    w: usize,
+    term: fn(f64) -> f64,
+    finish: fn(f64, f64) -> f64,
+    direct: fn(&[f64]) -> f64,
+) -> Vec<f64> {
+    let n = data.len();
+    let width = w.max(1);
+    let rebuild_every = ROLLING_REBUILD_EVERY.max(width);
+    let rebuild = |window: &[f64]| {
+        let mut acc = CompensatedSum::default();
+        for &v in window.iter().filter(|v| v.is_finite()) {
+            acc.add(term(v));
+        }
+        acc
+    };
+    let mut result = vec![0.0; n];
+    let mut acc = CompensatedSum::default();
+    let mut non_finite = 0usize;
+    let mut since_rebuild = 0usize;
+    for i in 0..n {
+        if data[i].is_finite() {
+            acc.add(term(data[i]));
+        } else {
+            non_finite += 1;
+        }
+        if i >= width {
+            let old = data[i - width];
+            if old.is_finite() {
+                acc.add(-term(old));
+            } else {
+                non_finite -= 1;
+            }
+        }
+        let window = &data[window_start(i, w)..=i];
+        if non_finite > 0 {
+            result[i] = direct(window);
+            continue;
+        }
+        since_rebuild += 1;
+        if since_rebuild >= rebuild_every || !acc.value().is_finite() {
+            acc = rebuild(window);
+            since_rebuild = 0;
+        }
+        result[i] = if acc.value().is_finite() { finish(acc.value(), window.len() as f64) } else { direct(window) };
     }
     result
 }
 
+/// Rolling RMS over a causal window of `w` samples (shortened at the left edge).
+///
+/// O(N): a compensated running sum of squares (rebuilt from scratch every few
+/// thousand samples). A window containing NaN / inf is computed directly, so
+/// it yields exactly what the per-window definition yields.
+pub fn rolling_rms(data: &[f64], w: usize) -> Vec<f64> {
+    rolling_running_sum(data, w, |v| v * v, |sum, count| (sum.max(0.0) / count).sqrt(), window_rms)
+}
+
 /// Rolling mean over a causal window of `w` samples (shortened at the left edge).
+///
+/// O(N): a compensated running sum (rebuilt from scratch every few thousand
+/// samples). A window containing NaN / inf is computed directly, so it yields
+/// exactly what the per-window definition yields.
 pub fn rolling_mean(data: &[f64], w: usize) -> Vec<f64> {
-    let n = data.len();
-    let mut result = vec![0.0; n];
-    for i in 0..n {
-        let start = i.saturating_sub(w.saturating_sub(1));
-        let sum: f64 = data[start..=i].iter().sum();
-        let count = (i - start + 1) as f64;
-        result[i] = sum / count;
-    }
-    result
+    rolling_running_sum(data, w, |v| v, |sum, count| sum / count, window_mean)
 }
 
 /// Rolling population standard deviation over a causal window of `w` samples
 /// (shortened at the left edge).
+///
+/// O(N): compensated running sums of `v − K` and `(v − K)²` about a shift `K`
+/// near the window mean, so large offsets (1e6 ± noise) do not cancel. `K` is
+/// re-centred (an O(w) rebuild) whenever the window mean drifts more than 8σ
+/// from it, and every few thousand samples. Never negative or NaN from
+/// cancellation (variance is clamped at zero); a window containing NaN / inf
+/// is computed directly, exactly as the per-window definition.
 pub fn rolling_std(data: &[f64], w: usize) -> Vec<f64> {
     let n = data.len();
+    let width = w.max(1);
+    let rebuild_every = ROLLING_REBUILD_EVERY.max(width);
+    // Re-centres on the window mean and recomputes both sums from scratch.
+    let recentre = |window: &[f64]| -> (f64, CompensatedSum, CompensatedSum) {
+        let k = window_mean(window);
+        let (mut s1, mut s2) = (CompensatedSum::default(), CompensatedSum::default());
+        for &v in window {
+            let d = v - k;
+            s1.add(d);
+            s2.add(d * d);
+        }
+        (k, s1, s2)
+    };
     let mut result = vec![0.0; n];
+    let mut k = match data.first() {
+        Some(v) if v.is_finite() => *v,
+        _ => 0.0,
+    };
+    let (mut s1, mut s2) = (CompensatedSum::default(), CompensatedSum::default());
+    let mut non_finite = 0usize;
+    let mut since_rebuild = 0usize;
     for i in 0..n {
-        let start = i.saturating_sub(w.saturating_sub(1));
-        let window = &data[start..=i];
+        if data[i].is_finite() {
+            let d = data[i] - k;
+            s1.add(d);
+            s2.add(d * d);
+        } else {
+            non_finite += 1;
+        }
+        if i >= width {
+            let old = data[i - width];
+            if old.is_finite() {
+                let d = old - k;
+                s1.add(-d);
+                s2.add(-(d * d));
+            } else {
+                non_finite -= 1;
+            }
+        }
+        let window = &data[window_start(i, w)..=i];
+        if non_finite > 0 {
+            result[i] = window_std(window);
+            continue;
+        }
         let count = window.len() as f64;
-        let mean = window.iter().sum::<f64>() / count;
-        let var_sum: f64 = window.iter().map(|v| (v - mean).powi(2)).sum();
-        result[i] = (var_sum / count).sqrt();
+        since_rebuild += 1;
+        let mut m = s1.value() / count;
+        let mut var = s2.value() / count - m * m;
+        let stale = m * m > 64.0 * var.max(0.0) && m * m > 1e-20 * k * k + f64::MIN_POSITIVE;
+        if since_rebuild >= rebuild_every || stale || !var.is_finite() {
+            (k, s1, s2) = recentre(window);
+            since_rebuild = 0;
+            m = s1.value() / count;
+            var = s2.value() / count - m * m;
+        }
+        result[i] = if var.is_finite() { var.max(0.0).sqrt() } else { window_std(window) };
     }
     result
 }
@@ -330,6 +484,119 @@ mod tests {
         for v in &s {
             assert_relative_eq!(*v, 0.0, epsilon = 1e-12);
         }
+    }
+
+    // ---- rolling windows: running-sum versions vs. the per-window definition ----
+
+    /// The pre-O(N) implementations, verbatim: the reference every running-sum
+    /// version must agree with.
+    fn reference_rolling(data: &[f64], w: usize, f: fn(&[f64]) -> f64) -> Vec<f64> {
+        (0..data.len()).map(|i| f(&data[i.saturating_sub(w.saturating_sub(1))..=i])).collect()
+    }
+
+    /// Deterministic noise in [-1, 1) (xorshift64), so the tests need no RNG crate.
+    fn noise(n: usize, seed: u64) -> Vec<f64> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 11) as f64 / (1u64 << 52) as f64 - 1.0
+            })
+            .collect()
+    }
+
+    fn assert_agrees(got: &[f64], want: &[f64], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        for (i, (g, r)) in got.iter().zip(want).enumerate() {
+            if r.is_nan() {
+                assert!(g.is_nan(), "{what}[{i}]: want NaN, got {g}");
+            } else if r.is_infinite() {
+                assert_eq!(g, r, "{what}[{i}]");
+            } else {
+                assert!((g - r).abs() <= 1e-12 * r.abs().max(1.0), "{what}[{i}]: got {g}, want {r}");
+            }
+        }
+    }
+
+    fn assert_all_three_agree(data: &[f64], w: usize, what: &str) {
+        assert_agrees(&rolling_mean(data, w), &reference_rolling(data, w, |s| s.iter().sum::<f64>() / s.len() as f64), &format!("{what} mean w={w}"));
+        assert_agrees(&rolling_rms(data, w), &reference_rolling(data, w, |s| (s.iter().map(|v| v * v).sum::<f64>() / s.len() as f64).sqrt()), &format!("{what} rms w={w}"));
+        assert_agrees(&rolling_std(data, w), &reference_rolling(data, w, window_std), &format!("{what} std w={w}"));
+    }
+
+    #[test]
+    fn rolling_running_sums_long_noise_agree_with_the_per_window_definition() {
+        // Arrange
+        let data = noise(50_000, 0x9E3779B97F4A7C15);
+
+        // Act / Assert — widths: 1, short, medium, longer than the rebuild stride.
+        for w in [0, 1, 7, 300, 2000] {
+            assert_all_three_agree(&data, w, "noise");
+        }
+    }
+
+    #[test]
+    fn rolling_running_sums_large_offset_agree_with_the_per_window_definition() {
+        // Arrange — 1e6 + noise: a naive sum-of-squares std cancels to garbage here.
+        let data: Vec<f64> = noise(50_000, 12345).iter().map(|v| 1e6 + v).collect();
+
+        // Act / Assert
+        for w in [7, 300, 2000] {
+            assert_all_three_agree(&data, w, "offset");
+        }
+    }
+
+    #[test]
+    fn rolling_running_sums_spikes_and_drift_agree_with_the_per_window_definition() {
+        // Arrange — a ramp (window mean drifts far from any fixed shift) with
+        // isolated 1e6 spikes that later leave the window.
+        let mut data: Vec<f64> = noise(40_000, 777).iter().enumerate().map(|(i, v)| v + i as f64 * 0.5).collect();
+        for i in (1000..40_000).step_by(2503) {
+            data[i] += 1e6;
+        }
+
+        // Act / Assert
+        for w in [5, 300, 2000] {
+            assert_all_three_agree(&data, w, "spikes");
+        }
+    }
+
+    #[test]
+    fn rolling_running_sums_nan_windows_are_nan_and_recover_exactly_when_the_nan_leaves() {
+        // Arrange — NaN and inf dropouts, one right at the start.
+        let mut data = noise(20_000, 4242);
+        for i in [0, 1, 500, 501, 9_999, 15_000] {
+            data[i] = f64::NAN;
+        }
+        data[7_000] = f64::INFINITY;
+        data[12_000] = f64::NEG_INFINITY;
+
+        // Act / Assert
+        for w in [1, 7, 300] {
+            assert_all_three_agree(&data, w, "nan");
+        }
+    }
+
+    #[test]
+    fn rolling_std_constant_large_offset_is_exactly_zero_not_negative_or_nan() {
+        // Arrange
+        let data = vec![1.0e6 + 0.1; 10_000];
+
+        // Act
+        let s = rolling_std(&data, 50);
+
+        // Assert
+        assert!(s.iter().all(|v| *v >= 0.0 && v.is_finite() && *v < 1e-6));
+    }
+
+    #[test]
+    fn rolling_running_sums_empty_input_is_empty() {
+        // Arrange / Act / Assert
+        assert!(rolling_mean(&[], 5).is_empty());
+        assert!(rolling_rms(&[], 5).is_empty());
+        assert!(rolling_std(&[], 5).is_empty());
     }
 
     // ---- detrend (global least-squares trend removal) ----
