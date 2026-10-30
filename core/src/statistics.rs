@@ -143,9 +143,11 @@ const ROLLING_REBUILD_EVERY: usize = 4096;
 /// the window, its rounding error is folded into the compensation term and
 /// every ordinary sample added beside it is lost. When the huge sample leaves
 /// the sum comes back, but the lost samples do not, and the result stays wrong
-/// until the next periodic rebuild. The error is about `eps^2 * peak`, so
-/// bounding `peak / magnitude` by 2^30 keeps it below `2.4e-7 * eps` of the
-/// true magnitude -- far below the 1e-12 relative agreement the rolling
+/// until the next periodic rebuild. The error is about `n * eps^2 * sum|x|`
+/// over the `n` adds since the last rebuild, and `sum|x|` is at most the peak
+/// magnitude; bounding `peak / magnitude` by 2^30 therefore keeps it within
+/// `n * eps * 2.4e-7` of the true magnitude, which for `n` up to the 4096-add
+/// rebuild stride is far below the 1e-12 relative agreement the rolling
 /// windows promise.
 const ROLLING_MAX_DECAY: f64 = 1_073_741_824.0;
 
@@ -263,12 +265,14 @@ fn rolling_running_sum(
             peak = magnitude;
             since_rebuild = 0;
         }
+        // Counted in non-finite windows too, so a stretch saturated with NaN
+        // cannot starve the periodic rebuild; it runs on the next clean window.
+        since_rebuild += 1;
         if counts.any() {
             result[i] = non_finite(&counts);
             continue;
         }
         let window = &data[window_start(i, w)..=i];
-        since_rebuild += 1;
         if poisoned {
             result[i] = direct(window);
             if since_rebuild >= width {
@@ -331,7 +335,9 @@ fn shifted_moments(s1: &CompensatedSum, s2: &CompensatedSum, count: f64) -> (f64
 /// cancellation (variance is clamped at zero). A window holding NaN or inf is
 /// NaN, from counts; one whose sums overflow is computed directly until a
 /// re-centre finds them finite. Equal to the per-window definition to a few
-/// ulp, not bit for bit.
+/// ulp, not bit for bit, degrading only when sigma is within a few thousand
+/// ulp of the data's own magnitude (the shifted sums then cancel to the last
+/// digits that the data itself carries).
 pub fn rolling_std(data: &[f64], w: usize) -> Vec<f64> {
     let n = data.len();
     let width = w.max(1);
@@ -393,13 +399,14 @@ pub fn rolling_std(data: &[f64], w: usize) -> Vec<f64> {
             peak = magnitude;
             since_rebuild = 0;
         }
+        // Counted in NaN windows too (see `rolling_running_sum`).
+        since_rebuild += 1;
         if counts.any() {
             result[i] = f64::NAN;
             continue;
         }
         let window = &data[window_start(i, w)..=i];
         let count = window.len() as f64;
-        since_rebuild += 1;
         if poisoned {
             result[i] = window_std(window);
             if since_rebuild >= width {
@@ -411,7 +418,7 @@ pub fn rolling_std(data: &[f64], w: usize) -> Vec<f64> {
             continue;
         }
         let (m, mut var) = shifted_moments(&s1, &s2, count);
-        let stale = m * m > 64.0 * var.max(0.0) && m * m > 1e-20 * k * k + f64::MIN_POSITIVE;
+        let stale = m * m > 64.0 * var.max(0.0) && m * m > 1e-26 * k * k + f64::MIN_POSITIVE;
         if since_rebuild >= rebuild_every || stale || !var.is_finite() {
             (k, s1, s2, magnitude) = recentre(window, k);
             peak = magnitude;
@@ -897,6 +904,50 @@ mod tests {
         // functions, w samples each) plus a handful of start-up ones.
         let periodic = 3 * (data.len() / ROLLING_REBUILD_EVERY + 1) * w;
         assert!(scanned <= 4 * periodic, "scanned {scanned} samples, periodic budget {periodic}");
+    }
+
+    #[test]
+    fn rolling_std_a_tiny_sigma_on_a_huge_offset_that_steps_is_accurate_not_stale() {
+        // Arrange -- 1e6 + a few ulp of noise (sigma ~ 1e-10), then the whole
+        // signal steps by 9e-5 (~8e5 ulp): the window mean moves far from K
+        // in units of sigma while m^2 stays under a 1e-20 * K^2 gate.
+        let ulp = 2f64.powi(-33);
+        let r: Vec<f64> = noise(3_000, 77).iter().map(|v| ((v + 1.0) * 1.5).floor()).collect();
+        let data: Vec<f64> =
+            r.iter().enumerate().map(|(i, r)| if i < 1_000 { 1e6 + ulp * r } else { 1e6 + 9e-5 + ulp * r }).collect();
+        let w = 100;
+
+        // Act
+        let got = rolling_std(&data, w);
+
+        // Assert -- against an exact two-pass reference on differences from
+        // data[0], which are exact, so the reference is itself accurate.
+        for i in 0..data.len() {
+            let window = &data[window_start(i, w)..=i];
+            let d: Vec<f64> = window.iter().map(|v| v - data[0]).collect();
+            let mean = d.iter().sum::<f64>() / d.len() as f64;
+            let want = (d.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / d.len() as f64).sqrt();
+            assert!((got[i] - want).abs() <= 1e-7 * want.max(1e-12), "std[{i}]: got {}, want {want}", got[i]);
+        }
+    }
+
+    #[test]
+    fn rolling_running_sums_a_nan_saturated_stretch_does_not_starve_the_periodic_rebuild() {
+        // Arrange -- NaN in every window for 10_000 samples, then 250 clean
+        // samples: too few for a rebuild 4096 clean windows on to rescue it.
+        let mut data = noise(10_300, 41);
+        for i in (0..10_000).step_by(50) {
+            data[i] = f64::NAN;
+        }
+        let w = 100;
+
+        // Act
+        let scanned = scans_of_all_three(&data, w);
+
+        // Assert -- the rebuild owed after the stretch happens at its first
+        // clean window, and the answers are the definition's.
+        assert!(scanned >= 3 * w, "no rebuild ran: {scanned}");
+        assert_all_three_agree(&data, w, "nan saturated then clean");
     }
 
     #[test]

@@ -1476,6 +1476,11 @@ pub struct SessionColumnReader {
     file: std::fs::File,
     footer: ArrowReaderMetadata,
     index: Vec<ChannelColumnInfo>,
+    /// Serialises decodes. A `try_clone`d [`std::fs::File`] shares its cursor
+    /// with the original, and the parquet `ChunkReader` for a file seeks then
+    /// reads on such a clone, so two threads decoding at once could read each
+    /// other's offsets. Taken before [`Self::axes`], never while holding it.
+    decode: Mutex<()>,
     axes: Mutex<HeldAxes>,
 }
 
@@ -1490,6 +1495,7 @@ impl SessionColumnReader {
             file,
             footer,
             index,
+            decode: Mutex::new(()),
             axes: Mutex::new(HeldAxes::default()),
         })
     }
@@ -1526,6 +1532,9 @@ impl SessionColumnReader {
         let Some(info) = self.index.iter().find(|c| c.channel_id == channel) else {
             return read_channel(&self.session_dir, channel);
         };
+        // Held to the end: decode, then store the axes it produced, so the next
+        // reader finds them (lock order: `decode`, then `axes`).
+        let _decoding = self.decode.lock().unwrap_or_else(|p| p.into_inner());
         let (held_t, held_recorded) = {
             let held = self.axes.lock().unwrap_or_else(|p| p.into_inner());
             (held.t.clone(), held.recorded.get(&info.source_kind).cloned())
@@ -2364,8 +2373,10 @@ mod tests {
     #[test]
     fn parquet_channel_source_a_same_width_rewrite_is_read_fresh_once_the_modification_time_moves() {
         // Arrange -- the replacement changes values, not row count or column
-        // widths, so size cannot tell the files apart; only the modification
-        // time does. It is moved explicitly: a filesystem's tick may not.
+        // widths, which in practice leaves the size unchanged, so only the
+        // modification time can tell the files apart. It is moved explicitly
+        // rather than trusting the filesystem's tick (the test does not assert
+        // the sizes are equal).
         let root = temp_root();
         let session = sample_session();
         let path = write_session_parquet(&root, &session, "0.1.0").unwrap();
@@ -2442,6 +2453,34 @@ mod tests {
             assert_eq!(a.t_us, b.t_us, "{id}");
             assert_eq!(a.t_recorded_us, b.t_recorded_us, "{id}");
             assert_eq!(a.materialize(), b.materialize(), "{id}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_column_reader_two_threads_reading_different_channels_each_get_their_own_samples() {
+        // Arrange
+        let (root, dir) = two_source_session();
+        let reader = SessionColumnReader::open(&dir).unwrap();
+        let want_imu = read_channel(&dir, "IMU0_C0").unwrap();
+        let want_wheel = read_channel(&dir, "WHEEL_C0").unwrap();
+
+        // Act
+        let (imu, wheel) = std::thread::scope(|scope| {
+            let imu = scope.spawn(|| (0..50).map(|_| reader.read_channel_transient("IMU0_C0").unwrap()).collect::<Vec<_>>());
+            let wheel =
+                scope.spawn(|| (0..50).map(|_| reader.read_channel_transient("WHEEL_C0").unwrap()).collect::<Vec<_>>());
+            (imu.join().unwrap(), wheel.join().unwrap())
+        });
+
+        // Assert
+        for got in &imu {
+            assert_eq!(got.t_us, want_imu.t_us);
+            assert_eq!(got.materialize(), want_imu.materialize());
+        }
+        for got in &wheel {
+            assert_eq!(got.t_us, want_wheel.t_us);
+            assert_eq!(got.materialize(), want_wheel.materialize());
         }
         let _ = std::fs::remove_dir_all(&root);
     }
