@@ -149,11 +149,47 @@ pub struct BtleplugBle {
     peripheral: Mutex<Option<Peripheral>>,
 }
 
+/// The one `btleplug` `Manager` this process makes, built on first use.
+///
+/// On Linux every `Manager::new` opens its own system D-Bus connection and
+/// detaches the task that drives it (btleplug 0.13 drops the `JoinHandle`
+/// bluez-async hands back), so the connection is never closed, even after
+/// the `Manager` and every `Adapter` from it are dropped. A `Manager` per
+/// transport leaked one connection per link retry (two a second), and at
+/// dbus-daemon's 256-per-user cap Bluetooth stopped working for the whole
+/// desktop session (2026-11-02). One shared `Manager` holds one connection
+/// for the life of the process. A failed build is not cached, so the next
+/// call tries again.
+static MANAGER: tokio::sync::OnceCell<Manager> = tokio::sync::OnceCell::const_new();
+
+/// How many `scan`s are running in this process. Every transport now shares
+/// one D-Bus connection, and BlueZ keeps one discovery session per
+/// connection, so the first scan starts discovery and the last one to end
+/// stops it; a scan ending early must not stop another one still running.
+/// The lock is held across the start/stop calls so they reach BlueZ in
+/// order.
+static ACTIVE_SCANS: Mutex<usize> = Mutex::const_new(0);
+
+/// Counts a scan in. `true` when it is the first, so it must start
+/// discovery.
+fn scan_begins(active: &mut usize) -> bool {
+    *active += 1;
+    *active == 1
+}
+
+/// Counts a scan out. `true` when it was the last, so it must stop
+/// discovery.
+fn scan_ends(active: &mut usize) -> bool {
+    *active = active.saturating_sub(1);
+    *active == 0
+}
+
 impl BtleplugBle {
-    /// Creates a manager and picks the first available adapter. Returns
-    /// `TransportErrorKind::Ble` if no Bluetooth adapter is present.
+    /// Picks the first available adapter of the process-wide [`MANAGER`].
+    /// Returns `TransportErrorKind::Ble` if no Bluetooth adapter is present.
     pub async fn new() -> Result<Self, TransportError> {
-        let manager = Manager::new()
+        let manager = MANAGER
+            .get_or_try_init(Manager::new)
             .await
             .map_err(|e| ble_error(format!("btleplug manager initialisation failed: {e}")))?;
         let adapters = manager
@@ -202,10 +238,15 @@ impl BleTransport for BtleplugBle {
             .events()
             .await
             .map_err(|e| ble_error(format!("failed to subscribe to adapter events: {e}")))?;
-        self.adapter
-            .start_scan(ScanFilter { services: vec![service] })
-            .await
-            .map_err(|e| ble_error(format!("failed to start BLE scan: {e}")))?;
+        {
+            let mut active = ACTIVE_SCANS.lock().await;
+            if scan_begins(&mut active) {
+                if let Err(e) = self.adapter.start_scan(ScanFilter { services: vec![service] }).await {
+                    scan_ends(&mut active);
+                    return Err(ble_error(format!("failed to start BLE scan: {e}")));
+                }
+            }
+        }
 
         let (tx, rx) = mpsc::channel(32);
         let adapter = self.adapter.clone();
@@ -249,7 +290,10 @@ impl BleTransport for BtleplugBle {
                     break;
                 }
             }
-            let _ = adapter.stop_scan().await;
+            let mut active = ACTIVE_SCANS.lock().await;
+            if scan_ends(&mut active) {
+                let _ = adapter.stop_scan().await;
+            }
         });
         Ok(rx)
     }
@@ -583,5 +627,58 @@ mod sequencing {
         assert_eq!(files[0].name, "session_001.idl0");
         assert_eq!(bytes_written, CONTENT.len() as u64);
         assert_eq!(sink, CONTENT);
+    }
+}
+
+/// The scan count behind the shared D-Bus connection's one discovery
+/// session: only the first scan starts discovery and only the last one
+/// stops it.
+#[cfg(test)]
+mod scan_count {
+    use super::{scan_begins, scan_ends};
+
+    #[test]
+    fn scan_count_one_scan_starts_and_stops_discovery() {
+        // Arrange
+        let mut active = 0;
+
+        // Act
+        let starts = scan_begins(&mut active);
+        let stops = scan_ends(&mut active);
+
+        // Assert
+        assert!(starts);
+        assert!(stops);
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn scan_count_overlapping_scans_only_the_last_to_end_stops_discovery() {
+        // Arrange
+        let mut active = 0;
+        scan_begins(&mut active);
+
+        // Act
+        let second_starts = scan_begins(&mut active);
+        let first_end_stops = scan_ends(&mut active);
+        let second_end_stops = scan_ends(&mut active);
+
+        // Assert
+        assert!(!second_starts);
+        assert!(!first_end_stops);
+        assert!(second_end_stops);
+    }
+
+    #[test]
+    fn scan_count_extra_end_stays_at_zero() {
+        // Arrange
+        let mut active = 0;
+
+        // Act
+        let stops = scan_ends(&mut active);
+
+        // Assert
+        assert!(stops);
+        assert_eq!(active, 0);
     }
 }
