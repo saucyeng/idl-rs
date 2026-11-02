@@ -199,6 +199,11 @@ pub struct SampleTimes {
     pub period_ticks: f64,
 }
 
+/// The most output slots [`place_samples`] makes per received sample (lost
+/// plus received): three lost for every one that arrived is more than a FIFO
+/// overrun can explain, so past it the chip timing is rejected.
+pub const MAX_SLOTS_PER_SAMPLE: usize = 4;
+
 /// Places `n` received samples in chip time from the timestamp `marks`
 /// (sorted or not; marks past `n` are ignored). Between two marks the
 /// samples are evenly spaced. The period is the median over the windows of
@@ -209,7 +214,9 @@ pub struct SampleTimes {
 /// mark are placed at the period from the nearest mark.
 ///
 /// `None` with fewer than two usable marks: there is no chip-time spacing to
-/// place samples by.
+/// place samples by. `None` too when the marks imply more than
+/// [`MAX_SLOTS_PER_SAMPLE`] slots per received sample: that is a broken
+/// clock, not loss, and is never filled.
 pub fn place_samples(n: usize, marks: &[TsMark]) -> Option<SampleTimes> {
     let mut m: Vec<TsMark> = marks.iter().copied().filter(|t| t.sample_index < n).collect();
     m.sort_by_key(|t| t.sample_index);
@@ -230,6 +237,17 @@ pub fn place_samples(n: usize, marks: &[TsMark]) -> Option<SampleTimes> {
         // look clean against the first estimate.
         let clean: Vec<f64> = periods.iter().copied().filter(|p| *p < period * 1.5).collect();
         period = median(&clean).unwrap_or(period);
+    }
+    // Counted before anything is allocated: a broken clock (a bad unwrap,
+    // say) reads as millions of lost samples per window, and filling them
+    // took a phone past 10 GB on a 120 MB ride (2026-11-02).
+    let slots = m.windows(2).fold(n, |sum, w| {
+        let received = w[1].sample_index - w[0].sample_index;
+        let expected = (((w[1].chip - w[0].chip) as f64 / period).round() as usize).max(received);
+        sum.saturating_add(expected - received)
+    });
+    if slots > n.saturating_mul(MAX_SLOTS_PER_SAMPLE) {
+        return None;
     }
 
     let mut chip = Vec::with_capacity(n);
@@ -423,6 +441,17 @@ mod tests {
         // The window's last received sample sits just before the next mark.
         let next_mark = t.source.iter().position(|s| *s == Some(64)).unwrap();
         assert!((t.chip[next_mark] - (1_000.0 + 67.0 * 96.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn place_samples_a_window_a_whole_counter_wrap_long_is_none_not_filled() {
+        // Arrange — the 2026-11-02 shape: a mark 2^32 ticks past the one
+        // before it, which would fill ~44.7 M lost slots at 96 ticks/sample.
+        let mut m = marks(320, 96, None);
+        m[5].chip += 1 << 32;
+
+        // Act / Assert
+        assert!(place_samples(320, &m).is_none());
     }
 
     #[test]

@@ -1430,4 +1430,89 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// `seconds` of IMU0 at 480 Hz drained every 20 ms with a timestamp word
+    /// every 32 samples, as the logger writes it, plus 5 Hz GPS.
+    fn long_idl1(seconds: usize) -> Vec<u8> {
+        let mut b = crate::parse::idl1::tests::Builder::new();
+        b.imu_axes(0, 480);
+        let tick_us = 21.75_f64;
+        let period_us = 1e6 / 480.0;
+        let total = seconds * 480;
+        let mut k = 0usize;
+        let mut read_us = 20_000i64;
+        while k < total {
+            let mut samples = Vec::new();
+            let mut ts = Vec::new();
+            while k < total && (k as f64 * period_us) < read_us as f64 {
+                if k % 32 == 0 {
+                    ts.push((samples.len() as u16, 0, ((k as f64 * period_us) / tick_us).round() as u32));
+                }
+                samples.push([(k % 1000) as i16; 6]);
+                k += 1;
+            }
+            b.imu_block(0, 0, read_us + 300, (read_us as f64 / tick_us).round() as u32, &samples, &[], &ts);
+            if read_us % 200_000 == 0 {
+                b.gps_fix(1_760_000_000_000 + read_us / 1000, read_us, 90);
+            }
+            read_us += 20_000;
+        }
+        b.end();
+        b.build()
+    }
+
+    #[test]
+    #[ignore = "memory probe: run by name with --ignored --nocapture"]
+    fn import_memory_probe() {
+        let bytes = long_idl1(600);
+        let samples = 600 * 480;
+
+        let (_, parse_peak) = crate::counting_alloc::peak_of(|| crate::parse::parse(&bytes).unwrap());
+        let root = temp_root();
+        let (_, import_peak) = crate::counting_alloc::peak_of(|| import_idl0(&root, &bytes).unwrap());
+
+        println!(
+            "file {} B, {} samples ({:.1} B/sample); parse peak {} B ({:.1}x file, {:.0} B/sample); import peak {} B ({:.1}x file, {:.0} B/sample)",
+            bytes.len(),
+            samples,
+            bytes.len() as f64 / samples as f64,
+            parse_peak,
+            parse_peak as f64 / bytes.len() as f64,
+            parse_peak as f64 / samples as f64,
+            import_peak,
+            import_peak as f64 / bytes.len() as f64,
+            import_peak as f64 / samples as f64,
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[ignore = "memory probe on a real log: IDL_PROBE_FILE=<path>, run by name with --ignored --nocapture"]
+    fn import_memory_probe_file() {
+        let path = std::env::var("IDL_PROBE_FILE").expect("IDL_PROBE_FILE names the log to import");
+        let bytes = std::fs::read(&path).unwrap();
+        let (parsed, parse_peak) = crate::counting_alloc::peak_of(|| crate::parse::parse(&bytes));
+        match &parsed {
+            Ok(r) => {
+                println!("parse ok");
+                for w in &r.import_warnings {
+                    println!("warning: {:?} {}", w.kind, w.message);
+                }
+            }
+            Err(e) => println!("parse error: {e:?}"),
+        }
+        drop(parsed);
+        let root = temp_root();
+        let (imported, import_peak) = crate::counting_alloc::peak_of(|| import_idl0(&root, &bytes).map(|_| ()));
+        println!("import: {imported:?}");
+        println!(
+            "file {} B; parse peak {} B ({:.1}x file); import peak {} B ({:.1}x file)",
+            bytes.len(),
+            parse_peak,
+            parse_peak as f64 / bytes.len() as f64,
+            import_peak,
+            import_peak as f64 / bytes.len() as f64,
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

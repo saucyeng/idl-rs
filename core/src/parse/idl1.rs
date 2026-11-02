@@ -497,11 +497,14 @@ fn time_stream(i: usize, high: bool, imu: &Imu, warnings: &mut Vec<ImportWarning
         }
         _ => {
             let label = if high { format!("IMU{i} high-g") } else { format!("IMU{i}") };
+            let reason = if map.is_some() && marks.len() >= 2 {
+                "its chip timestamps imply far more lost samples than arrived (a broken clock, not loss), so it was not timed by the chip clock"
+            } else {
+                "too few chip timestamps to time samples by the chip clock"
+            };
             warnings.push(ImportWarning {
                 kind: ImportWarningKind::TimingFallback,
-                message: format!(
-                    "{label}: too few chip timestamps to time samples by the chip clock; timed from read instants at the nominal {rate_hz} Hz"
-                ),
+                message: format!("{label}: {reason}; timed from read instants at the nominal {rate_hz} Hz"),
             });
             let esp = read_instant_times(&stream.blocks, rate_hz);
             let source = (0..stream.count).map(Some).collect();
@@ -568,7 +571,7 @@ fn read_imu_block(r: &mut ByteReader, len: usize, imus: &mut [Vec<Imu>; 3]) -> R
 /// produced in, then splits them into clock pairs and the two streams'
 /// marks.
 fn unwrap_chip_times(imu: &Imu) -> (Vec<ClockPair>, Vec<TsMark>, Vec<TsMark>) {
-    let raw: Vec<u32> = imu
+    let mut raw: Vec<u32> = imu
         .chip_order
         .iter()
         .map(|u| match *u {
@@ -577,6 +580,7 @@ fn unwrap_chip_times(imu: &Imu) -> (Vec<ClockPair>, Vec<TsMark>, Vec<TsMark>) {
             ChipUse::HighMark(k) => imu.high.marks[k].1,
         })
         .collect();
+    unshift_read_ts(&imu.chip_order, &mut raw);
     let unwrapped = idl1_timing::unwrap_u32(&raw);
     let (mut pairs, mut low, mut high) = (Vec::new(), Vec::new(), Vec::new());
     for (u, chip) in imu.chip_order.iter().zip(unwrapped) {
@@ -587,6 +591,43 @@ fn unwrap_chip_times(imu: &Imu) -> (Vec<ClockPair>, Vec<TsMark>, Vec<TsMark>) {
         }
     }
     (pairs, low, high)
+}
+
+/// Firmware through 0.3.0-beta.16 wrote each block's `read_chip_ts` as the
+/// TIMESTAMP register shifted left one byte (ST's vendored driver shifted
+/// once too often; fixed in idl1-firmware 2026-11-02): low byte zero, top
+/// byte lost. Unwrapped as is, every read→mark step looked like a 2^32-tick
+/// counter wrap. Recognised when every read (at least 4) has a zero low byte
+/// and its upper three bytes match the nearest earlier mark's lower three
+/// to within 2^16 ticks (≈1.4 s); each read is then rebuilt next to that
+/// mark. Correct data never matches: its reads' low bytes are not all zero.
+fn unshift_read_ts(order: &[ChipUse], raw: &mut [u32]) {
+    const MATCH_TICKS: i64 = 1 << 16;
+    let first_mark = order.iter().zip(raw.iter()).find(|(u, _)| !matches!(u, ChipUse::Read(_))).map(|(_, &v)| v);
+    let Some(mut mark) = first_mark else { return };
+    // Per read: its index and its offset from the mark, from the 24 bits kept.
+    let mut fixes = Vec::new();
+    for (i, u) in order.iter().enumerate() {
+        if !matches!(u, ChipUse::Read(_)) {
+            mark = raw[i];
+            continue;
+        }
+        if raw[i] & 0xFF != 0 {
+            return;
+        }
+        let d24 = ((raw[i] >> 8).wrapping_sub(mark) & 0xFF_FFFF) as i64;
+        let d = if d24 >= 1 << 23 { d24 - (1 << 24) } else { d24 };
+        if d.abs() >= MATCH_TICKS {
+            return;
+        }
+        fixes.push((i, mark.wrapping_add(d as i32 as u32)));
+    }
+    if fixes.len() < 4 {
+        return;
+    }
+    for (i, v) in fixes {
+        raw[i] = v;
+    }
 }
 
 /// The fallback without chip timing: each block's newest sample at its read
@@ -1059,6 +1100,12 @@ pub(crate) mod tests {
     /// on a chip whose TIMESTAMP counter read 0 at `chip_zero_us`. Sample k's
     /// value is `first_value + k`.
     fn imu_stream_at(b: &mut Builder, imu: u8, seconds: i64, start_us: i64, chip_zero_us: i64, first_value: i16) {
+        imu_stream_written(b, imu, seconds, start_us, chip_zero_us, first_value, |c| c);
+    }
+
+    /// [`imu_stream_at`], each block's `read_chip_ts` passed through
+    /// `written` (how a firmware wrote it).
+    fn imu_stream_written(b: &mut Builder, imu: u8, seconds: i64, start_us: i64, chip_zero_us: i64, first_value: i16, written: fn(u32) -> u32) {
         let tick_us = 21.75_f64;
         let period_us = 1e6 / 480.0;
         let total = (seconds as f64 * 480.0) as usize;
@@ -1075,9 +1122,32 @@ pub(crate) mod tests {
                 samples.push([first_value + k as i16; 6]);
                 k += 1;
             }
-            b.imu_block(imu, 0, read_us + 300, chip(read_us as f64), &samples, &[], &ts);
+            b.imu_block(imu, 0, read_us + 300, written(chip(read_us as f64)), &samples, &[], &ts);
             read_us += 20_000;
         }
+    }
+
+    #[test]
+    fn parse_idl1_beta16_shifted_read_chip_ts_is_rebuilt_and_chip_timed() {
+        // Arrange — 3 s at 480 Hz, the chip counter ~2.8e8 ticks in (the
+        // 2026-10-31 ride's), each block's read_chip_ts written as
+        // 0.3.0-beta.16 did: shifted left a byte, top byte lost.
+        let mut b = Builder::new();
+        b.imu_axes(1, 480);
+        imu_stream_written(&mut b, 1, 3, 0, -6_000_000_000, 0, |c| c << 8);
+        b.end();
+
+        // Act
+        let r = parse_idl1(&b.build()).unwrap();
+
+        // Assert — chip-timed at 480 Hz with nothing invented, as if the
+        // reads had been written right.
+        let ax = find(&r, "IMU1_AccelX");
+        assert_eq!(ax.t_us.len(), 1440);
+        assert!(ax.gaps.is_empty());
+        assert!(!r.import_warnings.iter().any(|w| w.kind == ImportWarningKind::TimingFallback), "{:?}", r.import_warnings);
+        let spacing = (ax.t_us[1439] - ax.t_us[0]) as f64 / 1439.0;
+        assert!((spacing - 1e6 / 480.0).abs() < 0.5, "spacing {spacing}");
     }
 
     #[test]
