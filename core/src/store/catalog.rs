@@ -24,7 +24,17 @@ use crate::workbook::v3::front_matter::parse_front_matter;
 /// (C4 §5). A mismatch on open means the catalog is deleted and rebuilt, not
 /// migrated in place — the catalog holds no data that doesn't also live,
 /// canonically, in a file under `<data>`.
-pub const CATALOG_SCHEMA_VERSION: i64 = 1;
+///
+/// 2: `sessions.source_format`'s CHECK admits `'idl1'` (2026-11-02). A v1
+/// catalog dropped every IDL1 row its incremental indexing (sync installs)
+/// tried to add, so a v1 file must not be kept.
+pub const CATALOG_SCHEMA_VERSION: i64 = 2;
+
+/// Serializes [`open_catalog`]'s rebuild of an out-of-date catalog: the app
+/// opens the catalog from several commands at once on launch, and each would
+/// otherwise run the same full rebuild (every blob rehashed, since an old
+/// catalog's rows are not carried) side by side.
+static STALE_CATALOG_REBUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Discriminant for [`CatalogError`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +184,21 @@ pub fn open_catalog(path: &Path) -> Result<Connection, CatalogError> {
     let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if user_version == 0 {
         create_schema(&conn)?;
+    } else if user_version != CATALOG_SCHEMA_VERSION && path.file_name().is_some_and(|n| n == "catalog.sqlite") {
+        // C4 §5: a catalog of another schema version is not migrated in
+        // place; it is rebuilt from `<data>`. Only the live
+        // `<data>/catalog.sqlite` — a rebuild's own staging file is always
+        // fresh (version 0, above).
+        drop(conn);
+        let data_root = path.parent().ok_or_else(|| CatalogError { kind: CatalogErrorKind::Io, message: format!("{} has no parent directory", path.display()) })?;
+        let _guard = STALE_CATALOG_REBUILD.lock().unwrap_or_else(|e| e.into_inner());
+        // Another caller may have rebuilt it while this one waited.
+        let still_stale = Connection::open(path)?.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?
+            != CATALOG_SCHEMA_VERSION;
+        if still_stale {
+            rebuild_catalog(data_root)?;
+        }
+        return open_catalog(path);
     }
     Ok(conn)
 }
@@ -1267,6 +1292,33 @@ mod tests {
     fn write_full_session(root: &Path, session_id: &str, timestamp_utc_ms: i64, doc: &crate::store::session_json::SessionJson) {
         let blob_sha256 = write_blob(root, format!("raw bytes for {session_id}").as_bytes()).unwrap();
         write_full_session_with_blob(root, session_id, timestamp_utc_ms, doc, blob_sha256);
+    }
+
+    #[test]
+    fn open_catalog_a_catalog_of_an_older_schema_version_is_rebuilt_from_data() {
+        // Arrange — a v1 catalog (the CHECK without 'idl1') that never
+        // indexed a session now on disk: the desktop after a sync,
+        // 2026-11-02.
+        let root = temp_root();
+        write_full_session(&root, "s1", 0, &empty_session_json("s1"));
+        let path = root.join("catalog.sqlite");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(&DDL.replace("'idl0','idl1',", "'idl0',")).unwrap();
+        old.pragma_update(None, "user_version", 1).unwrap();
+        drop(old);
+
+        // Act
+        let conn = open_catalog(&path).unwrap();
+
+        // Assert
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(user_version, CATALOG_SCHEMA_VERSION);
+        let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(sessions, 1);
+        let ddl: String = conn.query_row("SELECT sql FROM sqlite_master WHERE name = 'sessions'", [], |r| r.get(0)).unwrap();
+        assert!(ddl.contains("'idl1'"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
