@@ -732,7 +732,7 @@ mod tests {
         write_full_session(&root, "s1", 1_700_000_000_000, &empty_session_json("s1"));
         rebuild_catalog(&root).unwrap();
         let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
-        // `sessions.source_format` carries a `CHECK (... IN ('idl0','fit','gpx','csv'))`
+        // `sessions.source_format` carries a `CHECK (... IN ('idl0','idl1','fit','gpx','csv'))`
         // (this build's own known set) — disabling constraint enforcement for
         // this one write is how this test reaches a state that otherwise only
         // a future build's importer id, synced in from elsewhere, could put

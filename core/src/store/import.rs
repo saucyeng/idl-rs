@@ -833,6 +833,31 @@ mod tests {
     }
 
     #[test]
+    fn import_idl0_an_idl1_file_is_listed_after_a_catalog_rebuild() {
+        // Arrange — the catalog's `source_format` CHECK once left out 'idl1',
+        // and the rebuild's INSERT OR IGNORE dropped every IDL1 session
+        // without a word: each phone import failed with "missing from the
+        // catalog immediately after import" (2026-11-02).
+        let root = temp_root();
+        let mut b = crate::parse::idl1::tests::Builder::new();
+        b.imu_axes(0, 480);
+        b.imu_block(0, 0, 20_000, 920, &[[1; 6], [2; 6]], &[], &[(0, 0, 900)]);
+        b.imu_block(0, 0, 40_000, 1840, &[[3; 6], [4; 6]], &[], &[(0, 0, 1820)]);
+        b.end();
+        let report = import_idl0(&root, &b.build()).unwrap();
+
+        // Act
+        crate::store::catalog_read::rebuild_catalog_report(&root).unwrap();
+        let sessions = crate::store::catalog_read::list_sessions(&root).unwrap();
+
+        // Assert
+        let row = sessions.iter().find(|s| s.session_id == report.session_id).expect("the IDL1 session is catalogued");
+        assert_eq!(row.source_format, "idl1");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn import_idl0_stale_importer_version_regenerates() {
         // Arrange — a `data.parquet` for this same blob already exists, but
         // written by an older importer_version than the running build's.
