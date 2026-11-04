@@ -67,6 +67,14 @@ pub struct DeviceStatus {
     /// §7.3: "optional if the GPS driver does not expose it cheaply"), so
     /// `None` here is always "unknown", never a real HDOP of zero.
     pub gps_hdop_x100: Option<u32>,
+    /// IDL1 boot-time GPS module setup result (`GPSConfig:` line, SPEC
+    /// §7.3), the token as sent: `OK`, `NO_RESPONSE`, `BAUD_FAILED`, `NAK`,
+    /// `NO_ACK` or `NOT_RUN`. Anything but `OK` means the module runs on
+    /// earlier settings. `None` when unreported (IDL0, older firmware).
+    pub gps_config: Option<String>,
+    /// Navigation rate the GPS module acknowledged, Hz (`GPSRate:` line,
+    /// IDL1). `None` when unreported.
+    pub gps_rate_hz: Option<u32>,
     /// Per-IMU state for IMU index 0 (`IMU0:` line, SPEC §7.3).
     pub imu0: Option<ImuState>,
     /// Per-IMU state for IMU index 1 (`IMU1:` line, SPEC §7.3).
@@ -145,6 +153,8 @@ pub fn parse_status(text: &str) -> DeviceStatus {
             "gpsfix" => status.gps_fix_quality = value.parse().ok(),
             "gpssats" => status.gps_sats = value.parse().ok(),
             "gpshdop" => status.gps_hdop_x100 = value.parse().ok(),
+            "gpsconfig" => status.gps_config = Some(value.to_ascii_uppercase()),
+            "gpsrate" => status.gps_rate_hz = value.parse().ok(),
             "imu0" => status.imu0 = parse_imu_state(value),
             "imu1" => status.imu1 = parse_imu_state(value),
             "imu2" => status.imu2 = parse_imu_state(value),
@@ -257,7 +267,7 @@ mod tests {
         // Arrange
         let text = "Logging: RUNNING\nLoggingElapsed: 305\nBatteryRaw: 2731\nBatteryMv: 4012\n\
                     SD: OK\nSDFreeMiB: 14208\nGPS: FIX\nGPSFix: 1\nGPSSats: 7\n\
-                    GPSHDOP: 90\nIMU0: OK\nIMU1: ERROR\nIMU2: OFF";
+                    GPSHDOP: 90\nGPSConfig: NAK\nGPSRate: 8\nIMU0: OK\nIMU1: ERROR\nIMU2: OFF";
 
         // Act
         let status = parse_status(text);
@@ -270,6 +280,8 @@ mod tests {
         assert_eq!(status.gps_fix_quality, Some(1));
         assert_eq!(status.gps_sats, Some(7));
         assert_eq!(status.gps_hdop_x100, Some(90));
+        assert_eq!(status.gps_config.as_deref(), Some("NAK"));
+        assert_eq!(status.gps_rate_hz, Some(8));
         assert_eq!(status.imu0, Some(ImuState::Ok));
         assert_eq!(status.imu1, Some(ImuState::Error));
         assert_eq!(status.imu2, Some(ImuState::Off));
@@ -292,6 +304,8 @@ mod tests {
         assert_eq!(status.gps_fix_quality, None);
         assert_eq!(status.gps_sats, None);
         assert_eq!(status.gps_hdop_x100, None);
+        assert_eq!(status.gps_config, None);
+        assert_eq!(status.gps_rate_hz, None);
         assert_eq!(status.imu0, None);
         assert_eq!(status.imu1, None);
         assert_eq!(status.imu2, None);

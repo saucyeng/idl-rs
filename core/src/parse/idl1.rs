@@ -58,6 +58,7 @@ const REC_CHANNEL_SAMPLE: u8 = 0x03;
 const REC_IMU_BLOCK: u8 = 0x10;
 const REC_LOGGER_EVENT: u8 = 0x20;
 const REC_SESSION_SUMMARY: u8 = 0x21;
+const REC_GPS_CONFIG: u8 = 0x22;
 const REC_SESSION_END: u8 = 0xFF;
 
 /// One `.idl1` registry entry (spec §4.2).
@@ -254,6 +255,21 @@ pub fn parse_idl1(bytes: &[u8]) -> Result<ParseResult, ParseError> {
                 }
             }
             REC_SESSION_SUMMARY => warnings.extend(read_session_summary(&mut r, len)?),
+            REC_GPS_CONFIG => {
+                if let Some(cfg) = read_gps_config(&mut r, len)? {
+                    if !cfg.setup_ok() {
+                        warnings.push(ImportWarning {
+                            kind: ImportWarningKind::LoggerDiagnostic,
+                            message: format!(
+                                "GPS setup failed ({}): the module recorded on earlier settings at {} Hz, not the {} Hz configured",
+                                cfg.result_name(),
+                                cfg.applied_rate_hz,
+                                cfg.requested_rate_hz
+                            ),
+                        });
+                    }
+                }
+            }
             _ => {}
         }
         let consumed = r.position() - start;
@@ -781,6 +797,180 @@ fn read_session_summary(r: &mut ByteReader, len: usize) -> Result<Option<ImportW
     }))
 }
 
+/// The GPS_CONFIG record (`.idl1` DRAFT spec §4.3, 0x22): the SAM-M10Q
+/// settings a session recorded with (SPEC §8 "SAM-M10Q (IDL1)") and whether
+/// the module accepted them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpsConfig {
+    /// Setup result code: 0 not run, 1 OK, 2 no response, 3 baud change
+    /// failed, 4 refused (NAK), 5 no acknowledgement, 6 encode error.
+    pub result: u8,
+    /// Hz, as configured.
+    pub requested_rate_hz: u8,
+    /// Hz, as the module acknowledged (1, factory, when setup failed first).
+    pub applied_rate_hz: u8,
+    /// Bit 0 GPS, 1 Galileo, 2 BeiDou, 3 GLONASS, 4 QZSS, 5 SBAS.
+    pub signals: u8,
+    /// u-blox CFG-NAVSPG-DYNMODEL value.
+    pub dynamic_model: u8,
+    /// Degrees.
+    pub min_elevation_deg: i8,
+    /// dBHz.
+    pub min_cno_dbhz: u8,
+    pub min_satellites: u8,
+    pub max_satellites: u8,
+    /// 0 = off.
+    pub fix_gate_satellites: u8,
+    /// dBHz.
+    pub fix_gate_cno_dbhz: u8,
+    /// Position DOP mask (the record's × 10 value, scaled back).
+    pub pdop_mask: f64,
+    /// Metres.
+    pub position_accuracy_mask_m: u16,
+    pub high_precision_nmea: bool,
+    /// Bit 0 GLL, 1 GSA, 2 GSV, 3 VTG, 4 ZDA.
+    pub nmea_extra: u8,
+    /// UBX-MON-VER swVersion; empty when the module did not answer.
+    pub module_version: String,
+}
+
+/// GPS_CONFIG payload bytes for record version 1.
+const GPS_CONFIG_BYTES: usize = 48;
+
+impl GpsConfig {
+    /// True when the module acknowledged every setting.
+    pub fn setup_ok(&self) -> bool {
+        self.result == 1
+    }
+
+    /// The §7.3 `GPSConfig` token for `result`.
+    pub fn result_name(&self) -> &'static str {
+        match self.result {
+            1 => "OK",
+            2 => "NO_RESPONSE",
+            3 => "BAUD_FAILED",
+            4 => "NAK",
+            5 => "NO_ACK",
+            6 => "ENCODE",
+            _ => "NOT_RUN",
+        }
+    }
+
+    /// The SPEC §8 `gps.dynamic_model` name for `dynamic_model`.
+    pub fn dynamic_model_name(&self) -> String {
+        match self.dynamic_model {
+            0 => "portable".to_string(),
+            2 => "stationary".to_string(),
+            3 => "pedestrian".to_string(),
+            4 => "automotive".to_string(),
+            5 => "sea".to_string(),
+            6 => "airborne".to_string(),
+            7 => "airborne_2g".to_string(),
+            8 => "airborne_4g".to_string(),
+            other => format!("model {other}"),
+        }
+    }
+
+    /// The enabled constellations and augmentations, e.g. `"GPS+Galileo, QZSS, SBAS"`.
+    pub fn signals_text(&self) -> String {
+        let names = ["GPS", "Galileo", "BeiDou", "GLONASS"];
+        let major: Vec<&str> = names.iter().enumerate().filter(|(i, _)| self.signals & (1 << i) != 0).map(|(_, n)| *n).collect();
+        let mut parts = vec![if major.is_empty() { "none".to_string() } else { major.join("+") }];
+        if self.signals & (1 << 4) != 0 {
+            parts.push("QZSS".to_string());
+        }
+        if self.signals & (1 << 5) != 0 {
+            parts.push("SBAS".to_string());
+        }
+        parts.join(", ")
+    }
+}
+
+impl std::fmt::Display for GpsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} Hz (module accepted {} Hz), {}, {}, elevation >= {} deg, C/N0 >= {} dBHz, satellites {}-{}",
+            self.requested_rate_hz,
+            self.applied_rate_hz,
+            self.signals_text(),
+            self.dynamic_model_name(),
+            self.min_elevation_deg,
+            self.min_cno_dbhz,
+            self.min_satellites,
+            self.max_satellites
+        )?;
+        if self.fix_gate_satellites > 0 {
+            write!(f, ", fix needs {} above {} dBHz", self.fix_gate_satellites, self.fix_gate_cno_dbhz)?;
+        }
+        write!(f, ", PDOP <= {:.1}, accuracy <= {} m", self.pdop_mask, self.position_accuracy_mask_m)?;
+        if self.high_precision_nmea {
+            write!(f, ", high-precision NMEA")?;
+        }
+        write!(f, "; setup {}", self.result_name())?;
+        if !self.module_version.is_empty() {
+            write!(f, "; module {}", self.module_version)?;
+        }
+        Ok(())
+    }
+}
+
+/// Reads GPS_CONFIG. A record of an unknown version, or shorter than
+/// version 1's payload, is skipped (None).
+fn read_gps_config(r: &mut ByteReader, len: usize) -> Result<Option<GpsConfig>, ParseError> {
+    if len < GPS_CONFIG_BYTES {
+        return Ok(None);
+    }
+    if r.u8("gps_config version")? != 1 {
+        return Ok(None);
+    }
+    Ok(Some(GpsConfig {
+        result: r.u8("gps_config result")?,
+        requested_rate_hz: r.u8("gps_config requested_rate_hz")?,
+        applied_rate_hz: r.u8("gps_config applied_rate_hz")?,
+        signals: r.u8("gps_config signals")?,
+        dynamic_model: r.u8("gps_config dynamic_model")?,
+        min_elevation_deg: r.i8("gps_config min_elevation_deg")?,
+        min_cno_dbhz: r.u8("gps_config min_cno_dbhz")?,
+        min_satellites: r.u8("gps_config min_satellites")?,
+        max_satellites: r.u8("gps_config max_satellites")?,
+        fix_gate_satellites: r.u8("gps_config fix_gate_satellites")?,
+        fix_gate_cno_dbhz: r.u8("gps_config fix_gate_cno_dbhz")?,
+        pdop_mask: r.u16("gps_config pdop_mask_x10")? as f64 / 10.0,
+        position_accuracy_mask_m: r.u16("gps_config position_accuracy_mask_m")?,
+        high_precision_nmea: r.u8("gps_config nmea_flags")? & 1 != 0,
+        nmea_extra: r.u8("gps_config nmea_extra")?,
+        module_version: null_term_str(r.bytes(30, "gps_config module_version")?),
+    }))
+}
+
+/// The GPS_CONFIG record of an `.idl1` file, if it has one. Walks the
+/// records from the end of the header; the firmware writes GPS_CONFIG
+/// before any data record, so this stops at the first one it finds. None
+/// for a file that is not `.idl1`, predates the record, or is damaged.
+pub fn read_idl1_gps_config(bytes: &[u8]) -> Option<GpsConfig> {
+    if bytes.len() < 10 || &bytes[..4] != b"IDL1" {
+        return None;
+    }
+    let header_len = u32::from_le_bytes(bytes[6..10].try_into().ok()?) as usize;
+    let mut r = ByteReader::new(bytes.get(header_len..)?);
+    while r.remaining() >= 3 {
+        let kind = r.u8("record type").ok()?;
+        let len = r.u16("record length").ok()? as usize;
+        if r.remaining() < len {
+            return None;
+        }
+        if kind == REC_GPS_CONFIG {
+            return read_gps_config(&mut r, len).ok()?;
+        }
+        if kind == REC_SESSION_END {
+            return None;
+        }
+        r.skip(len, "record").ok()?;
+    }
+    None
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -894,6 +1084,20 @@ pub(crate) mod tests {
             p.extend(count.to_le_bytes());
             p.extend(ts_us.to_le_bytes());
             self.record(REC_LOGGER_EVENT, &p)
+        }
+
+        /// A GPS_CONFIG record, laid out as idl1-firmware's
+        /// `idl1_format_gps_config` writes it: 8 Hz GPS+Galileo+BeiDou,
+        /// automotive, factory filters.
+        pub(crate) fn gps_config(&mut self, result: u8, applied_rate_hz: u8) -> &mut Self {
+            let mut p = vec![1u8, result, 8, applied_rate_hz, 0x07 | 0x10 | 0x20, 4, 5, 6, 3, 32, 0, 0];
+            p.extend(250u16.to_le_bytes());
+            p.extend(100u16.to_le_bytes());
+            p.extend([1u8, 0u8]);
+            let mut version = [0u8; 30];
+            version[..12].copy_from_slice(b"ROM SPG 5.10");
+            p.extend(version);
+            self.record(REC_GPS_CONFIG, &p)
         }
 
         pub(crate) fn end(&mut self) -> &mut Self {
@@ -1223,6 +1427,57 @@ pub(crate) mod tests {
         assert_eq!(find(&r, "WheelFront").t_us, vec![500_000]);
         assert_eq!(r.session.timestamp_source, TimestampSource::GpsBackfill);
         assert_eq!(r.session.timestamp_utc_ms, 1_760_000_123_000);
+    }
+
+    #[test]
+    fn read_idl1_gps_config_reads_the_record_after_the_header() {
+        // Arrange
+        let mut b = Builder::new();
+        b.gps_config(1, 8);
+        b.logger_event(2, 0, 3, 4_000_000);
+        b.end();
+
+        // Act
+        let cfg = read_idl1_gps_config(&b.build()).expect("GPS_CONFIG present");
+
+        // Assert
+        assert!(cfg.setup_ok());
+        assert_eq!((cfg.requested_rate_hz, cfg.applied_rate_hz), (8, 8));
+        assert_eq!(cfg.signals_text(), "GPS+Galileo+BeiDou, QZSS, SBAS");
+        assert_eq!(cfg.dynamic_model_name(), "automotive");
+        assert_eq!((cfg.min_elevation_deg, cfg.min_cno_dbhz, cfg.min_satellites, cfg.max_satellites), (5, 6, 3, 32));
+        assert_eq!((cfg.pdop_mask, cfg.position_accuracy_mask_m), (25.0, 100));
+        assert!(cfg.high_precision_nmea);
+        assert_eq!(cfg.module_version, "ROM SPG 5.10");
+        assert!(cfg.to_string().starts_with("8 Hz (module accepted 8 Hz), GPS+Galileo+BeiDou, QZSS, SBAS, automotive"));
+    }
+
+    #[test]
+    fn read_idl1_gps_config_a_file_without_the_record_is_none() {
+        let mut b = Builder::new();
+        b.logger_event(2, 0, 3, 4_000_000);
+        b.end();
+        assert_eq!(read_idl1_gps_config(&b.build()), None);
+        assert_eq!(read_idl1_gps_config(b"IDL0 not an idl1 file"), None);
+    }
+
+    #[test]
+    fn parse_idl1_a_failed_gps_setup_becomes_an_import_warning_and_a_good_one_does_not() {
+        // Arrange
+        let mut failed = Builder::new();
+        failed.gps_config(4, 1);
+        failed.end();
+        let mut ok = Builder::new();
+        ok.gps_config(1, 8);
+        ok.end();
+
+        // Act
+        let failed = parse_idl1(&failed.build()).unwrap();
+        let ok = parse_idl1(&ok.build()).unwrap();
+
+        // Assert
+        assert!(failed.import_warnings.iter().any(|w| w.kind == ImportWarningKind::LoggerDiagnostic && w.message.contains("GPS setup failed (NAK)") && w.message.contains("at 1 Hz, not the 8 Hz")));
+        assert!(!ok.import_warnings.iter().any(|w| w.message.contains("GPS")));
     }
 
     #[test]

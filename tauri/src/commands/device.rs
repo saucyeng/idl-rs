@@ -211,6 +211,11 @@ pub struct DeviceStatus {
     /// HDOP × 100 (e.g. 0.9 → 90). Optional even when a fix is present — the
     /// GPS driver may not expose it cheaply — so `None` is always "unknown".
     pub gps_hdop_x100: Option<u32>,
+    /// IDL1 GPS module setup result token (`OK`, `NO_RESPONSE`,
+    /// `BAUD_FAILED`, `NAK`, `NO_ACK`, `NOT_RUN`); `None` if unreported.
+    pub gps_config: Option<String>,
+    /// Navigation rate the GPS module acknowledged, Hz; `None` if unreported.
+    pub gps_rate_hz: Option<u32>,
     /// Per-IMU state for IMU index 0. `None` if unreported.
     pub imu0: Option<ImuState>,
     /// Per-IMU state for IMU index 1. `None` if unreported.
@@ -239,6 +244,8 @@ impl From<idl_transport::ble_status::DeviceStatus> for DeviceStatus {
             gps_fix_quality: s.gps_fix_quality,
             gps_sats: s.gps_sats,
             gps_hdop_x100: s.gps_hdop_x100,
+            gps_config: s.gps_config,
+            gps_rate_hz: s.gps_rate_hz,
             imu0: s.imu0.map(ImuState::from),
             imu1: s.imu1.map(ImuState::from),
             imu2: s.imu2.map(ImuState::from),
@@ -1860,6 +1867,8 @@ pub(crate) mod tests {
             gps_fix_quality: Some(1),
             gps_sats: Some(7),
             gps_hdop_x100: Some(90),
+            gps_config: Some("OK".to_string()),
+            gps_rate_hz: Some(5),
             imu0: Some(idl_transport::ble_status::ImuState::Ok),
             imu1: Some(idl_transport::ble_status::ImuState::Error),
             imu2: Some(idl_transport::ble_status::ImuState::Off),
@@ -1886,6 +1895,8 @@ pub(crate) mod tests {
         assert_eq!(dto.gps_fix_quality, Some(1));
         assert_eq!(dto.gps_sats, Some(7));
         assert_eq!(dto.gps_hdop_x100, Some(90));
+        assert_eq!(dto.gps_config.as_deref(), Some("OK"));
+        assert_eq!(dto.gps_rate_hz, Some(5));
         assert_eq!(dto.imu0, Some(super::ImuState::Ok));
         assert_eq!(dto.imu1, Some(super::ImuState::Error));
         assert_eq!(dto.imu2, Some(super::ImuState::Off));
@@ -1917,6 +1928,8 @@ pub(crate) mod tests {
         assert_eq!(dto.gps_fix_quality, None);
         assert_eq!(dto.gps_sats, None);
         assert_eq!(dto.gps_hdop_x100, None);
+        assert_eq!(dto.gps_config, None);
+        assert_eq!(dto.gps_rate_hz, None);
         assert_eq!(dto.imu0, None);
         assert_eq!(dto.imu1, None);
         assert_eq!(dto.imu2, None);

@@ -640,9 +640,16 @@ fn main() -> ExitCode {
 fn cmd_info(file: &Path, format: OutFormat) -> Result<Structured, CliError> {
     let handle = load(file)?;
     let meta = handle.metadata();
+    // An `.idl1` file's GPS settings (its GPS_CONFIG record), so sessions
+    // recorded with different GPS settings can be told apart. A read error
+    // here only loses this line; `load` above already reported the file.
+    let gps_config = std::fs::read(file).ok().and_then(|bytes| idl_rs::parse::idl1::read_idl1_gps_config(&bytes));
     match format {
         OutFormat::Text => {
             print_info(&meta);
+            if let Some(cfg) = &gps_config {
+                println!("gps_settings   {cfg}");
+            }
             warn_if_truncated(&meta);
             Ok(Structured::Text)
         }
@@ -654,6 +661,7 @@ fn cmd_info(file: &Path, format: OutFormat) -> Result<Structured, CliError> {
                 "config_checksum": meta.config_checksum,
                 "channel_count": meta.channel_count,
                 "duration_ms": meta.duration_ms,
+                "gps_settings": gps_config.as_ref().map(|c| c.to_string()),
             }),
             warnings: truncation_warnings(&meta),
         }),
