@@ -26,6 +26,7 @@ use crate::store::parquet::{parse_source_format, read_channel_index, read_channe
 use crate::store::session_json::{
     read_session_json, LapJson, NeutralZoneVisitJson, OverlayLapKeyJson, SectorJson, TrackVisitJson,
 };
+use crate::session::synthesis::plan_base_channels;
 use crate::track_artifact::read::read_track;
 
 /// One row of the catalog `sessions` table (C4 §5), mirrored field for
@@ -402,6 +403,7 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
             sample_count: *count as u64,
         });
     }
+    channels.extend(base_channel_summaries(&channels));
 
     let videos = crate::store::video::session_videos(data_root, &doc);
     Ok(SessionDetail {
@@ -437,6 +439,36 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
         bike_id: doc.bike_id,
         bike_log: doc.bike_log,
     })
+}
+
+/// The engine's base channels (`Time`, and `Distance` with GPS speed) as
+/// [`ChannelSummary`] rows, from the recorded channels' metadata alone, so
+/// a session's channel list names everything a workbook can reference
+/// (C3 §3.2). The rule is [`plan_base_channels`], the same one
+/// [`crate::session::synthesis::synthesize_base_channels`] builds them by.
+/// A name the file already records is not listed twice.
+fn base_channel_summaries(recorded: &[ChannelSummary]) -> Vec<ChannelSummary> {
+    let dims: Vec<(&str, f64, usize)> =
+        recorded.iter().map(|c| (c.channel_id.as_str(), c.nominal_rate_hz, c.sample_count as usize)).collect();
+    let Some(plan) = plan_base_channels(&dims) else {
+        return Vec::new();
+    };
+    let mut names = vec![("Time", "s")];
+    if plan.distance {
+        names.push(("Distance", "m"));
+    }
+    names
+        .into_iter()
+        .filter(|(id, _)| !recorded.iter().any(|c| c.channel_id == *id))
+        .map(|(id, unit)| ChannelSummary {
+            channel_id: id.to_string(),
+            nominal_rate_hz: plan.nominal_rate_hz,
+            unit: unit.to_string(),
+            source_kind: "synthesized".to_string(),
+            channel_kind: if plan.nominal_rate_hz == 0.0 { "event".to_string() } else { "fixed-rate".to_string() },
+            sample_count: plan.len as u64,
+        })
+        .collect()
 }
 
 /// `session.json`'s `LapJson` -> this module's [`LapDetail`] — a plain
@@ -811,8 +843,8 @@ mod tests {
         // Act
         let detail = get_session(&root, "s1").unwrap();
 
-        // Assert
-        assert_eq!(detail.channels.len(), 1);
+        // Assert — the recorded channel, then the engine's synthesized Time.
+        assert_eq!(detail.channels.len(), 2);
         let ch = &detail.channels[0];
         assert_eq!(ch.unit, "g");
         assert_eq!(ch.source_kind, "imu0");
@@ -821,6 +853,76 @@ mod tests {
         assert_eq!(detail.source_format, "idl0");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn summary(id: &str, rate: f64, count: u64) -> ChannelSummary {
+        ChannelSummary {
+            channel_id: id.to_string(),
+            nominal_rate_hz: rate,
+            unit: String::new(),
+            source_kind: "imu0".to_string(),
+            channel_kind: "fixed-rate".to_string(),
+            sample_count: count,
+        }
+    }
+
+    #[test]
+    fn get_session_seeded_session_lists_time_after_the_recorded_channels() {
+        // Arrange
+        let root = temp_root();
+        let doc = empty_session_json("s1");
+        write_full_session(&root, "s1", 0, &doc);
+
+        // Act
+        let detail = get_session(&root, "s1").unwrap();
+
+        // Assert — Time follows the 2 Hz channel, 3 samples, seconds.
+        let time = detail.channels.last().unwrap();
+        assert_eq!(time.channel_id, "Time");
+        assert_eq!(time.source_kind, "synthesized");
+        assert_eq!(time.unit, "s");
+        assert_eq!(time.nominal_rate_hz, 2.0);
+        assert_eq!(time.channel_kind, "fixed-rate");
+        assert_eq!(time.sample_count, 3);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn base_channel_summaries_gps_speed_present_adds_distance_on_the_time_grid() {
+        // Arrange
+        let recorded = vec![summary("IMU0_LgAccelX", 400.0, 4000), summary("GPS_SpeedKmh", 10.0, 100)];
+
+        // Act
+        let base = base_channel_summaries(&recorded);
+
+        // Assert
+        let ids: Vec<&str> = base.iter().map(|c| c.channel_id.as_str()).collect();
+        assert_eq!(ids, vec!["Time", "Distance"]);
+        assert_eq!(base[1].unit, "m");
+        assert_eq!(base[1].nominal_rate_hz, 400.0);
+        assert_eq!(base[1].sample_count, 4000);
+    }
+
+    #[test]
+    fn base_channel_summaries_a_recorded_time_channel_is_not_listed_twice() {
+        // Arrange
+        let recorded = vec![summary("Time", 10.0, 50), summary("X", 10.0, 50)];
+
+        // Act
+        let base = base_channel_summaries(&recorded);
+
+        // Assert
+        assert!(base.is_empty());
+    }
+
+    #[test]
+    fn base_channel_summaries_no_channels_lists_nothing() {
+        // Act
+        let base = base_channel_summaries(&[]);
+
+        // Assert
+        assert!(base.is_empty());
     }
 
     #[test]

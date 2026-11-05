@@ -6,6 +6,64 @@
 use crate::integration::integrate;
 use crate::session::{Channel, RawColumn, Session};
 
+/// What [`synthesize_base_channels`] adds to a session, decided from each
+/// channel's id, nominal rate (Hz) and sample count alone — so a reader that
+/// has only a file's metadata (`store::catalog_read::get_session`) lists the
+/// same base channels the engine will build, without decoding anything.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BasePlan {
+    /// Index (into the dims given) of the channel whose real `t_us` `Time`
+    /// carries.
+    pub time_source: usize,
+    /// `Time`'s (and `Distance`'s) nominal rate, Hz; `0.0` when no channel
+    /// is fixed-rate (never a fabricated rate, ledger R23 Q2).
+    pub nominal_rate_hz: f64,
+    /// `Time`'s (and `Distance`'s) sample count.
+    pub len: usize,
+    /// Whether `Distance` is added (a non-empty fixed-rate `GPS_SpeedKmh`).
+    pub distance: bool,
+}
+
+/// The [`BasePlan`] for channels given as `(channel_id, nominal_rate_hz,
+/// sample_count)`, or `None` when there are none or every one is empty.
+/// `Time` follows the highest fixed-rate channel (the longest at that rate);
+/// with no fixed-rate channel, the channel with the most samples.
+pub fn plan_base_channels(dims: &[(&str, f64, usize)]) -> Option<BasePlan> {
+    let mut best: Option<(usize, f64, usize)> = None; // (index, rate, len)
+    for (i, &(_, rate, len)) in dims.iter().enumerate() {
+        if rate <= 0.0 {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((_, r, l)) => rate > r || (rate == r && len > l),
+        };
+        if better {
+            best = Some((i, rate, len));
+        }
+    }
+    // No fixed-rate channel — fall back to the channel with the most
+    // samples, using its own real `t_us` (ledger R23 Q2). This is what
+    // makes every FIT/GPX/CSV session (every channel `nominal_rate_hz:
+    // 0.0`) actually gain a `Time` channel; the rate stays `0.0` here,
+    // never a fabricated rate — `channel_kind` is `event` iff
+    // `nominal_rate_hz == 0.0` (`store/parquet.rs:158`), and an honest
+    // `Time` channel for event-driven data must itself read `event`.
+    if best.is_none() {
+        for (i, &(_, _, len)) in dims.iter().enumerate() {
+            if len > best.map_or(0, |(_, _, l)| l) {
+                best = Some((i, 0.0, len));
+            }
+        }
+    }
+    let (time_source, nominal_rate_hz, len) = best?;
+    if len == 0 {
+        return None;
+    }
+    let distance = dims.iter().any(|&(id, rate, n)| id == "GPS_SpeedKmh" && rate > 0.0 && n > 0);
+    Some(BasePlan { time_source, nominal_rate_hz, len, distance })
+}
+
 /// Appends a synthesized `Time` channel (and, when `GPS_SpeedKmh` is present, a
 /// cumulative `Distance` channel) to `session`. Returns the ids it appended
 /// (`["Time"]`, `["Time", "Distance"]`, or `[]`).
@@ -35,51 +93,12 @@ use crate::session::{Channel, RawColumn, Session};
 /// both ends; presented on `Time`'s own `t_us` (they share one time axis by
 /// construction). Omitted when `GPS_SpeedKmh` is absent/empty.
 pub fn synthesize_base_channels(session: &mut Session) -> Vec<String> {
-    // Highest fixed-rate channel; longest sample count at that rate; the
-    // winning channel's own index, so its real t_us can be carried forward.
-    let mut max_rate = 0.0_f64;
-    let mut max_rate_len = 0usize;
-    let mut time_source_idx: Option<usize> = None;
-    for (i, c) in session.channels.iter().enumerate() {
-        if c.nominal_rate_hz <= 0.0 {
-            continue;
-        }
-        if c.nominal_rate_hz > max_rate {
-            max_rate = c.nominal_rate_hz;
-            max_rate_len = c.len();
-            time_source_idx = Some(i);
-        } else if c.nominal_rate_hz == max_rate && c.len() > max_rate_len {
-            max_rate_len = c.len();
-            time_source_idx = Some(i);
-        }
-    }
-    // No fixed-rate channel — fall back to the channel with the most
-    // samples, using its own real `t_us` (ledger R23 Q2). This is what
-    // makes every FIT/GPX/CSV session (every channel `nominal_rate_hz:
-    // 0.0`) actually gain a `Time` channel; `max_rate` stays `0.0` here,
-    // never a fabricated rate — `channel_kind` is `event` iff
-    // `nominal_rate_hz == 0.0` (`store/parquet.rs:158`), and an honest
-    // `Time` channel for event-driven data must itself read `event`.
-    let time_source_idx = if let Some(idx) = time_source_idx {
-        idx
-    } else {
-        let mut fallback_idx: Option<usize> = None;
-        let mut fallback_len = 0usize;
-        for (i, c) in session.channels.iter().enumerate() {
-            if c.len() > fallback_len {
-                fallback_len = c.len();
-                fallback_idx = Some(i);
-            }
-        }
-        let Some(idx) = fallback_idx else {
-            return Vec::new();
-        };
-        max_rate_len = fallback_len;
-        idx
-    };
-    if max_rate_len == 0 {
+    let dims: Vec<(&str, f64, usize)> =
+        session.channels.iter().map(|c| (c.channel_id.as_str(), c.nominal_rate_hz, c.len())).collect();
+    let Some(plan) = plan_base_channels(&dims) else {
         return Vec::new();
-    }
+    };
+    let (time_source_idx, max_rate, max_rate_len) = (plan.time_source, plan.nominal_rate_hz, plan.len);
 
     let mut added = vec!["Time".to_string()];
 
@@ -157,6 +176,27 @@ mod tests {
             blob_sha256: String::new(),
             channels,
         }
+    }
+
+    #[test]
+    fn plan_base_channels_event_only_channels_fall_back_to_the_longest_at_rate_zero() {
+        // Arrange — a GPX-like session: every channel irregular.
+        let dims = [("GPS_Latitude", 0.0, 80), ("WheelFront", 0.0, 900), ("GPS_SpeedKmh", 0.0, 80)];
+
+        // Act
+        let plan = plan_base_channels(&dims).unwrap();
+
+        // Assert — Time follows WheelFront; no Distance without a fixed-rate GPS speed.
+        assert_eq!(plan, BasePlan { time_source: 1, nominal_rate_hz: 0.0, len: 900, distance: false });
+    }
+
+    #[test]
+    fn plan_base_channels_every_channel_empty_plans_nothing() {
+        // Act
+        let plan = plan_base_channels(&[("A", 100.0, 0), ("B", 0.0, 0)]);
+
+        // Assert
+        assert_eq!(plan, None);
     }
 
     #[test]

@@ -1429,7 +1429,8 @@ mod tests {
         assert_eq!(detail.source_format, "idl0");
         assert_eq!(detail.blob_sha256, blob_sha256);
 
-        assert_eq!(detail.channels.len(), 1);
+        // The recorded channel, then the engine's synthesized Time.
+        assert_eq!(detail.channels.len(), 2);
         let ch = &detail.channels[0];
         assert_eq!(ch.channel_id, "chan-S");
         assert_eq!(ch.nominal_rate_hz, 2.0);
