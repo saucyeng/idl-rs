@@ -29,6 +29,42 @@ pub fn differentiate(data: &[f64], sample_rate_hz: f64) -> Vec<f64> {
     result
 }
 
+/// [`differentiate`] over recorded sample times instead of a rate: for an
+/// event channel (GPS, wheel pulses), whose nominal rate is 0 and whose
+/// samples land when they land. `t_us` is microseconds, one per sample;
+/// `result[0] = 0.0`, and a repeated time (zero step) gives 0 rather than a
+/// division by zero. Output units = input units per second.
+pub fn differentiate_at_times(data: &[f64], t_us: &[i64]) -> Vec<f64> {
+    let n = data.len().min(t_us.len());
+    let mut result = vec![0.0; data.len()];
+    for i in 1..n {
+        let dt = (t_us[i] - t_us[i - 1]) as f64 / 1e6;
+        result[i] = if dt > 0.0 { (data[i] - data[i - 1]) / dt } else { 0.0 };
+    }
+    result
+}
+
+/// [`gradient`] over recorded sample times: the central difference
+/// `(data[i+1] - data[i-1]) / (t[i+1] - t[i-1])`, one-sided at the edges, 0
+/// where the span is zero. For event channels, as [`differentiate_at_times`].
+pub fn gradient_at_times(data: &[f64], t_us: &[i64]) -> Vec<f64> {
+    let n = data.len().min(t_us.len());
+    let mut result = vec![0.0; data.len()];
+    if n < 2 {
+        return result;
+    }
+    let slope = |a: usize, b: usize| {
+        let dt = (t_us[b] - t_us[a]) as f64 / 1e6;
+        if dt > 0.0 { (data[b] - data[a]) / dt } else { 0.0 }
+    };
+    result[0] = slope(0, 1);
+    for i in 1..n - 1 {
+        result[i] = slope(i - 1, i + 1);
+    }
+    result[n - 1] = slope(n - 2, n - 1);
+    result
+}
+
 /// Central finite-difference derivative — `numpy.gradient`'s own formula for
 /// uniformly-spaced samples, `edge_order=1` (numpy's default): interior
 /// samples use the central difference `(data[i+1] - data[i-1]) / (2·dt)`;
@@ -541,6 +577,24 @@ pub fn zupt_flags(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn differentiate_at_times_a_repeated_time_is_zero_not_a_division_by_zero() {
+        // Act — two samples stamped at the same microsecond.
+        let out = differentiate_at_times(&[0.0, 1.0, 2.0], &[0, 1_000, 1_000]);
+
+        // Assert
+        assert_eq!(out, vec![0.0, 1_000.0, 0.0]);
+    }
+
+    #[test]
+    fn gradient_at_times_fewer_than_two_samples_all_zero() {
+        // Act
+        let out = gradient_at_times(&[5.0], &[0]);
+
+        // Assert
+        assert_eq!(out, vec![0.0]);
+    }
 
     #[test]
     fn differentiate_linear_ramp_yields_constant_slope() {

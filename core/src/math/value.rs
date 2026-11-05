@@ -81,6 +81,54 @@ pub struct ChannelValue {
     pub axis: ValueAxis,
 }
 
+/// How a channel's samples are placed in time (C2 §3.6.10, added 2026-11-05).
+///
+/// A logger records two kinds of channel (C1 §4.2). A **fixed-rate** channel
+/// (an IMU axis) is a uniform grid at its rate; its `t_us` are that grid
+/// rounded to whole microseconds, so the rate is the more exact of the two
+/// and is what steps it. An **event** channel (GPS, a wheel pulse, heart-rate
+/// RR) has rate 0 and samples where they happen; only its recorded times
+/// say how far apart two samples are. Before this existed, every time-based
+/// builtin stepped by the rate alone, so on an event channel `differentiate`
+/// and `cumulative_trapezoid` returned zeros and a lap window read the whole
+/// session.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Spacing<'a> {
+    /// A uniform grid, Hz.
+    Uniform(f64),
+    /// Samples at these recorded times, µs since the session's first sample,
+    /// one per sample.
+    Recorded(&'a [i64]),
+    /// No time axis at all: a scalar-as-channel, a table column, spectrum
+    /// bins.
+    Untimed,
+}
+
+impl ChannelValue {
+    /// This channel's [`Spacing`]: its rate when it has one, else its
+    /// recorded times when there is one per sample, else none.
+    pub fn spacing(&self) -> Spacing<'_> {
+        if self.sample_rate_hz > 0.0 {
+            Spacing::Uniform(self.sample_rate_hz)
+        } else if !self.t_us.is_empty() && self.t_us.len() == self.samples.len() {
+            Spacing::Recorded(&self.t_us)
+        } else {
+            Spacing::Untimed
+        }
+    }
+}
+
+/// The one number a stored scalar-as-channel holds (see
+/// [`ChannelValue::sample_rate_hz`]: rate 0, one sample, no recorded time),
+/// or `None` for anything else. The single decoder for that encoding: a
+/// definition that reduced to a number is stored this way, and both
+/// `evaluate_scalar` and a `[name]` reference read it back through here, so
+/// `m = last([x]) / 4` followed by `[m] * [Channel]` scales the channel. A
+/// session's one-sample event channel carries its time and is not a scalar.
+pub fn stored_scalar(samples: &[f64], sample_rate_hz: f64, t_us: &[i64]) -> Option<f64> {
+    (sample_rate_hz == 0.0 && samples.len() == 1 && t_us.is_empty()).then(|| samples[0])
+}
+
 /// A 3-vector intermediate value: three component values sharing the
 /// broadcasting rules of the rest of the evaluator. Each component is itself a
 /// [`Value::Scalar`] (one value broadcast across every sample) or a

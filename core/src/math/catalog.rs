@@ -118,7 +118,7 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             signature: "butter(order, cutoff_hz, \"low\"|\"lowpass\"|\"high\"|\"highpass\", ch)",
             unit_rule: "SameAsArg(3)",
             shape: "[t]",
-            description: "Zero-phase Butterworth low- or high-pass filter; designs and applies the filter in one call.",
+            description: "Zero-phase Butterworth low- or high-pass filter; designs and applies the filter in one call. Needs a fixed-rate channel: put an event channel on a grid first, `resample(x, [Time])`.",
             example: "butter(2, 5, \"low\", [Fork])",
         },
         MathBuiltin {
@@ -140,7 +140,7 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             signature: "declip(ch)",
             unit_rule: "SameAsArg(0)",
             shape: "[t]",
-            description: "Reconstructs samples lost to clipping; designed for accelerometer data clipped at +/-32 g.",
+            description: "Reconstructs samples lost to clipping; designed for accelerometer data clipped at +/-32 g. Needs a fixed-rate channel.",
             example: "declip([AccelZ])",
         },
         MathBuiltin {
@@ -151,7 +151,7 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             signature: "cumulative_trapezoid(ch)",
             unit_rule: "Product(SameAsArg(0), Fixed(s))",
             shape: "[t]",
-            description: "Cumulative trapezoidal integral of a channel with respect to time.",
+            description: "Cumulative trapezoidal integral of a channel with respect to time. A fixed-rate channel steps by its rate; an event channel (GPS, wheel pulses) by its recorded sample times.",
             example: "cumulative_trapezoid([AccelZ])",
         },
         MathBuiltin {
@@ -173,7 +173,7 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             signature: "differentiate(ch)",
             unit_rule: "Quotient(SameAsArg(0), Fixed(s))",
             shape: "[t]",
-            description: "Backward difference with respect to time, with `result[0] = 0`. Deliberately not `gradient`'s central difference.",
+            description: "Backward difference with respect to time, with `result[0] = 0`. Deliberately not `gradient`'s central difference. A fixed-rate channel steps by its rate; an event channel (GPS, wheel pulses) by its recorded sample times.",
             example: "differentiate([Fork])",
         },
         MathBuiltin {
@@ -184,7 +184,7 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             signature: "gradient(ch)",
             unit_rule: "Quotient(SameAsArg(0), Fixed(s))",
             shape: "[t]",
-            description: "Central difference with respect to time, `numpy.gradient`'s own formula.",
+            description: "Central difference with respect to time, `numpy.gradient`'s own formula. A fixed-rate channel steps by its rate; an event channel by its recorded sample times.",
             example: "gradient([Fork])",
         },
         MathBuiltin {
@@ -547,7 +547,7 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             signature: "periodogram(ch, window=\"boxcar\", detrend=\"constant\", scaling=\"density\"|\"spectrum\"|\"raw_magnitude\")",
             unit_rule: "SelectByLiteral(scaling, { \"density\" -> Quotient(PowN(0, 2), Fixed(Hz)), \"spectrum\" -> PowN(0, 2), \"raw_magnitude\" -> SameAsArg(0) }, default \"density\")",
             shape: "[f]",
-            description: "Single-segment power spectrum, scipy-named and scipy-scaled. Retired name: `fft`.",
+            description: "Single-segment power spectrum, scipy-named and scipy-scaled. Needs a fixed-rate channel. Retired name: `fft`.",
             example: "periodogram([Fork])",
         },
         MathBuiltin {
@@ -558,7 +558,7 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             signature: "welch(ch, window=\"hann\", nperseg=n, noverlap=n, detrend=\"constant\", average=\"mean\"|\"median\"|\"max\"|\"none\", scaling=\"density\"|\"spectrum\"|\"raw_magnitude\")",
             unit_rule: "SelectByLiteral(scaling, { \"density\" -> Quotient(PowN(0, 2), Fixed(Hz)), \"spectrum\" -> PowN(0, 2), \"raw_magnitude\" -> SameAsArg(0) }, default \"density\")",
             shape: "[f]",
-            description: "Segmented, averaged power spectrum -- the spectrum the FFT charts compute.",
+            description: "Segmented, averaged power spectrum -- the spectrum the FFT charts compute. Needs a fixed-rate channel.",
             example: "welch([Fork])",
         },
         MathBuiltin {

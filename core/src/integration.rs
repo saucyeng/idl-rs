@@ -32,6 +32,24 @@ pub fn integrate(data: &[f64], sample_rate_hz: f64) -> Vec<f64> {
     result
 }
 
+/// [`integrate`] over recorded sample times instead of a rate, for an event
+/// channel (nominal rate 0): `result[i] = result[i-1] + (data[i-1] + data[i])
+/// / 2 · (t[i] - t[i-1])`, `t_us` in microseconds. Output units = input
+/// units × seconds.
+pub fn integrate_at_times(data: &[f64], t_us: &[i64]) -> Vec<f64> {
+    let n = data.len().min(t_us.len());
+    let mut result = Vec::with_capacity(data.len());
+    if data.is_empty() {
+        return result;
+    }
+    result.push(0.0_f64);
+    for i in 1..data.len() {
+        let dt = if i < n { (t_us[i] - t_us[i - 1]) as f64 / 1e6 } else { 0.0 };
+        result.push(result[i - 1] + (data[i - 1] + data[i]) * 0.5 * dt);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::math::parse::{Ast, BinOp, UnOp};
-use crate::math::value::{ChannelValue, Value, ValueAxis};
+use crate::math::value::{stored_scalar, ChannelValue, Spacing, Value, ValueAxis};
 use crate::math::{MathEvalError, MathEvalErrorKind};
 
 /// A channel resolved by [`ChannelLookup`]. Samples are an `Arc<[f64]>`: the
@@ -451,8 +451,8 @@ pub fn evaluate_scalar(
     lap_ctx: &MathLapContext,
 ) -> Result<f64, MathEvalError> {
     let out = evaluate(expression, lookup, lap_ctx)?;
-    if out.sample_rate_hz == 0.0 && out.samples.len() == 1 {
-        Ok(out.samples[0])
+    if let Some(v) = stored_scalar(&out.samples, out.sample_rate_hz, &out.t_us) {
+        Ok(v)
     } else {
         Err(err(
             MathEvalErrorKind::Runtime,
@@ -481,6 +481,12 @@ pub fn eval(
                     format!("Channel '[{name}]' not in this session"),
                 )
             })?;
+            // A definition that reduced to one number is stored in the
+            // scalar-as-channel encoding; read back, it is that number again,
+            // so `[m] * [Channel]` broadcasts instead of failing on lengths.
+            if let Some(v) = stored_scalar(&ch.samples, ch.sample_rate_hz, &ch.t_us) {
+                return Ok(Value::Scalar(v));
+            }
             Ok(Value::Channel(ChannelValue {
                 samples: ch.samples,
                 sample_rate_hz: ch.sample_rate_hz,
@@ -918,6 +924,17 @@ fn require_arg_count(name: &str, args: &[Value], expected: usize) -> Result<(), 
 fn require_channel(v: &Value, ctx: &str) -> Result<ChannelValue, MathEvalError> {
     match v {
         Value::Channel(c) => Ok(c.clone()),
+        // A scalar where a channel is expected is its one-sample, untimed
+        // form (the encoding [`stored_scalar`] reads back): `max([m])` of a
+        // definition `m = 42` is 42, and a builtin that steps through time
+        // refuses it as having no time axis.
+        Value::Scalar(x) => Ok(ChannelValue {
+            samples: Arc::from(vec![*x]),
+            sample_rate_hz: 0.0,
+            channel_id: None,
+            t_us: Arc::from(&[] as &[i64]),
+            axis: ValueAxis::Time,
+        }),
         other => Err(err(
             MathEvalErrorKind::Type,
             format!("{ctx}: expected channel argument, got {}", type_name(other)),
@@ -967,7 +984,7 @@ fn one_channel_windowed(
         ));
     }
     let ch = require_channel(&args[0], name)?;
-    let (start, end) = window_index_range(lap_ctx, ch.sample_rate_hz, ch.samples.len());
+    let (start, end) = channel_window(lap_ctx, &ch);
     Ok((ch.samples, start, end))
 }
 
@@ -1161,6 +1178,67 @@ pub(crate) fn main_lap_window(lap_ctx: &MathLapContext) -> Option<(f64, f64)> {
         (Some(n), bounds) => bounds.get((n as usize).saturating_sub(1)).copied(),
         (None, _) => None,
     }
+}
+
+/// The sample range of `ch` inside the selected lap or time window. A
+/// fixed-rate channel finds it from its rate ([`window_index_range`]); an
+/// event channel from its recorded times, so a lap-scoped `mean([GPS_SpeedKmh])`
+/// is the lap's mean, not the session's (C2 §3.6.10). An untimed value is never
+/// windowed (R124.3).
+fn channel_window(lap_ctx: &MathLapContext, ch: &ChannelValue) -> (usize, usize) {
+    match ch.spacing() {
+        Spacing::Uniform(rate) => window_index_range(lap_ctx, rate, ch.samples.len()),
+        Spacing::Recorded(t_us) => match main_lap_window(lap_ctx) {
+            None => (0, ch.samples.len()),
+            Some((start_sec, end_sec)) if !(start_sec < end_sec) => (0, 0),
+            Some((start_sec, end_sec)) => crate::session::handle::time_window_index_range(t_us, start_sec, end_sec),
+        },
+        Spacing::Untimed => (0, ch.samples.len()),
+    }
+}
+
+/// `ch`'s [`Spacing`] for a builtin that steps through time (`differentiate`,
+/// `gradient`, `cumulative_trapezoid`): uniform or recorded, never untimed.
+///
+/// # Errors
+/// A typed runtime error naming `name` for a value with no time axis.
+fn timed<'a>(ch: &'a ChannelValue, name: &str) -> Result<Spacing<'a>, MathEvalError> {
+    match ch.spacing() {
+        Spacing::Untimed => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{name}: {} has no time axis to step along", describe_channel(ch)),
+        )),
+        spacing => Ok(spacing),
+    }
+}
+
+/// `ch`'s rate for a builtin that needs a uniform grid (a filter, a spectrum,
+/// clip reconstruction).
+///
+/// # Errors
+/// An event channel or an untimed value, as a typed runtime error that says
+/// how to get a grid: resample onto a fixed-rate channel first.
+fn uniform_rate(ch: &ChannelValue, name: &str) -> Result<f64, MathEvalError> {
+    match ch.spacing() {
+        Spacing::Uniform(rate) => Ok(rate),
+        Spacing::Recorded(_) => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!(
+                "{name} needs a fixed-rate channel, and {} is an event channel (samples at recorded times, no rate). \
+                 Put it on a fixed grid first: resample(x, [Time]).",
+                describe_channel(ch)
+            ),
+        )),
+        Spacing::Untimed => Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("{name}: {} has no time axis", describe_channel(ch)),
+        )),
+    }
+}
+
+/// `[Name]` for a direct channel reference, "this value" for a derived one.
+fn describe_channel(ch: &ChannelValue) -> String {
+    ch.channel_id.as_deref().map_or_else(|| "this value".to_string(), |id| format!("[{id}]"))
 }
 
 // The scalar-aggregate index range for the selected window (R123/R124: the
@@ -1468,8 +1546,13 @@ fn call_function(
         "cumulative_trapezoid" | "cumtrapz" => {
             require_arg_count(name, &args, 1)?;
             let ch = require_channel(&args[0], name)?;
+            let integrated = match timed(&ch, name)? {
+                Spacing::Uniform(rate) => crate::integration::integrate(&ch.samples, rate),
+                Spacing::Recorded(t_us) => crate::integration::integrate_at_times(&ch.samples, t_us),
+                Spacing::Untimed => unreachable!("timed() refuses an untimed channel"),
+            };
             Ok(channel(
-                crate::integration::integrate(&ch.samples, ch.sample_rate_hz),
+                integrated,
                 ch.sample_rate_hz,
                 ch.t_us,
             ))
@@ -1501,12 +1584,12 @@ fn call_function(
             let order = order.round() as usize;
             match ftype {
                 "high" | "highpass" => {
-                    let out = crate::filters::highpass(&ch.samples, order, cutoff, ch.sample_rate_hz)
+                    let out = crate::filters::highpass(&ch.samples, order, cutoff, uniform_rate(&ch, name)?)
                         .map_err(|e| err(MathEvalErrorKind::Runtime, e.to_string()))?;
                     Ok(channel(out, ch.sample_rate_hz, ch.t_us))
                 }
                 "low" | "lowpass" => {
-                    let out = crate::filters::lowpass(&ch.samples, order, cutoff, ch.sample_rate_hz)
+                    let out = crate::filters::lowpass(&ch.samples, order, cutoff, uniform_rate(&ch, name)?)
                         .map_err(|e| err(MathEvalErrorKind::Runtime, e.to_string()))?;
                     Ok(channel(out, ch.sample_rate_hz, ch.t_us))
                 }
@@ -1546,10 +1629,10 @@ fn call_function(
             // full-record segment (`resolve_seg`), reproducing scipy's
             // `periodogram` exactly; `averaging` is irrelevant with exactly
             // one segment.
-            let (start, end) = window_index_range(lap_ctx, ch.sample_rate_hz, ch.samples.len());
+            let (start, end) = channel_window(lap_ctx, &ch);
             let result = crate::fft::welch(
                 ch.samples[start..end].to_vec(),
-                ch.sample_rate_hz,
+                uniform_rate(&ch, name)?,
                 window,
                 0,
                 0,
@@ -1567,7 +1650,7 @@ fn call_function(
             require_arg_count(name, &args, 1)?;
             reject_unknown_kwargs(name, kwargs, &["window", "nperseg", "noverlap", "detrend", "average", "scaling"])?;
             let ch = require_channel(&args[0], name)?;
-            let (start, end) = window_index_range(lap_ctx, ch.sample_rate_hz, ch.samples.len());
+            let (start, end) = channel_window(lap_ctx, &ch);
             let n = end - start;
             let window = parse_fft_window(kwarg_string(name, kwargs, "window", "hann")?, name)?;
             // scipy's own `welch` defaults: `nperseg` is 256 samples (or the
@@ -1585,7 +1668,7 @@ fn call_function(
             let scaling = parse_fft_scaling(kwarg_string(name, kwargs, "scaling", "density")?, name)?;
             let result = crate::fft::welch(
                 ch.samples[start..end].to_vec(),
-                ch.sample_rate_hz,
+                uniform_rate(&ch, name)?,
                 window,
                 nperseg,
                 noverlap,
@@ -1599,7 +1682,7 @@ fn call_function(
             require_arg_count(name, &args, 1)?;
             let ch = require_channel(&args[0], name)?;
             Ok(channel(
-                crate::clip_reconstruct::declip(&ch.samples, ch.sample_rate_hz),
+                crate::clip_reconstruct::declip(&ch.samples, uniform_rate(&ch, name)?),
                 ch.sample_rate_hz,
                 ch.t_us,
             ))
@@ -1609,8 +1692,13 @@ fn call_function(
         "differentiate" => {
             require_arg_count(name, &args, 1)?;
             let ch = require_channel(&args[0], name)?;
+            let derivative = match timed(&ch, name)? {
+                Spacing::Uniform(rate) => crate::statistics::differentiate(&ch.samples, rate),
+                Spacing::Recorded(t_us) => crate::statistics::differentiate_at_times(&ch.samples, t_us),
+                Spacing::Untimed => unreachable!("timed() refuses an untimed channel"),
+            };
             Ok(channel(
-                crate::statistics::differentiate(&ch.samples, ch.sample_rate_hz),
+                derivative,
                 ch.sample_rate_hz,
                 ch.t_us,
             ))
@@ -1623,8 +1711,13 @@ fn call_function(
         "gradient" => {
             require_arg_count(name, &args, 1)?;
             let ch = require_channel(&args[0], name)?;
+            let derivative = match timed(&ch, name)? {
+                Spacing::Uniform(rate) => crate::statistics::gradient(&ch.samples, rate),
+                Spacing::Recorded(t_us) => crate::statistics::gradient_at_times(&ch.samples, t_us),
+                Spacing::Untimed => unreachable!("timed() refuses an untimed channel"),
+            };
             Ok(channel(
-                crate::statistics::gradient(&ch.samples, ch.sample_rate_hz),
+                derivative,
                 ch.sample_rate_hz,
                 ch.t_us,
             ))
@@ -1819,7 +1912,7 @@ fn call_function(
             }
             let ch = require_channel(&args[0], "percentile")?;
             let q = require_scalar(&args[1], "percentile quantile")?;
-            let (start, end) = window_index_range(lap_ctx, ch.sample_rate_hz, ch.samples.len());
+            let (start, end) = channel_window(lap_ctx, &ch);
             Ok(Value::Scalar(crate::math::aggregate::percentile(&ch.samples[start..end], q)))
         }
         "atan2" => {
@@ -4778,6 +4871,110 @@ mod tests {
         // Assert
         assert_eq!(e.kind, MathEvalErrorKind::Runtime);
         assert!(e.message.contains("resample(x, onto)"), "{}", e.message);
+    }
+
+    /// A wheel-pulse-like event channel: the running count 0..=3 at 0, 0.1,
+    /// 0.3 and 0.7 s (rate 0).
+    fn pulses() -> TimedLookup {
+        timed(&[("pulse", vec![0.0, 1.0, 2.0, 3.0], 0.0, vec![0, 100_000, 300_000, 700_000])])
+    }
+
+    fn channel_samples(v: Value) -> Vec<f64> {
+        match v {
+            Value::Channel(c) => c.samples.to_vec(),
+            other => panic!("expected a channel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn differentiate_an_event_channel_steps_by_its_recorded_times() {
+        // Act — one count per step over 0.1, 0.2 and 0.4 s.
+        let out = channel_samples(eval_expr("differentiate([pulse])", &pulses()).unwrap());
+
+        // Assert — was all zeros: the nominal rate of an event channel is 0.
+        assert_eq!(out, vec![0.0, 10.0, 5.0, 2.5]);
+    }
+
+    #[test]
+    fn gradient_an_event_channel_central_difference_over_recorded_times() {
+        // Act
+        let out = channel_samples(eval_expr("gradient([pulse])", &pulses()).unwrap());
+
+        // Assert — interior: 2 counts over 0.3 s and over 0.6 s.
+        assert_eq!(out[0], 10.0);
+        assert!((out[1] - 2.0 / 0.3).abs() < 1e-12);
+        assert!((out[2] - 2.0 / 0.6).abs() < 1e-12);
+        assert_eq!(out[3], 2.5);
+    }
+
+    #[test]
+    fn cumulative_trapezoid_an_event_channel_integrates_over_recorded_times() {
+        // Arrange — a constant 2 m/s at irregular times.
+        let lk = timed(&[("v", vec![2.0, 2.0, 2.0], 0.0, vec![0, 500_000, 2_000_000])]);
+
+        // Act
+        let out = channel_samples(eval_expr("cumulative_trapezoid([v])", &lk).unwrap());
+
+        // Assert — metres travelled at each sample.
+        assert_eq!(out, vec![0.0, 1.0, 4.0]);
+    }
+
+    #[test]
+    fn butter_an_event_channel_typed_error_naming_resample() {
+        // Act
+        let e = eval_expr("butter(2, 1, \"low\", [pulse])", &pulses()).unwrap_err();
+
+        // Assert
+        assert_eq!(e.kind, MathEvalErrorKind::Runtime);
+        assert!(e.message.contains("[pulse] is an event channel"), "{}", e.message);
+        assert!(e.message.contains("resample(x, [Time])"), "{}", e.message);
+    }
+
+    #[test]
+    fn differentiate_a_scalar_typed_error_no_time_axis() {
+        // Act
+        let e = eval_expr("differentiate(4)", &pulses()).unwrap_err();
+
+        // Assert
+        assert_eq!(e.kind, MathEvalErrorKind::Runtime);
+        assert!(e.message.contains("no time axis"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_lap_window_over_an_event_channel_selects_by_recorded_time() {
+        // Arrange — window [0.2, 0.8) s holds the samples at 0.3 and 0.7 s.
+        let ast = crate::math::parse::parse("mean([pulse])").unwrap();
+
+        // Act
+        let out = eval(&ast, &pulses(), &window_ctx(0.2, 0.8)).unwrap();
+
+        // Assert — was the whole channel's mean, 1.5.
+        assert_eq!(out, Value::Scalar(2.5));
+    }
+
+    #[test]
+    fn a_stored_scalar_definition_referenced_broadcasts_over_a_channel() {
+        // Arrange — `m` in the scalar-as-channel encoding a resolved
+        // definition is stored in: rate 0, one sample, no recorded time.
+        let lk = timed(&[("m", vec![0.5], 0.0, vec![]), ("pulse", vec![0.0, 1.0, 2.0, 3.0], 0.0, vec![0, 100_000, 300_000, 700_000])]);
+
+        // Act
+        let out = channel_samples(eval_expr("[m] * [pulse]", &lk).unwrap());
+
+        // Assert — was "channel lengths differ (4 vs 1)".
+        assert_eq!(out, vec![0.0, 0.5, 1.0, 1.5]);
+    }
+
+    #[test]
+    fn a_one_sample_event_channel_stays_a_channel_not_a_scalar() {
+        // Arrange — a session channel carries its recorded time.
+        let lk = timed(&[("fix", vec![7.0], 0.0, vec![123])]);
+
+        // Act
+        let out = eval_expr("[fix]", &lk).unwrap();
+
+        // Assert
+        assert!(matches!(out, Value::Channel(_)), "{out:?}");
     }
 
     #[test]
