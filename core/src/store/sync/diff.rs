@@ -379,7 +379,9 @@ fn diff_data_parquet(
                 }),
             ),
             Some(Ordering::Equal) => {
-                if l.sha256 == r.sha256 {
+                // A side built since 2026-11-05 sends no hash (`""`, C4 §6):
+                // equal pairs are then simply equal, with no note.
+                if l.sha256.is_empty() || r.sha256.is_empty() || l.sha256 == r.sha256 {
                     (None, None)
                 } else {
                     (None, Some(SyncNote { class: SyncClass::DataParquet, key: session_id.to_string(), reason: SyncNoteReason::EquivalentDataParquet }))
@@ -596,6 +598,22 @@ mod tests {
         // Assert
         assert!(plan.actions.is_empty());
         assert_eq!(plan.notes, vec![SyncNote { class: SyncClass::DataParquet, key: "s1".to_string(), reason: SyncNoteReason::EquivalentDataParquet }]);
+    }
+
+    #[test]
+    fn plan_sync_data_parquet_same_version_pair_one_side_unhashed_no_action_and_no_note() {
+        // Arrange — a 2026-11-05 build sends `""`; an older peer still hashes.
+        let mut local = empty_manifest();
+        let mut remote = empty_manifest();
+        local.sessions.push(SessionEntry { session_id: "s1".to_string(), data_parquet: Some(dp("", "0.3.0", "v1")), derived: Vec::new(), session_json: None });
+        remote.sessions.push(SessionEntry { session_id: "s1".to_string(), data_parquet: Some(dp("h2", "0.3.0", "v1")), derived: Vec::new(), session_json: None });
+
+        // Act
+        let plan = plan_sync(&local, &remote, &[]);
+
+        // Assert
+        assert!(plan.actions.is_empty());
+        assert!(plan.notes.is_empty());
     }
 
     #[test]

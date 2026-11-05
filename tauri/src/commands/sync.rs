@@ -716,8 +716,9 @@ pub struct PeerLibraryDto {
 /// manifest), using `remote` (the peer's manifest) for the peer's hashes.
 /// A session is `Absent` with no local entry; `Differs` when the local copy
 /// has no `data.parquet` (a pull repairs it, whatever the peer has) or the
-/// peer's manifest no longer lists it; `Same` when its `data.parquet` and
-/// `session.json` hashes both equal the peer's (a `session.json` missing on
+/// peer's manifest no longer lists it; `Same` when its `data.parquet`
+/// identity (source blob, importer and seam-correction versions) and its
+/// `session.json` hash both equal the peer's (a `session.json` missing on
 /// both sides counts as equal); `Differs` otherwise. A workbook is compared
 /// by sha256 the same way.
 pub(crate) fn peer_library_dto(
@@ -731,7 +732,14 @@ pub(crate) fn peer_library_dto(
     let local_workbooks: HashMap<&str, &str> = local.workbooks.iter().map(|w| (w.workbook_id.as_str(), w.sha256.as_str())).collect();
     let remote_workbooks: HashMap<&str, &str> = remote.workbooks.iter().map(|w| (w.workbook_id.as_str(), w.sha256.as_str())).collect();
 
-    let hashes = |e: &SessionEntry| (e.data_parquet.as_ref().map(|d| d.sha256.clone()), e.session_json.as_ref().map(|j| j.sha256.clone()));
+    // `data.parquet` by what it is a function of (C4 §6, 2026-11-05: its
+    // content hash is no longer computed), `session.json` by content.
+    let hashes = |e: &SessionEntry| {
+        (
+            e.data_parquet.as_ref().map(|d| (d.blob_sha256.clone(), d.importer_version.clone(), d.seam_correction_version.clone())),
+            e.session_json.as_ref().map(|j| j.sha256.clone()),
+        )
+    };
     let sessions = summary
         .sessions
         .into_iter()
@@ -1447,16 +1455,18 @@ mod tests {
         Manifest { schema_version: 1, generated_at_ms: 0, blobs: Vec::new(), sessions, workbooks, tracks: Vec::new(), profiles: Vec::new(), bikes: Vec::new() }
     }
 
-    fn session_entry(id: &str, parquet_hash: &str, json_hash: &str) -> SessionEntry {
+    /// `parquet_source` stands for the `data.parquet`'s identity: its source
+    /// blob (C4 §6, 2026-11-05: the file's own hash is no longer sent).
+    fn session_entry(id: &str, parquet_source: &str, json_hash: &str) -> SessionEntry {
         SessionEntry {
             session_id: id.to_string(),
             data_parquet: Some(DataParquetEntry {
-                sha256: parquet_hash.to_string(),
+                sha256: String::new(),
                 size_bytes: 1,
                 importer_version: "1.0.0".to_string(),
                 seam_correction_version: "v1".to_string(),
                 engine_version: "1.0.0".to_string(),
-                blob_sha256: None,
+                blob_sha256: Some(parquet_source.to_string()),
             }),
             derived: Vec::new(),
             session_json: Some(SessionJsonEntry { sha256: json_hash.to_string(), size_bytes: 1, updated_at_ms: 0 }),
@@ -1769,6 +1779,32 @@ mod tests {
 
         // Act
         let here = here_of(session_entry("aa", "p", "j"), peer_no_parquet);
+
+        // Assert
+        assert_eq!(here, HereStatus::Differs);
+    }
+
+    #[test]
+    fn peer_library_dto_same_source_and_versions_one_side_hashed_by_an_older_build_is_same() {
+        // Arrange — an older peer still sends the parquet's content hash.
+        let mut theirs = session_entry("aa", "blob1", "j");
+        theirs.data_parquet.as_mut().unwrap().sha256 = "an-older-builds-hash".to_string();
+
+        // Act
+        let here = here_of(session_entry("aa", "blob1", "j"), theirs);
+
+        // Assert
+        assert_eq!(here, HereStatus::Same);
+    }
+
+    #[test]
+    fn peer_library_dto_newer_importer_version_on_the_peer_differs() {
+        // Arrange
+        let mut theirs = session_entry("aa", "blob1", "j");
+        theirs.data_parquet.as_mut().unwrap().importer_version = "1.1.0".to_string();
+
+        // Act
+        let here = here_of(session_entry("aa", "blob1", "j"), theirs);
 
         // Assert
         assert_eq!(here, HereStatus::Differs);

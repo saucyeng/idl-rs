@@ -342,9 +342,15 @@ pub async fn sync_with_peer(
     let client = reqwest::Client::new();
     let base_url = format!("http://{addr}/idl1/v1");
 
+    // The local walk is file I/O: off the async workers, and overlapping the
+    // peer's round trip instead of following it.
+    let root = data_root.to_path_buf();
+    let local_walk = tokio::task::spawn_blocking(move || build_manifest(&root, now_ms));
     let remote_manifest = fetch_manifest(&client, &base_url, &peer.token).await?;
-    let (local_manifest, local_skipped) =
-        build_manifest(data_root, now_ms).map_err(|e| sync_error(format!("building local manifest: {e}")))?;
+    let (local_manifest, local_skipped) = local_walk
+        .await
+        .map_err(|e| sync_error(format!("building local manifest: {e}")))?
+        .map_err(|e| sync_error(format!("building local manifest: {e}")))?;
 
     let plan = plan_sync(&local_manifest, &remote_manifest, &local_skipped);
     let mut plan = filter_plan(plan, selection, &local_manifest, &remote_manifest);

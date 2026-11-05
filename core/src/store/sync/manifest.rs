@@ -48,6 +48,13 @@ pub struct DerivedEntry {
 /// is informational provenance only (C1 §4.3), never part of it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataParquetEntry {
+    /// **Not computed since 2026-11-05: always `""`** (C4 §6). The file is a
+    /// function of its blob and version pair, which sync already compares,
+    /// so hashing it bought nothing and read the whole library on every
+    /// manifest: 8.1 GB, 55 s on the desktop (Beacon ride, 2026-11-04). Kept
+    /// on the wire, empty, so an older peer still parses this manifest; read
+    /// by nothing. Defaulted, so a newer peer may drop it.
+    #[serde(default)]
     pub sha256: String,
     /// File size in bytes.
     pub size_bytes: u64,
@@ -332,10 +339,12 @@ fn collect_sessions(data_root: &Path) -> (Vec<SessionEntry>, Vec<SkippedEntry>) 
 
         let dp_path = session_dir.join("data.parquet");
         let data_parquet = if dp_path.is_file() {
-            match (std::fs::read(&dp_path), read_data_parquet_manifest_fields(&dp_path)) {
-                (Ok(bytes), Some((importer_version, seam_correction_version, engine_version, blob_sha256))) => Some(DataParquetEntry {
-                    sha256: sha256_hex(&bytes),
-                    size_bytes: bytes.len() as u64,
+            // The footer and the size only: the file itself is not read (C4 §6,
+            // 2026-11-05; see [`DataParquetEntry::sha256`]).
+            match (std::fs::metadata(&dp_path), read_data_parquet_manifest_fields(&dp_path)) {
+                (Ok(meta), Some((importer_version, seam_correction_version, engine_version, blob_sha256))) => Some(DataParquetEntry {
+                    sha256: String::new(),
+                    size_bytes: meta.len(),
                     importer_version,
                     seam_correction_version,
                     engine_version,
@@ -628,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn build_manifest_one_blob_one_session_with_data_parquet_and_session_json_entries_carry_the_right_hashes_and_sizes() {
+    fn build_manifest_one_blob_one_session_entries_carry_the_right_hashes_and_sizes_data_parquet_unhashed() {
         // Arrange
         let root = temp_root();
         let blob_bytes = b"raw bytes".to_vec();
@@ -648,7 +657,7 @@ mod tests {
         assert_eq!(session.session_id, "s1");
         let dp = session.data_parquet.as_ref().unwrap();
         let dp_bytes = std::fs::read(root.join("sessions").join("s1").join("data.parquet")).unwrap();
-        assert_eq!(dp.sha256, sha256_hex(&dp_bytes));
+        assert_eq!(dp.sha256, "", "data.parquet is not hashed (C4 §6, 2026-11-05)");
         assert_eq!(dp.size_bytes, dp_bytes.len() as u64);
         assert_eq!(dp.importer_version, "0.1.0");
         assert!(!dp.seam_correction_version.is_empty());
@@ -1015,6 +1024,19 @@ mod tests {
         // Assert
         assert_eq!(entry.blob_sha256, None);
         assert!(serde_json::to_value(&entry).unwrap().get("blob_sha256").is_none());
+    }
+
+    #[test]
+    fn data_parquet_entry_without_sha256_parses_and_is_still_sent_empty_for_older_readers() {
+        // Arrange
+        let newer = r#"{"size_bytes":3,"importer_version":"0.1.0","seam_correction_version":"v1","engine_version":"0.7.2"}"#;
+
+        // Act
+        let entry: DataParquetEntry = serde_json::from_str(newer).unwrap();
+
+        // Assert — an older reader requires the key, so it is written, empty.
+        assert_eq!(entry.sha256, "");
+        assert_eq!(serde_json::to_value(&entry).unwrap()["sha256"], "");
     }
 
     #[test]

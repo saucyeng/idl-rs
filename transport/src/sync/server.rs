@@ -272,9 +272,13 @@ async fn handle_pair(State(state): State<ServerState>, body: axum::body::Bytes) 
 }
 
 async fn handle_manifest(State(state): State<ServerState>) -> Response {
-    match build_manifest(&state.data_root, now_ms()) {
-        Ok((manifest, _skipped)) => axum::Json(manifest).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message).into_response(),
+    // A walk of the whole library: off the async workers, so the server keeps
+    // answering other requests meanwhile.
+    let root = state.data_root.clone();
+    match tokio::task::spawn_blocking(move || build_manifest(&root, now_ms())).await {
+        Ok(Ok((manifest, _skipped))) => axum::Json(manifest).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.message).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
