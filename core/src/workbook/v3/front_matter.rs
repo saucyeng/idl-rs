@@ -246,8 +246,89 @@ pub fn parse_front_matter(markdown: &str) -> Result<(FrontMatter, &str), Workboo
 /// every top-level key this contract doesn't itself define is re-emitted,
 /// not dropped (ruling R135).
 pub fn render_front_matter(fm: &FrontMatter) -> String {
-    let yaml_block = serde_yaml_ng::to_string(fm).expect("FrontMatter has no non-serialisable field");
+    // C2 §3.7.1: the `graph` key has one canonical shape (`    key: [x, y]`
+    // flow pairs), which the graph view's strict reader requires; a generic
+    // YAML dump writes block sequences instead, which that reader treats as
+    // malformed, so every canvas position was lost on the first save.
+    // Render it canonically; a `graph` value of any other shape (a hand edit,
+    // a future contract) is kept as plain YAML, never dropped.
+    let mut rest = fm.clone();
+    let graph = rest.unknown.remove(GRAPH_KEY);
+    let mut yaml_block = serde_yaml_ng::to_string(&rest).expect("FrontMatter has no non-serialisable field");
+    if let Some(value) = graph {
+        match render_graph_canonical(&value) {
+            Some(text) => yaml_block.push_str(&text),
+            None => {
+                let mut only = BTreeMap::new();
+                only.insert(GRAPH_KEY.to_string(), value);
+                yaml_block.push_str(&serde_yaml_ng::to_string(&only).expect("a YAML value always serialises"));
+            }
+        }
+    }
     format!("---\n{yaml_block}---\n")
+}
+
+/// The front-matter key the maths graph view stores canvas positions under (C2 §3.7.1).
+const GRAPH_KEY: &str = "graph";
+
+/// `graph`'s sub-keys, in the order C2 §3.7.1's EBNF writes them.
+const GRAPH_SUBKEYS: [&str; 3] = ["nodes", "cells", "channels"];
+
+/// Whether `key` is a C2 §3.1 `identifier` or a §2.2 `hex8` cell id — the
+/// only keys a `position_entry` may carry.
+fn is_graph_entry_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let identifier = match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => chars.all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        _ => false,
+    };
+    let hex8 = key.len() == 8 && key.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+    identifier || hex8
+}
+
+/// Renders a `graph` value in C2 §3.7.1's canonical shape, or `None` when it
+/// is not that shape (a mapping of at most `nodes`/`cells`/`channels`, each a
+/// mapping of entry key to a two-integer sequence). Entries are sorted by key,
+/// matching the app's own writer (`graphLayout.ts`), so a load–save cycle
+/// leaves the block's bytes unchanged. Empty when every sub-map is empty.
+fn render_graph_canonical(value: &serde_yaml_ng::Value) -> Option<String> {
+    let map = value.as_mapping()?;
+    for key in map.keys() {
+        if !GRAPH_SUBKEYS.contains(&key.as_str()?) {
+            return None;
+        }
+    }
+    let mut out = String::new();
+    for sub in GRAPH_SUBKEYS {
+        let Some(entries) = map.get(sub) else { continue };
+        let entries = entries.as_mapping()?;
+        let mut lines: Vec<(String, i64, i64)> = Vec::new();
+        for (key, position) in entries {
+            // An all-digit hex8 id parses as a YAML integer; it is still a key.
+            let key = match key {
+                serde_yaml_ng::Value::String(s) => s.clone(),
+                serde_yaml_ng::Value::Number(n) => n.to_string(),
+                _ => return None,
+            };
+            if !is_graph_entry_key(&key) {
+                return None;
+            }
+            let pair = position.as_sequence()?;
+            if pair.len() != 2 {
+                return None;
+            }
+            lines.push((key, pair[0].as_i64()?, pair[1].as_i64()?));
+        }
+        if lines.is_empty() {
+            continue;
+        }
+        lines.sort_by(|a, b| a.0.cmp(&b.0));
+        out.push_str(&format!("  {sub}:\n"));
+        for (key, x, y) in lines {
+            out.push_str(&format!("    {key}: [{x}, {y}]\n"));
+        }
+    }
+    Some(if out.is_empty() { String::new() } else { format!("graph:\n{out}") })
 }
 
 #[cfg(test)]
@@ -259,6 +340,55 @@ mod tests {
 
     fn doc(front_matter_yaml: &str) -> String {
         format!("---\n{front_matter_yaml}\n---\nbody\n")
+    }
+
+    #[test]
+    fn render_front_matter_graph_key_is_written_in_the_canonical_flow_shape() {
+        let yaml = format!(
+            "id: {VALID_ID}\nname: T\ngraph:\n  nodes:\n    fork_v: [120, 80]\n  cells:\n    a1b2c3d4: [0, -5]\n  channels:\n    GPS_SpeedKmh: [10, 20]"
+        );
+
+        let (fm, _) = parse_front_matter(&doc(&yaml)).unwrap();
+        let rendered = render_front_matter(&fm);
+
+        assert!(
+            rendered.ends_with("graph:\n  nodes:\n    fork_v: [120, 80]\n  cells:\n    a1b2c3d4: [0, -5]\n  channels:\n    GPS_SpeedKmh: [10, 20]\n---\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_front_matter_graph_key_load_save_cycle_is_stable() {
+        let yaml = format!("id: {VALID_ID}\nname: T\ngraph:\n  channels:\n    b: [2, 2]\n    a: [1, 1]");
+        let (fm, _) = parse_front_matter(&doc(&yaml)).unwrap();
+        let once = render_front_matter(&fm);
+
+        let (again, _) = parse_front_matter(&format!("{once}body\n")).unwrap();
+        let twice = render_front_matter(&again);
+
+        assert_eq!(once, twice);
+        assert!(once.contains("  channels:\n    a: [1, 1]\n    b: [2, 2]\n"), "{once}");
+    }
+
+    #[test]
+    fn render_front_matter_graph_key_all_digit_cell_id_stays_a_key() {
+        let yaml = format!("id: {VALID_ID}\nname: T\ngraph:\n  cells:\n    12345678: [3, 4]");
+
+        let (fm, _) = parse_front_matter(&doc(&yaml)).unwrap();
+        let rendered = render_front_matter(&fm);
+
+        assert!(rendered.contains("graph:\n  cells:\n    12345678: [3, 4]\n"), "{rendered}");
+    }
+
+    #[test]
+    fn render_front_matter_graph_key_of_an_unknown_shape_is_kept_as_yaml() {
+        let yaml = format!("id: {VALID_ID}\nname: T\ngraph:\n  future: true");
+
+        let (fm, _) = parse_front_matter(&doc(&yaml)).unwrap();
+        let rendered = render_front_matter(&fm);
+        let (back, _) = parse_front_matter(&format!("{rendered}body\n")).unwrap();
+
+        assert_eq!(back.unknown.get("graph"), fm.unknown.get("graph"));
     }
 
     #[test]
