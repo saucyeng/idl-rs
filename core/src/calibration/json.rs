@@ -271,6 +271,7 @@ mod tests {
                 accel_bias_rw: 0.0,
             },
             captured_utc: Some("2026-01-01T00:00:00Z".to_string()),
+            min_median_rate_rad_s: None,
             sensors: vec![SensorStream {
                 imu_index: 0,
                 body: rigid::Body::Rear,

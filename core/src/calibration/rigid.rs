@@ -161,6 +161,12 @@ pub struct CalibrationInput {
     /// When the session was captured, RFC 3339, copied straight into the
     /// record. Supplied by the caller because `calibrate` reads no clock.
     pub captured_utc: Option<String>,
+    /// The rate-magnitude gate (§3), rad/s; `None` = [`MIN_MEDIAN_RATE_RAD_S`].
+    /// A hand tumble of a whole bike runs near 1 rad/s (Beacon calibration,
+    /// 2026-11-05: median 1.2), below the spec's 2.0, while its lever richness
+    /// clears that gate seventeen times over; this lets a caller study the fit
+    /// below the default without changing it for everyone.
+    pub min_median_rate_rad_s: Option<f64>,
 }
 
 /// One named way the motion fell short of §3. Each carries what was seen and
@@ -1270,11 +1276,12 @@ pub fn calibrate(input: &CalibrationInput) -> Result<CalibrationRecord, Calibrat
             });
         }
     }
+    let min_rate = input.min_median_rate_rad_s.unwrap_or(MIN_MEDIAN_RATE_RAD_S);
     if let Some(rate) = median_rate {
-        if rate < MIN_MEDIAN_RATE_RAD_S {
+        if rate < min_rate {
             shortfalls.push(ExcitationShortfall::RateMagnitude {
                 seen: rate,
-                needed: MIN_MEDIAN_RATE_RAD_S,
+                needed: min_rate,
             });
         }
     }
@@ -1294,7 +1301,7 @@ pub fn calibrate(input: &CalibrationInput) -> Result<CalibrationRecord, Calibrat
     }
 
     let rotation_ok = rotation_condition.is_some_and(|c| c <= MAX_ROTATION_CONDITION)
-        && median_rate.is_some_and(|r| r >= MIN_MEDIAN_RATE_RAD_S);
+        && median_rate.is_some_and(|r| r >= min_rate);
     let lever_ok = rotation_ok
         && !rear_others.is_empty()
         && lever_richness.is_some_and(|r| r >= MIN_LEVER_RICHNESS);
@@ -1566,7 +1573,7 @@ mod tests {
                 }
             })
             .collect();
-        CalibrationInput { sample_rate_hz: rate_hz, noise: reference_noise(), sensors, captured_utc: None }
+        CalibrationInput { sample_rate_hz: rate_hz, noise: reference_noise(), sensors, captured_utc: None, min_median_rate_rad_s: None }
     }
 
     /// The truth's sensor→body rotation. The generator stores body→sensor, so
@@ -1817,6 +1824,7 @@ mod tests {
             sample_rate_hz: 833.0,
             noise: reference_noise(),
             captured_utc: None,
+            min_median_rate_rad_s: None,
             sensors: vec![SensorStream {
                 imu_index: 0,
                 body: Body::Rear,
@@ -1847,6 +1855,7 @@ mod tests {
             sample_rate_hz: 833.0,
             noise: reference_noise(),
             captured_utc: None,
+            min_median_rate_rad_s: None,
             sensors: vec![SensorStream {
                 imu_index: 1,
                 body: Body::Front,

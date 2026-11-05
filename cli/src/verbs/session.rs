@@ -20,7 +20,7 @@ use idl_rs::store::import::{import_file_path, import_idl0_path};
 use idl_rs::store::session_json::{set_session_start, SessionJson};
 use idl_rs::calibration::json::CalibrationJson;
 use idl_rs::calibration::rigid;
-use idl_rs::commands::calibration_ops::{calibration_input_from_session, truth_errors};
+use idl_rs::commands::calibration_ops::{calibration_input_from_session_with, truth_errors, CalibrationSelection};
 use idl_rs::parse::parse;
 use idl_rs::synth::{generate, Protocol, SynthConfig, Truth};
 
@@ -472,7 +472,14 @@ pub fn calibrate(_ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
         .map_err(|e| CliError::io(format!("reading {}: {e}", file.display())))?;
     let parsed = parse(&bytes).map_err(|e| CliError::new(ErrorKind::Usage, e.to_string()))?;
 
-    let input = calibration_input_from_session(&parsed.session)
+    let ints = |name: &str| m.get_many::<i64>(name).map(|v| v.map(|&i| i as u8).collect::<Vec<u8>>()).unwrap_or_default();
+    let imus = ints("imu");
+    let window_s = match (opt_integer(m, "from-ms"), opt_integer(m, "to-ms")) {
+        (None, None) => None,
+        (from, to) => Some((from.unwrap_or(0) as f64 / 1000.0, to.map_or(f64::INFINITY, |t| t as f64 / 1000.0))),
+    };
+    let selection = CalibrationSelection { imus: if imus.is_empty() { None } else { Some(imus) }, rigid_with_chassis: ints("rigid"), window_s, min_median_rate_rad_s: opt_integer(m, "min-rate-mrad-s").map(|v| v as f64 / 1000.0) };
+    let input = calibration_input_from_session_with(&parsed.session, &selection)
         .map_err(|e| CliError::new(ErrorKind::Usage, e.to_string()))?;
     let sample_rate_hz = input.sample_rate_hz;
     let sample_count = input.sensors[0].gyro_rad_s.len();

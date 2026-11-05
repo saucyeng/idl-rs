@@ -46,13 +46,59 @@ impl std::fmt::Display for CalibrationInputError {
 
 impl std::error::Error for CalibrationInputError {}
 
+/// Which sensors and which stretch of a session feed the fit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CalibrationSelection {
+    /// IMU indices to include; `None` = every complete sextet.
+    pub imus: Option<Vec<u8>>,
+    /// IMU indices to treat as riding the **rear (chassis) body** although
+    /// their default is the front one: a fork pod over a window where the
+    /// bars did not turn is rigid with the frame, so its lever arm from
+    /// `IMU0` is fitted the same way as the swingarm pod's.
+    pub rigid_with_chassis: Vec<u8>,
+    /// Keep only `[t0, t1)`, seconds from the first grid sample.
+    pub window_s: Option<(f64, f64)>,
+    /// Passed through to [`CalibrationInput::min_median_rate_rad_s`].
+    pub min_median_rate_rad_s: Option<f64>,
+}
+
+/// One axis as recorded: its own hardware times and its values.
+struct Axis {
+    t_us: Vec<i64>,
+    values: Vec<f64>,
+}
+
+/// `axis` at time `t` (µs) by linear interpolation; held at either end.
+fn axis_at(axis: &Axis, t: f64) -> f64 {
+    let n = axis.t_us.len().min(axis.values.len());
+    let i = axis.t_us[..n].partition_point(|&x| (x as f64) < t);
+    if i == 0 {
+        return axis.values[0];
+    }
+    if i >= n {
+        return axis.values[n - 1];
+    }
+    let (t0, t1) = (axis.t_us[i - 1] as f64, axis.t_us[i] as f64);
+    let w = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+    axis.values[i - 1] + w * (axis.values[i] - axis.values[i - 1])
+}
+
 /// Builds the calibration model's input from a parsed session: every complete
 /// `IMU{n}_*` sextet, converted from the wire's `g` and `dps` (SPEC §5.3) into
 /// the m/s² and rad/s the model works in.
 ///
-/// The sample rate comes from the channel registry's nominal rate rather than
-/// from the timestamps: the model is written on a uniform grid, and the
-/// registry records what the device was configured at.
+/// **Time is recorded, not assumed.** The model is written on one uniform
+/// grid, but a real logger samples each IMU on its own clock (the Beacon
+/// calibration of 2026-11-04: 21 935 and 22 026 samples, and more, over the
+/// same 47 s), so pairing samples by index would pair different instants.
+/// Every axis is therefore read at the grid times by linear interpolation of
+/// its own `t_us`. The grid runs at `IMU0`'s gyro rate over the span every
+/// stream covers. A session whose streams already share one time base (the
+/// synthetic generator's) is taken as is.
+///
+/// The accelerometer is the low-g stream (`IMU{n}_LgAccel*`) where the
+/// importer split it from a high-g one: it shares the gyro's clock, and the
+/// merged `IMU{n}_Accel*` runs on the high-g grid.
 ///
 /// `noise` defaults to the generator's reference σ, which is also the spec's
 /// working default (§1.3).
@@ -61,53 +107,105 @@ impl std::error::Error for CalibrationInputError {}
 ///
 /// [`CalibrationInputError`] when the session has no IMU sextet or no declared
 /// rate.
-pub fn calibration_input_from_session(
+pub fn calibration_input_from_session(session: &Session) -> Result<CalibrationInput, CalibrationInputError> {
+    calibration_input_from_session_with(session, &CalibrationSelection::default())
+}
+
+/// [`calibration_input_from_session`] narrowed by `selection`.
+///
+/// # Errors
+///
+/// As [`calibration_input_from_session`]; also
+/// [`CalibrationInputError::NoImuChannels`] when the window leaves fewer than
+/// two samples.
+pub fn calibration_input_from_session_with(
     session: &Session,
+    selection: &CalibrationSelection,
 ) -> Result<CalibrationInput, CalibrationInputError> {
-    const AXES: [&str; 6] = ["AccelX", "AccelY", "AccelZ", "GyroX", "GyroY", "GyroZ"];
+    const ACCEL: [&str; 3] = ["AccelX", "AccelY", "AccelZ"];
+    const GYRO: [&str; 3] = ["GyroX", "GyroY", "GyroZ"];
     let dps_to_rad = std::f64::consts::PI / 180.0;
+    let find = |name: &str| session.channels.iter().find(|c| c.channel_id == name);
 
-    let mut sensors = Vec::new();
+    // (imu index, [accel x, y, z, gyro x, y, z])
+    let mut streams: Vec<(u8, Vec<Axis>)> = Vec::new();
     let mut sample_rate_hz = 0.0_f64;
-
     for index in 0..MAX_IMU_INDEX {
-        let mut columns = Vec::with_capacity(AXES.len());
-        for axis in AXES {
-            let name = format!("IMU{index}_{axis}");
-            let Some(channel) = session.channels.iter().find(|c| c.channel_id == name) else {
+        if let Some(wanted) = &selection.imus {
+            if !wanted.contains(&index) {
+                continue;
+            }
+        }
+        let mut axes = Vec::with_capacity(6);
+        for axis in ACCEL {
+            let Some(channel) = find(&format!("IMU{index}_Lg{axis}")).or_else(|| find(&format!("IMU{index}_{axis}"))) else {
                 break;
             };
-            if channel.nominal_rate_hz > 0.0 {
+            axes.push(Axis { t_us: channel.t_us.clone(), values: channel.materialize() });
+        }
+        for axis in GYRO {
+            let Some(channel) = find(&format!("IMU{index}_{axis}")) else { break };
+            if sample_rate_hz <= 0.0 && channel.nominal_rate_hz > 0.0 {
                 sample_rate_hz = channel.nominal_rate_hz;
             }
-            columns.push(channel.materialize());
+            axes.push(Axis { t_us: channel.t_us.clone(), values: channel.materialize() });
         }
-        if columns.len() != AXES.len() {
-            continue;
+        if axes.len() == 6 && axes.iter().all(|a| !a.values.is_empty() && !a.t_us.is_empty()) {
+            streams.push((index, axes));
         }
-
-        // A partial last sample on one axis would make the streams ragged,
-        // which the model refuses; truncating to the shortest is the only
-        // reading that keeps every axis on the same grid slot.
-        let n = columns.iter().map(Vec::len).min().unwrap_or(0);
-        sensors.push(SensorStream {
-            imu_index: index,
-            body: Body::of_imu(index),
-            gyro_rad_s: (0..n)
-                .map(|k| Vector3::new(columns[3][k], columns[4][k], columns[5][k]) * dps_to_rad)
-                .collect(),
-            accel_m_s2: (0..n)
-                .map(|k| Vector3::new(columns[0][k], columns[1][k], columns[2][k]) * GRAVITY_M_S2)
-                .collect(),
-        });
     }
 
-    if sensors.is_empty() {
+    if streams.is_empty() {
         return Err(CalibrationInputError::NoImuChannels);
     }
     if sample_rate_hz <= 0.0 {
         return Err(CalibrationInputError::NoSampleRate);
     }
+
+    // The grid: the shared times when every axis already has them, else
+    // IMU0's gyro rate over the overlap of every stream.
+    let first = streams[0].1[3].t_us.clone();
+    let shared = streams.iter().all(|(_, axes)| axes.iter().all(|a| a.t_us == first && a.values.len() >= first.len()));
+    let full_grid_us: Vec<f64> = if shared {
+        first.iter().map(|&t| t as f64).collect()
+    } else {
+        let start = streams.iter().flat_map(|(_, axes)| axes.iter().map(|a| a.t_us[0])).max().unwrap_or(0) as f64;
+        let end = streams
+            .iter()
+            .flat_map(|(_, axes)| axes.iter().map(|a| *a.t_us.last().unwrap_or(&0)))
+            .min()
+            .unwrap_or(0) as f64;
+        let step = 1e6 / sample_rate_hz;
+        let n = if end > start { ((end - start) / step).floor() as usize + 1 } else { 0 };
+        (0..n).map(|k| start + k as f64 * step).collect()
+    };
+    let origin = full_grid_us.first().copied().unwrap_or(0.0);
+    let kept: Vec<usize> = (0..full_grid_us.len())
+        .filter(|&k| match selection.window_s {
+            Some((t0, t1)) => {
+                let t = (full_grid_us[k] - origin) / 1e6;
+                t >= t0 && t < t1
+            }
+            None => true,
+        })
+        .collect();
+    if kept.len() < 2 {
+        return Err(CalibrationInputError::NoImuChannels);
+    }
+
+    let sensors = streams
+        .iter()
+        .map(|(index, axes)| {
+            let read = |a: usize, k: usize| if shared { axes[a].values[k] } else { axis_at(&axes[a], full_grid_us[k]) };
+            let body = if selection.rigid_with_chassis.contains(index) { Body::Rear } else { Body::of_imu(*index) };
+            SensorStream {
+                imu_index: *index,
+                body,
+                gyro_rad_s: kept.iter().map(|&k| Vector3::new(read(3, k), read(4, k), read(5, k)) * dps_to_rad).collect(),
+                accel_m_s2: kept.iter().map(|&k| Vector3::new(read(0, k), read(1, k), read(2, k)) * GRAVITY_M_S2).collect(),
+            }
+        })
+        .collect();
 
     Ok(CalibrationInput {
         sample_rate_hz,
@@ -119,6 +217,7 @@ pub fn calibration_input_from_session(
         },
         captured_utc: None,
         sensors,
+        min_median_rate_rad_s: selection.min_median_rate_rad_s,
     })
 }
 
@@ -290,5 +389,108 @@ mod tests {
             record.sensors.iter().filter(|s| s.mount_origin == MountOrigin::Gauge).count(),
             1
         );
+    }
+
+    /// One IMU's six axes on its own clock: sample `k` at `t0_us + k·step_us`,
+    /// every axis `value(t)` (dps for the gyro, g for the accel), the accel
+    /// named with `accel_prefix` (`"Accel"` or `"LgAccel"`).
+    fn imu(index: u8, t0_us: i64, step_us: i64, n: usize, accel_prefix: &str, value: impl Fn(f64) -> f64) -> Vec<crate::session::Channel> {
+        let t_us: Vec<i64> = (0..n as i64).map(|k| t0_us + k * step_us).collect();
+        let values: Vec<f64> = t_us.iter().map(|&t| value(t as f64)).collect();
+        let axes = [
+            format!("{accel_prefix}X"),
+            format!("{accel_prefix}Y"),
+            format!("{accel_prefix}Z"),
+            "GyroX".to_string(),
+            "GyroY".to_string(),
+            "GyroZ".to_string(),
+        ];
+        axes.iter()
+            .map(|axis| crate::session::Channel {
+                channel_id: format!("IMU{index}_{axis}"),
+                t_us: t_us.clone(),
+                t_recorded_us: None,
+                nominal_rate_hz: 1e6 / step_us as f64,
+                column: crate::session::RawColumn::F64(values.clone()),
+                source_kind: format!("imu{index}"),
+                unit: if axis.starts_with("Gyro") { "dps".to_string() } else { "g".to_string() },
+                gaps: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn session_of(channels: Vec<crate::session::Channel>) -> Session {
+        Session {
+            session_id: "s".to_string(),
+            device_id: None,
+            timestamp_utc_ms: 0,
+            timestamp_source: crate::session::TimestampSource::Header,
+            config_checksum: None,
+            source_format: crate::session::SourceFormat::Idl0,
+            blob_sha256: String::new(),
+            channels,
+        }
+    }
+
+    #[test]
+    fn calibration_input_two_imus_on_different_clocks_each_read_at_the_shared_grid_times() {
+        // Arrange — IMU0 every 10 ms from 0; IMU1 every 9 ms from 4 ms; both a
+        // ramp in time, which linear interpolation reproduces exactly.
+        let ramp = |t_us: f64| t_us / 1000.0;
+        let mut channels = imu(0, 0, 10_000, 101, "Accel", ramp);
+        channels.extend(imu(1, 4_000, 9_000, 112, "Accel", ramp));
+        let session = session_of(channels);
+
+        // Act
+        let input = calibration_input_from_session(&session).unwrap();
+
+        // Assert — the grid starts where both streams have begun (4 ms) and
+        // steps at IMU0's 100 Hz; each IMU reads the ramp at those times.
+        let dps = std::f64::consts::PI / 180.0;
+        assert_eq!(input.sample_rate_hz, 100.0);
+        for k in [0usize, 7, 50] {
+            let t_ms = 4.0 + 10.0 * k as f64;
+            assert!((input.sensors[0].gyro_rad_s[k].x - t_ms * dps).abs() < 1e-9, "IMU0 sample {k}");
+            assert!((input.sensors[1].gyro_rad_s[k].x - t_ms * dps).abs() < 1e-9, "IMU1 sample {k}");
+        }
+        assert_eq!(input.sensors[0].gyro_rad_s.len(), input.sensors[1].gyro_rad_s.len());
+    }
+
+    #[test]
+    fn calibration_input_low_g_stream_present_preferred_over_the_merged_accel() {
+        // Arrange — the merged `Accel` reads 5 g, the low-g stream 1 g.
+        let mut channels = imu(0, 0, 10_000, 50, "LgAccel", |_| 1.0);
+        channels.extend(imu(0, 0, 10_000, 50, "Accel", |_| 5.0).into_iter().filter(|c| c.channel_id.contains("_Accel")));
+        let session = session_of(channels);
+
+        // Act
+        let input = calibration_input_from_session(&session).unwrap();
+
+        // Assert
+        assert!((input.sensors[0].accel_m_s2[3].x - GRAVITY_M_S2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn calibration_input_with_a_window_an_imu_subset_and_a_rigid_fork_pod_narrowed_accordingly() {
+        // Arrange
+        let mut channels = imu(0, 0, 10_000, 101, "Accel", |_| 0.0);
+        channels.extend(imu(1, 0, 10_000, 101, "Accel", |_| 0.0));
+        channels.extend(imu(2, 0, 10_000, 101, "Accel", |_| 0.0));
+        let session = session_of(channels);
+        let selection = CalibrationSelection {
+            imus: Some(vec![0, 1]),
+            rigid_with_chassis: vec![1],
+            window_s: Some((0.2, 0.5)),
+            min_median_rate_rad_s: Some(0.5),
+        };
+
+        // Act
+        let input = calibration_input_from_session_with(&session, &selection).unwrap();
+
+        // Assert
+        assert_eq!(input.sensors.iter().map(|s| s.imu_index).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(input.sensors[1].body, Body::Rear);
+        assert_eq!(input.sensors[0].gyro_rad_s.len(), 30);
+        assert_eq!(input.min_median_rate_rad_s, Some(0.5));
     }
 }
