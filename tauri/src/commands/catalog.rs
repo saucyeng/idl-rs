@@ -1099,6 +1099,92 @@ pub fn ride_summary(
     Ok(summary)
 }
 
+/// What [`export_session_fit`] wrote (C3 §3.2, added 2026-11-05).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FitExportReport {
+    /// The file written, exactly as the caller named it.
+    pub path: String,
+    /// Its size, bytes.
+    pub bytes: u64,
+    /// Lap messages written; `0` means one whole-ride lap (no laps on the session).
+    pub laps: u32,
+}
+
+/// The session's laps (C1 §6 `laps[]`) as FIT laps, in start order; `None`
+/// when there are none, so the encoder writes one whole-ride lap. The split
+/// is the effective lap time (`lap_time_ms`, neutral zones removed), what
+/// idl0's export used and what Strava shows.
+fn fit_laps(doc: &idl_rs::store::session_json::SessionJson) -> Option<Vec<idl_rs::export::FitLap>> {
+    if doc.laps.is_empty() {
+        return None;
+    }
+    let mut laps: Vec<idl_rs::export::FitLap> = doc
+        .laps
+        .iter()
+        .map(|l| idl_rs::export::FitLap { start_ms: l.start_timestamp_ms, end_ms: l.end_timestamp_ms, elapsed_ms: l.lap_time_ms })
+        .collect();
+    laps.sort_by_key(|l| l.start_ms);
+    Some(laps)
+}
+
+/// [`export_session_fit`]'s body. Writes beside `path` first and renames, so
+/// a failed export never leaves a half-written `.fit` under the chosen name.
+///
+/// # Errors
+/// `not_found` (no such session), `invalid_argument` (the session has no GPS
+/// fixes: a FIT activity without positions is not uploadable), `io`.
+fn export_session_fit_via(
+    data_dir: &Path,
+    cache: &crate::session_cache::SessionCache,
+    session_id: &str,
+    path: &Path,
+) -> Result<FitExportReport, IpcError> {
+    let (handle, source) = crate::session_source::load_lazy_session_handle(data_dir, session_id, cache)?;
+    let json_path = crate::session_source::session_dir(data_dir, session_id).join("session.json");
+    let laps = match idl_rs::store::session_json::read_session_json(&json_path) {
+        Ok(doc) => fit_laps(&doc),
+        // No readable session.json: still a valid ride, exported as one lap.
+        Err(_) => None,
+    };
+    let lap_count = laps.as_ref().map_or(0, |l| l.len() as u32);
+    let options = idl_rs::export::FitOptions { sport: idl_rs::export::FitSport::Cycling, laps };
+
+    let mut bytes = Vec::new();
+    let written = idl_rs::export::write_fit(&handle, &options, &mut bytes);
+    if let Some(err) = source.take_first_error() {
+        return Err(err);
+    }
+    written.map_err(|e| match e {
+        idl_rs::export::FitExportError::NoGpsData => {
+            IpcError::new(IpcErrorKind::InvalidArgument, format!("session '{session_id}' has no GPS fixes; a FIT activity needs positions"))
+        }
+        idl_rs::export::FitExportError::Io(io) => IpcError::new(IpcErrorKind::Io, format!("encoding FIT: {io}")),
+    })?;
+
+    let part = path.with_extension("fit.part");
+    std::fs::write(&part, &bytes).map_err(|e| IpcError::new(IpcErrorKind::Io, format!("writing {}: {e}", part.display())))?;
+    if let Err(e) = std::fs::rename(&part, path) {
+        let _ = std::fs::remove_file(&part);
+        return Err(IpcError::new(IpcErrorKind::Io, format!("writing {}: {e}", path.display())));
+    }
+    Ok(FitExportReport { path: path.display().to_string(), bytes: bytes.len() as u64, laps: lap_count })
+}
+
+/// C3 §3.2 `export_session_fit(session_id, path)` (added 2026-11-05): writes
+/// the session as a Garmin FIT activity (sport cycling, the session's laps as
+/// splits) to `path`, which the app takes from a save dialog. idl0's
+/// "Export .fit" button, ported. A ride's FIT is a few hundred kB and takes
+/// well under a second, so no progress channel.
+#[tauri::command(async)]
+pub fn export_session_fit(
+    session_id: String,
+    path: String,
+    data_dir: tauri::State<'_, DataDir>,
+    cache: tauri::State<'_, crate::session_cache::SessionCache>,
+) -> Result<FitExportReport, IpcError> {
+    export_session_fit_via(&data_dir.0, &cache, &session_id, Path::new(&path))
+}
+
 /// C3 §3.2 `delete_session(session_id, delete_blob)`.
 #[tauri::command(async)]
 pub fn delete_session(
@@ -1630,6 +1716,131 @@ mod tests {
         assert_eq!(returned.session_id, reread.session_id);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One event channel (rate 0) with a sample at each of `t_us`.
+    fn event_channel(channel_id: &str, t_us: &[i64], values: Vec<f64>, unit: &str) -> Channel {
+        Channel {
+            channel_id: channel_id.to_string(),
+            t_us: t_us.to_vec(),
+            t_recorded_us: None,
+            nominal_rate_hz: 0.0,
+            column: RawColumn::F64(values),
+            source_kind: "gps".to_string(),
+            unit: unit.to_string(),
+            gaps: Vec::new(),
+        }
+    }
+
+    /// A session whose `session.json` is `doc` and whose channels are `channels`.
+    fn write_session_with(root: &Path, session_id: &str, doc: &idl_rs::store::session_json::SessionJson, channels: Vec<Channel>) {
+        let blob_sha256 = write_blob(root, format!("raw bytes for {session_id}").as_bytes()).unwrap();
+        write_session_json(root, session_id, doc, None).unwrap();
+        let session = Session {
+            session_id: session_id.to_string(),
+            device_id: None,
+            timestamp_utc_ms: 1_762_300_000_000,
+            timestamp_source: TimestampSource::Header,
+            config_checksum: None,
+            source_format: SourceFormat::Idl0,
+            blob_sha256,
+            channels,
+        };
+        write_session_parquet(root, &session, "0.1.0").unwrap();
+    }
+
+    /// Three GPS fixes a second apart near Beacon, NY.
+    fn gps_channels() -> Vec<Channel> {
+        let t = [0, 1_000_000, 2_000_000];
+        vec![
+            event_channel("GPS_Latitude", &t, vec![41.5048, 41.5049, 41.5050], "deg"),
+            event_channel("GPS_Longitude", &t, vec![-73.9696, -73.9695, -73.9694], "deg"),
+            event_channel("GPS_EpochMs", &t, vec![1_762_300_000_000.0, 1_762_300_001_000.0, 1_762_300_002_000.0], "ms"),
+        ]
+    }
+
+    fn lap(lap_number: u32, start_ms: i64, end_ms: i64, lap_time_ms: i64) -> LapJson {
+        LapJson {
+            lap_number,
+            start_timestamp_ms: start_ms,
+            end_timestamp_ms: end_ms,
+            raw_elapsed_ms: end_ms - start_ms,
+            lap_time_ms,
+            start_time_secs: 0.0,
+            end_time_secs: 1.0,
+            sectors: Vec::new(),
+            neutral_zone_visits: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn export_session_fit_via_a_session_with_gps_and_laps_writes_a_fit_file_with_those_laps() {
+        // Arrange
+        let root = temp_root();
+        let mut doc = empty_session_json("s1");
+        doc.laps = vec![lap(1, 1_762_300_000_000, 1_762_300_001_000, 1_000), lap(2, 1_762_300_001_000, 1_762_300_002_000, 900)];
+        write_session_with(&root, "s1", &doc, gps_channels());
+        let out = root.join("ride.fit");
+
+        // Act
+        let report = export_session_fit_via(&root, &crate::session_cache::SessionCache::new(), "s1", &out).unwrap();
+
+        // Assert
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(&bytes[8..12], b".FIT");
+        assert_eq!(report.bytes, bytes.len() as u64);
+        assert_eq!(report.laps, 2);
+        assert!(!out.with_extension("fit.part").exists(), "the staging file is renamed away");
+    }
+
+    #[test]
+    fn export_session_fit_via_a_session_without_gps_invalid_argument_and_no_file_written() {
+        // Arrange
+        let root = temp_root();
+        write_full_session(&root, "s1");
+        let out = root.join("ride.fit");
+
+        // Act
+        let err = export_session_fit_via(&root, &crate::session_cache::SessionCache::new(), "s1", &out).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+        assert!(!out.exists());
+        assert!(!out.with_extension("fit.part").exists());
+    }
+
+    #[test]
+    fn export_session_fit_via_unknown_session_not_found() {
+        // Arrange
+        let root = temp_root();
+
+        // Act
+        let err = export_session_fit_via(&root, &crate::session_cache::SessionCache::new(), "nope", &root.join("x.fit")).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::NotFound);
+    }
+
+    #[test]
+    fn fit_laps_laps_out_of_order_sorted_by_start_with_the_effective_lap_time() {
+        // Arrange
+        let mut doc = empty_session_json("s1");
+        doc.laps = vec![lap(2, 2_000, 3_000, 800), lap(1, 1_000, 2_000, 950)];
+
+        // Act
+        let laps = fit_laps(&doc).unwrap();
+
+        // Assert
+        assert_eq!(laps.iter().map(|l| (l.start_ms, l.elapsed_ms)).collect::<Vec<_>>(), vec![(1_000, 950), (2_000, 800)]);
+    }
+
+    #[test]
+    fn fit_laps_no_laps_none_so_the_ride_is_one_lap() {
+        // Act
+        let laps = fit_laps(&empty_session_json("s1"));
+
+        // Assert
+        assert!(laps.is_none());
     }
 
     #[test]
