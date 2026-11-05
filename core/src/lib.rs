@@ -32,6 +32,7 @@ pub mod integration;
 pub mod laps;
 pub mod math;
 pub mod parse;
+pub mod pulse;
 pub mod raster;
 pub mod rotation;
 pub mod scatter;

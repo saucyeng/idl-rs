@@ -2010,6 +2010,29 @@ fn call_function(
             let onto = require_channel(&args[1], "resample(x, onto) — onto")?;
             resample_onto(&x, &onto)
         }
+        // A wheel-pulse event channel with split gaps merged back (2026-11-05,
+        // `crate::pulse`): the kept pulses at their own recorded times, the
+        // running count renumbered so `differentiate` gives 1 / gap.
+        "deglitch_pulses" => {
+            require_arg_count(name, &args, 1)?;
+            reject_unknown_kwargs(name, kwargs, &["max_fraction"])?;
+            let ch = require_channel(&args[0], name)?;
+            let Spacing::Recorded(t_us) = ch.spacing() else {
+                return Err(err(
+                    MathEvalErrorKind::Runtime,
+                    format!("{name} takes a pulse event channel (samples at recorded times), and {} is not one", describe_channel(&ch)),
+                ));
+            };
+            let max_fraction = match kwargs.get("max_fraction") {
+                Some(v) => require_scalar(v, name)?,
+                None => crate::pulse::DEFAULT_MAX_FRACTION,
+            };
+            let kept = crate::pulse::deglitch(t_us, max_fraction);
+            let first = ch.samples.first().copied().unwrap_or(0.0);
+            let samples: Vec<f64> = (0..kept.len()).map(|k| first + k as f64).collect();
+            let times: Arc<[i64]> = kept.iter().map(|&i| t_us[i]).collect();
+            Ok(channel(samples, 0.0, times))
+        }
         "spectrogram" | "envelope" | "correlate" | "convolve" | "sosfilt" => {
             Err(err(MathEvalErrorKind::NotImplemented, format!("not yet implemented: {name}")))
         }

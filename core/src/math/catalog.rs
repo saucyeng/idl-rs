@@ -617,6 +617,17 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             example: "resample([IMU2_AccelZ], [IMU1_AccelZ])",
         },
         MathBuiltin {
+            name: "deglitch_pulses",
+            arity: &[1],
+            status: I,
+            category: "Resampling",
+            signature: "deglitch_pulses(pulses, max_fraction=0.35)",
+            unit_rule: "SameAsArg(0)",
+            shape: "[t]",
+            description: "A wheel-pulse event channel without the extra edges a marginal sensor adds: a pulse is dropped when the gap ending at it is under `max_fraction` of both the gap before and the gap after, so it reads as an extra edge inside one ordinary gap. Comparing both sides means the first pulses after a locked wheel spins up, and the growing gaps of hard braking, are never dropped. The result is renumbered 1, 2, 3, ... from the first kept pulse, at the kept pulses' recorded times.",
+            example: "deglitch_pulses([WheelFront])",
+        },
+        MathBuiltin {
             name: "where",
             arity: &[3],
             status: I,
@@ -959,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn math_builtin_catalog_len_is_75_after_the_scipy_splits_and_the_lap_shaped_trio() {
+    fn math_builtin_catalog_len_is_76_after_the_scipy_splits_the_lap_shaped_trio_and_deglitch_pulses() {
         // Arrange / Act
         let n = math_builtin_catalog().len();
 
@@ -971,12 +982,13 @@ mod tests {
         // spelling (net +1, task 10, R151 item 6), and `gradient` added
         // alongside `differentiate` (net +1, task 11, R151 item 3) —
         // 69 + 3 = 72; then `lap_number`/`lap_time`/`sector_time`, which C2
-        // §3.3 has listed all along and this catalog lacked (R233), 72 + 3 = 75.
-        assert_eq!(n, 75);
+        // §3.3 has listed all along and this catalog lacked (R233), 72 + 3 = 75;
+        // then `deglitch_pulses` for wheel-pulse channels (2026-11-05), 76.
+        assert_eq!(n, 76);
     }
 
     #[test]
-    fn implemented_and_not_implemented_counts_split_70_and_5() {
+    fn implemented_and_not_implemented_counts_split_71_and_5() {
         // Arrange
         let catalog = math_builtin_catalog();
 
@@ -989,9 +1001,10 @@ mod tests {
         // Assert — was 63/6; the scipy-alignment lane's three net-new entries
         // and the lap-shaped trio (see the length test above) are all
         // Implemented, so only that side of the split moved (69/6). R242 then
-        // implements `resample`, moving one entry across: 70/5.
+        // implements `resample`, moving one entry across: 70/5. `deglitch_pulses`
+        // arrives implemented: 71/5.
         assert_eq!(not_implemented, 5);
-        assert_eq!(implemented, 70);
+        assert_eq!(implemented, 71);
     }
 
     #[test]
