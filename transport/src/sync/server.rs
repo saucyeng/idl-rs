@@ -669,7 +669,8 @@ async fn handle_track_get(State(state): State<ServerState>, AxumPath(id): AxumPa
     if !is_valid_id(&id, IdClass::Uuid) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some(path) = safe_join(&state.data_root, &["tracks", &format!("{id}.idl0t")]) else {
+    // `id` is a validated UUID, so it joins onto `tracks/` safely.
+    let Some(path) = idl_rs::track_artifact::path::existing_track_file(&state.data_root, &id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     serve_file(&path, &headers).await

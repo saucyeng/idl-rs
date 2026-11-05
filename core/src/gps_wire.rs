@@ -19,6 +19,9 @@
 //! is absent.
 
 const MAGIC: &[u8; 4] = b"IDLG";
+/// `IDLL`: the `IDLG` layout in degrees — `x` longitude, `y` latitude —
+/// for the track editor's satellite map (track editor spec §3).
+const MAGIC_LATLON: &[u8; 4] = b"IDLL";
 const VERSION: u16 = 1;
 
 /// `flags` bit 0: a `c` (colour-by) array follows the `t` array.
@@ -44,6 +47,18 @@ pub const HEADER_LEN: usize = 16;
 /// present), so a caller cannot produce a header that over-states the arrays
 /// that follow it.
 pub fn encode_gps_trace_idlg(xs: &[f64], ys: &[f64], ts: &[f64], c: Option<&[f64]>) -> Vec<u8> {
+    encode(MAGIC, xs, ys, ts, c)
+}
+
+/// `IDLL` v1 byte encoder (track editor spec §3): byte for byte the
+/// [`encode_gps_trace_idlg`] layout under magic `"IDLL"`, with `x` the
+/// longitude and `y` the latitude, decimal degrees. `f64` keeps a
+/// millimetre at any latitude.
+pub fn encode_gps_trace_idll(lons: &[f64], lats: &[f64], ts: &[f64], c: Option<&[f64]>) -> Vec<u8> {
+    encode(MAGIC_LATLON, lons, lats, ts, c)
+}
+
+fn encode(magic: &[u8; 4], xs: &[f64], ys: &[f64], ts: &[f64], c: Option<&[f64]>) -> Vec<u8> {
     let mut n = xs.len().min(ys.len()).min(ts.len());
     if let Some(cs) = c {
         n = n.min(cs.len());
@@ -52,7 +67,7 @@ pub fn encode_gps_trace_idlg(xs: &[f64], ys: &[f64], ts: &[f64], c: Option<&[f64
     let per_point = if has_c { 32 } else { 24 };
 
     let mut out = Vec::with_capacity(HEADER_LEN + n * per_point);
-    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(magic);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&(if has_c { FLAG_HAS_C } else { 0u16 }).to_le_bytes());
     out.extend_from_slice(&(n as u32).to_le_bytes());
@@ -74,6 +89,20 @@ pub fn encode_gps_trace_idlg(xs: &[f64], ys: &[f64], ts: &[f64], c: Option<&[f64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_gps_trace_idll_same_layout_as_idlg_under_its_own_magic() {
+        // Arrange
+        let (x, y, t) = ([-71.1, -71.2], [42.3, 42.4], [0.0, 1.0]);
+
+        // Act
+        let ll = encode_gps_trace_idll(&x, &y, &t, None);
+        let lg = encode_gps_trace_idlg(&x, &y, &t, None);
+
+        // Assert
+        assert_eq!(&ll[..4], b"IDLL");
+        assert_eq!(&ll[4..], &lg[4..]);
+    }
 
     fn read_f64(bytes: &[u8], offset: usize) -> f64 {
         f64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())

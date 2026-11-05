@@ -23,6 +23,7 @@ pub mod seams;
 pub mod session_set;
 pub mod sync;
 pub mod tiles;
+pub mod track_editor;
 /// Linked video (C3 §3.12).
 pub mod video;
 pub mod workbook;

@@ -30,6 +30,7 @@ pub mod histogram2d;
 pub mod import;
 pub mod integration;
 pub mod laps;
+pub mod map_tiles;
 pub mod math;
 pub mod parse;
 pub mod pulse;

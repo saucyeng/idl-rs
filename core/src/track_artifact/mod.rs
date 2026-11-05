@@ -1,9 +1,10 @@
-//! Portable Track artifact (`.idl0t`): read a GUI-authored track config from a
+//! Portable Track artifact (`.idl1t`, formerly `.idl0t`): read a GUI-authored track config from a
 //! file into the domain [`Track`] for the CLI's `laps`/`visits`, and write one
 //! back out (authoring itself stays in the app; this is the persistence
 //! primitive the app calls, C4 §2).
 
 pub mod model;
+pub mod path;
 pub mod read;
 pub mod validate;
 pub mod write;

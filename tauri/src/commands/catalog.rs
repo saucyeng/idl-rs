@@ -2017,7 +2017,7 @@ mod tests {
             assert_eq!(result.track.name, "A-Line");
             assert_eq!(result.track.created_at_ms, 1_000);
             assert_eq!(result.track.updated_at_ms, 1_000);
-            let on_disk = read_track(&root.join("tracks").join("new-id-1.idl0t")).unwrap();
+            let on_disk = read_track(&root.join("tracks").join("new-id-1.idl1t")).unwrap();
             assert_eq!(on_disk.created_at_ms, 1_000);
             assert_eq!(on_disk.updated_at_ms, 1_000);
 
@@ -2226,7 +2226,7 @@ mod tests {
 
             // Assert
             assert_eq!(result.track_id, "t-1");
-            assert!(!root.join("tracks").join("t-1.idl0t").exists());
+            assert!(!root.join("tracks").join("t-1.idl1t").exists());
 
             let _ = std::fs::remove_dir_all(&root);
         }
@@ -2242,7 +2242,7 @@ mod tests {
 
             // Assert
             assert_eq!(err.kind, crate::error::IpcErrorKind::NotFound);
-            assert!(root.join("tracks").join("t-1.idl0t").exists());
+            assert!(root.join("tracks").join("t-1.idl1t").exists());
 
             let _ = std::fs::remove_dir_all(&root);
         }

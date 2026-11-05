@@ -1,4 +1,4 @@
-//! Encode side of `.idl0t` (contract C4 §2) — the inventory's noted gap
+//! Encode side of the track file (`.idl1t`, formerly `.idl0t`; contract C4 §2) — the inventory's noted gap
 //! ("encode missing in engine"). Serialises through the same private
 //! `TrackDto` (and nested DTOs) that `track_artifact::read` already reads
 //! (`track_artifact::model`'s `From<&Track> for TrackArtifact`), so the
@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::store::atomic::{sha256_hex, write_atomic_with_retry, AtomicWriteError};
 use crate::track_artifact::model::{Track, TrackArtifact};
+use crate::track_artifact::path::{legacy_track_file, track_file};
 
 /// Discriminant for [`TrackWriteError`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,8 +57,9 @@ fn validate_track_id(track_id: &str) -> Result<(), TrackWriteError> {
 /// Serialises `track` to the `.idl0t` wire JSON shape (mirroring
 /// [`read_track`](crate::track_artifact::read::read_track) exactly, via the
 /// shared `TrackDto`) and writes it atomically to
-/// `<data_root>/tracks/<track_id>.idl0t`, replacing any existing file for
-/// the same id (last-write-wins, consistent with C4 §6's LWW-by-
+/// `<data_root>/tracks/<track_id>.idl1t`, replacing any existing file for
+/// the same id (and removing a legacy `.idl0t` of that id, so the id has
+/// one file) (last-write-wins, consistent with C4 §6's LWW-by-
 /// `updated_at_ms`) via [`write_atomic_with_retry`] (C4 §4 step 4).
 /// `track.created_at_ms`/`updated_at_ms` are written verbatim — the caller
 /// owns picking real timestamps. Rejects a `track_id` containing a path
@@ -67,21 +69,28 @@ pub fn write_track(data_root: &Path, track: &Track) -> Result<PathBuf, TrackWrit
     let artifact = TrackArtifact::from(track);
     let bytes = serde_json::to_vec_pretty(&artifact)
         .map_err(|e| TrackWriteError { kind: TrackWriteErrorKind::Encode, message: e.to_string() })?;
-    let target = data_root.join("tracks").join(format!("{}.idl0t", track.id));
+    let target = track_file(data_root, &track.id);
     let based_on = std::fs::read(&target).ok().map(|b| sha256_hex(&b));
     write_atomic_with_retry(data_root, &target, &bytes, based_on.as_deref(), |_current| bytes.clone())?;
+    remove_if_present(&legacy_track_file(data_root, &track.id))?;
     Ok(target)
 }
 
-/// Removes `<data_root>/tracks/<track_id>.idl0t`. `Ok(false)` when the file
-/// was already absent — not an error; the caller decides whether that is
+/// Removes `<data_root>/tracks/<track_id>.idl1t` and any legacy `.idl0t`
+/// of the same id. `Ok(false)` when neither existed — not an error; the caller decides whether that is
 /// `not_found`. Touches no catalog and no `session.json`. Rejects a
 /// `track_id` containing a path separator or a `..` segment before touching
 /// the filesystem.
 pub fn delete_track(data_root: &Path, track_id: &str) -> Result<bool, TrackWriteError> {
     validate_track_id(track_id)?;
-    let target = data_root.join("tracks").join(format!("{track_id}.idl0t"));
-    match std::fs::remove_file(&target) {
+    let current = remove_if_present(&track_file(data_root, track_id))?;
+    let legacy = remove_if_present(&legacy_track_file(data_root, track_id))?;
+    Ok(current || legacy)
+}
+
+/// Removes `path`: `Ok(true)` if it existed, `Ok(false)` if it did not.
+fn remove_if_present(path: &Path) -> Result<bool, TrackWriteError> {
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(TrackWriteError { kind: TrackWriteErrorKind::Io, message: e.to_string() }),
@@ -201,7 +210,7 @@ mod tests {
         track.name = "B-Line".to_string();
         track.updated_at_ms = 999;
         write_track(&root, &track).unwrap();
-        let back = read_track(&root.join("tracks").join(format!("{}.idl0t", track.id))).unwrap();
+        let back = read_track(&root.join("tracks").join(format!("{}.idl1t", track.id))).unwrap();
 
         // Assert
         assert_eq!(back.name, "B-Line");
@@ -278,6 +287,41 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.kind, TrackWriteErrorKind::Io);
         assert!(!root.join("tracks").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_track_a_legacy_idl0t_of_the_same_id_is_replaced_by_the_idl1t() {
+        // Arrange
+        let root = temp_root();
+        let track = sample_track();
+        std::fs::create_dir_all(root.join("tracks")).unwrap();
+        std::fs::write(legacy_track_file(&root, &track.id), b"{}").unwrap();
+
+        // Act
+        let path = write_track(&root, &track).unwrap();
+
+        // Assert
+        assert_eq!(path, track_file(&root, &track.id));
+        assert!(!legacy_track_file(&root, &track.id).exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_track_a_legacy_only_track_is_removed() {
+        // Arrange
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("tracks")).unwrap();
+        std::fs::write(legacy_track_file(&root, "t-old"), b"{}").unwrap();
+
+        // Act
+        let removed = delete_track(&root, "t-old").unwrap();
+
+        // Assert
+        assert!(removed);
+        assert!(!legacy_track_file(&root, "t-old").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -73,27 +73,14 @@ pub fn track_library_hash(tracks: &[Track]) -> String {
     format!("sha256:{digest:x}")
 }
 
-/// Every `<data_root>/tracks/*.idl0t`, sorted by track id. A missing
+/// Every `<data_root>/tracks/*.idl1t` (and legacy `.idl0t`), sorted by track id. A missing
 /// `tracks/` directory is `Ok(vec![])`, not an error. An unreadable or
 /// version-rejected artifact is skipped, and a warning naming its file
 /// records why.
 pub fn load_track_library(data_root: &Path) -> Result<(Vec<Track>, Vec<String>), LapIndexError> {
-    let tracks_dir = data_root.join("tracks");
-    if !tracks_dir.is_dir() {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let entries = fs::read_dir(&tracks_dir)
+    let tracks_dir = crate::track_artifact::path::tracks_dir(data_root);
+    let paths = crate::track_artifact::path::list_track_files(&tracks_dir)
         .map_err(|e| LapIndexError::new(LapIndexErrorKind::Io, format!("cannot read {}: {e}", tracks_dir.display())))?;
-
-    let mut paths: Vec<std::path::PathBuf> = Vec::new();
-    for entry in entries {
-        let entry = entry
-            .map_err(|e| LapIndexError::new(LapIndexErrorKind::Io, format!("cannot read {}: {e}", tracks_dir.display())))?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("idl0t") {
-            paths.push(path);
-        }
-    }
 
     let mut tracks: Vec<Track> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();

@@ -128,6 +128,12 @@ pub fn resolve_data_dir(app_data_dir: &Path, app_config_dir: &Path) -> Result<Pa
             });
         }
     }
+    // Tracks written before 2026-11-05 are `.idl0t`; rename them once
+    // (C4 §2). A file that fails to rename is still read through the
+    // fallback, so a warning is all a failure earns.
+    for warning in idl_rs::track_artifact::path::migrate_legacy_track_files(&data) {
+        eprintln!("idl1: {warning}");
+    }
     Ok(data)
 }
 

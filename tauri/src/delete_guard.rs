@@ -91,10 +91,13 @@ mod tests {
         ("core/src/store/catalog.rs", "rebuild_catalog_with_progress"),
         // (g) an explicit single-profile delete, no-op if absent.
         ("core/src/store/profile.rs", "delete"),
-        // `delete_track`: one `tracks/<id>.idl0t`, the explicit "delete
-        // track" action, path-validated first. Added to the audit on
-        // 2026-09-10 — this scan is what found it missing from it.
-        ("core/src/track_artifact/write.rs", "delete_track"),
+        // `remove_if_present`: one track file, `tracks/<id>.idl1t` or the
+        // legacy `.idl0t`, path-validated first. Called by `delete_track`
+        // (the explicit "delete track" action; added to the audit on
+        // 2026-09-10, this scan is what found it missing) and by
+        // `write_track`, which removes a same-id `.idl0t` only after the
+        // `.idl1t` replacing it is written (2026-11-05).
+        ("core/src/track_artifact/write.rs", "remove_if_present"),
         // (h) `move_data_dir` (C3 §3.10 as amended by R197: move, not copy).
         // `copy_verify_delete` removes a source file only after its copy has
         // verified at the destination; `move_data_dir_with` removes a source

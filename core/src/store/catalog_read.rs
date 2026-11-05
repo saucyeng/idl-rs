@@ -576,16 +576,18 @@ pub fn list_tracks(data_root: &Path) -> Result<Vec<TrackSummary>, CatalogError> 
     rows.collect::<Result<Vec<_>, _>>().map_err(CatalogError::from)
 }
 
-/// C3 §3.2 `get_track(track_id)` — the full `<data>/tracks/<track_id>.idl0t`
+/// C3 §3.2 `get_track(track_id)` — the full `<data>/tracks/<track_id>.idl1t` (or legacy `.idl0t`)
 /// artifact, read from disk (never on a hot path, C3 §4). Every field comes
 /// from the one parsed domain [`Track`](crate::track_artifact::model::Track)
 /// — `track_artifact::read` already converts the file's degrees-x1e7 wire
 /// scale to decimal degrees, so nothing here re-lifts or re-scales.
 pub fn get_track(data_root: &Path, track_id: &str) -> Result<TrackDetail, CatalogError> {
-    let path = data_root.join("tracks").join(format!("{track_id}.idl0t"));
-    if !path.is_file() {
+    if track_id.contains('/') || track_id.contains('\') || track_id.contains("..") {
         return Err(not_found(format!("track {track_id} not found")));
     }
+    let Some(path) = crate::track_artifact::path::existing_track_file(data_root, track_id) else {
+        return Err(not_found(format!("track {track_id} not found")));
+    };
 
     let track = read_track(&path).map_err(io_like)?;
 

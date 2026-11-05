@@ -516,8 +516,10 @@ fn rederive_workbook_write(data_root: &Path, workbook_id: &str, peer_doc: &Workb
 fn install_track(data_root: &Path, bytes: &[u8]) -> Result<InstallOutcome, SyncError> {
     let peer: Track = parse_track(bytes).map_err(|e| malformed(format!("track: {e}")))?;
     let track_id = validated_id(&peer.id, IdClass::Uuid, "track")?;
-    let path = joined_or_err(data_root, &["tracks", &format!("{track_id}.idl0t")])?;
-    let local_updated_at_ms = crate::track_artifact::read::read_track(&path).ok().map(|t| t.updated_at_ms);
+    joined_or_err(data_root, &["tracks", &format!("{track_id}.{}", crate::track_artifact::path::TRACK_EXT)])?;
+    let local_updated_at_ms = crate::track_artifact::path::existing_track_file(data_root, &track_id)
+        .and_then(|path| crate::track_artifact::read::read_track(&path).ok())
+        .map(|t| t.updated_at_ms);
 
     if let Some(local_ms) = local_updated_at_ms {
         if peer.updated_at_ms < local_ms {
@@ -1037,7 +1039,7 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind, SyncErrorKind::Malformed);
-        assert!(!root.join("tracks").join(format!("{TRACK_ID}.idl0t")).exists());
+        assert!(!root.join("tracks").join(format!("{TRACK_ID}.idl1t")).exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1099,7 +1101,7 @@ mod tests {
 
         // Assert
         assert_eq!(outcome, InstallOutcome::KeptLocal);
-        let back = crate::track_artifact::read::read_track(&root.join("tracks").join(format!("{TRACK_ID}.idl0t"))).unwrap();
+        let back = crate::track_artifact::read::read_track(&root.join("tracks").join(format!("{TRACK_ID}.idl1t"))).unwrap();
         assert_eq!(back.updated_at_ms, 100);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1120,7 +1122,7 @@ mod tests {
 
         // Assert
         assert_eq!(outcome, InstallOutcome::Installed);
-        let back = crate::track_artifact::read::read_track(&root.join("tracks").join(format!("{TRACK_ID}.idl0t"))).unwrap();
+        let back = crate::track_artifact::read::read_track(&root.join("tracks").join(format!("{TRACK_ID}.idl1t"))).unwrap();
         assert_eq!(back.updated_at_ms, 100);
 
         let _ = std::fs::remove_dir_all(&root);

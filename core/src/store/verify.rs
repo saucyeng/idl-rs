@@ -153,13 +153,9 @@ fn check_derived(data_root: &Path, out: &mut Vec<Finding>) {
 }
 
 fn check_tracks(data_root: &Path, out: &mut Vec<Finding>) {
-    let dir = data_root.join("tracks");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("idl0t") {
-            continue;
-        }
+    let dir = crate::track_artifact::path::tracks_dir(data_root);
+    let Ok(paths) = crate::track_artifact::path::list_track_files(&dir) else { return };
+    for path in paths {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
         match crate::track_artifact::read::read_track(&path) {
             Ok(track) if track.id == stem => {}
@@ -211,7 +207,7 @@ fn matches_layout(rel: &Path) -> bool {
         ["workbooks", ".sync-base", _name] => true,
         ["workbooks", name] => name.ends_with(".idl1wb"),
         ["tracks"] => true,
-        ["tracks", name] => name.ends_with(".idl0t"),
+        ["tracks", name] => name.ends_with(".idl1t") || name.ends_with(".idl0t"),
         // A bike and its log, one file each (bike-log DRAFT spec §4).
         ["bikes"] => true,
         ["bikes", name] => name.ends_with(".json"),
@@ -551,7 +547,7 @@ mod tests {
             updated_at_ms: 2,
         };
         let path = write_track(&root, &track).unwrap();
-        let renamed = path.parent().unwrap().join("t-2.idl0t");
+        let renamed = path.parent().unwrap().join("t-2.idl1t");
         std::fs::rename(&path, &renamed).unwrap();
 
         // Act

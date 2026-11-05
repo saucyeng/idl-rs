@@ -890,7 +890,9 @@ fn read_local_item_bytes(data_root: &Path, item: &SyncItem, local_manifest: &Man
             safe_join(data_root, &["workbooks", &format!("{file_name}.idl1wb")]).ok_or_else(|| sync_error("workbook path would land outside data_root"))?
         }
         SyncClass::Track => {
-            safe_join(data_root, &["tracks", &format!("{}.idl0t", item.key)]).ok_or_else(|| sync_error("track path would land outside data_root"))?
+            let current = safe_join(data_root, &["tracks", &format!("{}.{}", item.key, idl_rs::track_artifact::path::TRACK_EXT)])
+                .ok_or_else(|| sync_error("track path would land outside data_root"))?;
+            if current.is_file() { current } else { current.with_extension(idl_rs::track_artifact::path::LEGACY_TRACK_EXT) }
         }
         SyncClass::Profile => {
             safe_join(data_root, &["profiles", &format!("{}.idl0p", item.key)]).ok_or_else(|| sync_error("profile path would land outside data_root"))?

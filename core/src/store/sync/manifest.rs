@@ -465,13 +465,9 @@ fn collect_workbooks(data_root: &Path) -> (Vec<WorkbookEntry>, Vec<SkippedEntry>
 fn collect_tracks(data_root: &Path) -> (Vec<TrackEntry>, Vec<SkippedEntry>) {
     let mut out = Vec::new();
     let mut skipped = Vec::new();
-    let dir = data_root.join("tracks");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return (out, skipped) };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("idl0t") {
-            continue;
-        }
+    let dir = crate::track_artifact::path::tracks_dir(data_root);
+    let Ok(paths) = crate::track_artifact::path::list_track_files(&dir) else { return (out, skipped) };
+    for path in paths {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
         let Ok(track) = read_track(&path) else {
             skipped.push(SkippedEntry { path: relative_path_str(data_root, &path), reason: "track: could not parse".to_string() });
@@ -887,7 +883,7 @@ mod tests {
             updated_at_ms: 2,
         };
         write_track(&root, &track).unwrap();
-        std::fs::rename(root.join("tracks").join("actual-id.idl0t"), root.join("tracks").join("renamed.idl0t")).unwrap();
+        std::fs::rename(root.join("tracks").join("actual-id.idl1t"), root.join("tracks").join("renamed.idl1t")).unwrap();
 
         // Act
         let (manifest, skipped) = build_manifest(&root, 1).unwrap();
@@ -896,7 +892,7 @@ mod tests {
         assert!(manifest.tracks.is_empty());
         assert_eq!(
             skipped,
-            vec![SkippedEntry { path: "tracks/renamed.idl0t".to_string(), reason: "track: file name does not match the track's own id".to_string() }]
+            vec![SkippedEntry { path: "tracks/renamed.idl1t".to_string(), reason: "track: file name does not match the track's own id".to_string() }]
         );
 
         let _ = std::fs::remove_dir_all(&root);

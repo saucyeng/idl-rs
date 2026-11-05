@@ -8,6 +8,7 @@ pub mod distance;
 pub mod gate_synthesis;
 pub mod geometry;
 pub mod model;
+pub mod preview;
 pub mod renumber;
 
 pub use detect::detect_laps;
@@ -18,4 +19,5 @@ pub use gate_synthesis::{
 };
 pub use geometry::find_crossings;
 pub use model::{Gate, Lap, LapTiming, NeutralZone, NeutralZoneVisit, Sector, SectorGate};
+pub use preview::{preview_runs, RunPreview};
 pub use renumber::{renumber_session_laps, RenumberedLap};

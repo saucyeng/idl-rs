@@ -429,12 +429,12 @@ async fn two_peers_a_adds_a_track_newer_than_bs_b_takes_it_the_reverse_direction
     // Assert — `Track` has no `PartialEq`, so identity is checked field by
     // field on the two fields this scenario actually varies.
     assert_eq!(b_pulls_a.tracks_updated, 1);
-    let b_now = read_track(&b.data_root.join("tracks").join(format!("{TRACK_ID}.idl0t"))).unwrap();
+    let b_now = read_track(&b.data_root.join("tracks").join(format!("{TRACK_ID}.idl1t"))).unwrap();
     assert_eq!(b_now.name, a_track.name);
     assert_eq!(b_now.updated_at_ms, a_track.updated_at_ms);
 
     assert_eq!(a_pulls_b.tracks_updated, 0);
-    let a_now = read_track(&a.data_root.join("tracks").join(format!("{TRACK_ID}.idl0t"))).unwrap();
+    let a_now = read_track(&a.data_root.join("tracks").join(format!("{TRACK_ID}.idl1t"))).unwrap();
     assert_eq!(a_now.name, a_track.name, "A must be untouched by the reverse-direction run");
     assert_eq!(a_now.updated_at_ms, a_track.updated_at_ms, "A must be untouched by the reverse-direction run");
 

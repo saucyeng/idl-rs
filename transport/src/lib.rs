@@ -17,6 +17,7 @@ pub mod ble_transport;
 pub mod device;
 pub mod firmware_catalog;
 pub mod link;
+pub mod map_tiles;
 pub mod error;
 pub mod sync;
 pub mod wifi_transport;

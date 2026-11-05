@@ -90,7 +90,7 @@ pub struct GateSegmentDto {
 /// which is the axis every other channel is indexed on — a window resolves to
 /// a span on that clock, so slicing anywhere else would drift against the rest
 /// of the session.
-fn window_fixes(handle: &idl_rs::session::handle::SessionHandle, t0: f64, t1: f64) -> (Vec<GpsFix>, Vec<f64>, Vec<usize>) {
+pub(crate) fn window_fixes(handle: &idl_rs::session::handle::SessionHandle, t0: f64, t1: f64) -> (Vec<GpsFix>, Vec<f64>, Vec<usize>) {
     let fixes = build_gps_track(handle);
     if fixes.is_empty() {
         return (Vec::new(), Vec::new(), Vec::new());

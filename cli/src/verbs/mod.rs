@@ -98,10 +98,18 @@ impl Ctx {
     ///
     /// # Errors
     /// [`ErrorKind::Usage`] when neither `--data-dir` nor `IDL1_DATA_DIR` is set.
+    ///
+    /// Renames the directory's legacy `.idl0t` tracks to `.idl1t` on the
+    /// way (C4 §2); a file that fails to rename is still read, so that is
+    /// a warning on stderr, not an error.
     pub fn data_dir(&self) -> Result<&Path, CliError> {
-        self.data_dir.as_deref().ok_or_else(|| {
+        let dir = self.data_dir.as_deref().ok_or_else(|| {
             CliError::usage(format!("no data directory: pass --data-dir or set {DATA_DIR_ENV}"))
-        })
+        })?;
+        for warning in idl_rs::track_artifact::path::migrate_legacy_track_files(dir) {
+            eprintln!("warning: {warning}");
+        }
+        Ok(dir)
     }
 }
 

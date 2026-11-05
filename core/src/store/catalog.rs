@@ -265,7 +265,7 @@ pub struct RebuildReport {
 pub enum RebuildPhase {
     /// Step 1: walking `blobs/sha256/*/*`.
     Blobs,
-    /// Step 2: walking `tracks/*.idl0t`.
+    /// Step 2: walking `tracks/*.idl1t` (and legacy `.idl0t`).
     Tracks,
     /// Steps 3–5: walking `sessions/*/`.
     Sessions,
@@ -356,14 +356,9 @@ pub fn rebuild_catalog_with_progress(
     }
 
     // 2. tracks
-    let tracks_dir = data_root.join("tracks");
+    let tracks_dir = crate::track_artifact::path::tracks_dir(data_root);
     if tracks_dir.is_dir() {
-        let track_paths: Vec<std::path::PathBuf> = std::fs::read_dir(&tracks_dir)
-            .map_err(io_err)?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("idl0t"))
-            .collect();
+        let track_paths = crate::track_artifact::path::list_track_files(&tracks_dir).map_err(io_err)?;
         let tracks_total = track_paths.len();
         for (done, path) in track_paths.into_iter().enumerate() {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
