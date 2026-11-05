@@ -120,6 +120,11 @@ mod tests {
         // `copy_into_blobs`: its own `tmp/video-<uuid>.part` on a failed or
         // cancelled copy, or when the blob turns out to exist already.
         ("core/src/store/video.rs", "copy_into_blobs"),
+        // `export_session_fit_via` (C3 §3.2, 2026-11-05): its own
+        // `<chosen>.fit.part` beside a user-chosen export path, outside
+        // `<data>`, when the rename onto the chosen name fails. Never the
+        // chosen file itself, never anything in the library.
+        ("tauri/src/commands/catalog.rs", "export_session_fit_via"),
         // (f) crash markers, outside `<data>` (app data dir `crash/`,
         // evaluation memory spec Phase 1, 2026-10-27). `begin_run`: removes
         // its own `running-<pid>.json.tmp` after a failed rename, and stale
