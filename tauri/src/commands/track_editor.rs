@@ -32,7 +32,7 @@ pub struct RunDto {
 }
 
 /// `preview_track_runs`' return (track editor spec §3).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TrackRunsPreview {
     pub runs: Vec<RunDto>,
     /// The reference run's fixes, decimal degrees, every fix; empty when the

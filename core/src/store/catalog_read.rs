@@ -582,7 +582,7 @@ pub fn list_tracks(data_root: &Path) -> Result<Vec<TrackSummary>, CatalogError> 
 /// — `track_artifact::read` already converts the file's degrees-x1e7 wire
 /// scale to decimal degrees, so nothing here re-lifts or re-scales.
 pub fn get_track(data_root: &Path, track_id: &str) -> Result<TrackDetail, CatalogError> {
-    if track_id.contains('/') || track_id.contains('\') || track_id.contains("..") {
+    if track_id.contains('/') || track_id.contains('\\') || track_id.contains("..") {
         return Err(not_found(format!("track {track_id} not found")));
     }
     let Some(path) = crate::track_artifact::path::existing_track_file(data_root, track_id) else {
