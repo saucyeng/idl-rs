@@ -759,6 +759,7 @@ fn function_unit_rule(name: &str, arg_count: usize) -> (FnUnitRule, Vec<FnUnitCh
         // the same reason — that argument does not enter the result).
         "resample" => (SameAsArg(0), no_checks),
         "deglitch_pulses" => (SameAsArg(0), no_checks),
+        "keep" => (SameAsArg(0), no_checks),
         "where" => (AllMatch(vec![1, 2]), no_checks),
         "current_lap" => (Dimensionless, no_checks),
         "lap_start_time" => (Fixed("s"), no_checks),

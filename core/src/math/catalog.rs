@@ -628,6 +628,17 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             example: "deglitch_pulses([WheelFront])",
         },
         MathBuiltin {
+            name: "keep",
+            arity: &[2],
+            status: I,
+            category: "Logic",
+            signature: "keep(x, cond)",
+            unit_rule: "SameAsArg(0)",
+            shape: "[t]",
+            description: "Only the samples of `x` where `cond` is true (non-zero), each at its own recorded time: an event list, such as every pulse gap over a threshold, comes out as a short channel instead of a full-length one with zeros. `cond` pairs with `x` sample for sample (put it on `x`'s axis with `resample` first if it is not); a number keeps all or nothing. Nothing kept is an empty channel. Over a `[lap]` value it keeps laps.",
+            example: "keep([gap_ratio], [gap_ratio] > 1.8)",
+        },
+        MathBuiltin {
             name: "where",
             arity: &[3],
             status: I,
@@ -970,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn math_builtin_catalog_len_is_76_after_the_scipy_splits_the_lap_shaped_trio_and_deglitch_pulses() {
+    fn math_builtin_catalog_len_is_77_after_the_scipy_splits_the_lap_shaped_trio_deglitch_pulses_and_keep() {
         // Arrange / Act
         let n = math_builtin_catalog().len();
 
@@ -983,8 +994,9 @@ mod tests {
         // alongside `differentiate` (net +1, task 11, R151 item 3) —
         // 69 + 3 = 72; then `lap_number`/`lap_time`/`sector_time`, which C2
         // §3.3 has listed all along and this catalog lacked (R233), 72 + 3 = 75;
-        // then `deglitch_pulses` for wheel-pulse channels (2026-11-05), 76.
-        assert_eq!(n, 76);
+        // then `deglitch_pulses` for wheel-pulse channels (2026-11-05), 76;
+        // then `keep` for event lists (2026-11-05), 77.
+        assert_eq!(n, 77);
     }
 
     #[test]
@@ -1002,9 +1014,9 @@ mod tests {
         // and the lap-shaped trio (see the length test above) are all
         // Implemented, so only that side of the split moved (69/6). R242 then
         // implements `resample`, moving one entry across: 70/5. `deglitch_pulses`
-        // arrives implemented: 71/5.
+        // arrives implemented: 71/5; `keep` too: 72/5.
         assert_eq!(not_implemented, 5);
-        assert_eq!(implemented, 71);
+        assert_eq!(implemented, 72);
     }
 
     #[test]

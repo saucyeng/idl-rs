@@ -70,14 +70,15 @@ impl From<crate::math::ValueAxis> for AxisKind {
 /// boundary. Then `t` as `t_length` times `f64` (seconds) at
 /// offset 24, then `v` as `length` times `f64` at offset `24 + t_length*8`.
 ///
-/// Decimation is a plain fixed-stride sample (`step = ceil(hc.v.len() /
-/// budget)`, keep every `step`-th index), **not**
-/// `crate::chart_decimation::decimate_channel`'s bucket min/max: that
-/// function doubles point count with a `(min, max)` pair per bucket for a
-/// tile's rendering, which does not fit a host channel bound to a JS
-/// variable and plotted as a single-value-per-point line series. `v` and
-/// (when non-empty) `t` are decimated together at the same indices so a
-/// sample's value and its recorded time stay paired. `hc.t` is already in
+/// Decimation (amended 2026-11-05, C3 §3.4) is a min/max envelope chosen by
+/// [`envelope_indices`]: `budget / 2` equal time buckets, each sending its
+/// lowest and its highest sample as two ordinary samples at their own
+/// recorded times. The result is still one value per point in time order, a
+/// plain line series, so it fits a host channel bound to a JS variable; and
+/// unlike the every-Nth stride it replaced, a spike between kept samples is
+/// never dropped. A value within `budget` is sent whole. `v` and (when
+/// non-empty) `t` are picked at the same indices so a sample's value and its
+/// recorded time stay paired. `hc.t` is already in
 /// seconds by the time it reaches this function (`super::to_host_channel`
 /// does the microsecond-to-second conversion) — this encoder does not
 /// repeat it.
@@ -92,13 +93,74 @@ impl From<crate::math::ValueAxis> for AxisKind {
 /// one of them answered `Time` because that was the only shape that existed.
 /// The value knows its own axis, so the encoder asks it.
 pub fn encode_host_channel_idlh(hc: &HostChannel, budget: u32) -> Vec<u8> {
-    let budget = budget.max(1) as usize;
-    let step = hc.v.len().div_ceil(budget).max(1);
+    let has_t = !hc.t.is_empty() && hc.t.len() >= hc.v.len();
+    let keep = envelope_indices(0..hc.v.len(), &hc.v, |i| if has_t { Some(hc.t[i]) } else { None }, budget);
 
-    let v: Vec<f64> = hc.v.iter().step_by(step).copied().collect();
-    let t: Vec<f64> = if hc.t.is_empty() { Vec::new() } else { hc.t.iter().step_by(step).copied().collect() };
+    let v: Vec<f64> = keep.iter().map(|&i| hc.v[i]).collect();
+    let t: Vec<f64> = if hc.t.is_empty() { Vec::new() } else { keep.iter().filter(|&&i| i < hc.t.len()).map(|&i| hc.t[i]).collect() };
 
     write_idlh(&v, &t, hc.axis)
+}
+
+/// The indices of `range` to send for at most `budget` points: all of them
+/// when they fit, else each of `budget / 2` equal buckets' lowest and highest
+/// sample (one index when they coincide), in order. Buckets are equal spans of
+/// `time_at` when every index has a time and the span is positive, else equal
+/// runs of indices. A bucket whose values are all NaN sends its first index,
+/// so a gap stays a gap (a NaN breaks a Plot line). `v` is read only at
+/// `range`'s indices.
+fn envelope_indices(
+    range: std::ops::Range<usize>,
+    v: &[f64],
+    time_at: impl Fn(usize) -> Option<f64>,
+    budget: u32,
+) -> Vec<usize> {
+    let budget = budget.max(1) as usize;
+    let n = range.len();
+    if n <= budget {
+        return range.collect();
+    }
+    let buckets = (budget / 2).max(1);
+    let (first, last) = (range.start, range.end - 1);
+    let span = match (time_at(first), time_at(last)) {
+        (Some(a), Some(b)) if b > a => Some((a, b - a)),
+        _ => None,
+    };
+    let bucket_of = |i: usize| -> usize {
+        let f = match span.and_then(|(a, w)| time_at(i).map(|t| (t - a) / w)) {
+            Some(f) => f,
+            None => (i - first) as f64 / n as f64,
+        };
+        ((f * buckets as f64) as usize).min(buckets - 1)
+    };
+    // Per bucket: (first index, index of min, index of max).
+    let mut slots: Vec<Option<(usize, Option<usize>, Option<usize>)>> = vec![None; buckets];
+    for i in range {
+        let b = bucket_of(i);
+        let slot = slots[b].get_or_insert((i, None, None));
+        let x = v[i];
+        if x.is_nan() {
+            continue;
+        }
+        if slot.1.is_none_or(|m| x < v[m]) {
+            slot.1 = Some(i);
+        }
+        if slot.2.is_none_or(|m| x > v[m]) {
+            slot.2 = Some(i);
+        }
+    }
+    let mut out = Vec::with_capacity(budget);
+    for slot in slots.into_iter().flatten() {
+        match (slot.1, slot.2) {
+            (Some(lo), Some(hi)) if lo == hi => out.push(lo),
+            (Some(lo), Some(hi)) => {
+                out.push(lo.min(hi));
+                out.push(lo.max(hi));
+            }
+            _ => out.push(slot.0),
+        }
+    }
+    out
 }
 
 /// [`encode_host_channel_idlh`] over a [`super::HostChannelView`]: the same
@@ -107,11 +169,28 @@ pub fn encode_host_channel_idlh(hc: &HostChannel, budget: u32) -> Vec<u8> {
 /// [`HostChannel`] would hold (8 B per sample) is never built. `v` is read in
 /// place from the evaluator's own buffer.
 pub fn encode_host_channel_view_idlh(view: &super::HostChannelView, budget: u32) -> Vec<u8> {
-    let budget = budget.max(1) as usize;
-    let step = view.v.len().div_ceil(budget).max(1);
+    encode_host_channel_view_idlh_in(view, budget, None)
+}
 
-    let v: Vec<f64> = view.v.iter().step_by(step).copied().collect();
-    let t: Vec<f64> = (0..view.t_len()).step_by(step).map(|i| view.t_at(i)).collect();
+/// [`encode_host_channel_view_idlh`] over the part of `view` inside
+/// `range_us` (`t0 <= t_us < t1`, the session clock), then decimated
+/// (C3 §3.4 `fetch_host_channel_v2`'s `view`, 2026-11-05). `None`, or a
+/// value without a time axis on the session clock (no `t`, or a `[lap]`
+/// axis), sends the whole value. `t_us` is recorded time and so ascending,
+/// which the slice relies on.
+pub fn encode_host_channel_view_idlh_in(view: &super::HostChannelView, budget: u32, range_us: Option<(i64, i64)>) -> Vec<u8> {
+    let has_t = view.t_len() > 0 && view.t_len() == view.v.len();
+    let slice = match range_us {
+        Some((t0, t1)) if has_t && view.axis == super::AxisKind::Time => {
+            let t = &view.t_us[..view.t_len()];
+            t.partition_point(|&x| x < t0)..t.partition_point(|&x| x < t1)
+        }
+        _ => 0..view.v.len(),
+    };
+    let keep = envelope_indices(slice, &view.v, |i| if has_t { Some(view.t_at(i)) } else { None }, budget);
+
+    let v: Vec<f64> = keep.iter().map(|&i| view.v[i]).collect();
+    let t: Vec<f64> = keep.iter().filter(|&&i| i < view.t_len()).map(|&i| view.t_at(i)).collect();
 
     write_idlh(&v, &t, view.axis)
 }
@@ -209,8 +288,8 @@ mod tests {
     }
 
     #[test]
-    fn encode_host_channel_idlh_source_exceeds_budget_decimates_to_at_most_budget_points() {
-        // Arrange — 10 samples, budget 3: step = ceil(10/3) = 4, indices 0,4,8 -> 3 points.
+    fn encode_host_channel_idlh_source_exceeds_budget_decimates_to_at_most_budget_points_keeping_the_extremes() {
+        // Arrange — 10 rising samples, budget 3: one bucket, its min (index 0) and max (index 9).
         let v: Vec<f64> = (0..10).map(|i| i as f64).collect();
         let t: Vec<f64> = (0..10).map(|i| i as f64 * 0.1).collect();
         let hc = HostChannel { length: 10, t, v, unit: crate::math::units::UnitLabel::Dimensionless, axis: AxisKind::Time };
@@ -218,18 +297,64 @@ mod tests {
         // Act
         let bytes = encode_host_channel_idlh(&hc, 3);
 
-        // Assert
+        // Assert — paired: each value sits beside its own time.
         let length = read_u32(&bytes, 8);
-        let t_length = read_u32(&bytes, 12);
-        assert!(length <= 3, "length must not exceed budget");
-        assert_eq!(length, t_length, "v and t decimated together, same point count");
-        assert_eq!(length, 3, "fixed stride 4 over 10 samples lands exactly on budget here");
-
-        // paired: value at index i must match the value at the same source index as its time
+        assert_eq!(length, read_u32(&bytes, 12), "v and t decimated together");
+        assert_eq!(length, 2);
         assert_eq!(read_f64(&bytes, 24), 0.0); // t[0]
-        assert_eq!(read_f64(&bytes, 24 + 3 * 8), 0.0); // v[0]
-        assert_eq!(read_f64(&bytes, 24 + 8), 0.4); // t[4]
-        assert_eq!(read_f64(&bytes, 24 + 3 * 8 + 8), 4.0); // v[4]
+        assert_eq!(read_f64(&bytes, 24 + 8), 0.9); // t[9]
+        assert_eq!(read_f64(&bytes, 24 + 2 * 8), 0.0); // v[0]
+        assert_eq!(read_f64(&bytes, 24 + 2 * 8 + 8), 9.0); // v[9]
+    }
+
+    #[test]
+    fn encode_host_channel_view_idlh_a_one_sample_spike_survives_decimation() {
+        // Arrange — 1000 samples of 1.0 with a single 9.0 at index 577; budget 40.
+        let mut v = vec![1.0; 1000];
+        v[577] = 9.0;
+        let t_us: Vec<i64> = (0..1000).map(|i| i * 1000).collect();
+        let view = super::super::HostChannelView::new(t_us.into(), v.into(), crate::math::units::UnitLabel::Dimensionless, crate::math::ValueAxis::Time);
+
+        // Act
+        let bytes = encode_host_channel_view_idlh(&view, 40);
+
+        // Assert — the spike and its time are sent; the stride it replaced kept every 25th sample and missed it.
+        let n = read_u32(&bytes, 8) as usize;
+        assert!(n <= 40);
+        let t: Vec<f64> = (0..n).map(|k| read_f64(&bytes, 24 + k * 8)).collect();
+        let v: Vec<f64> = (0..n).map(|k| read_f64(&bytes, 24 + n * 8 + k * 8)).collect();
+        let at = v.iter().position(|&x| x == 9.0).expect("spike kept");
+        assert_eq!(t[at], 0.577);
+        assert!(t.windows(2).all(|w| w[0] < w[1]), "time order kept");
+    }
+
+    #[test]
+    fn encode_host_channel_view_idlh_in_a_view_range_sends_only_that_part_at_full_detail() {
+        // Arrange — 10 000 samples at 1 kHz; a 50 ms view holds 50 of them, under budget 1000.
+        let v: Vec<f64> = (0..10_000).map(|i| i as f64).collect();
+        let t_us: Vec<i64> = (0..10_000).map(|i| i * 1000).collect();
+        let view = super::super::HostChannelView::new(t_us.into(), v.into(), crate::math::units::UnitLabel::Dimensionless, crate::math::ValueAxis::Time);
+
+        // Act
+        let bytes = encode_host_channel_view_idlh_in(&view, 1000, Some((4_000_000, 4_050_000)));
+
+        // Assert — samples 4000..4050, every one.
+        assert_eq!(read_u32(&bytes, 8), 50);
+        assert_eq!(read_f64(&bytes, 24), 4.0);
+        assert_eq!(read_f64(&bytes, 24 + 50 * 8), 4000.0);
+        assert_eq!(read_f64(&bytes, 24 + 50 * 8 + 49 * 8), 4049.0);
+    }
+
+    #[test]
+    fn encode_host_channel_view_idlh_in_a_lap_axis_ignores_the_view() {
+        // Arrange — three laps; a view in µs means nothing on a lap axis.
+        let view = super::super::HostChannelView::new(vec![1i64, 2, 3].into(), vec![60.0, 58.0, 59.0].into(), crate::math::units::UnitLabel::Dimensionless, crate::math::ValueAxis::Lap);
+
+        // Act
+        let bytes = encode_host_channel_view_idlh_in(&view, 100, Some((0, 1)));
+
+        // Assert
+        assert_eq!(read_u32(&bytes, 8), 3);
     }
 
     #[test]

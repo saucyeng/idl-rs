@@ -761,6 +761,61 @@ fn combine_t_us(op_name: &str, a: &Arc<[i64]>, b: &Arc<[i64]>) -> Result<Arc<[i6
     ))
 }
 
+/// `keep(x, cond)`: the samples of `x` where `cond` is non-zero (and not
+/// NaN), at `x`'s own recorded coordinates, as an event channel (rate 0).
+/// The one builtin that shortens a channel by a condition: `where` keeps
+/// every sample and only changes values, so an event list (traction breaks,
+/// stops, flights) had no way to come out of the engine as a short series.
+/// `cond` pairs with `x` sample for sample as any binary operation does
+/// (same length, same time axis per [`combine_t_us`]); a scalar `cond`
+/// keeps all or nothing. `x` must carry its coordinates (`t_us`), because
+/// a kept sample is meaningless without saying where it was. The axis kind
+/// is `x`'s, so `keep` over a `[lap]` value keeps laps.
+fn keep_where(x: &ChannelValue, cond: &Value) -> Result<Value, MathEvalError> {
+    const NAME: &str = "keep";
+    if x.t_us.is_empty() || x.t_us.len() != x.samples.len() {
+        return Err(err(
+            MathEvalErrorKind::Runtime,
+            format!("\"{NAME}(x, cond)\": x ({}) carries no per-sample times, so a kept sample could not say when it was", describe_channel(x)),
+        ));
+    }
+    let keep_at: Box<dyn Fn(usize) -> bool> = match cond {
+        Value::Scalar(c) => {
+            let all = *c != 0.0 && !c.is_nan();
+            Box::new(move |_| all)
+        }
+        Value::Channel(c) => {
+            if let Some(s) = stored_scalar(&c.samples, c.sample_rate_hz, &c.t_us) {
+                let all = s != 0.0 && !s.is_nan();
+                Box::new(move |_| all)
+            } else {
+                if c.samples.len() != x.samples.len() {
+                    return Err(err(
+                        MathEvalErrorKind::Runtime,
+                        format!(
+                            "\"{NAME}(x, cond)\": cond has {} samples and x has {}; they must pair sample for sample. Put cond on x's time axis first: resample(cond, x).",
+                            c.samples.len(),
+                            x.samples.len()
+                        ),
+                    ));
+                }
+                combine_t_us(NAME, &x.t_us, &c.t_us)?;
+                let samples = c.samples.clone();
+                Box::new(move |i| samples[i] != 0.0 && !samples[i].is_nan())
+            }
+        }
+        other => return Err(err(MathEvalErrorKind::Type, format!("\"{NAME}(x, cond)\": cond must be a channel or a number, got {}", type_name(other)))),
+    };
+    let kept: Vec<usize> = (0..x.samples.len()).filter(|&i| keep_at(i)).collect();
+    Ok(Value::Channel(ChannelValue {
+        samples: kept.iter().map(|&i| x.samples[i]).collect(),
+        sample_rate_hz: 0.0,
+        channel_id: None,
+        t_us: kept.iter().map(|&i| x.t_us[i]).collect(),
+        axis: x.axis,
+    }))
+}
+
 /// `resample(x, onto)` (ruling R242): linear interpolation of channel `x` onto
 /// channel `onto`'s own per-sample time axis. The result carries `onto`'s axis
 /// (`t_us`), `onto`'s sample rate and `onto`'s length, so it pairs sample for
@@ -2032,6 +2087,11 @@ fn call_function(
             let samples: Vec<f64> = (0..kept.len()).map(|k| first + k as f64).collect();
             let times: Arc<[i64]> = kept.iter().map(|&i| t_us[i]).collect();
             Ok(channel(samples, 0.0, times))
+        }
+        "keep" => {
+            require_arg_count(name, &args, 2)?;
+            let x = require_channel(&args[0], name)?;
+            keep_where(&x, &args[1])
         }
         "spectrogram" | "envelope" | "correlate" | "convolve" | "sosfilt" => {
             Err(err(MathEvalErrorKind::NotImplemented, format!("not yet implemented: {name}")))
@@ -4735,6 +4795,71 @@ mod tests {
     }
 
     // ---- resample(x, onto) (R242) ----
+
+    #[test]
+    fn keep_a_condition_on_the_same_axis_keeps_those_samples_at_their_times_as_an_event_channel() {
+        // Arrange — a 1 kHz channel and a condition true at samples 1 and 3.
+        let lk = timed(&[("x", vec![1.0, 5.0, 2.0, 7.0], 1000.0, vec![0, 1000, 2000, 3000])]);
+
+        // Act
+        let v = eval_expr("keep([x], [x] > 4)", &lk).unwrap();
+
+        // Assert
+        match v {
+            Value::Channel(c) => {
+                assert_eq!(c.samples.as_ref(), &[5.0, 7.0]);
+                assert_eq!(c.t_us.as_ref(), &[1000, 3000]);
+                assert_eq!(c.sample_rate_hz, 0.0);
+                assert_eq!(c.axis, ValueAxis::Time);
+            }
+            other => panic!("expected a channel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keep_nothing_true_is_an_empty_channel_not_an_error() {
+        // Arrange
+        let lk = timed(&[("x", vec![1.0, 2.0], 1000.0, vec![0, 1000])]);
+
+        // Act
+        let v = eval_expr("keep([x], [x] > 9)", &lk).unwrap();
+
+        // Assert
+        match v {
+            Value::Channel(c) => assert!(c.samples.is_empty() && c.t_us.is_empty()),
+            other => panic!("expected a channel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keep_a_condition_on_another_axis_is_a_typed_error_naming_resample() {
+        // Arrange — same length, different times.
+        let lk = timed(&[
+            ("x", vec![1.0, 2.0], 1000.0, vec![0, 1000]),
+            ("c", vec![1.0, 1.0], 1000.0, vec![500, 1500]),
+        ]);
+
+        // Act
+        let e = eval_expr("keep([x], [c])", &lk).unwrap_err();
+
+        // Assert
+        assert!(e.message.contains("resample"), "{}", e.message);
+    }
+
+    #[test]
+    fn keep_a_condition_of_another_length_is_a_typed_error() {
+        // Arrange
+        let lk = timed(&[
+            ("x", vec![1.0, 2.0, 3.0], 1000.0, vec![0, 1000, 2000]),
+            ("c", vec![1.0, 1.0], 1000.0, vec![0, 1000]),
+        ]);
+
+        // Act
+        let e = eval_expr("keep([x], [c])", &lk).unwrap_err();
+
+        // Assert
+        assert!(e.message.contains("pair sample for sample"), "{}", e.message);
+    }
 
     #[test]
     fn resample_onto_another_axis_interpolates_linearly_and_takes_that_axis() {

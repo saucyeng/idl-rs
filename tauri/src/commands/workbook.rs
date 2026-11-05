@@ -858,9 +858,19 @@ fn fetch_host_channel_v2_via(
     window: Option<&crate::session_source::WindowDto>,
     def_name: &str,
     budget: u32,
+    view: Option<&HostChannelViewRange>,
 ) -> Result<Vec<u8>, IpcError> {
     if !(1..=65536).contains(&budget) {
         return Err(IpcError::new(IpcErrorKind::InvalidArgument, format!("budget {budget} outside 1..=65536")));
+    }
+    if let Some(r) = view {
+        if r.t0_us >= r.t1_us {
+            return Err(IpcError::with_detail(
+                IpcErrorKind::InvalidArgument,
+                format!("view must have t0_us < t1_us, got {}..{}", r.t0_us, r.t1_us),
+                serde_json::json!({ "t0_us": r.t0_us, "t1_us": r.t1_us }),
+            ));
+        }
     }
 
     let path = resolve_workbook_path(data_dir, id)?;
@@ -926,7 +936,19 @@ fn fetch_host_channel_v2_via(
     // numbers as its `t`. This call site no longer chooses — choosing is what
     // made every definition claim seconds regardless of its shape. Encoded
     // from the kept value in place: only the emitted points are converted.
-    Ok(idl_rs::workbook::v3::encode_host_channel_view_idlh(hc, budget))
+    // `view` slices what is sent, never what was evaluated (C3 §3.4,
+    // 2026-11-05).
+    Ok(idl_rs::workbook::v3::encode_host_channel_view_idlh_in(hc, budget, view.map(|r| (r.t0_us, r.t1_us))))
+}
+
+/// `fetch_host_channel_v2`'s optional `view` (C3 §3.4, 2026-11-05): the part
+/// of an evaluated definition to send, µs on the window's session clock,
+/// `t0_us <= t < t1_us`. The definition is still evaluated over the whole
+/// window; this only chooses which samples are decimated and sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub struct HostChannelViewRange {
+    pub t0_us: i64,
+    pub t1_us: i64,
 }
 
 /// One planned, admitted evaluation (evaluation-memory spec §4.2.B and
@@ -1442,8 +1464,9 @@ pub fn fetch_host_channel_v2(
     window: Option<WindowDto>,
     def_name: String,
     budget: u32,
+    view: Option<HostChannelViewRange>,
 ) -> Result<tauri::ipc::Response, IpcError> {
-    let bytes = fetch_host_channel_v2_via(&cache, &data_dir.0, &workbook_id, window.as_ref(), &def_name, budget)?;
+    let bytes = fetch_host_channel_v2_via(&cache, &data_dir.0, &workbook_id, window.as_ref(), &def_name, budget, view.as_ref())?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -2649,7 +2672,7 @@ version: 3
         let opened = eval_workbook_v2_via(&cache, &root, WB_ID, std::slice::from_ref(&window)).unwrap();
 
         // Act
-        let bytes = fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 100).unwrap();
+        let bytes = fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 100, None).unwrap();
 
         // Assert — the open kept only its length; the fetch got the values.
         let WindowEval::Ok { ok } = &opened[0] else { panic!("open failed: {:?}", opened[0]) };
@@ -2680,7 +2703,7 @@ version: 3
         cache.invalidate_all();
 
         // Act
-        fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 100).unwrap();
+        fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 100, None).unwrap();
 
         // Assert — only ChanA decoded for the closure; both evaluations kept.
         assert!(cache.is_resident("s1", "ChanA"));
@@ -3290,7 +3313,7 @@ version: 3
 
         // Act
         let v2 = eval_workbook_v2_via(&SessionCache::new(), &root, WB_ID, std::slice::from_ref(&window)).unwrap();
-        let bytes = fetch_host_channel_v2_via(&SessionCache::new(), &root, WB_ID, Some(&window), "x", 65536).unwrap();
+        let bytes = fetch_host_channel_v2_via(&SessionCache::new(), &root, WB_ID, Some(&window), "x", 65536, None).unwrap();
 
         // Assert — same window, same definition, same value: `eval_workbook_v2`'s
         // marker (length/has_t) matches the decoded `IDLH` bytes, and both
@@ -3341,7 +3364,7 @@ version: 3
         // Act
         let fetched: Vec<Vec<u8>> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..7)
-                .map(|_| scope.spawn(|| fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 65536).unwrap()))
+                .map(|_| scope.spawn(|| fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 65536, None).unwrap()))
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
@@ -3367,7 +3390,7 @@ version: 3
         // Act
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..7)
-                .map(|_| scope.spawn(|| fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 65536).unwrap()))
+                .map(|_| scope.spawn(|| fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 65536, None).unwrap()))
                 .collect();
             for h in handles {
                 h.join().unwrap();
@@ -3389,13 +3412,13 @@ version: 3
         write_workbook(&root, "test.idl1wb", &registry_workbook(""));
         let window = lap_three_window();
         let cache = SessionCache::new();
-        fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 65536).unwrap();
-        fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 65536).unwrap();
+        fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 65536, None).unwrap();
+        fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "x", 65536, None).unwrap();
         assert_eq!(cache.evals().runs(), 1, "unchanged bytes are served from the kept evaluation");
 
         // Act — the same definition, a different document.
         write_workbook(&root, "test.idl1wb", &registry_workbook("y = 2 + 3\n"));
-        let after = fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "y", 65536).unwrap();
+        let after = fetch_host_channel_v2_via(&cache, &root, WB_ID, Some(&window), "y", 65536, None).unwrap();
 
         // Assert
         assert_eq!(cache.evals().runs(), 2);
@@ -3416,7 +3439,7 @@ version: 3
 
         // Act
         let via = fetch_host_channel_via(&SessionCache::new(), &root, WB_ID, None, "x", 100).unwrap();
-        let v2 = fetch_host_channel_v2_via(&SessionCache::new(), &root, WB_ID, None, "x", 100).unwrap();
+        let v2 = fetch_host_channel_v2_via(&SessionCache::new(), &root, WB_ID, None, "x", 100, None).unwrap();
 
         // Assert
         assert_eq!(via, v2);
@@ -3430,7 +3453,22 @@ version: 3
         let root = temp_root();
 
         // Act
-        let err = fetch_host_channel_v2_via(&SessionCache::new(), &root, WB_ID, None, "x", 0).unwrap_err();
+        let err = fetch_host_channel_v2_via(&SessionCache::new(), &root, WB_ID, None, "x", 0, None).unwrap_err();
+
+        // Assert
+        assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_host_channel_v2_via_a_view_that_ends_before_it_starts_invalid_argument() {
+        // Arrange
+        let root = temp_root();
+        let view = HostChannelViewRange { t0_us: 2_000_000, t1_us: 1_000_000 };
+
+        // Act
+        let err = fetch_host_channel_v2_via(&SessionCache::new(), &root, WB_ID, None, "x", 100, Some(&view)).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
@@ -3454,7 +3492,7 @@ version: 3
         };
 
         // Act
-        let err = fetch_host_channel_v2_via(&SessionCache::new(), &root, WB_ID, Some(&window), "x", 100).unwrap_err();
+        let err = fetch_host_channel_v2_via(&SessionCache::new(), &root, WB_ID, Some(&window), "x", 100, None).unwrap_err();
 
         // Assert
         assert_eq!(err.kind, IpcErrorKind::InvalidArgument);
