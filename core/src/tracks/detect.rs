@@ -362,4 +362,35 @@ mod tests {
         assert!(detect_visits(&many, &[], VisitParams::default()).is_empty());
     }
 
+    #[test]
+    fn detect_visits_walden_moto_1_with_the_pit_exit_as_out_lap_gate_is_one_visit_led_by_an_out_lap() {
+        // Arrange — moto 1 at Walden (1 Hz GPS), and Walden '26 given the
+        // Walden Out Lap '26 start gate (pit exit) as its out-lap gate: the
+        // migration the track-matching spec describes.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
+        let handle = SessionHandle::from_path(&format!("{dir}walden-moto1-gps.idl0")).expect("fixture parses");
+        let read = |name: &str| crate::track_artifact::read_track(std::path::Path::new(&format!("{dir}{name}")));
+        let mut walden = read("walden-26.idl1t").expect("Walden '26 reads");
+        let Some(LapTiming::PointToPoint { start: pit_exit, .. }) = read("walden-outlap-26.idl1t").expect("out lap reads").timing
+        else {
+            panic!("Walden Out Lap '26 is point-to-point");
+        };
+        if let Some(LapTiming::Circuit { out_lap_gate, .. }) = &mut walden.timing {
+            *out_lap_gate = Some(pit_exit);
+        }
+        let timing = walden.timing.clone().expect("Walden '26 has timing");
+
+        // Act
+        let visits = detect_visits(&handle, &[walden.track_ref()], VisitParams::default());
+        let window = (visits[0].start_timestamp_ms, visits[0].end_timestamp_ms);
+        let laps = crate::laps::detect_laps(&handle, &timing, &walden.sector_gates, &walden.neutral_zones, Some(window));
+
+        // Assert — one visit: the out lap from pit exit, then the moto's
+        // three start/finish-to-start/finish laps.
+        use crate::laps::LapKind::{Normal, Out};
+        assert_eq!(visits.len(), 1);
+        assert_eq!(laps.iter().map(|l| l.kind).collect::<Vec<_>>(), vec![Out, Normal, Normal, Normal]);
+        assert_eq!(laps.iter().map(|l| l.lap_time_ms).collect::<Vec<_>>(), vec![177_667, 166_131, 155_250, 152_674]);
+        assert_eq!(window, (laps[0].start_ms, laps[3].end_ms));
+    }
 }

@@ -8,8 +8,9 @@ repository = "https://github.com/saucyeng/idl-rs"
 readme = "README.md"
 keywords = ["telemetry", "signal-processing", "parquet", "datalogger", "imu"]
 categories = ["science", "parser-implementations"]
-# A real ride excerpt (3.4 MB) for the diagnostics in examples/; not shipped to crates.io.
-exclude = ["tests/fixtures/walden-*.idl0"]
+# Real Walden rides (a 3.4 MB excerpt for the diagnostics in examples/, a GPS-only moto and its
+# two tracks for the track-matching test); not shipped to crates.io.
+exclude = ["tests/fixtures/walden-*.idl0", "tests/fixtures/walden-*.idl1t"]
 
 [lib]
 name = "idl_rs"
