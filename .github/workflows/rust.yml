@@ -5,9 +5,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      # .cargo/config.toml pins target-dir to a Windows path shared across the
-      # dev machine's worktrees; on Linux that path cannot be joined into
-      # LD_LIBRARY_PATH. The env var overrides it.
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v4
@@ -22,3 +19,11 @@ jobs:
       # and are tested there; nothing here needs Tauri's system packages.
       - name: cargo test -p idl-rs -p idl-library -p idl-rs-cli
         run: cargo test -p idl-rs -p idl-library -p idl-rs-cli -- --test-threads=4
+
+      # The two references are generated from the engine's own tables, so a
+      # builtin or command changed without regenerating them fails here.
+      - name: Generated references are up to date
+        run: |
+          cargo run -q -p idl-rs-cli -- docs workbook --out docs/WORKBOOK-REFERENCE.md --src docs/reference-src
+          cargo run -q -p idl-rs-cli -- docs cli --out docs/CLI-REFERENCE.md
+          git diff --exit-code -- docs/WORKBOOK-REFERENCE.md docs/CLI-REFERENCE.md
