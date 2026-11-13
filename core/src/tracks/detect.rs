@@ -1,8 +1,8 @@
 //! Multi-track visit detection: the gates decide, the polyline confirms.
 //! Candidate runs come from each track's gate crossings (`laps::detect_runs`);
 //! a run counts for its track when enough of its time lies near the track's
-//! polyline; where confirmed runs of two tracks overlap, the closer fit keeps
-//! the overlap; consecutive surviving runs of one track make a visit. A moment
+//! polyline; where confirmed runs of two tracks overlap, the closer fit wins;
+//! consecutive surviving runs of one track make a visit. A moment
 //! no surviving run covers belongs to no track. Identity (`visit_id`) is
 //! assigned by the caller — this function is pure and deterministic.
 
@@ -21,11 +21,14 @@ pub struct VisitParams {
     /// A run is confirmed when at least this fraction of its time (0..=1,
     /// time-weighted) is on track.
     pub min_on_track_fraction: f64,
+    /// Runs of two tracks overlapping for less than this are no conflict
+    /// (they meet at a shared gate line), seconds.
+    pub min_conflict_s: f64,
 }
 
 impl Default for VisitParams {
     fn default() -> Self {
-        Self { threshold_m: 30.0, min_on_track_fraction: 0.8 }
+        Self { threshold_m: 30.0, min_on_track_fraction: 0.8, min_conflict_s: 2.0 }
     }
 }
 
@@ -107,27 +110,29 @@ pub fn detect_visits(handle: &SessionHandle, tracks: &[TrackRef], params: VisitP
         candidates.push(Candidate { track_id: &t.track_id, dist_sq, runs, confirmed });
     }
 
-    // 2. Overlaps go to the closer track: a confirmed run is dropped when an
-    //    overlapping confirmed run of another track has the smaller mean
-    //    squared distance over the overlap (ties to the smaller track id).
+    // 2. Overlaps go to the closer track, greedily: confirmed runs in order
+    //    of mean squared distance to their own polyline over the run
+    //    (ascending, ties to the smaller track id), each accepted unless it
+    //    overlaps an already accepted run of another track by at least
+    //    `min_conflict_s`. Only accepted runs exclude others, so a run that
+    //    lost is never the reason a third one loses too.
     //    3. The survivors, as (start, candidate, run index, end), in time order.
-    let mut kept: Vec<(i64, usize, usize, i64)> = Vec::new();
+    let mut order: Vec<(f64, &str, i64, usize, usize)> = Vec::new();
     for (ci, c) in candidates.iter().enumerate() {
         for (ri, r) in c.runs.iter().enumerate().filter(|&(ri, _)| c.confirmed[ri]) {
-            let loses = candidates.iter().enumerate().filter(|&(oi, _)| oi != ci).any(|(_, o)| {
-                o.runs.iter().zip(&o.confirmed).any(|(q, &ok)| {
-                    let (s, e) = (r.start_ms.max(q.start_ms), r.end_ms.min(q.end_ms));
-                    if !ok || s >= e {
-                        return false;
-                    }
-                    let mine = time_mean(&gps, &c.dist_sq, s, e).unwrap_or(f64::INFINITY);
-                    let theirs = time_mean(&gps, &o.dist_sq, s, e).unwrap_or(f64::INFINITY);
-                    theirs < mine || (theirs == mine && o.track_id < c.track_id)
-                })
-            });
-            if !loses {
-                kept.push((r.start_ms, ci, ri, r.end_ms));
-            }
+            let msd = time_mean(&gps, &c.dist_sq, r.start_ms, r.end_ms).unwrap_or(f64::INFINITY);
+            order.push((msd, c.track_id, r.start_ms, ci, ri));
+        }
+    }
+    order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)).then(a.2.cmp(&b.2)));
+    let min_conflict_ms = (params.min_conflict_s * 1000.0).round() as i64;
+    let mut kept: Vec<(i64, usize, usize, i64)> = Vec::new();
+    for (_, _, _, ci, ri) in order {
+        let r = candidates[ci].runs[ri];
+        let conflicts =
+            kept.iter().any(|&(s, oc, _, e)| oc != ci && r.end_ms.min(e) - r.start_ms.max(s) >= min_conflict_ms);
+        if !conflicts {
+            kept.push((r.start_ms, ci, ri, r.end_ms));
         }
     }
     kept.sort();
@@ -392,5 +397,53 @@ mod tests {
         assert_eq!(laps.iter().map(|l| l.kind).collect::<Vec<_>>(), vec![Out, Normal, Normal, Normal]);
         assert_eq!(laps.iter().map(|l| l.lap_time_ms).collect::<Vec<_>>(), vec![177_667, 166_131, 155_250, 152_674]);
         assert_eq!(window, (laps[0].start_ms, laps[3].end_ms));
+    }
+
+    #[test]
+    fn detect_visits_walden_moto_1_before_the_migration_the_out_lap_track_keeps_the_out_lap() {
+        // Arrange — the chain case: Walden '26 with the pit-exit gate AND
+        // Walden Out Lap '26. The out-lap track's run fits the out lap closer
+        // than Walden '26's out lap does, and overlaps Walden '26's lap 2 by
+        // 21 ms at the finish line — no conflict, so nobody loses the out lap.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
+        let handle = SessionHandle::from_path(&format!("{dir}walden-moto1-gps.idl0")).expect("fixture parses");
+        let read = |name: &str| crate::track_artifact::read_track(std::path::Path::new(&format!("{dir}{name}")));
+        let mut walden = read("walden-26.idl1t").expect("Walden '26 reads");
+        let out_lap = read("walden-outlap-26.idl1t").expect("out lap reads");
+        let Some(LapTiming::PointToPoint { start: pit_exit, .. }) = out_lap.timing.clone() else {
+            panic!("Walden Out Lap '26 is point-to-point");
+        };
+        if let Some(LapTiming::Circuit { out_lap_gate, .. }) = &mut walden.timing {
+            *out_lap_gate = Some(pit_exit);
+        }
+
+        // Act
+        let visits = detect_visits(&handle, &[walden.track_ref(), out_lap.track_ref()], VisitParams::default());
+
+        // Assert — the out lap to the out-lap track, laps 2..4 to Walden '26.
+        let got: Vec<(&str, i64, i64)> =
+            visits.iter().map(|v| (v.track_id.as_str(), v.start_timestamp_ms, v.end_timestamp_ms)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (out_lap.id.as_str(), 1_794_065_781_154, 1_794_065_958_842),
+                (walden.id.as_str(), 1_794_065_958_821, 1_794_066_432_876),
+            ]
+        );
+    }
+
+    #[test]
+    fn detect_visits_runs_meeting_at_a_shared_gate_line_overlapping_under_2_s_are_no_conflict() {
+        // Arrange — trail X ends at north 400; trail Y starts at north 395,
+        // so at 10 m/s their runs overlap for 0.5 s.
+        let x = point_to_point("X", &[(0.0, 0.0), (500.0, 0.0)], across(100.0, 0.0), across(400.0, 0.0));
+        let y = point_to_point("Y", &[(390.0, 0.0), (900.0, 0.0)], across(395.0, 0.0), across(800.0, 0.0));
+
+        // Act
+        let v = detect_visits(&ride(&[(0.0, 0.0), (900.0, 0.0)]), &[x, y], VisitParams::default());
+
+        // Assert — both kept.
+        assert_eq!(v.iter().map(|v| v.track_id.as_str()).collect::<Vec<_>>(), vec!["X", "Y"]);
+        assert_eq!(v[0].end_timestamp_ms - v[1].start_timestamp_ms, 500);
     }
 }
