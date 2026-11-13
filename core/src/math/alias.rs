@@ -30,7 +30,6 @@ pub enum MigrationKind {
     /// The call is re-spelled; its arguments are untouched.
     Rename,
     /// The call is re-spelled *and* its arguments change shape.
-    #[allow(dead_code)] // no table entry uses this yet (task 6 will)
     Rewrite,
 }
 

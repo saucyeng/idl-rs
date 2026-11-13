@@ -307,29 +307,6 @@ impl Channel {
         }
     }
 
-    /// Like [`Channel::from_f64_with_times`], but with an explicit,
-    /// possibly-different `t_recorded_us` (post burst-seam-correction
-    /// construction path — Task 6).
-    pub fn from_f64_corrected(
-        channel_id: impl Into<String>,
-        nominal_rate_hz: f64,
-        samples: Vec<f64>,
-        t_us: Vec<i64>,
-        t_recorded_us: Vec<i64>,
-        source_kind: impl Into<String>,
-    ) -> Self {
-        Channel {
-            channel_id: channel_id.into(),
-            t_us,
-            t_recorded_us: Some(t_recorded_us),
-            nominal_rate_hz,
-            column: RawColumn::F64(samples),
-            source_kind: source_kind.into(),
-            unit: String::new(),
-            gaps: Vec::new(),
-        }
-    }
-
     /// Sets `unit` (builder-style, since every other constructor defaults it
     /// to empty — most callers that care about a real unit are the parser,
     /// which knows it only after construction, from the channel registry).

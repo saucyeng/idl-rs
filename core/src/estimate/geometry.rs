@@ -31,13 +31,6 @@ pub struct ImuPose {
     pub lever: Vector3<f64>,
 }
 
-impl ImuPose {
-    /// An IMU mounted coincident with and aligned to the chassis frame.
-    pub fn aligned_at_origin() -> Self {
-        ImuPose { mount: UnitQuaternion::identity(), lever: Vector3::zeros() }
-    }
-}
-
 /// A rear axle path sampled as (travel arc-length `s` in metres, axle position in
 /// the chassis frame in metres, relative to the neutral axle location). The
 /// **tangent** `t(s) = d(position)/ds` (normalized) is the measurement/parameter

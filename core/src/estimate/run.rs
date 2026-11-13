@@ -371,11 +371,6 @@ impl StateEstimate {
     pub fn front_dynamic_sag(&self) -> Option<f64> {
         median_where(&self.front_travel, &self.stationary)
     }
-
-    /// Dynamic sag for the rear wheel, m (see [`StateEstimate::front_dynamic_sag`]).
-    pub fn rear_dynamic_sag(&self) -> Option<f64> {
-        median_where(&self.rear_travel, &self.stationary)
-    }
 }
 
 /// Median of `values` at indices where `stationary` is false (riding samples).

@@ -516,13 +516,6 @@ pub fn read_info(bytes: &[u8]) -> Result<Mp4Info, VideoError> {
     read_info_from(&mut Cursor::new(bytes))
 }
 
-/// Container facts of a file on disk, reading only its `moov`.
-pub fn read_info_path(path: &Path) -> Result<Mp4Info, VideoError> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| VideoError::io(format!("open {}: {e}", path.display())))?;
-    read_info_from(&mut file)
-}
-
 /// Extract every `gpmd` sample (payload + decode time) from in-memory
 /// MP4/MOV bytes.
 pub fn read_gpmd_samples(bytes: &[u8]) -> Result<Vec<GpmdSample>, VideoError> {

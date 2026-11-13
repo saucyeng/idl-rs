@@ -19,7 +19,7 @@ use super::rigid::{
     AccelBiasDifference, Body, CalibrationRecord, CalibrationSource, ExcitationShortfall,
     MountOrigin, Quality, SensorCalibration,
 };
-use nalgebra::{Quaternion, UnitQuaternion, Vector3};
+use nalgebra::{UnitQuaternion, Vector3};
 
 /// One session's `calibration.*` block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -233,23 +233,6 @@ impl From<&CalibrationRecord> for CalibrationJson {
             steer_datum: quaternion_array(&record.steer_datum),
             quality: QualityJson::from(&record.quality),
         }
-    }
-}
-
-impl CalibrationJson {
-    /// The record as a quaternion, in the form the estimator consumes. Only
-    /// the fields a consumer of the *calibration* needs come back; the quality
-    /// block stays in the JSON, where a reviewer reads it.
-    pub fn mount_of(&self, imu_index: u8) -> Option<UnitQuaternion<f64>> {
-        let sensor = self.sensors.iter().find(|s| s.imu_index == imu_index)?;
-        let [w, x, y, z] = sensor.mount;
-        Some(UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z)))
-    }
-
-    /// The lever arm of `imu_index`, metres, when one was measured.
-    pub fn lever_of(&self, imu_index: u8) -> Option<Vector3<f64>> {
-        let sensor = self.sensors.iter().find(|s| s.imu_index == imu_index)?;
-        sensor.lever_m.map(Vector3::from)
     }
 }
 

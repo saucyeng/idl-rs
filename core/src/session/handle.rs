@@ -441,13 +441,6 @@ impl SessionHandle {
         }
     }
 
-    /// `true` when this handle decodes channels on demand ([`Self::lazy`])
-    /// rather than holding them all. The accessors documented as eager-only
-    /// ([`Self::channel_data`]) are the reason a caller would ask.
-    pub fn is_lazy(&self) -> bool {
-        self.lazy.is_some()
-    }
-
     /// Compact summary for the catalog / library list.
     ///
     /// On a lazy handle ([`Self::lazy`]) `channel_count` comes from the

@@ -3,7 +3,6 @@
 //! Direct port of the helpers in `app/test/data/binary_parser_test.dart` so the
 //! Rust parser is exercised against byte-identical inputs and the same expected
 //! outputs — the parity gate for the Dart→Rust migration.
-#![allow(dead_code)]
 
 /// 2024-01-01 12:00:00 UTC in ms since Unix epoch (the Dart `_rmcUtcMs`).
 pub const RMC_UTC_MS: i64 = 1_704_110_400_000;
