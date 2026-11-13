@@ -2159,7 +2159,12 @@ its column's `template`; a column with no template renders empty.
 `mainRowId` names the row `main({col[]})` compares against. The literal
 `"fastest"` is reserved for derived rows: the row with the smallest recorded
 `lap_time()`, skipping any lap with no recorded time, ties going to the first.
-It is highlighted in the grid. Under `rowSource: "authored"` the word is a
+It is highlighted in the grid. Out laps, in laps and ignored laps are never
+`"fastest"`: they keep their rows, but the pick skips them. A track with an
+out-lap gate (pit exit) times the lap from that gate to the first
+start/finish crossing and marks it out (`kind: "out"` in `session.json`); a
+track with an in-lap gate (pit entry) marks the lap that ends there in. A lap
+is ignored with `idl-rs session set-meta <id> --ignore-lap <n>`. Under `rowSource: "authored"` the word is a
 validation error rather than a silently unset baseline — an authored table's
 rows are named, so a magic id there would shadow a real row id.
 
