@@ -49,16 +49,6 @@ pub enum ValueKind {
 }
 
 impl ValueKind {
-    /// The placeholder the help text and the generated Markdown print.
-    pub fn placeholder(self) -> &'static str {
-        match self {
-            ValueKind::Path => "<path>",
-            ValueKind::Text => "<text>",
-            ValueKind::Integer => "<n>",
-            ValueKind::Choice => "<choice>",
-        }
-    }
-
     /// The wire name used in the JSON export and the Markdown table.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -286,13 +276,15 @@ pub const VERBS_RULED: &[(&str, &str)] = &[
     ("note", "R251"),
 ];
 
-/// Whether `verb` is in either vocabulary.
-pub fn verb_is_known(verb: &str) -> bool {
+/// Whether `verb` is in either vocabulary (the table's own vocabulary tests).
+#[cfg(test)]
+fn verb_is_known(verb: &str) -> bool {
     VERBS.contains(&verb) || VERBS_RULED.iter().any(|(v, _)| *v == verb)
 }
 
 /// Whether `noun` is in [`NOUNS`].
-pub fn noun_is_known(noun: &str) -> bool {
+#[cfg(test)]
+fn noun_is_known(noun: &str) -> bool {
     NOUNS.contains(&noun)
 }
 

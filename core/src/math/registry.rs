@@ -489,7 +489,7 @@ mod tests {
             .map(|k| {
                 let (start, stop) = (end * k as f64 / 3.0, end * (k + 1) as f64 / 3.0);
                 let mid = (start + stop) / 2.0;
-                LapSpan { lap_number: k + 1, start_secs: start, end_secs: stop, lap_time_secs: stop - start, sectors: vec![(start, mid), (mid, stop)] }
+                LapSpan { lap_number: k + 1, start_secs: start, end_secs: stop, lap_time_secs: stop - start, sectors: vec![(start, mid), (mid, stop)], excluded: false }
             })
             .collect();
         MathLapContext {

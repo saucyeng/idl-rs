@@ -1133,6 +1133,7 @@ mod tests {
             end_time_secs,
             sectors: Vec::new(),
             neutral_zone_visits: Vec::new(),
+            kind: Default::default(),
         })
         .collect();
         std::fs::write(root.join("sessions").join("synth").join("session.json"), serde_json::to_vec(&json).unwrap()).unwrap();
