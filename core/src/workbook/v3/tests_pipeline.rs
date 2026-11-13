@@ -1,11 +1,10 @@
 //! Integration-level parity tests for the v3 workbook pipeline (L3 Task 15,
 //! the lane's done-criteria proof task; L3-R36 replaces the original
 //! v2-vs-migration parity gate with a v3-vs-direct-evaluator one, since
-//! Task 13 (`migrate_workbook`) is cut, R30). Two independent proofs:
-//! Step 1 that the cell pipeline hands back the evaluator's own numbers,
-//! unaltered; Step 2 that a tile built from a real evaluated result matches
-//! `chart_decimation::decimate_channel` called directly on the same array.
-//! Neither proof touches migration — see R36's mapping of the lane's
+//! Task 13 (`migrate_workbook`) is cut, R30). The proof: the cell pipeline
+//! hands back the evaluator's own numbers, unaltered. (Step 2, a wire tile
+//! built from an evaluated result, moved with the tile encoder to
+//! `idl1-bridge`.) Nothing here touches migration — see R36's mapping of the lane's
 //! Done-when (1) onto this file.
 
 use super::*;
@@ -112,51 +111,6 @@ fn workbook_v3_pipeline_values_match_a_direct_evaluate_bit_for_bit() {
             for i in 0..value.t.len() {
                 assert_eq!(value.t[i], direct.t_us[i] as f64 / 1e6, "{name}: t[{i}] is t_us[{i}] in µs / 1e6");
             }
-        }
-    }
-}
-
-/// tile bytes — built from an evaluated math-cell result — sample region
-/// equals `decimate_channel` cast to `f32`, element-for-element.
-///
-/// Takes definition `a`'s evaluated `(v, t_us)` (never the scalar `avg`; it
-/// has no `t_us` and a tile has no axis to write), runs it through
-/// `tile::build_tile_bytes` as Task 10 landed it, decodes the sample region
-/// back out as `f32` LE, and compares it to `decimate_channel` called
-/// directly on the same array. This is the integration-level pass Task 10
-/// Step 4 promised at the unit level, on a real evaluated result rather than
-/// a hand-built array.
-#[test]
-fn tile_built_from_an_evaluated_math_cell_matches_decimate_channel_directly() {
-    // Arrange
-    let handle = synthetic_session();
-    let lap_ctx = MathLapContext::empty();
-    let (doc, structural) = parse_workbook(WORKBOOK_MD).expect("front matter is well-formed");
-    let cells = eval_cells(&doc, &structural, &handle, &lap_ctx);
-    let a = cells[0].defs.iter().find(|d| d.name == "a").unwrap().value.as_ref().unwrap().to_host_channel();
-    let tier = 0u32;
-    let tile_index = 0u32;
-    let column_count = 4u32;
-
-    // Act
-    let a_t_us: Vec<i64> = a.t.iter().map(|&s| (s * 1e6).round() as i64).collect();
-    let bytes = crate::tile::build_tile_bytes(&a.v, &a_t_us, tier, tile_index, column_count);
-    let want = crate::chart_decimation::decimate_channel(&a.v, tier, tile_index);
-
-    // Assert — decode the sample region (32-byte header, then
-    // `sample_count * 8` bytes of interleaved f32 [min, max] pairs) and
-    // compare element-for-element against `decimate_channel` cast to f32.
-    let sample_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-    assert_eq!(sample_count, want.len() / 2, "sample_count must match decimate_channel's bucket count");
-    let sample_off = 32usize;
-    for i in 0..want.len() {
-        let base = sample_off + i * 4;
-        let got = f32::from_le_bytes(bytes[base..base + 4].try_into().unwrap());
-        let want_f32 = want[i] as f32;
-        if want_f32.is_nan() {
-            assert!(got.is_nan(), "sample region[{i}]: expected NaN to match NaN");
-        } else {
-            assert_eq!(got, want_f32, "sample region[{i}]: mismatch against decimate_channel");
         }
     }
 }

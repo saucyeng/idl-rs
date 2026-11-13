@@ -421,7 +421,7 @@ impl SessionHandle {
     /// comment states that guarantee and its tests pin it.
     ///
     /// Everything reached through [`Self::with_channel`] — `lookup`,
-    /// `channel_samples`, `decimate_tile`, the lap slicers, the estimator —
+    /// `channel_samples`, the lap slicers, the estimator —
     /// behaves exactly as on an eager handle. [`Self::channel_data`] does
     /// not: it borrows `session.channels`, which is empty here.
     pub fn lazy(session: Session, index: Vec<LazyChannelInfo>, source: Arc<dyn ChannelSource>) -> Self {
@@ -899,44 +899,6 @@ impl SessionHandle {
         lazy.shared.write().unwrap().entry(channel_id.to_string()).or_insert(fetched).clone()
     }
 
-    /// Decimate the chart tile at (`tier`, `tile_index`) for `channel_id`.
-    /// All-NaN when the channel is absent, or when `tier` exceeds
-    /// [`crate::chart_decimation::MAX_TIER`] (checked before any bucket
-    /// folds data, at every `tile_index` including `0` — C3 §3.5 has L5
-    /// reject an out-of-range `tier` first, but core does not depend on that
-    /// for this guarantee). Folds min/max per bucket directly over the raw
-    /// column ([`RawColumn::min_max_range`]) — no f64 window is ever
-    /// materialized, so the cost is one pass over the tile's raw samples at
-    /// any tier (master design §4 seam). NaN semantics match
-    /// [`crate::chart_decimation::decimate_tile_pure`]: past-end and all-NaN
-    /// buckets emit `[NaN, NaN]`; mixed buckets fold finite samples only.
-    pub fn decimate_tile(&self, channel_id: &str, tier: u32, tile_index: u32) -> Vec<f64> {
-        if tier > crate::chart_decimation::MAX_TIER {
-            return crate::chart_decimation::empty_tile();
-        }
-        self.with_channel(channel_id, |c| {
-            let bucket = crate::chart_decimation::TIER_BASE.checked_pow(tier).unwrap_or(u32::MAX) as usize;
-            let n_buckets = crate::chart_decimation::TILE_SIZE_BUCKETS as usize;
-            let tile_start = (tile_index as usize).saturating_mul(n_buckets).saturating_mul(bucket);
-            let mut out = Vec::with_capacity(n_buckets * 2);
-            for b in 0..n_buckets {
-                let lo = tile_start.saturating_add(b * bucket);
-                match c.column.min_max_range(lo, lo.saturating_add(bucket)) {
-                    Some((mn, mx)) => {
-                        out.push(mn);
-                        out.push(mx);
-                    }
-                    None => {
-                        out.push(f64::NAN);
-                        out.push(f64::NAN);
-                    }
-                }
-            }
-            out
-        })
-        .unwrap_or_else(crate::chart_decimation::empty_tile)
-    }
-
     /// Finite min/max of `channel_id`'s samples — the Y-axis auto-scale bound
     /// (master design §4 seam). `None` when absent or all-non-finite. Folds over
     /// the raw column and scales the extremum pair (no full materialization).
@@ -1359,9 +1321,9 @@ fn nearest_by_t_us(samples: &[f64], t_us: &[i64], t_secs: f64) -> f64 {
 /// `None` iff there is no sample to return, i.e.
 /// `samples.len().min(t_us.len()) == 0` — never derived from `is_nan()`,
 /// since `NaN` is a legitimate *sample* value elsewhere in this crate
-/// (`decimate_tile_pure`'s NaN contract). A `NaN` sample nearest the
+/// (the chart-tile decimation's NaN contract). A `NaN` sample nearest the
 /// target is `Some(f64::NAN)`.
-pub(crate) fn nearest_at_t_us(samples: &[f64], t_us: &[i64], target_us: i64) -> Option<f64> {
+pub fn nearest_at_t_us(samples: &[f64], t_us: &[i64], target_us: i64) -> Option<f64> {
     let n = samples.len().min(t_us.len());
     if n == 0 {
         return None;
@@ -1702,126 +1664,6 @@ mod tests {
     }
 
     #[test]
-    fn decimate_tile_matches_pure_fold_over_materialized_samples() {
-        // Arrange — compact i16 column with scale/offset, length not
-        // bucket-aligned, so extremum-pair scaling and NaN right-edge padding
-        // are both exercised.
-        let meta = SessionMetaInput {
-            session_id: String::new(),
-            device_id: None,
-            timestamp_utc_ms: 0,
-            config_checksum: None,
-        };
-        let mut h = SessionHandle::from_channels(meta, vec![]);
-        let raws: Vec<i16> = (0..5000).map(|i| ((i * 37) % 1000) as i16 - 500).collect();
-        h.session.channels.push(Channel {
-            channel_id: "C".to_string(),
-            t_us: (0..5000i64).map(|i| i * 10_000).collect(),
-            t_recorded_us: None,
-            nominal_rate_hz: 100.0,
-            column: RawColumn::I16 { data: raws, scale: 0.5, offset: 1.0 },
-            source_kind: "c".to_string(),
-            unit: String::new(),
-            gaps: Vec::new(),
-        });
-
-        // Act + Assert — every tier/tile pair matches the reference fold over
-        // the fully materialized samples (including NaN padding past the end).
-        let samples = h.channel_samples("C");
-        for tier in 0..=6u32 {
-            for tile in 0..2u32 {
-                let got = h.decimate_tile("C", tier, tile);
-                let want = crate::chart_decimation::decimate_channel(&samples, tier, tile);
-                assert_eq!(got.len(), want.len(), "tier {tier} tile {tile}");
-                for (g, w) in got.iter().zip(want.iter()) {
-                    assert!(
-                        (g.is_nan() && w.is_nan()) || g == w,
-                        "tier {tier} tile {tile}: got {g}, want {w}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn decimate_tile_tier_above_max_tier_at_tile_index_zero_returns_all_nan_tile_no_panic() {
-        // Arrange — the case that used to leak real data: at tile_index 0
-        // the saturating start offset was 0, so bucket 0 folded the whole
-        // channel as genuine (non-NaN) min/max before the early-return fix.
-        let h = SessionHandle::from_channels(test_meta(), vec![input_channel("C", 10.0, vec![1.0; 20])]);
-
-        // Act
-        let out = h.decimate_tile("C", crate::chart_decimation::MAX_TIER + 1, 0);
-
-        // Assert
-        assert_eq!(out.len(), (crate::chart_decimation::TILE_SIZE_BUCKETS as usize) * 2);
-        assert!(out.iter().all(|v| v.is_nan()));
-    }
-
-    #[test]
-    fn decimate_tile_tier_above_max_tier_at_tile_index_one_returns_all_nan_tile_no_panic() {
-        // Arrange
-        let h = SessionHandle::from_channels(test_meta(), vec![input_channel("C", 10.0, vec![1.0; 20])]);
-
-        // Act
-        let out = h.decimate_tile("C", crate::chart_decimation::MAX_TIER + 1, 1);
-
-        // Assert
-        assert_eq!(out.len(), (crate::chart_decimation::TILE_SIZE_BUCKETS as usize) * 2);
-        assert!(out.iter().all(|v| v.is_nan()));
-    }
-
-    #[test]
-    fn build_tile_bytes_sample_region_matches_decimate_tile_over_materialized_samples() {
-        // Arrange — same compact i16 fixture as
-        // decimate_tile_matches_pure_fold_over_materialized_samples, proving
-        // tile::build_tile_bytes itself (not just decimate_channel) agrees
-        // with the non-materializing SessionHandle::decimate_tile path.
-        let meta = SessionMetaInput {
-            session_id: String::new(),
-            device_id: None,
-            timestamp_utc_ms: 0,
-            config_checksum: None,
-        };
-        let mut h = SessionHandle::from_channels(meta, vec![]);
-        let raws: Vec<i16> = (0..5000).map(|i| ((i * 37) % 1000) as i16 - 500).collect();
-        let t_us: Vec<i64> = (0..5000i64).map(|i| i * 10_000).collect();
-        h.session.channels.push(Channel {
-            channel_id: "C".to_string(),
-            t_us: t_us.clone(),
-            t_recorded_us: None,
-            nominal_rate_hz: 100.0,
-            column: RawColumn::I16 { data: raws, scale: 0.5, offset: 1.0 },
-            source_kind: "c".to_string(),
-            unit: String::new(),
-            gaps: Vec::new(),
-        });
-
-        // Act + Assert
-        let samples = h.channel_samples("C");
-        for tier in 0..=6u32 {
-            for tile in 0..2u32 {
-                let want = h.decimate_tile("C", tier, tile);
-                let bytes = crate::tile::build_tile_bytes(&samples, &t_us, tier, tile, 0);
-                let sample_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-                let mut got = Vec::with_capacity(sample_count * 2);
-                for i in 0..sample_count {
-                    let base = 32 + i * 8;
-                    got.push(f32::from_le_bytes(bytes[base..base + 4].try_into().unwrap()) as f64);
-                    got.push(f32::from_le_bytes(bytes[base + 4..base + 8].try_into().unwrap()) as f64);
-                }
-                assert_eq!(got.len(), want.len(), "tier {tier} tile {tile}");
-                for (g, w) in got.iter().zip(want.iter()) {
-                    assert!(
-                        (g.is_nan() && w.is_nan()) || g == w,
-                        "tier {tier} tile {tile}: got {g}, want {w}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn from_path_missing_file_is_io_error() {
         // Act
         let r = SessionHandle::from_path("definitely/not/a/real/file.idl0");
@@ -1961,69 +1803,6 @@ mod tests {
         // Assert
         assert_eq!(len, 50);
         assert_eq!(rate, 100.0);
-    }
-
-    #[test]
-    fn decimate_tile_base_channel_returns_bucket_pairs() {
-        // Arrange — base channel "X" = 0..16.
-        let meta = SessionMetaInput {
-            session_id: String::new(),
-            device_id: None,
-            timestamp_utc_ms: 0,
-            config_checksum: None,
-        };
-        let samples: Vec<f64> = (0..16).map(|i| i as f64).collect();
-        let h = SessionHandle::from_channels(meta, vec![input_channel("X", 10.0, samples)]);
-
-        // Act — tier 0 (raw): bucket k is [sample k, sample k].
-        let out = h.decimate_tile("X", 0, 0);
-
-        // Assert
-        assert_eq!(out[0], 0.0);
-        assert_eq!(out[1], 0.0);
-        assert_eq!(out[2], 1.0);
-        assert_eq!(out[3], 1.0);
-    }
-
-    #[test]
-    fn decimate_tile_math_store_channel_is_decimated() {
-        // Arrange — a math channel written via store_math (not a base channel).
-        let meta = SessionMetaInput {
-            session_id: String::new(),
-            device_id: None,
-            timestamp_utc_ms: 0,
-            config_checksum: None,
-        };
-        let h = SessionHandle::from_channels(meta, vec![input_channel("X", 10.0, vec![0.0; 4])]);
-        h.store_math("M", 10.0, (0..16).map(|i| i as f64).collect());
-
-        // Act
-        let out = h.decimate_tile("M", 1, 0);
-
-        // Assert — tier 1, bucket size 8: bucket 0 = 0..8 (0,7), bucket 1 = 8..16 (8,15).
-        assert_eq!(out[0], 0.0);
-        assert_eq!(out[1], 7.0);
-        assert_eq!(out[2], 8.0);
-        assert_eq!(out[3], 15.0);
-    }
-
-    #[test]
-    fn decimate_tile_absent_channel_returns_all_nan() {
-        // Arrange
-        let meta = SessionMetaInput {
-            session_id: String::new(),
-            device_id: None,
-            timestamp_utc_ms: 0,
-            config_checksum: None,
-        };
-        let h = SessionHandle::from_channels(meta, vec![input_channel("X", 10.0, vec![1.0])]);
-
-        // Act
-        let out = h.decimate_tile("nope", 0, 0);
-
-        // Assert
-        assert_eq!(out.len(), 1024 * 2);
-        assert!(out.iter().all(|v| v.is_nan()));
     }
 
     #[test]

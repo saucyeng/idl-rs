@@ -15,10 +15,47 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::math::eval::{ChannelLookup, LookupChannel, MathLapContext};
-use crate::math::{MathEvalError, MathEvalErrorKind};
+use crate::math::{MathEvalError, MathEvalErrorKind, ValueAxis};
 use crate::session::Session;
 
 use super::WorkbookDoc;
+
+/// What an `IDLH` payload's `t` array measures (C3 §3.4's `axis_kind`,
+/// version 2, ruling R217 item 5).
+///
+/// Version 1 said only *that* a recorded axis existed, never what it was. A
+/// `[lap]` value's axis is ordinal lap numbers and C2 §5.1 binds it under the
+/// key `lap`, not `t`; a `[f]` value's is Hz. A reader that cannot tell them
+/// apart binds every rank-1 value as time and draws lap 3 at three seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum AxisKind {
+    /// No recorded axis — a scalar or table-column result. Always paired with
+    /// an empty `t`.
+    None = 0,
+    /// Seconds since the session's first sample.
+    Time = 1,
+    /// Hertz.
+    Frequency = 2,
+    /// Ordinal lap number, 1-based.
+    Lap = 3,
+}
+
+/// The one mapping from the evaluator's value-side axis vocabulary (C2
+/// §3.6.1) to this wire-side one (C3 §3.4). The wire codes live here, beside the value they describe.
+///
+/// [`AxisKind::None`] has no [`ValueAxis`] counterpart — "no
+/// axis" is a property of an *empty* `t`, not of a value's shape, and both
+/// [`super::to_host_channel`] and `encode_host_channel_idlh` (in `idl1-bridge`) derive it from
+/// emptiness rather than from the value.
+impl From<ValueAxis> for AxisKind {
+    fn from(axis: ValueAxis) -> Self {
+        match axis {
+            ValueAxis::Time => AxisKind::Time,
+            ValueAxis::Lap => AxisKind::Lap,
+        }
+    }
+}
 
 /// Column-oriented (SoA) channel shape handed to JS host code (C2 §5.1) —
 /// matches `@observablehq/plot`'s tabular-data protocol so `Plot.lineY(x,
@@ -58,9 +95,9 @@ pub struct HostChannel {
     /// the JS decoder already reads; adding a fifth JSON key would be a
     /// second, redundant channel for the same fact, and the two could then
     /// disagree. Engine-internal: set by [`to_host_channel`], read by
-    /// [`encode_host_channel_idlh`](super::encode_host_channel_idlh).
+    /// `encode_host_channel_idlh` (in `idl1-bridge`).
     #[serde(skip)]
-    pub axis: super::AxisKind,
+    pub axis: AxisKind,
 }
 
 /// Converts a resolved channel's `(t_us, v)` pair into the [`HostChannel`]
@@ -97,7 +134,7 @@ pub fn to_host_channel(
     // `AxisKind::None` is the only honest kind for an absent axis — see
     // `encode_host_channel_idlh`, which refuses to claim a kind for an empty
     // `t` for the same reason.
-    let kind = if t.is_empty() { super::AxisKind::None } else { super::AxisKind::from(axis) };
+    let kind = if t.is_empty() { AxisKind::None } else { AxisKind::from(axis) };
     HostChannel { length: v.len(), t, v: v.to_vec(), unit, axis: kind }
 }
 
@@ -107,7 +144,7 @@ pub fn to_host_channel(
 /// definition, although a workbook open sends none of them and a chart fetch
 /// sends one decimated to at most 65,536 points; this keeps the `Arc` pair the
 /// evaluator produced and lets
-/// [`encode_host_channel_view_idlh`](super::encode_host_channel_view_idlh)
+/// `encode_host_channel_view_idlh` (in `idl1-bridge`)
 /// read it in place. Same fields and meanings as [`HostChannel`], except the
 /// time axis is the raw `t_us`, not seconds.
 #[derive(Debug, Clone, PartialEq)]
@@ -126,7 +163,7 @@ pub struct HostChannelView {
     pub unit: crate::math::units::UnitLabel,
     /// What [`Self::t_us`] measures; [`AxisKind::None`] whenever no `t` would
     /// be produced, exactly as [`HostChannel::axis`].
-    pub axis: super::AxisKind,
+    pub axis: AxisKind,
     /// `true` when the evaluator released this value's buffers after its last
     /// consumer because nothing outside the maths reads it
     /// (evaluation-memory spec §4.2.B): `v` and `t_us` are then empty, and
@@ -144,7 +181,7 @@ impl HostChannelView {
         unit: crate::math::units::UnitLabel,
         axis: crate::math::ValueAxis,
     ) -> Self {
-        let kind = if t_us.len().min(v.len()) == 0 { super::AxisKind::None } else { super::AxisKind::from(axis) };
+        let kind = if t_us.len().min(v.len()) == 0 { AxisKind::None } else { AxisKind::from(axis) };
         HostChannelView { length: v.len(), v, t_us, unit, axis: kind, released: false }
     }
 
@@ -156,7 +193,7 @@ impl HostChannelView {
         unit: crate::math::units::UnitLabel,
         axis: crate::math::ValueAxis,
     ) -> Self {
-        let kind = if has_t && length > 0 { super::AxisKind::from(axis) } else { super::AxisKind::None };
+        let kind = if has_t && length > 0 { AxisKind::from(axis) } else { AxisKind::None };
         HostChannelView { length, v: Arc::from(&[] as &[f64]), t_us: Arc::from(&[] as &[i64]), unit, axis: kind, released: true }
     }
 
@@ -171,7 +208,7 @@ impl HostChannelView {
     /// it did.
     pub fn has_t(&self) -> bool {
         if self.released {
-            return self.axis != super::AxisKind::None;
+            return self.axis != AxisKind::None;
         }
         self.t_len() > 0
     }
@@ -181,7 +218,7 @@ impl HostChannelView {
     /// axis ([`to_host_channel`]'s rule).
     pub fn t_at(&self, i: usize) -> f64 {
         match self.axis {
-            super::AxisKind::Lap => self.t_us[i] as f64,
+            AxisKind::Lap => self.t_us[i] as f64,
             _ => self.t_us[i] as f64 / 1e6,
         }
     }

@@ -5,52 +5,40 @@
 //! idl1-bridge) and the idl-rs CLI, and future Python/WASM bindings.
 
 pub mod calibration;
-pub mod chart_decimation;
 pub mod clip_reconstruct;
-pub mod colormap;
 /// The one command table (ruling R230) and the core operations behind the
 /// rows R229 added. Pure data plus pure functions; the CLI builds its clap
 /// tree from it and `docs cli` renders it.
 pub mod commands;
 pub mod config;
-pub mod cursor;
 /// Renders `docs/WORKBOOK-REFERENCE.md` from the engine's own catalogs
 /// (ruling R222 item 1). Pure: no I/O, no filesystem.
 pub mod docs;
 pub mod estimate;
 pub mod export;
 pub mod fft;
-pub mod fft_wire;
 pub mod filters;
 pub mod gps;
-pub mod gps_projection;
-pub mod gps_wire;
 pub mod histogram;
 pub mod histogram2d;
 pub mod import;
 pub mod integration;
 pub mod laps;
-pub mod map_tiles;
 pub mod math;
 pub mod parse;
 pub mod pulse;
-pub mod raster;
 pub mod rotation;
-pub mod scatter;
-pub mod scatter_wire;
 pub mod session;
 pub mod spectrogram;
 pub mod statistics;
 pub mod store;
 pub mod synth;
 pub mod table;
-pub mod tile;
 pub mod track_artifact;
 pub mod track_projection;
 pub mod tracks;
 pub mod variance;
 pub mod video;
-pub mod wire_golden;
 pub mod workbook;
 
 /// The engine's crate version, stamped into derived-file hashes and reported

@@ -102,7 +102,7 @@ pub enum Averaging {
 /// Failures raised validating a [`welch`] request before the transform runs
 /// (ruling R76). Neither variant is raised by `welch()` itself — `welch()`
 /// has no way to signal failure and stays infallible for its existing
-/// callers (`core/src/session/handle.rs`, `core/src/fft_wire.rs`'s tests);
+/// callers (`core/src/session/handle.rs`, `idl1-bridge`'s `fft_wire.rs`'s tests);
 /// callers that accept `averaging`/`sample_rate_hz` from an untrusted wire
 /// argument (`tauri/src/commands/rasters.rs::fetch_fft_via`) must call
 /// [`check_none_averaging_segments`] and [`effective_rate_hz_from_t_us`]

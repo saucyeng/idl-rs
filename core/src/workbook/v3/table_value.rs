@@ -22,7 +22,7 @@ use crate::table::{
     TableModel, WindowLaps,
 };
 
-use super::host_channel_wire::AxisKind;
+use super::AxisKind;
 use super::CellEvalResult;
 
 /// Every evaluated definition in `cells`, by name, as a table cell reads it:

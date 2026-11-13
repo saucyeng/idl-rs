@@ -8,7 +8,34 @@
 //! (row = y bin), **not** `spectrogram::SpectrogramResult`'s row-major
 //! layout — that matrix's row axis is time, a different convention entirely.
 
-use crate::scatter::pair_finite;
+/// Index-aligns `xs`/`ys` (and optional `cs`) over their common length, keeping
+/// only triples whose `x` and `y` are both finite. A non-finite colour is kept
+/// (the renderer maps it to a transparent dot). This is the same-rate G-G
+/// pairing — both channels come off the central IMU at one rate, so equal length
+/// means exact index alignment. Cross-rate resampling is deferred (design §12);
+/// mismatched-rate channels pair by sample index over the shorter length.
+pub fn pair_finite(
+    xs: &[f64],
+    ys: &[f64],
+    cs: Option<&[f64]>,
+) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    let n = xs.len().min(ys.len());
+    let mut out_x = Vec::with_capacity(n);
+    let mut out_y = Vec::with_capacity(n);
+    let mut out_c = cs.map(|_| Vec::with_capacity(n));
+    for i in 0..n {
+        let (x, y) = (xs[i], ys[i]);
+        if !x.is_finite() || !y.is_finite() {
+            continue;
+        }
+        out_x.push(x);
+        out_y.push(y);
+        if let (Some(c), Some(out)) = (cs, out_c.as_mut()) {
+            out.push(c.get(i).copied().unwrap_or(f64::NAN));
+        }
+    }
+    (out_x, out_y, out_c)
+}
 
 /// A 2-D equal-width histogram of a paired `(x, y)` cloud.
 pub struct Histogram2dResult {
@@ -38,7 +65,7 @@ impl Histogram2dResult {
 /// Bins finite `(x, y)` pairs into an `nx × ny` equal-width grid.
 ///
 /// `xs`/`ys` are paired by index and filtered to finite pairs via
-/// `scatter::pair_finite`. Each axis's range is `range_x`/`range_y` when
+/// [`pair_finite`]. Each axis's range is `range_x`/`range_y` when
 /// `Some`, else the finite data's own min/max. A pair outside its resolved
 /// `[lo, hi]` range on either axis is skipped (mirrors `histogram.rs`'s
 /// explicit-range behaviour) — for an auto-derived range this is a no-op,

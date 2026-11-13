@@ -133,7 +133,6 @@ pub fn docs(row: &CommandRow, ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, C
             }
         }
         "cli" => cli(ctx, m),
-        "wire" => wire(ctx, m),
         other => Err(CliError::new(
             ErrorKind::Internal,
             format!("`docs {other}` is in the command table but has no implementation"),
@@ -207,25 +206,6 @@ fn cli(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
             Ok(VerbOutput::new(format!("wrote {}", out.display()), data))
         }
         (None, false) => Ok(VerbOutput::new(markdown, data)),
-    }
-}
-
-/// `docs wire` — regenerates the cross-language wire golden fixtures
-/// (ruling R236) by delegating to `docs_cmd::run`, the same reuse-not-repeat
-/// idiom `docs workbook` above uses.
-fn wire(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
-    let out = opt_path(m, "out").ok_or_else(|| CliError::usage("docs wire needs --out"))?;
-    if ctx.dry_run {
-        return Ok(VerbOutput::new(
-            format!("would write wire golden fixtures to {}", out.display()),
-            json!({ "out": out.display().to_string(), "written": false }),
-        ));
-    }
-    let code = docs_cmd::run(DocsAction::Wire { out: out.clone() });
-    if code == ExitCode::SUCCESS {
-        Ok(VerbOutput::new(String::new(), json!({ "out": out.display().to_string(), "written": true })))
-    } else {
-        Err(CliError::io(format!("writing wire golden fixtures to {} failed", out.display())))
     }
 }
 
@@ -304,7 +284,7 @@ mod tests {
         let verbs: Vec<&str> = rows_for("docs").iter().map(|r| r.verb).collect();
 
         // Act
-        let known = ["workbook", "cli", "wire"];
+        let known = ["workbook", "cli"];
 
         // Assert
         for verb in &verbs {
