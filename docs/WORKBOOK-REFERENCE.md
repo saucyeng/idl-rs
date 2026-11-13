@@ -931,7 +931,7 @@ Time-varying spectrum. Not implemented; the signature and shape are fixed by C2 
 | Shape | `[t,f]` |
 | Unit rule | `SelectByLiteral(scaling, ...) as `periodogram`, over a `[t,f]` value` |
 | Status | **not implemented** |
-| Arguments | 1 |
+| Arguments | 1 to 6 |
 
 Example:
 

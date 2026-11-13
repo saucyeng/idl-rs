@@ -162,7 +162,13 @@ fn render_builtins(out: &mut String) {
                     MathBuiltinStatus::NotImplemented => "**not implemented**",
                 }
             ));
-            let arity = entry.arity.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" or ");
+            // A run of three or more consecutive counts reads as a range ("1 to 6").
+            let a = entry.arity;
+            let arity = if a.len() >= 3 && a.windows(2).all(|w| w[1] == w[0] + 1) {
+                format!("{} to {}", a[0], a[a.len() - 1])
+            } else {
+                a.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" or ")
+            };
             out.push_str(&format!("| Arguments | {} |\n\n", arity));
             out.push_str(&format!("Example:\n\n```\nresult = {}\n```\n\n", entry.example));
         }
