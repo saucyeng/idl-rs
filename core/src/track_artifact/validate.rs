@@ -89,8 +89,14 @@ pub fn validate_track(track: &Track) -> Result<(), TrackValidationError> {
 
     if let Some(timing) = &track.timing {
         match timing {
-            LapTiming::Circuit { start_finish } => {
+            LapTiming::Circuit { start_finish, out_lap_gate, in_lap_gate } => {
                 validate_gate(start_finish, "lap_timing.start_finish")?;
+                if let Some(g) = out_lap_gate {
+                    validate_gate(g, "lap_timing.out_lap_gate")?;
+                }
+                if let Some(g) = in_lap_gate {
+                    validate_gate(g, "lap_timing.in_lap_gate")?;
+                }
             }
             LapTiming::PointToPoint { start, finish } => {
                 validate_gate(start, "lap_timing.start")?;
@@ -246,6 +252,8 @@ mod tests {
         let mut track = minimal_track();
         track.timing = Some(LapTiming::Circuit {
             start_finish: Gate { lat1: 5.0, lon1: 6.0, lat2: 5.0, lon2: 6.0 },
+            out_lap_gate: None,
+            in_lap_gate: None,
         });
 
         // Act
@@ -255,6 +263,25 @@ mod tests {
         let e = result.unwrap_err();
         assert_eq!(e.kind, TrackValidationErrorKind::DegenerateGate);
         assert_eq!(e.field, "lap_timing.start_finish");
+    }
+
+    #[test]
+    fn validate_track_a_degenerate_out_lap_gate_is_degenerate_gate_naming_it() {
+        // Arrange
+        let mut track = minimal_track();
+        track.timing = Some(LapTiming::Circuit {
+            start_finish: valid_gate(),
+            out_lap_gate: Some(Gate { lat1: 5.0, lon1: 6.0, lat2: 5.0, lon2: 6.0 }),
+            in_lap_gate: None,
+        });
+
+        // Act
+        let result = validate_track(&track);
+
+        // Assert
+        let e = result.unwrap_err();
+        assert_eq!(e.kind, TrackValidationErrorKind::DegenerateGate);
+        assert_eq!(e.field, "lap_timing.out_lap_gate");
     }
 
     #[test]

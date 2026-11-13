@@ -21,6 +21,7 @@ pub fn lap_span(lap: &LapJson) -> LapSpan {
         end_secs: lap.end_time_secs,
         lap_time_secs: lap.lap_time_ms as f64 / 1000.0,
         sectors: lap.sectors.iter().map(|s| (s.start_time_secs, s.end_time_secs)).collect(),
+        excluded: !lap.kind.is_normal(),
     }
 }
 
@@ -39,9 +40,12 @@ pub fn laps_in_window(laps: &[LapJson], (start, end): (f64, f64)) -> Vec<LapSpan
 /// window is *the* selected span, not "the Nth lap". `laps` is every lap the
 /// window covers, each keeping its number; `session_laps` is every lap of the
 /// session, so the lap functions number against the whole session whatever
-/// the window (memory spec §7 Q1). Never a row context.
+/// the window (memory spec §7 Q1). Never a row context. A lap in `doc`'s
+/// `ignored_lap_numbers` is [`LapSpan::excluded`], like an out or in lap.
 pub fn window_lap_context(doc: Option<&SessionJson>, bounds: (f64, f64)) -> MathLapContext {
-    let laps = doc.map(|d| laps_in_window(&d.laps, bounds)).unwrap_or_default();
+    let ignored: &[u32] = doc.map_or(&[][..], |d| d.ignored_lap_numbers.as_slice());
+    let mark = |span: LapSpan| LapSpan { excluded: span.excluded || ignored.contains(&span.lap_number), ..span };
+    let laps = doc.map(|d| laps_in_window(&d.laps, bounds)).unwrap_or_default().into_iter().map(mark).collect();
     MathLapContext {
         main_lap_bounds: vec![bounds],
         main_sectors: Vec::new(),
@@ -50,7 +54,7 @@ pub fn window_lap_context(doc: Option<&SessionJson>, bounds: (f64, f64)) -> Math
         baseline_row: None,
         laps,
         row_lap: None,
-        session_laps: Some(doc.map(|d| d.laps.iter().map(lap_span).collect()).unwrap_or_default()),
+        session_laps: Some(doc.map(|d| d.laps.iter().map(lap_span).map(mark).collect()).unwrap_or_default()),
     }
 }
 
@@ -83,6 +87,7 @@ mod tests {
     fn lap(n: u32, start: f64, end: f64) -> LapJson {
         LapJson {
             lap_number: n,
+            kind: Default::default(),
             start_timestamp_ms: 0,
             end_timestamp_ms: 0,
             raw_elapsed_ms: 0,
@@ -116,5 +121,26 @@ mod tests {
         assert_eq!(ctx.laps.len(), 2);
         assert_eq!(ctx.session_laps.as_ref().map(Vec::len), Some(2));
         assert_eq!(ctx.row_lap, None);
+    }
+
+    #[test]
+    fn window_lap_context_out_and_ignored_laps_are_listed_but_excluded() {
+        // Arrange — lap 1 an out lap, lap 3 ignored by the rider.
+        let mut doc = idl_rs::store::session_json::empty_session_json("s");
+        doc.laps = vec![
+            LapJson { kind: idl_rs::laps::LapKind::Out, ..lap(1, 0.0, 10.0) },
+            lap(2, 10.0, 20.0),
+            lap(3, 20.0, 30.0),
+        ];
+        doc.ignored_lap_numbers = vec![3];
+
+        // Act
+        let ctx = whole_session_context_without_data(Some(&doc));
+
+        // Assert
+        let excluded: Vec<bool> = ctx.laps.iter().map(|l| l.excluded).collect();
+        assert_eq!(excluded, vec![true, false, true]);
+        let session: Vec<bool> = ctx.session_laps.unwrap().iter().map(|l| l.excluded).collect();
+        assert_eq!(session, vec![true, false, true]);
     }
 }

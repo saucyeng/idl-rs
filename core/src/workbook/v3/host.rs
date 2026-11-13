@@ -642,6 +642,7 @@ mod tests {
                 end_secs: n as f64,
                 lap_time_secs: 1.0,
                 sectors: Vec::new(),
+                excluded: false,
             })
             .collect();
         MathLapContext {

@@ -42,6 +42,7 @@ pub fn lap_spans(laps: &[Lap]) -> Vec<LapSpan> {
             end_secs: lap.end_time_secs,
             lap_time_secs: lap.lap_time_ms as f64 / 1000.0,
             sectors: lap.sectors.iter().map(|s| (s.start_time_secs, s.end_time_secs)).collect(),
+            excluded: !lap.kind.is_normal(),
         })
         .collect()
 }
@@ -101,6 +102,7 @@ mod tests {
     fn lap(lap_number: u32, start_time_secs: f64, end_time_secs: f64, sectors: Vec<Sector>) -> Lap {
         Lap {
             lap_number,
+            kind: Default::default(),
             start_ms: 0,
             end_ms: 0,
             start_time_secs,

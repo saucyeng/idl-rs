@@ -937,6 +937,7 @@ mod tests {
         // Arrange
         let lap = crate::store::session_json::LapJson {
             lap_number: 1,
+            kind: Default::default(),
             start_timestamp_ms: 0,
             end_timestamp_ms: 0,
             raw_elapsed_ms: 0,

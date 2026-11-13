@@ -126,6 +126,9 @@ pub struct SessionDetail {
 pub struct LapDetail {
     /// 1-based (C1 §6 `laps[].lap_number`).
     pub lap_number: u32,
+    /// C1 §6 `laps[].kind`: normal, out or in. Out and in laps are listed but
+    /// skipped by "fastest" and by averages, like an ignored lap.
+    pub kind: idl_rs::laps::LapKind,
     /// Unix epoch milliseconds.
     pub start_timestamp_ms: i64,
     pub end_timestamp_ms: i64,
@@ -477,6 +480,7 @@ fn base_channel_summaries(recorded: &[ChannelSummary]) -> Vec<ChannelSummary> {
 fn lap_json_to_detail(lap: &LapJson) -> LapDetail {
     LapDetail {
         lap_number: lap.lap_number,
+        kind: lap.kind,
         start_timestamp_ms: lap.start_timestamp_ms,
         end_timestamp_ms: lap.end_timestamp_ms,
         raw_elapsed_ms: lap.raw_elapsed_ms,
@@ -934,6 +938,7 @@ mod tests {
         let mut doc = empty_session_json("s1");
         doc.laps = vec![LapJson {
             lap_number: 1,
+            kind: Default::default(),
             start_timestamp_ms: 0,
             end_timestamp_ms: 1_000,
             raw_elapsed_ms: 1_000,
@@ -978,6 +983,7 @@ mod tests {
         doc.laps = vec![
             LapJson {
                 lap_number: 1,
+                kind: Default::default(),
                 start_timestamp_ms: 0,
                 end_timestamp_ms: 500,
                 raw_elapsed_ms: 500,
@@ -989,6 +995,7 @@ mod tests {
             },
             LapJson {
                 lap_number: 2,
+                kind: Default::default(),
                 start_timestamp_ms: 500,
                 end_timestamp_ms: 1_000,
                 raw_elapsed_ms: 500,
@@ -1130,7 +1137,7 @@ mod tests {
         assert_eq!(detail.created_at_ms, 1111);
         assert_eq!(detail.updated_at_ms, 2222);
         match detail.lap_timing {
-            Some(idl_rs::laps::model::LapTiming::Circuit { start_finish }) => {
+            Some(idl_rs::laps::model::LapTiming::Circuit { start_finish, .. }) => {
                 assert_eq!(start_finish.lat1, 50.1163);
                 assert_eq!(start_finish.lon1, -122.9574);
             }

@@ -53,6 +53,7 @@ mod tests {
     fn lap(number: u32, start_ms: i64) -> LapJson {
         LapJson {
             lap_number: number,
+            kind: Default::default(),
             start_timestamp_ms: start_ms,
             end_timestamp_ms: start_ms + 1000,
             raw_elapsed_ms: 1000,

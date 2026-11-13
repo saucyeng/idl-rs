@@ -416,8 +416,9 @@ pub fn plan_rows(
 /// [`validate`] reports it: an authored table's rows are named, so a magic id
 /// there would shadow a real row id.
 ///
-/// A lap whose recorded time is `NaN` is skipped rather than compared; ties go
-/// to the lowest index, so the answer does not depend on iteration luck.
+/// An excluded lap (out, in or ignored, [`LapSpan::excluded`]) is skipped,
+/// as is a lap whose recorded time is `NaN`; ties go to the lowest index, so
+/// the answer does not depend on iteration luck.
 pub fn resolve_baseline_row(table: &TableModel, bindings: &[RowBinding]) -> Option<usize> {
     let id = table.main_row_id.as_deref()?;
     if id == MAIN_ROW_FASTEST {
@@ -427,7 +428,7 @@ pub fn resolve_baseline_row(table: &TableModel, bindings: &[RowBinding]) -> Opti
         return bindings
             .iter()
             .enumerate()
-            .filter_map(|(i, b)| b.lap.as_ref().map(|l| (i, l.lap_time_secs)))
+            .filter_map(|(i, b)| b.lap.as_ref().filter(|l| !l.excluded).map(|l| (i, l.lap_time_secs)))
             .filter(|(_, t)| !t.is_nan())
             // `total_cmp`, not `partial_cmp(..).unwrap()`: the NaN filter above
             // makes the unwrap unreachable today, but that is an invariant held
@@ -709,6 +710,7 @@ mod tests {
     fn lap(n: u32, t0: f64, t1: f64) -> Lap {
         Lap {
             lap_number: n + 1,
+            kind: Default::default(),
             start_ms: 0,
             end_ms: 0,
             start_time_secs: t0,
@@ -1048,7 +1050,7 @@ mod tests {
     // ---- C2 §4 row derivation (ruling R217 item 2, R233) ----
 
     fn span(lap_number: u32, start: f64, end: f64, lap_time: f64) -> LapSpan {
-        LapSpan { lap_number, start_secs: start, end_secs: end, lap_time_secs: lap_time, sectors: vec![] }
+        LapSpan { lap_number, start_secs: start, end_secs: end, lap_time_secs: lap_time, sectors: vec![], excluded: false }
     }
 
     /// A one-column table whose column has a template, and one authored row
@@ -1117,6 +1119,31 @@ mod tests {
 
         // Assert
         assert_eq!(baseline, Some(1));
+    }
+
+    #[test]
+    fn resolve_baseline_row_fastest_skips_out_in_and_ignored_laps() {
+        // Arrange — the two quickest laps are excluded (an out lap and an
+        // ignored lap); lap 4 is the quickest that counts.
+        let t = derived_table(Some(MAIN_ROW_FASTEST));
+        let excluded = |s: LapSpan| LapSpan { excluded: true, ..s };
+        let windows = vec![WindowLaps {
+            session_id: "s1".into(),
+            laps: vec![
+                excluded(span(1, 0.0, 70.0, 70.0)),
+                excluded(span(2, 70.0, 150.0, 80.0)),
+                span(3, 150.0, 245.0, 95.0),
+                span(4, 245.0, 335.0, 90.0),
+            ],
+        }];
+        let (planned, bindings) = plan_rows(&t, &[], &windows);
+
+        // Act
+        let baseline = resolve_baseline_row(&planned, &bindings);
+
+        // Assert — still four rows; the Main row is lap 4.
+        assert_eq!(planned.rows.len(), 4);
+        assert_eq!(baseline, Some(3));
     }
 
     #[test]

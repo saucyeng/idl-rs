@@ -616,6 +616,7 @@ mod tests {
         let mut doc = idl_rs::store::session_json::empty_session_json(id);
         doc.laps = vec![idl_rs::store::session_json::LapJson {
             lap_number: 1,
+            kind: Default::default(),
             start_timestamp_ms: 0,
             end_timestamp_ms: 0,
             raw_elapsed_ms: (lap_s * 1000.0) as i64,

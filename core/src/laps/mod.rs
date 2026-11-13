@@ -11,13 +11,13 @@ pub mod model;
 pub mod preview;
 pub mod renumber;
 
-pub use detect::detect_laps;
+pub use detect::{detect_laps, detect_runs, Run};
 pub use distance::{GateCrossing, LapDistanceAccumulator, LapDistanceError, LapDistanceErrorKind};
 pub use gate_synthesis::{
     endpoint_gates, endpoint_gates_default, perpendicular_gate_at, snap_to_nearest_fix, GateSynthesisError,
     GateSynthesisErrorKind,
 };
 pub use geometry::find_crossings;
-pub use model::{Gate, Lap, LapTiming, NeutralZone, NeutralZoneVisit, Sector, SectorGate};
+pub use model::{Gate, Lap, LapKind, LapTiming, NeutralZone, NeutralZoneVisit, Sector, SectorGate};
 pub use preview::{preview_runs, RunPreview};
 pub use renumber::{renumber_session_laps, RenumberedLap};

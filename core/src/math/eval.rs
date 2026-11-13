@@ -221,6 +221,10 @@ pub struct LapSpan {
     /// *not* flattened across laps the way `main_sectors` is, because
     /// `sector_time(i)` asks for sector `i` **of each lap**.
     pub sectors: Vec<(f64, f64)>,
+    /// `true` for an out lap, an in lap or an ignored lap: still a lap on the
+    /// `[lap]` axis and still listed, but skipped by `"fastest"` and by
+    /// averages over laps.
+    pub excluded: bool,
 }
 
 /// Injected lap/overlay state for the lap-aware and variance functions.
@@ -4651,6 +4655,7 @@ mod tests {
                     // time, not the difference of the bounds.
                     lap_time_secs: 86.0,
                     sectors: vec![(0.0, 30.0), (30.0, 90.0)],
+                    excluded: false,
                 },
                 LapSpan {
                     lap_number: 4,
@@ -4658,6 +4663,7 @@ mod tests {
                     end_secs: 178.5,
                     lap_time_secs: 88.5,
                     sectors: vec![(90.0, 120.0)],
+                    excluded: false,
                 },
             ],
             ..MathLapContext::empty()

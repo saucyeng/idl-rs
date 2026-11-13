@@ -1651,6 +1651,7 @@ mod tests {
         let mut doc = empty_session_json(session_id);
         doc.laps = vec![LapJson {
             lap_number: 1,
+            kind: Default::default(),
             start_timestamp_ms: 10_000,
             end_timestamp_ms: 10_500,
             raw_elapsed_ms: 500,
@@ -1701,6 +1702,7 @@ mod tests {
         let mut doc = empty_session_json(session_id);
         doc.laps = vec![LapJson {
             lap_number: 1,
+            kind: Default::default(),
             start_timestamp_ms: 10_000,
             end_timestamp_ms: 10_500,
             raw_elapsed_ms: 500,
@@ -1916,6 +1918,7 @@ mod tests {
         let mut doc = empty_session_json(session_id);
         doc.laps = vec![LapJson {
             lap_number: 1,
+            kind: Default::default(),
             start_timestamp_ms: 0,
             end_timestamp_ms: 500,
             raw_elapsed_ms: 500,
@@ -2000,6 +2003,7 @@ mod tests {
         let mut doc = empty_session_json(session_id);
         doc.laps = vec![LapJson {
             lap_number: 1,
+            kind: Default::default(),
             start_timestamp_ms: 1_000,
             end_timestamp_ms: 1_500,
             raw_elapsed_ms: 500,
@@ -2045,6 +2049,7 @@ mod tests {
         let mut doc = empty_session_json(session_id);
         doc.laps = vec![LapJson {
             lap_number: 1,
+            kind: Default::default(),
             start_timestamp_ms: 10_000,
             end_timestamp_ms: 10_500,
             raw_elapsed_ms: 500,
@@ -2092,6 +2097,7 @@ mod tests {
         let mut doc = empty_session_json(session_id);
         doc.laps = vec![LapJson {
             lap_number: 1,
+            kind: Default::default(),
             start_timestamp_ms: 1_000,
             end_timestamp_ms: 1_500,
             raw_elapsed_ms: 500,
@@ -2227,6 +2233,7 @@ mod tests {
     fn simple_lap(lap_number: u32, start_ms: i64, end_ms: i64) -> LapJson {
         LapJson {
             lap_number,
+            kind: Default::default(),
             start_timestamp_ms: start_ms,
             end_timestamp_ms: end_ms,
             raw_elapsed_ms: end_ms - start_ms,

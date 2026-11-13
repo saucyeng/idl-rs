@@ -130,11 +130,11 @@ pub struct LapIndex {
 ///
 /// 1. `detect_visits` runs with `VisitParams::default()` — tuning lives once
 ///    in the engine (IDL0_SPEC §17.3), this function takes no overrides.
-/// 2. Each window's `Track` is resolved by id. A window whose track is
-///    missing from `tracks`, or whose track has `timing: None`, still
-///    produces a [`TrackVisitJson`] (with `laps: []`) and a warning — the
-///    visit is recorded even though it has no laps.
-/// 3. Otherwise `detect_laps` runs restricted to the visit's window, and each
+///    Visits come from gate crossings, so a track with `timing: None` never
+///    has one.
+/// 2. Each window's `Track` is resolved by id (see [`resolve_visit`] for the
+///    defensive no-track / no-timing branch).
+/// 3. `detect_laps` keeps the laps inside the visit's window, and each
 ///    `laps::model::Lap`/`Sector`/`NeutralZoneVisit` converts field for field
 ///    into the matching `session_json` DTO.
 /// 4. `renumber_session_laps` assigns the top-level, session-wide lap
@@ -170,7 +170,10 @@ pub fn compute_lap_index(handle: &SessionHandle, tracks: &[Track], ignored_lap_n
 /// `session.json.lap_detector_version` (C1 §6, additive field, ruling R83
 /// Q2) by [`index_laps`]; a mismatch (including a file with no stamp at all)
 /// marks the cache stale exactly like a changed [`track_library_hash`].
-pub const LAP_DETECTOR_VERSION: &str = "1";
+///
+/// `"2"` (2026-11-13): visits from gate crossings confirmed by the polyline,
+/// out/in laps, and no lap before a circuit's first start/finish crossing.
+pub const LAP_DETECTOR_VERSION: &str = "2";
 
 /// Outcome of one [`index_laps`]/[`reindex_laps`] call.
 #[derive(Debug)]
@@ -422,6 +425,7 @@ fn resolve_visit(handle: &SessionHandle, window: idl_rs::tracks::VisitWindow, tr
 fn lap_to_json(lap: idl_rs::laps::model::Lap) -> LapJson {
     LapJson {
         lap_number: lap.lap_number,
+        kind: lap.kind,
         start_timestamp_ms: lap.start_ms,
         end_timestamp_ms: lap.end_ms,
         raw_elapsed_ms: lap.raw_elapsed_ms,
@@ -626,10 +630,10 @@ mod tests {
         }
     }
 
-    /// A there-and-back-and-there GPS track: 3 legs of 100 one-second fixes,
-    /// lat sweeping 0.000→0.099→0.000→0.099 at a fixed longitude, crossing a
-    /// gate at lat 0.05 three times (so a circuit start/finish gate there
-    /// detects three laps). Long enough (300 s) to clear `min_visit_s`.
+    /// A there-and-back, twice, GPS track: 4 legs of 100 one-second fixes,
+    /// lat sweeping 0.000→0.099→0.000→0.099→0.000 at a fixed longitude,
+    /// crossing a gate at lat 0.05 four times (so a circuit start/finish gate
+    /// there detects three laps, crossing to crossing).
     fn three_lap_fixes() -> Vec<GpsFix> {
         let mut fixes = Vec::new();
         let leg = |t0: i64, up: bool| -> Vec<GpsFix> {
@@ -643,6 +647,7 @@ mod tests {
         fixes.extend(leg(0, true));
         fixes.extend(leg(100_000, false));
         fixes.extend(leg(200_000, true));
+        fixes.extend(leg(300_000, false));
         fixes
     }
 
@@ -655,7 +660,7 @@ mod tests {
             id: id.to_string(),
             name: "Loop".to_string(),
             venue: String::new(),
-            timing: Some(LapTiming::Circuit { start_finish: Gate { lat1: 0.05, lon1: -0.001, lat2: 0.05, lon2: 0.001 } }),
+            timing: Some(LapTiming::Circuit { start_finish: Gate { lat1: 0.05, lon1: -0.001, lat2: 0.05, lon2: 0.001 }, out_lap_gate: None, in_lap_gate: None }),
             sector_gates: Vec::new(),
             neutral_zones: Vec::new(),
             reference_polyline: polyline,
@@ -684,8 +689,9 @@ mod tests {
     }
 
     #[test]
-    fn compute_lap_index_track_with_no_timing_records_visit_with_no_laps() {
-        // Arrange -- same GPS/track geometry, but the track has no lap timing.
+    fn compute_lap_index_track_with_no_timing_has_no_gates_so_no_visit() {
+        // Arrange -- same GPS/track geometry, but the track has no lap timing:
+        // visits come from gate crossings, and it has no gates.
         let handle = handle_from_fixes(&three_lap_fixes());
         let mut track = circuit_track("loop-1");
         track.timing = None;
@@ -694,11 +700,10 @@ mod tests {
         // Act
         let index = compute_lap_index(&handle, &tracks, &[]);
 
-        // Assert -- the visit is still recorded, with no laps and a warning.
-        assert_eq!(index.track_visits.len(), 1);
-        assert!(index.track_visits[0].laps.is_empty());
+        // Assert
+        assert!(index.track_visits.is_empty());
         assert!(index.laps.is_empty());
-        assert_eq!(index.warnings.len(), 1);
+        assert!(index.warnings.is_empty());
     }
 
     #[test]
@@ -745,13 +750,20 @@ mod tests {
 
     #[test]
     fn compute_lap_index_two_visits_renumber_session_wide_but_keep_per_visit_numbering() {
-        // Arrange -- track A gets one 3-lap visit at t=0..300s; track B gets a
-        // separate, later single-lap visit, at a different longitude so the
-        // two tracks don't overlap geometrically.
+        // Arrange -- track A gets one 3-lap visit at t=0..400s; track B gets a
+        // separate, later single-lap visit (there and back past its gate), at
+        // a different longitude so the two tracks don't overlap geometrically.
         let mut fixes = three_lap_fixes();
-        let b_leg: Vec<GpsFix> =
-            (0..100).map(|i| GpsFix { timestamp_ms: 400_000 + i * 1000, lat: i as f64 * 0.001, lon: 0.9005 }).collect();
-        fixes.extend(b_leg);
+        let b_leg = |t0: i64, up: bool| -> Vec<GpsFix> {
+            (0..100)
+                .map(|i| {
+                    let lat = if up { i as f64 * 0.001 } else { 0.099 - i as f64 * 0.001 };
+                    GpsFix { timestamp_ms: t0 + i * 1000, lat, lon: 0.9005 }
+                })
+                .collect()
+        };
+        fixes.extend(b_leg(500_000, true));
+        fixes.extend(b_leg(600_000, false));
         let handle = handle_from_fixes(&fixes);
 
         let track_a = circuit_track("track-a");
@@ -763,7 +775,7 @@ mod tests {
         // consecutive GPS segment against the gate's own line segment, which
         // never crosses a fixed lat line far from where the GPS track runs.
         track_b.timing =
-            Some(LapTiming::Circuit { start_finish: Gate { lat1: 0.05, lon1: 0.8995, lat2: 0.05, lon2: 0.9015 } });
+            Some(LapTiming::Circuit { start_finish: Gate { lat1: 0.05, lon1: 0.8995, lat2: 0.05, lon2: 0.9015 }, out_lap_gate: None, in_lap_gate: None });
 
         // Act
         let index = compute_lap_index(&handle, &[track_a, track_b], &[]);

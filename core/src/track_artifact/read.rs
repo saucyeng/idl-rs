@@ -43,7 +43,8 @@ mod tests {
         // Assert — identity + circuit timing + one sector + one reference point.
         assert_eq!(t.id, "t-1");
         assert_eq!(t.name, "A-Line");
-        assert!(matches!(t.timing, Some(LapTiming::Circuit { .. })));
+        // A file from before out/in-lap gates reads with neither.
+        assert!(matches!(t.timing, Some(LapTiming::Circuit { out_lap_gate: None, in_lap_gate: None, .. })));
         assert_eq!(t.sector_gates.len(), 1);
         assert_eq!(t.sector_gates[0].name, "S1");
         assert_eq!(t.reference_polyline.len(), 1);

@@ -34,6 +34,7 @@ use idl_rs::laps::model::Lap;
 use idl_rs::math::eval::MathLapContext;
 use idl_rs::session::handle::SessionHandle;
 use idl_rs::track_artifact;
+use idl_rs::tracks::{detect_visits, VisitParams};
 use idl_rs::math::units::UnitLabel;
 use idl_library::set_job::{engine_identity, run_session_set, SetJobOptions, SetJobReport};
 use idl_rs::table::{CellResult, RowSource, TableModel};
@@ -548,7 +549,9 @@ fn run_set(
     }))
 }
 
-/// Detects laps against `track` and folds them into a [`MathLapContext`].
+/// Detects laps against `track` and folds them into a [`MathLapContext`]:
+/// the track's visits first, then the laps inside each, numbered through —
+/// what indexing does, so lap 1 starts in the same place on both paths.
 ///
 /// `main_lap` is the 1-based lap a lap-scoped expression means. There is no
 /// default: a `.idl0` file carries no designation, and an absent main lap
@@ -569,8 +572,16 @@ fn lap_context(
             json!({ "track": artifact.name }),
         )
     })?;
-    let laps: Vec<Lap> =
-        detect_laps(handle, timing, &artifact.sector_gates, &artifact.neutral_zones, None);
+    let visits = detect_visits(handle, &[artifact.track_ref()], VisitParams::default());
+    let laps: Vec<Lap> = visits
+        .iter()
+        .flat_map(|v| {
+            let window = Some((v.start_timestamp_ms, v.end_timestamp_ms));
+            detect_laps(handle, timing, &artifact.sector_gates, &artifact.neutral_zones, window)
+        })
+        .enumerate()
+        .map(|(i, lap)| Lap { lap_number: (i + 1) as u32, ..lap })
+        .collect();
 
     let designated = match main_lap {
         Some(n) => MainLap::Number(u32::try_from(n).map_err(|_| {
@@ -1039,6 +1050,7 @@ mod tests {
             let mut json = idl_rs::store::session_json::empty_session_json(id);
             json.laps = vec![idl_rs::store::session_json::LapJson {
                 lap_number: 1,
+                kind: Default::default(),
                 start_timestamp_ms: 0,
                 end_timestamp_ms: 0,
                 raw_elapsed_ms: 10_000,

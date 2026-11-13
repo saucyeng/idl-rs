@@ -1148,11 +1148,12 @@ mod tests {
         format!("2026-01-01T{:02}:{:02}:{:02}Z", offset_secs / 3600, (offset_secs % 3600) / 60, offset_secs % 60)
     }
 
-    /// A GPX file crossing lat 0.05 three times over 300 s — enough for
-    /// `circuit_track_fixture`'s start/finish gate to detect 3 laps.
+    /// A GPX file crossing lat 0.05 four times over 400 s — enough for
+    /// `circuit_track_fixture`'s start/finish gate to detect 3 laps, each
+    /// from one crossing to the next.
     fn gpx_three_lap_bytes() -> Vec<u8> {
         let mut trkpts = String::new();
-        for leg in 0..3i64 {
+        for leg in 0..4i64 {
             let up = leg % 2 == 0;
             for i in 0..100i64 {
                 let lat = if up { i as f64 * 0.001 } else { 0.099 - i as f64 * 0.001 };
@@ -1174,7 +1175,7 @@ mod tests {
             id: id.to_string(),
             name: "Loop".to_string(),
             venue: String::new(),
-            timing: Some(LapTiming::Circuit { start_finish: Gate { lat1: 0.05, lon1: -0.001, lat2: 0.05, lon2: 0.001 } }),
+            timing: Some(LapTiming::Circuit { start_finish: Gate { lat1: 0.05, lon1: -0.001, lat2: 0.05, lon2: 0.001 }, out_lap_gate: None, in_lap_gate: None }),
             sector_gates: Vec::new(),
             neutral_zones: Vec::new(),
             reference_polyline: polyline,

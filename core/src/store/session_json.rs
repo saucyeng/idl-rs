@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{parse_config, read_config, ConfigError, VersionedConfig};
+use crate::laps::model::LapKind;
 use crate::store::atomic::{sha256_hex, write_atomic, AtomicWriteError};
 
 /// The schema version this build of `idl-rs` writes and accepts for
@@ -176,6 +177,11 @@ pub struct SectorGateJson {
 pub struct LapJson {
     /// 1-based lap number within the session.
     pub lap_number: u32,
+    /// `"normal"`, `"out"` or `"in"`. Additive (2026-11-13); absent reads as
+    /// `"normal"` and a normal lap omits the key. Out and in laps are
+    /// listed but skipped by "fastest" and by averages.
+    #[serde(default, skip_serializing_if = "LapKind::is_normal")]
+    pub kind: LapKind,
     /// Lap start, milliseconds since the Unix epoch.
     pub start_timestamp_ms: i64,
     /// Lap end, milliseconds since the Unix epoch.
@@ -652,5 +658,35 @@ mod tests {
         assert_eq!(back, doc);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lap_kind_normal_is_omitted_out_is_written_and_absent_reads_normal() {
+        // Arrange
+        let lap = |kind: LapKind| LapJson {
+            lap_number: 1,
+            kind,
+            start_timestamp_ms: 0,
+            end_timestamp_ms: 1000,
+            raw_elapsed_ms: 1000,
+            lap_time_ms: 1000,
+            start_time_secs: 0.0,
+            end_time_secs: 1.0,
+            sectors: Vec::new(),
+            neutral_zone_visits: Vec::new(),
+        };
+        let legacy = r#"{"lap_number":1,"start_timestamp_ms":0,"end_timestamp_ms":1000,"raw_elapsed_ms":1000,"lap_time_ms":1000,"start_time_secs":0.0,"end_time_secs":1.0}"#;
+
+        // Act
+        let normal = serde_json::to_string(&lap(LapKind::Normal)).unwrap();
+        let out = serde_json::to_string(&lap(LapKind::Out)).unwrap();
+        let parsed: LapJson = serde_json::from_str(legacy).unwrap();
+        let back: LapJson = serde_json::from_str(&out).unwrap();
+
+        // Assert
+        assert!(!normal.contains("kind"));
+        assert!(out.contains(r#""kind":"out""#));
+        assert_eq!(parsed.kind, LapKind::Normal);
+        assert_eq!(back.kind, LapKind::Out);
     }
 }

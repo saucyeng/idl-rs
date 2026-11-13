@@ -4,7 +4,7 @@
 
 use crate::gps::{build_gps_track, GpsFix};
 use crate::laps::detect::detect_laps;
-use crate::laps::model::{Lap, LapTiming, SectorGate};
+use crate::laps::model::{Lap, LapKind, LapTiming, SectorGate};
 use crate::session::handle::SessionHandle;
 
 /// [`preview_runs`]' answer.
@@ -19,16 +19,13 @@ pub struct RunPreview {
 }
 
 /// The runs `timing` and `sector_gates` catch on `handle`, and the fixes of
-/// its reference run. Point-to-point: the first run, start gate to finish
-/// gate. Circuit: the first lap that starts on a crossing (lap 2 — lap 1 runs
-/// from the session's first fix), falling back to lap 1 when there is only
-/// one. Neutral zones play no part: they shorten a lap's time, not its line.
+/// its reference run: the first ordinary run (start gate to finish gate, or
+/// start/finish to start/finish — not an out or in lap), falling back to the
+/// first run of any kind. Neutral zones play no part: they shorten a lap's
+/// time, not its line.
 pub fn preview_runs(handle: &SessionHandle, timing: &LapTiming, sector_gates: &[SectorGate]) -> RunPreview {
     let runs = detect_laps(handle, timing, sector_gates, &[], None);
-    let reference = match timing {
-        LapTiming::PointToPoint { .. } => runs.first(),
-        LapTiming::Circuit { .. } => runs.get(1).or(runs.first()),
-    };
+    let reference = runs.iter().find(|r| r.kind == LapKind::Normal).or(runs.first());
     let reference_polyline = match reference {
         Some(run) => build_gps_track(handle)
             .into_iter()
@@ -108,18 +105,20 @@ mod tests {
     }
 
     #[test]
-    fn preview_runs_circuit_reference_line_is_the_first_lap_between_two_crossings() {
-        // Arrange — out and back past one gate: two crossings, so lap 2 runs crossing to crossing.
+    fn preview_runs_circuit_reference_line_is_the_first_ordinary_lap_not_the_out_lap() {
+        // Arrange — north across an out-lap gate (0.01) and start/finish
+        // (0.05), back south across start/finish: an out lap, then one lap.
         let mut fixes: Vec<(i64, f64, f64)> = (0..100).map(|i| (1000 + i * 1000, i as f64 * 0.001, 0.0005)).collect();
         fixes.extend((0..100).map(|i| (1000 + (100 + i) * 1000, 0.099 - i as f64 * 0.001, 0.0005)));
         let h = handle_for(&fixes);
-        let timing = LapTiming::Circuit { start_finish: gate_at(0.05) };
+        let timing = LapTiming::Circuit { start_finish: gate_at(0.05), out_lap_gate: Some(gate_at(0.01)), in_lap_gate: None };
 
         // Act
         let preview = preview_runs(&h, &timing, &[]);
 
-        // Assert
+        // Assert — the out lap is listed, the line is lap 2's.
         assert_eq!(preview.runs.len(), 2);
+        assert_eq!(preview.runs[0].kind, LapKind::Out);
         assert_eq!(preview.reference_polyline.first().unwrap().timestamp_ms, preview.runs[1].start_ms);
     }
 }

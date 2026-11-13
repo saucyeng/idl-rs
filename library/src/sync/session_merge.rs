@@ -203,6 +203,7 @@ mod tests {
         peer.track_visits_library_hash = Some("hash-peer".to_string());
         peer.laps = vec![LapJson {
             lap_number: 1,
+            kind: Default::default(),
             start_timestamp_ms: 0,
             end_timestamp_ms: 1000,
             raw_elapsed_ms: 1000,

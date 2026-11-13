@@ -118,6 +118,8 @@ mod tests {
             venue: "Whistler".to_string(),
             timing: Some(LapTiming::Circuit {
                 start_finish: Gate { lat1: 1.0, lon1: 2.0, lat2: 3.0, lon2: 4.0 },
+                out_lap_gate: Some(Gate { lat1: 1.5, lon1: 2.5, lat2: 3.5, lon2: 4.5 }),
+                in_lap_gate: None,
             }),
             sector_gates: vec![SectorGate {
                 name: "S1".to_string(),
@@ -151,8 +153,13 @@ mod tests {
         assert_eq!(back.created_at_ms, track.created_at_ms);
         assert_eq!(back.updated_at_ms, track.updated_at_ms);
         match (&back.timing, &track.timing) {
-            (Some(LapTiming::Circuit { start_finish: a }), Some(LapTiming::Circuit { start_finish: b })) => {
+            (
+                Some(LapTiming::Circuit { start_finish: a, out_lap_gate: a_out, in_lap_gate: a_in }),
+                Some(LapTiming::Circuit { start_finish: b, out_lap_gate: b_out, in_lap_gate: b_in }),
+            ) => {
                 assert_eq!(a, b);
+                assert_eq!(a_out, b_out);
+                assert_eq!(a_in, b_in);
             }
             other => panic!("expected circuit timing to round-trip, got {other:?}"),
         }

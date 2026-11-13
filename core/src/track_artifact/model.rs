@@ -35,10 +35,10 @@ pub struct Track {
 }
 
 impl Track {
-    /// Matcher input for [`crate::tracks::detect_visits`] (clones the polyline —
+    /// Matcher input for [`crate::tracks::detect_visits`] (clones the polyline and gates —
     /// one-shot CLI use; the matcher takes `&[TrackRef]`).
     pub fn track_ref(&self) -> TrackRef {
-        TrackRef { track_id: self.id.clone(), polyline: self.reference_polyline.clone() }
+        TrackRef { track_id: self.id.clone(), polyline: self.reference_polyline.clone(), timing: self.timing.clone() }
     }
 }
 
@@ -108,6 +108,12 @@ enum LapTimingDto {
         #[serde(default)]
         name: String,
         start_finish: LapGateDto,
+        // Pit exit / pit entry (2026-11-13). Absent = no such gate, so a
+        // file written before them reads unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        out_lap_gate: Option<LapGateDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_lap_gate: Option<LapGateDto>,
     },
     PointToPoint {
         start: LapGateDto,
@@ -159,9 +165,11 @@ impl LapGateDto {
 impl LapTimingDto {
     fn into_timing(self) -> LapTiming {
         match self {
-            LapTimingDto::Circuit { start_finish, .. } => {
-                LapTiming::Circuit { start_finish: start_finish.into_gate() }
-            }
+            LapTimingDto::Circuit { start_finish, out_lap_gate, in_lap_gate, .. } => LapTiming::Circuit {
+                start_finish: start_finish.into_gate(),
+                out_lap_gate: out_lap_gate.map(LapGateDto::into_gate),
+                in_lap_gate: in_lap_gate.map(LapGateDto::into_gate),
+            },
             LapTimingDto::PointToPoint { start, finish } => {
                 LapTiming::PointToPoint { start: start.into_gate(), finish: finish.into_gate() }
             }
@@ -218,9 +226,12 @@ impl From<&Gate> for LapGateDto {
 impl From<&LapTiming> for LapTimingDto {
     fn from(t: &LapTiming) -> Self {
         match t {
-            LapTiming::Circuit { start_finish } => {
-                LapTimingDto::Circuit { name: String::new(), start_finish: start_finish.into() }
-            }
+            LapTiming::Circuit { start_finish, out_lap_gate, in_lap_gate } => LapTimingDto::Circuit {
+                name: String::new(),
+                start_finish: start_finish.into(),
+                out_lap_gate: out_lap_gate.as_ref().map(Into::into),
+                in_lap_gate: in_lap_gate.as_ref().map(Into::into),
+            },
             LapTiming::PointToPoint { start, finish } => {
                 LapTimingDto::PointToPoint { start: start.into(), finish: finish.into() }
             }

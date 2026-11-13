@@ -647,8 +647,8 @@ mod tests {
     }
 
     /// The same there-and-back-and-there GPS shape `lap_index`'s tests use:
-    /// 3 legs of 100 one-second fixes crossing a gate at lat 0.05 three
-    /// times, so a circuit track there detects three laps.
+    /// 4 legs of 100 one-second fixes crossing a gate at lat 0.05 four
+    /// times, so a circuit track there detects three laps between them.
     fn three_lap_fixes() -> Vec<GpsFix> {
         let leg = |t0: i64, up: bool| -> Vec<GpsFix> {
             (0..100)
@@ -661,6 +661,7 @@ mod tests {
         let mut fixes = leg(0, true);
         fixes.extend(leg(100_000, false));
         fixes.extend(leg(200_000, true));
+        fixes.extend(leg(300_000, false));
         fixes
     }
 
@@ -671,7 +672,7 @@ mod tests {
             id: id.to_string(),
             name: "Loop".to_string(),
             venue: String::new(),
-            timing: Some(LapTiming::Circuit { start_finish: Gate { lat1: 0.05, lon1: -0.001, lat2: 0.05, lon2: 0.001 } }),
+            timing: Some(LapTiming::Circuit { start_finish: Gate { lat1: 0.05, lon1: -0.001, lat2: 0.05, lon2: 0.001 }, out_lap_gate: None, in_lap_gate: None }),
             sector_gates: Vec::new(),
             neutral_zones: Vec::new(),
             reference_polyline: polyline,

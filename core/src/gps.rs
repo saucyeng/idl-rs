@@ -44,6 +44,92 @@ pub fn build_gps_track(handle: &SessionHandle) -> Vec<GpsFix> {
     fixes
 }
 
+/// Synthetic GPS for the lap and track tests: positions in local metres
+/// (north, east) around a fixed origin, walked at constant speed, and a
+/// handle that replays them.
+#[cfg(test)]
+pub(crate) mod synthetic {
+    use super::GpsFix;
+    use crate::laps::model::Gate;
+    use crate::session::handle::{ChannelInput, SessionHandle, SessionMetaInput};
+
+    /// Origin latitude, decimal degrees (off (0,0), which is the no-fix sentinel).
+    const LAT0: f64 = 0.1;
+    /// Origin longitude, decimal degrees.
+    const LON0: f64 = 0.1;
+    /// Metres per degree of latitude, the same constant the track matcher uses.
+    const M_PER_DEG: f64 = 111_320.0;
+
+    /// `(north_m, east_m)` from the origin as `(lat, lon)` decimal degrees.
+    pub(crate) fn at((north_m, east_m): (f64, f64)) -> (f64, f64) {
+        (LAT0 + north_m / M_PER_DEG, LON0 + east_m / (M_PER_DEG * LAT0.to_radians().cos()))
+    }
+
+    /// A gate between two points given in metres.
+    pub(crate) fn gate(a: (f64, f64), b: (f64, f64)) -> Gate {
+        let ((lat1, lon1), (lat2, lon2)) = (at(a), at(b));
+        Gate { lat1, lon1, lat2, lon2 }
+    }
+
+    /// Fixes every `dt_ms` from `t0_ms`, `step_m` metres apart along the
+    /// waypoint path (metres), the first on the first waypoint.
+    pub(crate) fn walk(t0_ms: i64, dt_ms: i64, step_m: f64, waypoints: &[(f64, f64)]) -> Vec<GpsFix> {
+        let mut out = Vec::new();
+        let mut seg_start_m = 0.0;
+        for w in waypoints.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let len_m = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+            loop {
+                let d_m = out.len() as f64 * step_m;
+                if d_m > seg_start_m + len_m || len_m == 0.0 {
+                    break;
+                }
+                let f = (d_m - seg_start_m) / len_m;
+                let (lat, lon) = at((a.0 + f * (b.0 - a.0), a.1 + f * (b.1 - a.1)));
+                out.push(GpsFix { timestamp_ms: t0_ms + out.len() as i64 * dt_ms, lat, lon });
+            }
+            seg_start_m += len_m;
+        }
+        out
+    }
+
+    /// Appends a [`walk`] to `fixes`, starting `dt_ms` after its last fix.
+    pub(crate) fn then_walk(fixes: &mut Vec<GpsFix>, dt_ms: i64, step_m: f64, waypoints: &[(f64, f64)]) {
+        let t0 = fixes.last().map_or(0, |f| f.timestamp_ms + dt_ms);
+        fixes.extend(walk(t0, dt_ms, step_m, waypoints));
+    }
+
+    /// Appends `n` stationary fixes at `point` (metres), `dt_ms` apart.
+    pub(crate) fn then_stay(fixes: &mut Vec<GpsFix>, dt_ms: i64, n: usize, point: (f64, f64)) {
+        for _ in 0..n {
+            let t = fixes.last().map_or(0, |f| f.timestamp_ms + dt_ms);
+            let (lat, lon) = at(point);
+            fixes.push(GpsFix { timestamp_ms: t, lat, lon });
+        }
+    }
+
+    /// A handle whose GPS channels replay `fixes`, sampled at `rate_hz`.
+    pub(crate) fn handle(fixes: &[GpsFix], rate_hz: f64) -> SessionHandle {
+        let meta =
+            SessionMetaInput { session_id: String::new(), device_id: None, timestamp_utc_ms: 0, config_checksum: None };
+        let ch = |id: &str, samples: Vec<f64>| ChannelInput {
+            channel_id: id.to_string(),
+            sample_rate_hz: rate_hz,
+            t_us: (0..samples.len() as i64).map(|i| (i as f64 * 1e6 / rate_hz).round() as i64).collect(),
+            samples,
+            source_kind: id.to_lowercase(),
+        };
+        SessionHandle::from_channels(
+            meta,
+            vec![
+                ch("GPS_Latitude", fixes.iter().map(|f| f.lat).collect()),
+                ch("GPS_Longitude", fixes.iter().map(|f| f.lon).collect()),
+                ch("GPS_EpochMs", fixes.iter().map(|f| f.timestamp_ms as f64).collect()),
+            ],
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
