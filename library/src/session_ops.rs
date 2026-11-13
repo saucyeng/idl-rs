@@ -106,6 +106,11 @@ pub struct SessionMetaPatch {
     /// `session.json`'s `long_comment` — the CLI spells it `--notes`.
     pub long_comment: Option<String>,
     pub tag: Option<String>,
+    /// Lap numbers (session-wide, 1-based) to add to `ignored_lap_numbers`.
+    pub ignore_laps: Vec<u32>,
+    /// Lap numbers to remove from `ignored_lap_numbers`; applied after
+    /// [`Self::ignore_laps`], so naming a lap in both leaves it counted.
+    pub unignore_laps: Vec<u32>,
 }
 
 impl SessionMetaPatch {
@@ -140,6 +145,20 @@ pub fn apply_session_meta(doc: &mut SessionJson, patch: &SessionMetaPatch) -> Ve
     set("event_session", &mut doc.event_session, &patch.event_session);
     set("long_comment", &mut doc.long_comment, &patch.long_comment);
     set("tag", &mut doc.tag, &patch.tag);
+
+    if !patch.ignore_laps.is_empty() || !patch.unignore_laps.is_empty() {
+        let before = doc.ignored_lap_numbers.clone();
+        for &n in &patch.ignore_laps {
+            if !doc.ignored_lap_numbers.contains(&n) {
+                doc.ignored_lap_numbers.push(n);
+            }
+        }
+        doc.ignored_lap_numbers.retain(|n| !patch.unignore_laps.contains(n));
+        doc.ignored_lap_numbers.sort_unstable(); // C1 §6: ascending
+        if doc.ignored_lap_numbers != before {
+            changed.push("ignored_lap_numbers");
+        }
+    }
 
     changed
 }
@@ -415,6 +434,28 @@ mod tests {
 
         // Assert
         assert_eq!(changed, vec!["venue_name", "bike", "tag"]);
+    }
+
+    #[test]
+    fn ignore_and_unignore_laps_edit_ignored_lap_numbers_sorted_and_idempotent() {
+        // Arrange — lap 2 already ignored.
+        let mut doc = empty_session_json("s1");
+        doc.ignored_lap_numbers = vec![2];
+        let ignore = SessionMetaPatch { ignore_laps: vec![5, 1, 2], ..Default::default() };
+        let unignore = SessionMetaPatch { unignore_laps: vec![2, 9], ..Default::default() };
+
+        // Act
+        let first = apply_session_meta(&mut doc, &ignore);
+        let after_ignore = doc.ignored_lap_numbers.clone();
+        let again = apply_session_meta(&mut doc, &ignore);
+        let third = apply_session_meta(&mut doc, &unignore);
+
+        // Assert
+        assert_eq!(first, vec!["ignored_lap_numbers"]);
+        assert_eq!(after_ignore, vec![1, 2, 5]);
+        assert!(again.is_empty());
+        assert_eq!(third, vec!["ignored_lap_numbers"]);
+        assert_eq!(doc.ignored_lap_numbers, vec![1, 5]);
     }
 
     #[test]

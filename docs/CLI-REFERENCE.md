@@ -104,6 +104,8 @@ Set a session's descriptive metadata; omitted fields are left alone.
 | `--event-session` | text | Event session, e.g. `Qualifying 2` |
 | `--notes` | text | Long comment |
 | `--tag` | text | Tag |
+| `--ignore-lap` | integer | Ignore this lap number: still listed, left out of the fastest lap and averages; repeat for several |
+| `--unignore-lap` | integer | Count this lap number again; repeat for several |
 | `--data-dir` | path | Data directory root (contract C4 §1's <data>); defaults to $IDL1_DATA_DIR |
 | `--dry-run` | switch | Report what would change and write nothing |
 | `--json` | switch | Emit the result as JSON on stdout (schema_version 1); errors become typed JSON on stderr |

@@ -152,6 +152,8 @@ pub fn set_meta(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
         event_session: opt_text(m, "event-session"),
         long_comment: opt_text(m, "notes"),
         tag: opt_text(m, "tag"),
+        ignore_laps: lap_numbers(m, "ignore-lap")?,
+        unignore_laps: lap_numbers(m, "unignore-lap")?,
     };
 
     let report = set_session_meta(root, &id, &patch, ctx.dry_run)?;
@@ -171,6 +173,21 @@ pub fn set_meta(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
             "session": session_json(&report.doc),
         }),
     ))
+}
+
+/// Every value of the repeatable lap-number flag `name`; a usage error for a
+/// value below 1 (lap numbers are 1-based).
+fn lap_numbers(m: &ArgMatches, name: &str) -> Result<Vec<u32>, CliError> {
+    m.get_many::<i64>(name)
+        .into_iter()
+        .flatten()
+        .map(|&n| {
+            u32::try_from(n)
+                .ok()
+                .filter(|&n| n >= 1)
+                .ok_or_else(|| CliError::usage(format!("--{name} takes a lap number, 1 or more; got {n}")))
+        })
+        .collect()
 }
 
 /// `session import` — import one log file into the data directory.
@@ -329,6 +346,7 @@ fn session_json(doc: &SessionJson) -> Value {
         "short_comment": doc.short_comment,
         "long_comment": doc.long_comment,
         "tag": doc.tag,
+        "ignored_lap_numbers": doc.ignored_lap_numbers,
     })
 }
 
@@ -968,7 +986,7 @@ mod tests {
         // Assert — one key per `SessionMetaPatch` field, plus identity and start.
         for key in
             ["session_id", "timestamp_utc_ms", "rider", "bike", "venue_name", "event_name",
-             "event_session", "long_comment", "tag"]
+             "event_session", "long_comment", "tag", "ignored_lap_numbers"]
         {
             assert!(value.get(key).is_some(), "{key} missing");
         }
