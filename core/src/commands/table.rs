@@ -777,7 +777,7 @@ pub const COMMANDS: &[CommandRow] = &[
         verb: "list",
         args: &[],
         flags: &[],
-        core_fn: "idl_library::catalog_read::list_tracks",
+        core_fn: "idl_rs::track_artifact::path::list_track_files + idl_rs::track_artifact::read::read_track",
         json_shape: Some("TrackSummary[]"),
         help: "List the tracks in the library",
         tier: Tier::Occasional,

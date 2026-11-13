@@ -8,18 +8,22 @@ use clap::ArgMatches;
 use serde_json::{json, Value};
 
 use idl_library::catalog::{rebuild_catalog, RebuildReport};
-use idl_library::catalog_read::{list_tracks, TrackSummary};
+use idl_library::catalog_read::TrackSummary;
+use idl_rs::track_artifact::path::{list_track_files, tracks_dir};
+use idl_rs::track_artifact::read::read_track;
 use idl_library::lap_index::{self, LapIndexReport};
 use idl_library::verify::{self, Finding, Severity};
 
 use crate::envelope::CliError;
 use crate::verbs::{text, Ctx, VerbOutput};
 
-/// `track list` — the tracks in the library.
+/// `track list` — the tracks in the library, read from the track files in
+/// `<data>/tracks/` (`.idl1t`, else legacy `.idl0t`) rather than the catalog,
+/// which is only an index and may not have seen a new file yet (CLAUDE.md §3).
 pub fn track_list(ctx: &Ctx, _m: &ArgMatches) -> Result<VerbOutput, CliError> {
     let root = ctx.data_dir()?;
 
-    let tracks = list_tracks(root)?;
+    let tracks = list_tracks_from_files(root)?;
 
     let text = tracks
         .iter()
@@ -32,6 +36,27 @@ pub fn track_list(ctx: &Ctx, _m: &ArgMatches) -> Result<VerbOutput, CliError> {
         text,
         json!({ "tracks": tracks.iter().map(track_json).collect::<Vec<_>>() }),
     ))
+}
+
+/// Every readable track file in `<root>/tracks/` as a [`TrackSummary`],
+/// ordered by name like the catalog's `list_tracks`. A file that does not
+/// parse is skipped, as the catalog rebuild skips it.
+fn list_tracks_from_files(root: &std::path::Path) -> Result<Vec<TrackSummary>, CliError> {
+    let dir = tracks_dir(root);
+    let files = list_track_files(&dir).map_err(|e| CliError::io(format!("reading {}: {e}", dir.display())))?;
+    let mut tracks: Vec<TrackSummary> = files
+        .iter()
+        .filter_map(|path| read_track(path).ok())
+        .map(|t| TrackSummary {
+            track_id: t.id,
+            name: t.name,
+            venue_name: t.venue,
+            created_at_ms: t.created_at_ms,
+            updated_at_ms: t.updated_at_ms,
+        })
+        .collect();
+    tracks.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.track_id.cmp(&b.track_id)));
+    Ok(tracks)
 }
 
 /// `track detect` — re-run lap indexing for one session.
@@ -235,5 +260,43 @@ mod tests {
         // Assert
         assert_eq!(value["written"], true);
         assert_eq!(value["laps_indexed"], 11);
+    }
+
+    #[test]
+    fn list_tracks_from_files_new_current_and_legacy_files_appear_without_a_catalog_rebuild() {
+        // Arrange
+        let root = std::env::temp_dir().join(format!("idl-rs-track-list-{}", std::process::id()));
+        let dir = root.join("tracks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = |id: &str, name: &str| {
+            format!(
+                r#"{{"track_artifact_version":1,"track":{{"track_id":"{id}","name":"{name}","venue_name":"Whistler","created_at_ms":1,"updated_at_ms":2}}}}"#
+            )
+        };
+        std::fs::write(dir.join("t-b.idl1t"), body("t-b", "B-Line")).unwrap();
+        std::fs::write(dir.join("t-a.idl0t"), body("t-a", "A-Line")).unwrap();
+        std::fs::write(dir.join("broken.idl1t"), b"not json").unwrap();
+
+        // Act
+        let tracks = list_tracks_from_files(&root).unwrap();
+
+        // Assert
+        let ids: Vec<&str> = tracks.iter().map(|t| t.track_id.as_str()).collect();
+        assert_eq!(ids, vec!["t-a", "t-b"]);
+        assert_eq!(tracks[0].venue_name, "Whistler");
+        assert!(!root.join("catalog.sqlite").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_tracks_from_files_no_tracks_directory_is_an_empty_list() {
+        // Arrange
+        let root = std::env::temp_dir().join(format!("idl-rs-track-list-none-{}", std::process::id()));
+
+        // Act
+        let tracks = list_tracks_from_files(&root).unwrap();
+
+        // Assert
+        assert!(tracks.is_empty());
     }
 }

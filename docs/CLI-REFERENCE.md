@@ -290,7 +290,7 @@ List the tracks in the library.
 | `--data-dir` | path | Data directory root (contract C4 §1's <data>); defaults to $IDL1_DATA_DIR |
 | `--json` | switch | Emit the result as JSON on stdout (schema_version 1); errors become typed JSON on stderr |
 
-Calls `idl_library::catalog_read::list_tracks`; `--json` emits `TrackSummary[]`.
+Calls `idl_rs::track_artifact::path::list_track_files + idl_rs::track_artifact::read::read_track`; `--json` emits `TrackSummary[]`.
 
 ### `idl-rs track detect <id>`
 

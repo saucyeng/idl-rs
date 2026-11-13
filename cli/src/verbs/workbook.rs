@@ -111,6 +111,20 @@ pub fn check(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
     };
 
     let mut problems: Vec<Value> = structural.iter().map(structural_json).collect();
+    // The parser silently replaces a malformed `id=` with a fresh random one
+    // (C2 §2.2), so the cell is unreachable by the id the author wrote.
+    let source = std::fs::read_to_string(&file)
+        .map_err(|e| CliError::io(format!("reading {}: {e}", file.display())))?;
+    problems.extend(malformed_cell_ids(&source).into_iter().map(|(line, id)| {
+        json!({
+            "cell_id": id,
+            "kind": "InvalidCellId",
+            "line": line,
+            "message": format!(
+                "cell id `{id}` (line {line}) is not 8 lowercase hex digits, so it is replaced by a new random id on every parse and `workbook data` cannot reach it"
+            ),
+        })
+    }));
     for cell in &cells {
         for def in &cell.defs {
             if let Some(error) = &def.error {
@@ -152,6 +166,49 @@ pub fn check(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
             "problems": problems,
         }),
     ))
+}
+
+/// Every cell fence (`math`/`table`/`js`/`video`) whose `id=` attribute is
+/// not 8 lowercase hex digits, as `(1-based line, id as written)`. Only fence
+/// openers outside other fences count; an empty `id=` is reported too.
+fn malformed_cell_ids(source: &str) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    // (fence char, run length) of the fence currently open, if any.
+    let mut open: Option<(char, usize)> = None;
+    for (i, raw) in source.lines().enumerate() {
+        let indent = raw.len() - raw.trim_start_matches(' ').len();
+        let line = raw.trim_start_matches(' ');
+        let Some(ch) = line.chars().next().filter(|c| (*c == '`' || *c == '~') && indent <= 3) else {
+            continue;
+        };
+        let run = line.chars().take_while(|c| *c == ch).count();
+        if run < 3 {
+            continue;
+        }
+        let info = line[run..].trim();
+        match open {
+            Some((c, n)) => {
+                if c == ch && run >= n && info.is_empty() {
+                    open = None;
+                }
+            }
+            None => {
+                open = Some((ch, run));
+                let mut parts = info.split_whitespace();
+                if matches!(parts.next(), Some("math" | "table" | "js" | "video")) {
+                    for attr in parts {
+                        if let Some(id) = attr.strip_prefix("id=") {
+                            let ok = id.len() == 8 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+                            if !ok {
+                                found.push((i + 1, id.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
 }
 
 /// `workbook cells` — the cell list, in document order.
@@ -418,8 +475,15 @@ fn session_context(ctx: &Ctx, m: &ArgMatches) -> Result<Option<(SessionHandle, M
         None if !session.exists() && ctx.data_dir.is_some() => {
             return Err(CliError::with_details(
                 ErrorKind::NotFound,
-                format!("no session `{}`: not a file, and not a session in the data directory", session.display()),
-                json!({ "session": session.display().to_string() }),
+                format!(
+                    "no session `{}`: not a file, and not a session id in the data directory {}",
+                    session.display(),
+                    ctx.data_dir.as_deref().map(|d| d.display().to_string()).unwrap_or_default()
+                ),
+                json!({
+                    "session": session.display().to_string(),
+                    "data_dir": ctx.data_dir.as_deref().map(|d| d.display().to_string()),
+                }),
             ));
         }
         None => (crate::load(&session)?, None),
@@ -1032,5 +1096,98 @@ mod tests {
         assert!(out.text.lines().any(|l| l == "peak  9"), "{}", out.text);
         assert!(out.text.lines().any(|l| l.starts_with("lt  10")), "{}", out.text);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workbook_eval_unknown_session_id_is_not_found_naming_the_id_and_data_dir() {
+        // Arrange
+        let (root, wb) = library();
+        let m = eval_matches(&[
+            &wb.display().to_string(),
+            "--data-dir",
+            &root.display().to_string(),
+            "--session",
+            "no-such-id",
+        ]);
+
+        // Act
+        let err = eval(&Ctx::from_matches(&m), &m).err().unwrap();
+
+        // Assert
+        assert_eq!(err.kind, ErrorKind::NotFound);
+        assert!(err.message.contains("no-such-id"), "{}", err.message);
+        assert!(err.message.contains(&root.display().to_string()), "{}", err.message);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn malformed_cell_ids_non_hex_id_is_reported_with_line_and_valid_or_nested_ones_are_not() {
+        // Arrange
+        let source = "---
+id: x
+---
+
+```math id=gps
+a = 1
+```
+
+```math id=0123abcd
+b = 2
+```
+
+```text
+```js id=zzz
+```
+
+```js id=ABCDEF01
+```
+";
+
+        // Act
+        let found = malformed_cell_ids(source);
+
+        // Assert
+        assert_eq!(found, vec![(5, "gps".to_string()), (17, "ABCDEF01".to_string())]);
+    }
+
+    #[test]
+    fn workbook_check_non_hex_cell_id_is_a_problem_naming_the_written_id() {
+        // Arrange
+        let dir = std::env::temp_dir().join(format!("idl-rs-wb-check-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("w.idl0wb");
+        std::fs::write(
+            &file,
+            "---
+id: 9f3c1e2d-4b6a-4f1c-9c3d-2a7e8f9b0c1d
+name: W
+---
+
+```math id=gps
+a = 1
+```
+",
+        )
+        .unwrap();
+        let mut full = vec!["idl-rs", "workbook", "check"];
+        let f = file.display().to_string();
+        full.push(&f);
+        let m = crate::verbs::augment(clap::Command::new("idl-rs"))
+            .try_get_matches_from(full)
+            .unwrap()
+            .remove_subcommand()
+            .unwrap()
+            .1
+            .remove_subcommand()
+            .unwrap()
+            .1;
+
+        // Act
+        let out = check(&Ctx::from_matches(&m), &m).unwrap();
+
+        // Assert
+        let problems = out.data["problems"].as_array().unwrap();
+        assert!(problems.iter().any(|p| p["kind"] == "InvalidCellId" && p["cell_id"] == "gps"), "{}", out.text);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
