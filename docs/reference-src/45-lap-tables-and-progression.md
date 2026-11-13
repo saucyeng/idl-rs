@@ -23,12 +23,16 @@ Three builtins read the lap a value belongs to:
 `lap_time()` reads the recorded lap time, so a neutralised zone that was
 subtracted when the session was recorded stays subtracted here.
 
-A `[t]` series becomes a `[lap]` one by reducing it per lap:
+Reducing a `[t]` series per lap, `mean([peak_freq], "t:lap")`, is planned but
+not supported yet: the engine rejects it with `expected scalar argument, got
+string`. Today a `[lap]` value comes from the three builtins above:
 
 ```
-peak_freq_by_lap = mean([peak_freq], "t:lap")   # shape: [lap]
-lap_time_s       = lap_time()                   # shape: [lap]
+lap_time_s = lap_time()                         # shape: [lap]
 ```
+
+For one lap's reduction headless, window the evaluation with `idl-rs workbook
+data --track <track> --main-lap <n>`.
 
 Combining a `[lap]` value with a `[t]` one is an error naming both shapes —
 lap 3 and second 3 are not the same coordinate, and the alternative to the
