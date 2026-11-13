@@ -30,7 +30,7 @@ fn type_name(v: &Value) -> &'static str {
 }
 
 /// Borrows the [`Vec3Value`] inside a `Value`, or a typed error otherwise.
-fn require_vec3<'a>(v: &'a Value, ctx: &str) -> Result<&'a Vec3Value, MathEvalError> {
+pub(super) fn require_vec3<'a>(v: &'a Value, ctx: &str) -> Result<&'a Vec3Value, MathEvalError> {
     match v {
         Value::Vec3(b) => Ok(b),
         other => Err(err(

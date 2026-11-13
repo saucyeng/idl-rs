@@ -1099,6 +1099,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The builtin registry end to end (spec 2026-11-13 v2): the committed
+    /// `registry-e2e.idl1wb` (a filter, an RMS, an integration, per-lap
+    /// reductions) over the committed synthetic ride, imported as a library
+    /// session carrying the generator's own three laps, through the real
+    /// `workbook eval --values` path.
+    #[test]
+    fn workbook_eval_registry_fixture_over_the_synthetic_ride_matches_the_committed_values() {
+        // Arrange
+        use idl_rs::store::session_json::LapJson;
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/fixtures");
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("idl-rs-wb-registry-{}-{nanos}", std::process::id()));
+        let bytes = std::fs::read(fixtures.join("synth-3lap.idl0")).unwrap();
+        let mut session = idl_rs::parse::parse(&bytes).unwrap().session;
+        session.session_id = "synth".to_string();
+        idl_rs::store::parquet::write_session_parquet(&root, &session, "0.1.0").unwrap();
+        let mut json = idl_rs::store::session_json::empty_session_json("synth");
+        // `synth-3lap.truth.json`'s `laps`: (number, start s, end s, start ms, end ms).
+        json.laps = [
+            (1, 0.0, 11.817136381417498, 1_767_225_600_000, 1_767_225_611_817),
+            (2, 11.817136381417498, 23.634272762834996, 1_767_225_611_817, 1_767_225_623_634),
+            (3, 23.634272762834996, 35.451409144252494, 1_767_225_623_634, 1_767_225_635_451),
+        ]
+        .into_iter()
+        .map(|(lap_number, start_time_secs, end_time_secs, start_timestamp_ms, end_timestamp_ms)| LapJson {
+            lap_number,
+            start_timestamp_ms,
+            end_timestamp_ms,
+            raw_elapsed_ms: end_timestamp_ms - start_timestamp_ms,
+            lap_time_ms: end_timestamp_ms - start_timestamp_ms,
+            start_time_secs,
+            end_time_secs,
+            sectors: Vec::new(),
+            neutral_zone_visits: Vec::new(),
+        })
+        .collect();
+        std::fs::write(root.join("sessions").join("synth").join("session.json"), serde_json::to_vec(&json).unwrap()).unwrap();
+        let expected = std::fs::read_to_string(fixtures.join("registry-e2e.expected.txt")).unwrap().replace("\r\n", "\n");
+        let wb = fixtures.join("registry-e2e.idl1wb");
+        let m = eval_matches(&[
+            &wb.display().to_string(),
+            "--data-dir",
+            &root.display().to_string(),
+            "--session",
+            "synth",
+            "--values",
+        ]);
+
+        // Act
+        let out = eval(&Ctx::from_matches(&m), &m);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Assert — a mismatch prints the actual output, to review and commit.
+        let text = out.unwrap().text;
+        assert_eq!(text.trim_end(), expected.trim_end(), "actual `workbook eval --values` output:\n{text}");
+    }
+
     #[test]
     fn workbook_eval_unknown_session_id_is_not_found_naming_the_id_and_data_dir() {
         // Arrange

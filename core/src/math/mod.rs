@@ -4,11 +4,13 @@
 
 pub mod aggregate;
 pub mod alias;
+mod builtins;
 pub mod catalog;
 pub mod channel_def;
 pub mod error;
 pub mod eval;
 pub mod parse;
+pub mod registry;
 pub mod resolve;
 pub mod token;
 pub mod units;
@@ -24,9 +26,10 @@ pub use catalog::{math_builtin_catalog, MathBuiltin, MathBuiltinStatus};
 pub use channel_def::MathChannelDef;
 pub use error::{MathEvalError, MathEvalErrorKind};
 pub use eval::{
-    evaluate, evaluate_scalar, ChannelLookup, EvalOutput, LookupChannel, MathLapContext,
+    eval_with, evaluate, evaluate_scalar, ChannelLookup, EvalOutput, LookupChannel, MathLapContext,
     MathOverlay,
 };
+pub use registry::{BuiltinMeta, Ctx, FromArg, IntoBuiltin, Registry, RegistryError};
 pub use resolve::{channel_refs, resolve_dependencies};
 pub use value::{ChannelValue, Value, ValueAxis, Vec3Value};
 

@@ -1,0 +1,4 @@
+fork_rms  0.9959  g
+speed_end  35.2011  g·s
+lap_s  [lap] 1:11.817 2:11.817 3:11.817  s
+fastest_s  11.817  s
