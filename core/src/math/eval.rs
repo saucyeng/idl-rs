@@ -1492,7 +1492,7 @@ fn reject_unknown_kwargs(fn_name: &str, kwargs: &Kwargs, accepted: &[&str]) -> R
 /// tasks add one (`dim=` reductions, task 12). Every other function rejects
 /// any `kwargs` outright in [`call_function`]'s entry guard below, rather
 /// than each arm needing its own "I take no keywords" check.
-const KWARG_AWARE_FUNCTIONS: &[&str] = &["mean", "periodogram", "welch"];
+const KWARG_AWARE_FUNCTIONS: &[&str] = &["mean", "periodogram", "welch", "deglitch_pulses"];
 
 /// A keyword argument's string value, or `default` when the caller didn't
 /// supply it. Every `periodogram`/`welch` keyword is optional (scipy-style
@@ -4338,6 +4338,23 @@ mod tests {
         // Assert
         assert_eq!(err.kind, MathEvalErrorKind::Runtime);
         assert!(err.message.contains("scale"), "{}", err.message);
+    }
+
+    #[test]
+    fn deglitch_pulses_max_fraction_keyword_is_accepted_and_changes_what_is_dropped() {
+        // Arrange — an extra edge at 110 ms splits the 100 -> 200 ms gap (10 ms
+        // against 100 ms before and 90 ms after). The reference documents
+        // `deglitch_pulses(pulses, max_fraction=0.35)`; the entry guard used to
+        // reject the keyword before the arm could read it.
+        let lk = timed(&[("pulse", vec![0.0, 1.0, 2.0, 3.0, 4.0], 0.0, vec![0, 100_000, 110_000, 200_000, 300_000])]);
+
+        // Act
+        let default = channel_samples(eval_expr("deglitch_pulses([pulse])", &lk).unwrap());
+        let strict = channel_samples(eval_expr("deglitch_pulses([pulse], max_fraction=0.05)", &lk).unwrap());
+
+        // Assert
+        assert_eq!(default.len(), 4, "the 110 ms edge is dropped at the default fraction");
+        assert_eq!(strict.len(), 5, "10 ms is not under 5 % of 90 ms, so it is kept");
     }
 
     #[test]
