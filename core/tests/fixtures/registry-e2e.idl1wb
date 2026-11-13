@@ -1,0 +1,17 @@
+---
+id: 5b1d7c2e-3f4a-4e8b-9c6d-1a2b3c4d5e6f
+name: Registry end-to-end
+---
+
+A filter, an RMS, an integration and per-lap reductions over
+`synth-3lap.idl0`, evaluated by `idl-rs workbook eval --values` in
+`cli/src/verbs/workbook.rs`; the values are `registry-e2e.expected.txt`.
+
+```math id=a1b2c3d4
+fork = butter(2, 2, "low", [IMU0_AccelZ])
+fork_rms = rms([fork])
+speed = cumulative_trapezoid([IMU0_AccelZ])
+speed_end = last([speed])
+lap_s = lap_time()
+fastest_s = min(lap_time())
+```
