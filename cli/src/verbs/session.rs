@@ -408,7 +408,7 @@ pub fn synth(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
 /// Every flag carries a table-declared default, so clap always supplies a
 /// value; the fallbacks restate [`SynthConfig::default`] rather than relying
 /// on that. `--noise` is [`crate::verbs::opt_text`] because the command table
-/// has no floating-point [`idl_rs::commands::table::ValueKind`] — adding one
+/// has no floating-point [`crate::table::ValueKind`] — adding one
 /// would change a shape every noun shares, which is not this lane's to change.
 fn synth_config(m: &ArgMatches) -> Result<SynthConfig, CliError> {
     let defaults = SynthConfig::default();

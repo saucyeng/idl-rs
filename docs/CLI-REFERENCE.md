@@ -1,6 +1,6 @@
 # idl-rs command reference
 
-Generated from the one command table (`idl_rs::commands::table`, ruling R230).
+Generated from the one command table (`idl_rs_cli::table`, ruling R230).
 Do not edit by hand: run `idl-rs docs cli --out <file>`.
 
 ## Grammar
@@ -490,5 +490,5 @@ Emit this command table as Markdown, or as JSON with --json.
 | `--dry-run` | switch | Report what would change and write nothing |
 | `--json` | switch | Emit the result as JSON on stdout (schema_version 1); errors become typed JSON on stderr |
 
-Calls `commands::markdown::render_command_reference`; `--json` emits `CommandTable`.
+Calls `idl_rs_cli::markdown::render_command_reference`; `--json` emits `CommandTable`.
 

@@ -1,4 +1,4 @@
-//! The command table itself (ruling R230): the row shape, the closed noun
+//! The command table itself (ruling R230), the CLI's own contract: the row shape, the closed noun
 //! and verb vocabularies, and [`COMMANDS`].
 //!
 //! # Why the vocabularies are two lists, not one
@@ -31,6 +31,9 @@
 //! thing each row has to remember.
 
 use std::fmt;
+
+pub use idl_rs::commands::workbook_ops::WORKBOOK_TEMPLATES;
+pub use idl_rs::commands::JSON_SCHEMA_VERSION;
 
 /// What a positional argument or a flag's value is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,9 +252,6 @@ pub const DRY_RUN_FLAG: Flag =
 /// The environment variable [`DATA_DIR_FLAG`] falls back to.
 pub const DATA_DIR_ENV: &str = "IDL1_DATA_DIR";
 
-/// The `schema_version` every `--json` payload carries (R230 item 3).
-pub const JSON_SCHEMA_VERSION: u32 = 1;
-
 /// R230's closed noun vocabulary.
 pub const NOUNS: &[&str] =
     &["session", "workbook", "track", "bike", "catalog", "library", "device", "docs"];
@@ -400,10 +400,6 @@ const MAIN_LAP_FLAG: Flag = Flag::value(
     ValueKind::Integer,
     "1-based lap number that lap-scoped expressions mean; needs --track",
 );
-
-/// The templates `workbook new` knows. Kept a closed set in the table so
-/// adding one is a new value rather than a new verb.
-pub const WORKBOOK_TEMPLATES: &[&str] = &["blank", "session"];
 
 /// What `workbook export` can write.
 pub const WORKBOOK_EXPORT_FORMATS: &[&str] = &["md", "json"];
@@ -999,7 +995,7 @@ pub const COMMANDS: &[CommandRow] = &[
         verb: "cli",
         args: &[],
         flags: &[Flag::value("out", ValueKind::Path, "File to write; stdout when omitted")],
-        core_fn: "commands::markdown::render_command_reference",
+        core_fn: "idl_rs_cli::markdown::render_command_reference",
         json_shape: Some("CommandTable"),
         help: "Emit this command table as Markdown, or as JSON with --json",
         tier: Tier::Rare,

@@ -1,25 +1,19 @@
-//! The one command table (ruling R230) and the core operations the rows
-//! behind the newer verbs call.
+//! The core operations the CLI's newer verbs call (rulings R229, R230).
 //!
-//! R230: `idl-rs <noun> <verb> [args] [--flags]`, with one table as the
-//! source of truth for the CLI's subcommands, the generated reference, and
-//! (later, R228 item 2) the agent tool schemas. Adding a command is one row
-//! plus one core function; there is no CLI-only logic.
+//! R230: `idl-rs <noun> <verb> [args] [--flags]`. The command table itself
+//! (the rows, the vocabularies, the generated reference) is the CLI's own
+//! contract and lives in `idl-rs-cli`; what stays here is the engine-side
+//! logic those rows call, so there is no CLI-only logic.
 //!
-//! This module lives in `core`, not `cli`, for two reasons. The table is
-//! pure data — no clap, no I/O, no Tauri — so it breaks none of CLAUDE.md
-//! §2's purity rule. And `idl1-bridge` needs the same rows to derive the
-//! agent tool schemas, which it cannot take from the CLI binary.
-//!
-//! - [`table`] — the row shape, the closed vocabularies, and [`table::COMMANDS`].
-//! - [`markdown`] — the table rendered as Markdown and as JSON (`docs cli`).
+//! - [`calibration_ops`] — calibration inputs and truth checks for a session.
 //! - [`lap_ops`] — assembling a `MathLapContext` from detected laps.
 //! - [`workbook_ops`] — the skeletons behind `workbook new`.
 
 pub mod calibration_ops;
 pub mod lap_ops;
-pub mod markdown;
-pub mod table;
 pub mod workbook_ops;
 
-pub use table::{Arg, CommandRow, Flag, Status, Tier, ValueKind, COMMANDS, NOUNS, VERBS};
+/// The `schema_version` every CLI `--json` payload carries (R230 item 3),
+/// shared by the command envelope and `docs workbook --json`. Unitless
+/// integer, bumped when an envelope's shape changes.
+pub const JSON_SCHEMA_VERSION: u32 = 1;

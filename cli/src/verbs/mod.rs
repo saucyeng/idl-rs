@@ -1,7 +1,7 @@
 //! The noun-rooted command surface (ruling R230): `idl-rs <noun> <verb>`.
 //!
 //! Nothing here declares a subcommand by hand. [`augment`] walks
-//! [`idl_rs::commands::COMMANDS`] and builds one clap subcommand per row, so
+//! [`crate::table::COMMANDS`] and builds one clap subcommand per row, so
 //! the flags a command accepts, the help it prints and the generated
 //! reference all come from the same table — a row is the only place a
 //! command is declared.
@@ -36,7 +36,7 @@ use std::process::ExitCode;
 use clap::{Arg as ClapArg, ArgAction, ArgMatches, Command as ClapCommand};
 use serde_json::{json, Value};
 
-use idl_rs::commands::table::{
+use crate::table::{
     find, nouns_in_use, rows_for, Arg, CommandRow, Flag, ValueKind, DATA_DIR_ENV,
     JSON_SCHEMA_VERSION,
 };
@@ -354,7 +354,7 @@ pub fn switch(m: &ArgMatches, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use idl_rs::commands::COMMANDS;
+    use crate::table::COMMANDS;
 
     /// The whole generated tree, with a root that declares nothing itself.
     fn tree() -> ClapCommand {

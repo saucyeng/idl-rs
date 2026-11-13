@@ -18,8 +18,8 @@ use std::process::ExitCode;
 use clap::ArgMatches;
 use serde_json::json;
 
-use idl_rs::commands::markdown::{command_table_json, render_command_reference};
-use idl_rs::commands::table::CommandRow;
+use crate::markdown::{command_table_json, render_command_reference};
+use crate::table::CommandRow;
 
 use crate::docs_cmd::{self, DocsAction};
 use crate::envelope::{CliError, ErrorKind};
@@ -216,7 +216,7 @@ fn folder(m: &ArgMatches) -> Result<PathBuf, CliError> {
 
 #[cfg(test)]
 mod tests {
-    use idl_rs::commands::table::rows_for;
+    use crate::table::rows_for;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn temp_dir() -> std::path::PathBuf {

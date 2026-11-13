@@ -26,7 +26,7 @@
 //! No I/O — the caller (`idl-rs docs workbook`) reads the curated files and
 //! writes the result.
 
-use crate::commands::table::JSON_SCHEMA_VERSION;
+use crate::commands::JSON_SCHEMA_VERSION;
 use crate::math::{math_builtin_catalog, math_name_migrations, MathBuiltin, MathBuiltinStatus};
 
 /// One curated section to append after the generated half: the file's

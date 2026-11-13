@@ -5,7 +5,7 @@
 //! template" and "Create" fold into one `workbook.new`. A template here is
 //! therefore nothing more than a named starting document: a closed set of
 //! source skeletons, named in
-//! [`crate::commands::table::WORKBOOK_TEMPLATES`], so adding one is a new
+//! [`WORKBOOK_TEMPLATES`], so adding one is a new
 //! value in that list rather than a new verb or a new ruling.
 //!
 //! Skeletons are emitted as workbook *source text*, not as a constructed
@@ -24,6 +24,11 @@ use crate::workbook::v3::{FrontMatter, UnitsPref};
 /// at `3`.
 pub const NEW_WORKBOOK_VERSION: u32 = 4;
 
+/// The templates `workbook new` knows, as the CLI spells them. A closed set
+/// so adding one is a new value rather than a new verb; [`WorkbookTemplate`]
+/// has one variant per entry.
+pub const WORKBOOK_TEMPLATES: &[&str] = &["blank", "session"];
+
 /// Which skeleton [`new_workbook_source`] writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkbookTemplate {
@@ -36,7 +41,7 @@ pub enum WorkbookTemplate {
 
 impl WorkbookTemplate {
     /// The name as the CLI spells it, matching
-    /// [`crate::commands::table::WORKBOOK_TEMPLATES`].
+    /// [`WORKBOOK_TEMPLATES`].
     pub fn as_str(self) -> &'static str {
         match self {
             WorkbookTemplate::Blank => "blank",
@@ -122,7 +127,6 @@ pub fn new_workbook_source(template: WorkbookTemplate, spec: &NewWorkbook) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::table::WORKBOOK_TEMPLATES;
     use crate::workbook::v3::parse_workbook;
 
     fn spec() -> NewWorkbook {

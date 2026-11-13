@@ -15,7 +15,9 @@
 mod docs_cmd;
 mod envelope;
 mod library;
+mod markdown;
 mod recover;
+mod table;
 mod verbs;
 
 use std::fs::File;

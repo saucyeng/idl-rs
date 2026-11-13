@@ -1,14 +1,14 @@
 //! The command table rendered for readers and for machines: Markdown for
 //! the generated reference, JSON for the app's checked-in copy.
 //!
-//! Both are pure functions of [`super::table::COMMANDS`], and both are
+//! Both are pure functions of [`crate::table::COMMANDS`], and both are
 //! byte-stable for a given table — CI regenerates them and fails on a diff,
 //! the same gate `docs workbook` already runs under. Every line ends `\n` on
 //! every platform for that reason.
 
 use serde_json::{json, Value};
 
-use super::table::{
+use crate::table::{
     CommandRow, Status, COMMANDS, DATA_DIR_ENV, JSON_SCHEMA_VERSION, NOUNS, VERBS, VERBS_RULED,
 };
 
@@ -18,7 +18,7 @@ pub fn render_command_reference() -> String {
     let mut out = String::new();
 
     out.push_str("# idl-rs command reference\n\n");
-    out.push_str("Generated from the one command table (`idl_rs::commands::table`, ruling R230).\n");
+    out.push_str("Generated from the one command table (`idl_rs_cli::table`, ruling R230).\n");
     out.push_str("Do not edit by hand: run `idl-rs docs cli --out <file>`.\n\n");
 
     out.push_str("## Grammar\n\n");
@@ -167,7 +167,7 @@ fn row_json(row: &CommandRow) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::table::find;
+    use crate::table::find;
 
     #[test]
     fn the_reference_names_every_registered_command() {
