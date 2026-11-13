@@ -34,7 +34,7 @@ const F64_BYTES: u64 = 8;
 
 /// The `(numerator, denominator)` safety margin on an estimate, 5/4: the
 /// spec's `E = (I + F + T) × 1.25` (§4.2.B), the same margin
-/// `idl-rs-tauri`'s decode reservations carry.
+/// `idl1-bridge`'s decode reservations carry.
 pub const ESTIMATE_MARGIN: (u64, u64) = (5, 4);
 
 /// Bytes the session cache holds per stored sample beyond the raw value

@@ -62,7 +62,7 @@ impl BudgetGuard for () {}
 /// A process-wide byte semaphore an indexing worker reserves against before
 /// it decodes (ruling R208.1 item 3, ruling R211's "wait, don't fail").
 ///
-/// The app implements this over `idl-rs-tauri`'s `SessionCache`, so indexing
+/// The app implements this over `idl1-bridge`'s `SessionCache`, so indexing
 /// decodes queue behind the same budget as every command's; the CLI uses
 /// [`ByteBudget`]; tests use [`NoBudget`].
 pub trait DecodeBudget: Sync {
@@ -186,7 +186,7 @@ impl std::error::Error for NeverFits {}
 /// Callable per unit of work from any thread — one workbook evaluation, or
 /// one member of a session set — and shared by every caller, so N workers
 /// can never hold more than one budget between them. The app implements it
-/// over `idl-rs-tauri`'s `SessionCache` (the ledger that also counts decoded
+/// over `idl1-bridge`'s `SessionCache` (the ledger that also counts decoded
 /// channels, decodes in flight and kept evaluations, and is sized from the
 /// machine); the CLI uses [`ByteBudget`].
 pub trait MemoryBudget: Sync {

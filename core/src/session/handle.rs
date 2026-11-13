@@ -103,7 +103,7 @@ pub const TIME_CHANNEL_ID: &str = "Time";
 /// asked for one channel and each got every channel, f64, concurrently. An
 /// implementation of this trait decodes exactly the column it is asked for —
 /// [`crate::store::parquet::ParquetChannelSource`] here, and the app's
-/// byte-budgeted `SessionCache` in `idl-rs-tauri`.
+/// byte-budgeted `SessionCache` in `idl1-bridge`.
 ///
 /// `None` means "no samples for that id". Both "this source has no such
 /// channel" and "the decode failed or was refused" read back as `None`,
@@ -1160,7 +1160,7 @@ fn slice_channel_by_time(c: &Channel, t0: f64, t1: f64) -> Vec<f64> {
 /// 1). `(0, 0)` when `t_us` is empty, the window is inverted (`t1 < t0`),
 /// or the window covers no sample. Shared boundary math between
 /// [`slice_channel_by_time`] (which widens the resulting window into
-/// materialized `f64` samples) and `idl-rs-tauri`'s `fetch_fft` lap
+/// materialized `f64` samples) and `idl1-bridge`'s `fetch_fft` lap
 /// slicing, which needs the raw `t_us` entries in the same window to
 /// derive an effective sample rate (ruling R85) — pulled out here so both
 /// call sites share one boundary-math implementation instead of each

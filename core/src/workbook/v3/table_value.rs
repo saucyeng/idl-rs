@@ -7,7 +7,7 @@
 //! (`SessionHandle::store_math`, `workbook::apply`) before a table read the
 //! same handle, so `[Name]` found them as channels. Workbook v3 resolves
 //! definitions in their own overlay (`resolve.rs`) and never writes them to
-//! the handle, and the first v3 table wiring (`idl-rs-tauri`
+//! the handle, and the first v3 table wiring (`idl1-bridge`
 //! `table_cell_value`, 2026-09-04, `8d737fe`) evaluated tables against the
 //! bare handle — so from then on a table saw channels only. C2 §4 kept
 //! idl0's "`[Channel]` refs" wording, which read as channels-only once

@@ -1039,7 +1039,7 @@ mod tests {
 
         // `write_session_parquet` never persists synthesized `Time`/
         // `Distance` (C1 §2) — re-run the same synthesis the real reader
-        // (`rust/tauri/src/session_source.rs::load_session`) does on every
+        // (`crates/idl1-bridge/src/session_source.rs::load_session`) does on every
         // read-back, proving Q2's fallback survives the parquet round trip.
         let mut session = read_session_parquet(&report.data_parquet).unwrap();
         crate::session::synthesis::synthesize_base_channels(&mut session);
@@ -1083,7 +1083,7 @@ mod tests {
 
         // `write_session_parquet` never persists synthesized `Time`/
         // `Distance` (C1 §2) — re-run the same synthesis the real reader
-        // (`rust/tauri/src/session_source.rs::load_session`) does on every
+        // (`crates/idl1-bridge/src/session_source.rs::load_session`) does on every
         // read-back, proving Q2's fallback survives the parquet round trip.
         let mut session = read_session_parquet(&report.data_parquet).unwrap();
         crate::session::synthesis::synthesize_base_channels(&mut session);
@@ -1110,7 +1110,7 @@ mod tests {
 
         // `write_session_parquet` never persists synthesized `Time`/
         // `Distance` (C1 §2) — re-run the same synthesis the real reader
-        // (`rust/tauri/src/session_source.rs::load_session`) does on every
+        // (`crates/idl1-bridge/src/session_source.rs::load_session`) does on every
         // read-back, proving Q2's fallback survives the parquet round trip.
         let mut session = read_session_parquet(&report.data_parquet).unwrap();
         crate::session::synthesis::synthesize_base_channels(&mut session);

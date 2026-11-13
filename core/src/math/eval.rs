@@ -1308,7 +1308,7 @@ fn describe_channel(ch: &ChannelValue) -> String {
 // "smallest i with i/rate >= end_sec" (the first *excluded* index) are the
 // same ceiling computation. Callers resolving a whole session (`SpanDto::
 // Session`) must supply `end_sec` one microsecond past the last sample
-// (`idl-rs-tauri`'s `full_session_span_us`, R126) — the last sample's own
+// (`idl1-bridge`'s `full_session_span_us`, R126) — the last sample's own
 // timestamp as `end_sec` silently drops it, since it lands exactly on the
 // excluded boundary.
 //
@@ -3123,7 +3123,7 @@ mod tests {
         // Arrange — a window whose bounds are the whole recorded span
         // (`SpanDto::Session`'s shape) must change nothing: the regression
         // that proves scope changed, not arithmetic. The bound is built the
-        // way `idl-rs-tauri`'s `full_session_span_us`/`resolve_window`
+        // way `idl1-bridge`'s `full_session_span_us`/`resolve_window`
         // actually produce it for `SpanDto::Session` (ruling R126), not a
         // fabricated duration-shaped `(0.0, 1.0)`: 10 samples at 10 Hz have
         // `t_us` 0, 100_000, …, 900_000, so `end_sec` is one microsecond

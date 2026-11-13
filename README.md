@@ -2,14 +2,14 @@
 
 The IDL0 signal-processing engine — a pure Rust workspace that owns all DSP,
 `.idl0` binary parsing, the math-channel evaluator, and the suspension-kinematics
-estimator. Consumed by the idl1 app via `idl-rs-tauri` and by the `idl-rs` CLI.
+estimator. Consumed by the idl1 app via `idl1-bridge` and by the `idl-rs` CLI.
 
 | Crate | What |
 |-------|------|
 | `core/` | `idl-rs` — filters, FFT, integration, rotation, statistics, estimation (sci-rs, nalgebra). Pure: no Tauri, no I/O beyond `std::fs`. |
-| `transport/` | `idl-transport` — BLE, WiFi transfer, config push, LAN sync. Never depends on Tauri; never does DSP. |
-| `tauri/` | `idl-rs-tauri` — `#[tauri::command]` glue over `core` and `transport`; the only crate the frontend sees. |
 | `cli/` | `idl-rs-cli` — the standalone `idl-rs` binary. |
+
+The app-side crates (`idl1-bridge`, the `#[tauri::command]` glue, and `idl1-transport`, BLE/WiFi/LAN sync) now live in the idl1-app repo under `crates/`.
 
 ## Build & test
 

@@ -1092,7 +1092,7 @@ fn read_derived_channels(path: &Path) -> Result<(Vec<i64>, Vec<(String, Vec<f64>
 /// enables `PRAGMA foreign_keys = ON` per connection, so both cascades fire
 /// for a connection built through it. Deliberately a single targeted
 /// `DELETE`, not a `rebuild_catalog` call (needlessly expensive per delete,
-/// R68) — the tauri command layer (`idl-rs-tauri`'s `delete_session`) calls
+/// R68) — the tauri command layer (`idl1-bridge`'s `delete_session`) calls
 /// this after removing `<data>/sessions/<session_id>/` from disk.
 ///
 /// Returns `true` if a `sessions` row existed and was removed, `false` if
@@ -1143,7 +1143,7 @@ pub fn upsert_track(conn: &Connection, track: &crate::track_artifact::Track, ful
 /// NULL` (this file's `DDL`), and `open_catalog` enables `PRAGMA
 /// foreign_keys = ON` per connection, so this single `DELETE` also nulls
 /// out `track_id` on every lap row that named this track — the tauri
-/// command layer (`idl-rs-tauri`'s `delete_track`) calls this after removing
+/// command layer (`idl1-bridge`'s `delete_track`) calls this after removing
 /// `<data>/tracks/<track_id>.idl0t` from disk. Deliberately a single
 /// targeted `DELETE`, not a `rebuild_catalog` call, matching
 /// [`delete_session`]'s own R68 reasoning.
@@ -1159,7 +1159,7 @@ pub fn delete_track(conn: &Connection, track_id: &str) -> Result<bool, CatalogEr
 /// `workbook_id` — a rename of the file keeps the id, so a later upsert with
 /// the same `workbook_id` but a different `file_name`/`name` updates the
 /// existing row rather than creating a second one. Called by
-/// [`rebuild_catalog`]'s step 6 and by `idl-rs-tauri`'s `create_workbook`/
+/// [`rebuild_catalog`]'s step 6 and by `idl1-bridge`'s `create_workbook`/
 /// `save_workbook` commands right after their own atomic write, so
 /// `list_workbooks` (C3 §3.2) reflects a new/edited workbook without waiting
 /// for the next rebuild.

@@ -1,5 +1,5 @@
 //! Catalog read API (contract C3 §3.2) — the seven read queries the
-//! `idl-rs-tauri` catalog commands wrap. `store::catalog` (L1) is
+//! `idl1-bridge` catalog commands wrap. `store::catalog` (L1) is
 //! write/rebuild only; this is a new file so none of it is edited (ledger
 //! R40). `get_session`/`get_track` read canonical files directly, never the
 //! catalog (C4 §5: "nothing reads the catalog for truth"); `list_laps`
@@ -11,7 +11,7 @@
 //! backing row/file; a genuine `rusqlite::Error` (e.g. a corrupt
 //! `catalog.sqlite`) keeps `CatalogErrorKind::Sql` via `catalog.rs`'s own
 //! `From<rusqlite::Error>`, and any other failure (filesystem, parse) folds
-//! to `Io`. `idl-rs-tauri`'s `From<CatalogError> for IpcError` maps
+//! to `Io`. `idl1-bridge`'s `From<CatalogError> for IpcError` maps
 //! `NotFound -> not_found`, `Sql -> internal`, `Io -> io` — matching C3
 //! §3.2's per-command error sets exactly. (R46 replaced an earlier revision
 //! of this module, which reused `Sql` for both meanings and so surfaced a
@@ -544,7 +544,7 @@ pub fn list_laps(data_root: &Path, session_id: &str) -> Result<Vec<LapSummary>, 
 
 /// C3 §3.2 `rebuild_catalog()` — returns `store::catalog::RebuildReport`
 /// unchanged; the C3 four-field mapping and timing happen at the command
-/// boundary (`idl-rs-tauri`), not here.
+/// boundary (`idl1-bridge`), not here.
 pub fn rebuild_catalog_report(data_root: &Path) -> Result<RebuildReport, CatalogError> {
     rebuild_catalog(data_root)
 }

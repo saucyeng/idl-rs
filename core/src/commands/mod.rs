@@ -8,7 +8,7 @@
 //!
 //! This module lives in `core`, not `cli`, for two reasons. The table is
 //! pure data — no clap, no I/O, no Tauri — so it breaks none of CLAUDE.md
-//! §2's purity rule. And `idl-rs-tauri` needs the same rows to derive the
+//! §2's purity rule. And `idl1-bridge` needs the same rows to derive the
 //! agent tool schemas, which it cannot take from the CLI binary.
 //!
 //! - [`table`] — the row shape, the closed vocabularies, and [`table::COMMANDS`].

@@ -435,7 +435,7 @@ impl UnknownReason {
 // §2) mirrors `HostChannel`'s own already-established exception
 // (`core/src/workbook/v3/host.rs`): a host-variable value crosses to the
 // JS sandbox as JSON via `postMessage`, never through Tauri IPC, so there
-// is no `idl-rs-tauri` layer between this type and its wire form the way
+// is no `idl1-bridge` layer between this type and its wire form the way
 // `CellDefResult`'s own `UnitLabel` mirror (`tauri/src/commands/workbook.rs`)
 // has. Same shape as that mirror (`tag = "state"`) so the two paths render
 // identically JS-side.

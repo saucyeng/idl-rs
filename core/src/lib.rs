@@ -2,7 +2,7 @@
 //!
 //! Parsing, data model, DSP, and analysis. No Tauri, no async runtime,
 //! no clap, no I/O beyond std::fs. Consumed by the idl1 app (via
-//! idl-rs-tauri) and the idl-rs CLI, and future Python/WASM bindings.
+//! idl1-bridge) and the idl-rs CLI, and future Python/WASM bindings.
 
 pub mod calibration;
 pub mod chart_decimation;

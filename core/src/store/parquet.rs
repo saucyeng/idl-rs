@@ -1916,7 +1916,7 @@ pub fn read_channel_sample_counts(session_dir: &Path) -> Result<Vec<(String, usi
 ///
 /// Nothing is cached here beyond the parsed footer (no decoded axis or
 /// channel is kept) — a lazy [`SessionHandle`] remembers what it has
-/// already asked for, and the app's `SessionCache` (`idl-rs-tauri`) is the
+/// already asked for, and the app's `SessionCache` (`idl1-bridge`) is the
 /// cross-request, byte-budgeted cache. This type is the plain, unbudgeted
 /// source the CLI and the import pipeline use.
 #[derive(Debug, Clone)]

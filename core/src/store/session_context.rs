@@ -1,5 +1,5 @@
 //! A stored session's lap context for one window (C1 §6.1), from
-//! `session.json` — the part of `idl-rs-tauri`'s `load_window_context_from`
+//! `session.json` — the part of `idl1-bridge`'s `load_window_context_from`
 //! that is not about the wire (session-sets spec §6.2), so the app's
 //! per-window path, the session-set runner and the CLI build the same
 //! [`MathLapContext`] for the same window.

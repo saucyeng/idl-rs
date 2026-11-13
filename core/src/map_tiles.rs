@@ -1,6 +1,6 @@
 //! The map's satellite tiles on disk (track editor spec §4): which tiles
 //! exist, where a cached one lives, and reading and writing it. The fetch
-//! itself is `idl-transport`'s; this module never touches the network.
+//! itself is `idl1-transport`'s; this module never touches the network.
 //!
 //! The cache lives under the OS cache directory the caller passes in, never
 //! in the library: tiles are not the rider's data, are never synced, and can

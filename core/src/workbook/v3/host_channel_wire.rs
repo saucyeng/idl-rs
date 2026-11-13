@@ -1,7 +1,7 @@
 //! `IDLH` v2 binary wire encoder (C3 §3.4, ruling R59 Q3(a)'s 24-byte
 //! padded header) for a [`super::HostChannel`] crossing Tauri IPC as raw
 //! bytes — the byte-path half of the host-channel story; a `HostChannelRef`-
-//! shaped JSON marker (built in `idl-rs-tauri`, not here) stays the light
+//! shaped JSON marker (built in `idl1-bridge`, not here) stays the light
 //! "does a value exist" half. Kept as its own module, not folded into
 //! `host.rs`, so this pure byte-layout concern stays apart from `host.rs`'s
 //! channel lookup/conversion logic.

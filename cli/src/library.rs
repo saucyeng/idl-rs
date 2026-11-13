@@ -692,7 +692,7 @@ fn stale_json(rows: &[StaleSession]) -> Value {
 // ── index ────────────────────────────────────────────────────────────────
 
 /// Memory the CLI's indexing pool may hold in flight at once, bytes: 2 GiB,
-/// the same ceiling `idl-rs-tauri`'s `memory::MAX_BUDGET_BYTES` puts on the
+/// the same ceiling `idl1-bridge`'s `memory::MAX_BUDGET_BYTES` puts on the
 /// app. Fixed rather than a fraction of RAM because `idl-rs` is pure and has
 /// no physical-memory query (CLAUDE.md §2), and because a shell tool with no
 /// webview alongside it can afford the ceiling on any machine that can run
