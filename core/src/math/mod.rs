@@ -4,11 +4,11 @@
 
 pub mod aggregate;
 pub mod alias;
-pub mod catalog;
 pub mod channel_def;
 pub mod error;
 pub mod eval;
 pub mod parse;
+pub mod registry;
 pub mod resolve;
 pub mod token;
 pub mod units;
@@ -20,7 +20,7 @@ pub use alias::{
     math_name_migrations, migrate_body, migrate_cell_body, migrate_document, migrate_expression,
     AppliedRename, DocumentRename, MigrationKind, NameMigration,
 };
-pub use catalog::{math_builtin_catalog, MathBuiltin, MathBuiltinStatus};
+pub use registry::{math_builtin_catalog, Builtin, MathBuiltin, MathBuiltinStatus};
 pub use channel_def::MathChannelDef;
 pub use error::{MathEvalError, MathEvalErrorKind};
 pub use eval::{

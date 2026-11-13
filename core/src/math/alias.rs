@@ -46,8 +46,8 @@ pub struct NameMigration {
 }
 
 /// The full retired-name table (C2 §3.8's "Retired names" list, hand
-/// transcribed here — see [`crate::math::catalog`]'s module doc for why this
-/// codebase transcribes rather than derives its function metadata). Consulted
+/// transcribed here, as the builtin metadata in [`crate::math::registry`] is
+/// transcribed from C2 §3.3's table rather than derived). Consulted
 /// by every migration door named in the plan: in-memory evaluation of a
 /// `version: 3` document, [`migrate_expression`]/[`migrate_document`], and a
 /// `version: 4` document's [`crate::math::error::MathEvalErrorKind::UnknownFunction`]

@@ -1635,7 +1635,7 @@ mod tests {
         // Arrange — task 3's own required test: a function added to
         // call_function with no entry here must fail loudly, not silently
         // report Unknown by omission.
-        for builtin in crate::math::catalog::math_builtin_catalog() {
+        for builtin in crate::math::registry::BUILTINS.iter().filter(|b| b.documented) {
             // Act
             let (rule, _) = function_unit_rule(builtin.name, builtin.arity[0] as usize);
 
