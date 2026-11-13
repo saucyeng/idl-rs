@@ -668,7 +668,9 @@ mod tests {
         // Arrange
         let registry = Registry::builtins();
 
-        for e in registry.entries.iter().filter(|e| e.documented) {
+        // A signature that abbreviates a run of parameters (`rotate_mat(v, m00..m22)`) can't be
+        // counted from its text, so it is left out.
+        for e in registry.entries.iter().filter(|e| e.documented && !e.meta.signature.contains("..")) {
             // Act — the first call form's positional parameters (`k=v` is a keyword).
             let n = top_level_args(e.meta.signature).iter().filter(|p| !p.contains('=')).count();
 
