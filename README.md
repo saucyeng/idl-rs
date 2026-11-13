@@ -1,10 +1,12 @@
 # idl-rs
 
-<!-- ISAAC: one or two sentences: what idl-rs is, in your words -->
+idl-rs is a cross-platform Rust library and command-line tool for processing data logs, built for MTB and motocross racing. It parses, converts, and processes time series data through `nalgebra`, `sci-rs`, and `rustfft`, and stores results in Parquet so long sessions stay compact and fast to query.
 
 ## Why
 
-<!-- ISAAC: why does it exist, and who is it for? A few sentences in your words. -->
+While tools like NumPy/SciPy, MATLAB, and Julia have been the go-to in scientific computing for years, the mobile options are few and far between. Until now, there was no complete, high-level pipeline that ran the same on mobile as on desktop.
+
+idl-rs is an FFmpeg-inspired, cross-platform tool that puts a full toolbox of scientific computing capabilities on a racer's or mechanic's phone for trackside analysis.
 
 ## Quick start
 
@@ -59,4 +61,4 @@ Never `--workspace`. The two reference files above are generated; see `docs/refe
 
 AGPL-3.0-or-later; see [LICENSE](LICENSE). Contributions require the CLA ([CLA.md](CLA.md)), which keeps commercial dual-licensing available.
 
-<!-- ISAAC: one sentence on commercial licensing: who to contact, and what it covers? -->
+idl-rs is available for free under an AGPL-3.0 license, meaning you may use it, modify it, and distribute it as you please, as long as your project remains open source. Commercial licenses are available for purchase if you would like to use this pipeline in a closed source project. Please reach out to isaac@marlboroelectronics.com.
