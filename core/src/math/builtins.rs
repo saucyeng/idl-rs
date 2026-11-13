@@ -186,7 +186,7 @@ pub(super) fn register(r: &mut Registry) -> Result<(), RegistryError> {
     r.add_not_implemented(BuiltinMeta { name: "spectrogram", category: "Frequency", unit_rule: "SelectByLiteral(scaling, ...) as `periodogram`, over a `[t,f]` value", shape: "[t,f]", kwargs: &[],
         signature: "spectrogram(ch, window_size, hop_size, window, detrend, scaling)",
         description: "Time-varying spectrum. Not implemented; the signature and shape are fixed by C2 3.6.3.",
-        example: "spectrogram([Fork])" }, &[1])?;
+        example: "spectrogram([Fork])" }, &[1, 2, 3, 4, 5, 6])?;
     r.add_not_implemented(BuiltinMeta { name: "envelope", category: "Frequency", unit_rule: "SameAsArg(0)", shape: "[t]", kwargs: &[],
         signature: "envelope(ch)",
         description: "Amplitude envelope -- a magnitude, not scipy's complex analytic signal. Not implemented. Retired name: `hilbert`.",
