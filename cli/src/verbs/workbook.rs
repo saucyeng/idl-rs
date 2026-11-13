@@ -29,12 +29,10 @@ use idl_rs::commands::lap_ops::{self, MainLap};
 use idl_rs::commands::workbook_ops::{
     new_workbook_id, new_workbook_source, NewWorkbook, WorkbookTemplate,
 };
-use idl_rs::laps::detect_laps;
 use idl_rs::laps::model::Lap;
 use idl_rs::math::eval::MathLapContext;
 use idl_rs::session::handle::SessionHandle;
 use idl_rs::track_artifact;
-use idl_rs::tracks::{detect_visits, VisitParams};
 use idl_rs::math::units::UnitLabel;
 use idl_library::set_job::{engine_identity, run_session_set, SetJobOptions, SetJobReport};
 use idl_rs::table::{CellResult, RowSource, TableModel};
@@ -565,23 +563,14 @@ fn lap_context(
     main_lap: Option<i64>,
 ) -> Result<MathLapContext, CliError> {
     let artifact = track_artifact::read_track(track).map_err(CliError::from)?;
-    let timing = artifact.timing.as_ref().ok_or_else(|| {
+    artifact.timing.as_ref().ok_or_else(|| {
         CliError::with_details(
             ErrorKind::InvalidInput,
             format!("track '{}' has no lap timing configured", artifact.name),
             json!({ "track": artifact.name }),
         )
     })?;
-    let visits = detect_visits(handle, &[artifact.track_ref()], VisitParams::default());
-    let laps: Vec<Lap> = visits
-        .iter()
-        .flat_map(|v| {
-            let window = Some((v.start_timestamp_ms, v.end_timestamp_ms));
-            detect_laps(handle, timing, &artifact.sector_gates, &artifact.neutral_zones, window)
-        })
-        .enumerate()
-        .map(|(i, lap)| Lap { lap_number: (i + 1) as u32, ..lap })
-        .collect();
+    let laps: Vec<Lap> = artifact.laps(handle);
 
     let designated = match main_lap {
         Some(n) => MainLap::Number(u32::try_from(n).map_err(|_| {

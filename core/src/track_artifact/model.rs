@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::VersionedConfig;
 use crate::gps::GpsFix;
-use crate::laps::model::{Gate, LapTiming, NeutralZone, SectorGate};
-use crate::tracks::TrackRef;
+use crate::laps::detect_laps;
+use crate::laps::model::{Gate, Lap, LapTiming, NeutralZone, SectorGate};
+use crate::session::handle::SessionHandle;
+use crate::tracks::{detect_visits, TrackRef, VisitParams};
 
 /// Highest `.idl0t` schema version this build understands.
 pub const SUPPORTED_TRACK_ARTIFACT_VERSION: u32 = 1;
@@ -39,6 +41,23 @@ impl Track {
     /// one-shot CLI use; the matcher takes `&[TrackRef]`).
     pub fn track_ref(&self) -> TrackRef {
         TrackRef { track_id: self.id.clone(), polyline: self.reference_polyline.clone(), timing: self.timing.clone() }
+    }
+
+    /// This track's laps on `handle`, found the way indexing finds them: its
+    /// visits ([`detect_visits`]) first, then the laps inside each, numbered
+    /// 1.. through all of them — so lap 1 starts in the same place on every
+    /// path. Empty when the track has no lap timing.
+    pub fn laps(&self, handle: &SessionHandle) -> Vec<Lap> {
+        let Some(timing) = &self.timing else { return Vec::new() };
+        detect_visits(handle, &[self.track_ref()], VisitParams::default())
+            .iter()
+            .flat_map(|v| {
+                let window = Some((v.start_timestamp_ms, v.end_timestamp_ms));
+                detect_laps(handle, timing, &self.sector_gates, &self.neutral_zones, window)
+            })
+            .enumerate()
+            .map(|(i, lap)| Lap { lap_number: (i + 1) as u32, ..lap })
+            .collect()
     }
 }
 

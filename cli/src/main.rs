@@ -30,7 +30,6 @@ use serde_json::{json, Value};
 
 use idl_rs::export::{self, ExportFormat, ExportOptions, FitLap, FitOptions, FitSport};
 use idl_rs::fft::{Averaging, Detrend, FftWindow, Scaling};
-use idl_rs::laps::detect_laps;
 use idl_rs::laps::model::Lap;
 use idl_rs::math::MathLapContext;
 use idl_rs::session::handle::{ChannelMeta, SessionHandle, SessionMeta};
@@ -609,11 +608,8 @@ fn cmd_channels(file: &Path, format: OutFormat) -> Result<Structured, CliError> 
 fn cmd_laps(file: &Path, track: &Path, format: OutFormat) -> Result<Structured, CliError> {
     let handle = load(file)?;
     let t = track_artifact::read_track(track)?;
-    let timing = t
-        .timing
-        .as_ref()
-        .ok_or_else(|| no_timing_error(&t.name, track))?;
-    let laps = detect_laps(&handle, timing, &t.sector_gates, &t.neutral_zones, None);
+    t.timing.as_ref().ok_or_else(|| no_timing_error(&t.name, track))?; // laps need gates
+    let laps = t.laps(&handle);
     let meta = handle.metadata();
     match format {
         OutFormat::Text => {
@@ -944,11 +940,8 @@ fn cmd_fit(
     let laps = match track {
         Some(track_path) => {
             let t = track_artifact::read_track(track_path)?;
-            let timing = t
-                .timing
-                .as_ref()
-                .ok_or_else(|| no_timing_error(&t.name, track_path))?;
-            let detected = detect_laps(&handle, timing, &t.sector_gates, &t.neutral_zones, None);
+            t.timing.as_ref().ok_or_else(|| no_timing_error(&t.name, track_path))?; // laps need gates
+            let detected = t.laps(&handle);
             Some(
                 detected
                     .iter()
