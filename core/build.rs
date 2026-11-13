@@ -9,9 +9,12 @@
 //! a distinct identity, so a dirty build never reuses another build's cached
 //! numbers. `src/` is watched, so an edit re-runs this script and re-hashes.
 //!
-//! An `IDL_RS_GIT_COMMIT` already in the environment wins (a packaging build
-//! outside a checkout can supply one). A build with neither leaves the
-//! variable empty, and such a build does not use the disk cache.
+//! An `IDL_RS_GIT_COMMIT` already in the environment wins. A build of the
+//! published crate (crates.io) is not a checkout: cargo puts
+//! `.cargo_vcs_info.json` in every packaged crate, and a published version
+//! never changes, so there the identity is `v<version>`. A build with none of
+//! these leaves the variable empty, and such a build does not use the disk
+//! cache.
 
 use std::process::Command;
 
@@ -33,6 +36,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=IDL_RS_GIT_COMMIT");
     if let Ok(given) = std::env::var("IDL_RS_GIT_COMMIT") {
         println!("cargo:rustc-env=IDL_RS_GIT_COMMIT={given}");
+        return;
+    }
+    if std::path::Path::new(".cargo_vcs_info.json").exists() {
+        let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+        println!("cargo:rustc-env=IDL_RS_GIT_COMMIT=v{version}");
         return;
     }
 
