@@ -117,9 +117,9 @@ impl Warning {
 // Engine-error → CliError mappings (design §4).
 // ---------------------------------------------------------------------------
 
-impl From<idl_rs::store::catalog::CatalogError> for CliError {
-    fn from(e: idl_rs::store::catalog::CatalogError) -> Self {
-        use idl_rs::store::catalog::CatalogErrorKind;
+impl From<idl_library::catalog::CatalogError> for CliError {
+    fn from(e: idl_library::catalog::CatalogError) -> Self {
+        use idl_library::catalog::CatalogErrorKind;
         // `Sql` is a driver/schema/corruption failure, never "you asked for
         // something that isn't there" (ruling R46) — it points at
         // `catalog rebuild`, which is an internal fault, not bad input.
@@ -144,9 +144,9 @@ impl From<idl_rs::store::session_json::SessionJsonError> for CliError {
     }
 }
 
-impl From<idl_rs::store::import::ImportError> for CliError {
-    fn from(e: idl_rs::store::import::ImportError) -> Self {
-        use idl_rs::store::import::ImportErrorKind;
+impl From<idl_library::import::ImportError> for CliError {
+    fn from(e: idl_library::import::ImportError) -> Self {
+        use idl_library::import::ImportErrorKind;
         let kind = match e.kind {
             ImportErrorKind::Io => ErrorKind::Io,
             // A refusal to overwrite a `data.parquet` written from a

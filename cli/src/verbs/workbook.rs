@@ -35,7 +35,7 @@ use idl_rs::math::eval::MathLapContext;
 use idl_rs::session::handle::SessionHandle;
 use idl_rs::track_artifact;
 use idl_rs::math::units::UnitLabel;
-use idl_rs::store::set_job::{engine_identity, run_session_set, SetJobOptions, SetJobReport};
+use idl_library::set_job::{engine_identity, run_session_set, SetJobOptions, SetJobReport};
 use idl_rs::table::{CellResult, RowSource, TableModel};
 use idl_rs::workbook::v3::session_set::{parse_session_set, SessionSet, SetGroup, SetMember};
 use idl_rs::workbook::v3::set_eval::{MemberResults, MemberValue, PlanScope};
@@ -411,9 +411,9 @@ fn session_context(ctx: &Ctx, m: &ArgMatches) -> Result<Option<(SessionHandle, M
             let json = std::fs::read(dir.join("session.json"))
                 .ok()
                 .and_then(|b| idl_rs::store::session_json::parse_session_json(&b).ok());
-            let bounds = idl_rs::store::session_context::whole_session_bounds(&dir)
+            let bounds = idl_library::session_context::whole_session_bounds(&dir)
                 .map_err(|e| CliError::io(format!("sizing {}: {}", dir.display(), e.message)))?;
-            (handle, Some(idl_rs::store::session_context::window_lap_context(json.as_ref(), bounds)))
+            (handle, Some(idl_library::session_context::window_lap_context(json.as_ref(), bounds)))
         }
         None if !session.exists() && ctx.data_dir.is_some() => {
             return Err(CliError::with_details(
@@ -471,7 +471,7 @@ fn run_set(
     let data_dir = ctx.data_dir()?;
     // The same fixed ceiling the CLI's indexing pool uses (core has no
     // physical-memory query); members are admitted one at a time against it.
-    let budget = idl_rs::store::index_job::ByteBudget::new(crate::library::CLI_INDEX_BUDGET_BYTES);
+    let budget = idl_library::index_job::ByteBudget::new(crate::library::CLI_INDEX_BUDGET_BYTES);
     let options = SetJobOptions {
         use_cache: !m.try_get_one::<bool>("no-cache").ok().flatten().copied().unwrap_or(false),
         engine_identity: engine_identity(),

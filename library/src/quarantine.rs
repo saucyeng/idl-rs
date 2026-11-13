@@ -12,7 +12,7 @@ use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::store::atomic::write_atomic;
+use idl_rs::store::atomic::write_atomic;
 
 /// `entry_id`s are C3 §3.2 uuids in their canonical 36-char
 /// lowercase-with-dashes form (`<uuid>-<original file name>`,

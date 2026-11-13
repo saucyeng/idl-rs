@@ -530,7 +530,7 @@ fn lww_diff<T: LwwFields>(class: SyncClass, key: &str, local: Option<T>, remote:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::sync::manifest::{BlobEntry, DerivedEntry, SessionJsonEntry};
+    use crate::sync::manifest::{BlobEntry, DerivedEntry, SessionJsonEntry};
 
     fn empty_manifest() -> Manifest {
         Manifest { schema_version: 1, generated_at_ms: 0, blobs: Vec::new(), sessions: Vec::new(), workbooks: Vec::new(), tracks: Vec::new(), profiles: Vec::new(), bikes: Vec::new() }

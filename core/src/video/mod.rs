@@ -3,7 +3,7 @@
 //! recovered from idl0 (idl-rs tag `idl0-video-export`, IDL0_SPEC §33.3)
 //! without its painters (design D9 still holds for those). Pure: `std::fs`
 //! and `std::io` only. The `session.json` side of linking lives in
-//! [`crate::store::video`].
+//! `idl_library::video`.
 //!
 //! [`VideoLink`] is one C1 §6 `videos` entry, serialised as is across IPC
 //! (C3 §3.12).

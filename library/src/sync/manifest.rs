@@ -10,9 +10,9 @@ use std::path::Path;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
 
-use crate::store::atomic::sha256_hex;
-use crate::track_artifact::read::read_track;
-use crate::workbook::v3::front_matter::parse_front_matter;
+use idl_rs::store::atomic::sha256_hex;
+use idl_rs::track_artifact::read::read_track;
+use idl_rs::workbook::v3::front_matter::parse_front_matter;
 
 /// One content-addressed blob's manifest entry (C4 §6). `sha256` is both
 /// the identity key and the CAS path (`blobs/sha256/<2>/<62>`) — no
@@ -78,7 +78,7 @@ pub struct DataParquetEntry {
 
 /// One `sessions/<id>/session.json` manifest entry. `updated_at_ms` is the
 /// file's own mtime (the schema carries no such field, C1 §6) — the same
-/// convention this crate already uses for workbooks (`store::catalog`'s
+/// convention this crate already uses for workbooks (`catalog`'s
 /// `index_workbook_file`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionJsonEntry {
@@ -272,7 +272,7 @@ fn relative_path_str(data_root: &Path, path: &Path) -> String {
 }
 
 /// Last-modified time of `meta`, milliseconds since the Unix epoch. `0` if
-/// unavailable (matches `store::catalog`'s own `file_mtime_ms` — the two
+/// unavailable (matches `catalog`'s own `file_mtime_ms` — the two
 /// are kept as separate private helpers rather than sharing one `pub(crate)`
 /// symbol, since each module's need is a one-line computation over
 /// [`std::fs::Metadata`] it already has in hand).
@@ -282,13 +282,13 @@ fn file_mtime_ms(meta: &std::fs::Metadata) -> i64 {
 
 /// Lists blobs by the hash their CAS path already names (`blobs/sha256/<2
 /// hex shard>/<62 hex>`, C4 §2) rather than re-hashing every file's bytes —
-/// `store::blob::write_blob`'s own doc comment establishes that convention
+/// `blob::write_blob`'s own doc comment establishes that convention
 /// ("the same hash can only mean the same bytes... trusted without
 /// re-reading"), and a corrupted blob (path hash ≠ content hash) is
 /// `verify_data_dir`'s finding to make, not this walk's (ruling R90).
 fn collect_blobs(data_root: &Path) -> Vec<BlobEntry> {
     let mut out = Vec::new();
-    let videos = crate::store::video::video_blobs(data_root);
+    let videos = crate::video::video_blobs(data_root);
     let shards_dir = data_root.join("blobs").join("sha256");
     let Ok(shards) = std::fs::read_dir(&shards_dir) else { return out };
     for shard in shards.flatten() {
@@ -313,7 +313,7 @@ fn collect_blobs(data_root: &Path) -> Vec<BlobEntry> {
 /// absent). `None` on any read/parse failure or a
 /// missing key — the caller treats that as "session malformed, omit
 /// `data_parquet`" rather than aborting the walk. A separate reader from
-/// `store::catalog::read_data_parquet_session_fields` (whose fields —
+/// `catalog::read_data_parquet_session_fields` (whose fields —
 /// `importer_version`, `seam_correction_version`, `engine_version` — are
 /// private, not the function itself, and its field set differs) rather
 /// than widening that struct's visibility for a three-field subset.
@@ -387,7 +387,7 @@ fn collect_sessions(data_root: &Path) -> (Vec<SessionEntry>, Vec<SkippedEntry>) 
         let sj_path = session_dir.join("session.json");
         let session_json = if sj_path.is_file() {
             match (std::fs::read(&sj_path), std::fs::metadata(&sj_path)) {
-                (Ok(bytes), Ok(meta)) if crate::store::session_json::parse_session_json(&bytes).is_ok() => Some(SessionJsonEntry {
+                (Ok(bytes), Ok(meta)) if idl_rs::store::session_json::parse_session_json(&bytes).is_ok() => Some(SessionJsonEntry {
                     sha256: sha256_hex(&bytes),
                     size_bytes: bytes.len() as u64,
                     updated_at_ms: file_mtime_ms(&meta),
@@ -465,8 +465,8 @@ fn collect_workbooks(data_root: &Path) -> (Vec<WorkbookEntry>, Vec<SkippedEntry>
 fn collect_tracks(data_root: &Path) -> (Vec<TrackEntry>, Vec<SkippedEntry>) {
     let mut out = Vec::new();
     let mut skipped = Vec::new();
-    let dir = crate::track_artifact::path::tracks_dir(data_root);
-    let Ok(paths) = crate::track_artifact::path::list_track_files(&dir) else { return (out, skipped) };
+    let dir = idl_rs::track_artifact::path::tracks_dir(data_root);
+    let Ok(paths) = idl_rs::track_artifact::path::list_track_files(&dir) else { return (out, skipped) };
     for path in paths {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
         let Ok(track) = read_track(&path) else {
@@ -513,7 +513,7 @@ fn collect_profiles(data_root: &Path) -> (Vec<ProfileEntry>, Vec<SkippedEntry>) 
             skipped.push(SkippedEntry { path: relative_path_str(data_root, &path), reason: "profile: could not read file".to_string() });
             continue;
         };
-        let Ok(profile) = serde_json::from_slice::<crate::store::profile::BikeProfile>(&bytes) else {
+        let Ok(profile) = serde_json::from_slice::<crate::profile::BikeProfile>(&bytes) else {
             skipped.push(SkippedEntry { path: relative_path_str(data_root, &path), reason: "profile: could not parse".to_string() });
             continue;
         };
@@ -540,7 +540,7 @@ fn collect_profiles(data_root: &Path) -> (Vec<ProfileEntry>, Vec<SkippedEntry>) 
 /// `bikes/*.json`: a file whose name isn't a valid id, that doesn't parse,
 /// or whose `bike_id` differs from its name is skipped.
 fn collect_bikes(data_root: &Path) -> (Vec<BikeEntry>, Vec<SkippedEntry>) {
-    use crate::store::bikelog::{is_valid_id, BikeFile};
+    use crate::bikelog::{is_valid_id, BikeFile};
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     let Ok(entries) = std::fs::read_dir(data_root.join("bikes")) else { return (out, skipped) };
@@ -569,14 +569,14 @@ fn collect_bikes(data_root: &Path) -> (Vec<BikeEntry>, Vec<SkippedEntry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
-    use crate::store::blob::write_blob;
-    use crate::store::parquet::write_session_parquet;
-    use crate::store::profile::BikeProfile;
-    use crate::store::session_json::{empty_session_json, write_session_json};
-    use crate::track_artifact::model::Track;
-    use crate::track_artifact::write::write_track;
-    use crate::workbook::v3::front_matter::{render_front_matter, FrontMatter};
+    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
+    use crate::blob::write_blob;
+    use idl_rs::store::parquet::write_session_parquet;
+    use crate::profile::BikeProfile;
+    use idl_rs::store::session_json::{empty_session_json, write_session_json};
+    use idl_rs::track_artifact::model::Track;
+    use idl_rs::track_artifact::write::write_track;
+    use idl_rs::workbook::v3::front_matter::{render_front_matter, FrontMatter};
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -677,7 +677,7 @@ mod tests {
         // this walk's (ruling R90).
         let root = temp_root();
         let blob_sha256 = write_blob(&root, b"raw bytes").unwrap();
-        std::fs::write(crate::store::blob::blob_path(&root, &blob_sha256), b"tampered bytes").unwrap();
+        std::fs::write(crate::blob::blob_path(&root, &blob_sha256), b"tampered bytes").unwrap();
 
         // Act
         let (manifest, skipped) = build_manifest(&root, 1).unwrap();
@@ -729,7 +729,7 @@ mod tests {
         let (manifest, skipped) = build_manifest(&root, 1).unwrap();
 
         // Assert — every class stays empty; catalog/tmp are simply never
-        // walked by this module (unlike `store::verify`, this walk has no
+        // walked by this module (unlike `verify`, this walk has no
         // "unexpected path" reporting to accidentally trip on them).
         assert!(manifest.blobs.is_empty());
         assert!(manifest.sessions.is_empty());
@@ -1059,14 +1059,14 @@ mod tests {
     #[test]
     fn build_manifest_marks_a_blob_a_videos_entry_references_as_video() {
         // Arrange — two blobs; a session's tombstoned entry names one.
-        use crate::store::blob::write_blob;
-        use crate::store::session_json::{empty_session_json, write_session_json};
+        use crate::blob::write_blob;
+        use idl_rs::store::session_json::{empty_session_json, write_session_json};
         let root = std::env::temp_dir().join(format!("idl-rs-manifest-video-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let log = write_blob(&root, b"a log").unwrap();
         let mp4 = write_blob(&root, b"an mp4").unwrap();
         let mut doc = empty_session_json("00112233445566778899aabbccddeeff");
-        doc.videos.push(crate::video::VideoLink {
+        doc.videos.push(idl_rs::video::VideoLink {
             blob_sha256: mp4.clone(),
             size_bytes: 6,
             file_name: "a.mp4".to_string(),
@@ -1076,7 +1076,7 @@ mod tests {
             fps: 1.0,
             duration_s: 1.0,
             offset_s: 0.0,
-            sync_method: crate::video::SyncMethod::Manual,
+            sync_method: idl_rs::video::SyncMethod::Manual,
             unlinked: true,
             updated_at_ms: 1,
         });
@@ -1107,7 +1107,7 @@ mod tests {
     #[test]
     fn build_manifest_lists_bike_files_and_skips_one_whose_id_disagrees_with_its_name() {
         // Arrange
-        use crate::store::bikelog::{save_bike, Bike};
+        use crate::bikelog::{save_bike, Bike};
         let root = std::env::temp_dir().join(format!("idl-rs-manifest-bike-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         save_bike(&root, &Bike { bike_id: "gt".into(), name: "GT".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 1 }).unwrap();

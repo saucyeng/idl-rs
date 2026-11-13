@@ -5,7 +5,7 @@
 //! its own identity from the bytes themselves, and `session.json`/workbook
 //! merges compute their result from full documents, never from a manifest
 //! summary alone (design §7, C4 §6's transfer section). No network, no
-//! catalog write (`store::catalog::index_session` runs after install, at
+//! catalog write (`catalog::index_session` runs after install, at
 //! the command layer — CLAUDE.md §2) and no lap recomputation (the L2b
 //! cache is never merged, see [`super::session_merge`]).
 //!
@@ -26,21 +26,21 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::store::atomic::{sha256_hex, write_atomic, write_atomic_with_retry, AtomicWriteError};
-use crate::store::profile::{BikeProfile, ProfileError};
-use crate::store::session_json::{
+use idl_rs::store::atomic::{sha256_hex, write_atomic, write_atomic_with_retry, AtomicWriteError};
+use crate::profile::{BikeProfile, ProfileError};
+use idl_rs::store::session_json::{
     empty_session_json, parse_session_json, read_session_json, SessionJson, SessionJsonError,
 };
-use crate::store::sync::base_cache;
-use crate::store::sync::diff::{SyncClass, SyncItem};
-use crate::store::sync::ids::{is_valid_id, safe_join, IdClass};
-use crate::store::sync::manifest::{SyncError, SyncErrorKind};
-use crate::store::sync::session_merge::merge_session_json;
-use crate::track_artifact::model::Track;
-use crate::track_artifact::read::parse_track;
-use crate::track_artifact::write::{write_track, TrackWriteError};
-use crate::workbook::merge::{merge, MergeError};
-use crate::workbook::v3::{front_matter::parse_front_matter, parse_workbook, render_workbook, WorkbookDoc};
+use crate::sync::base_cache;
+use crate::sync::diff::{SyncClass, SyncItem};
+use crate::sync::ids::{is_valid_id, safe_join, IdClass};
+use crate::sync::manifest::{SyncError, SyncErrorKind};
+use crate::sync::session_merge::merge_session_json;
+use idl_rs::track_artifact::model::Track;
+use idl_rs::track_artifact::read::parse_track;
+use idl_rs::track_artifact::write::{write_track, TrackWriteError};
+use idl_rs::workbook::merge::{merge, MergeError};
+use idl_rs::workbook::v3::{front_matter::parse_front_matter, parse_workbook, render_workbook, WorkbookDoc};
 
 /// What installing one received file did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +176,7 @@ fn install_blob(data_root: &Path, item: &SyncItem, bytes: &[u8]) -> Result<Insta
     if digest != item.key {
         return Err(malformed(format!("blob: requested {}, received bytes hash to {digest}", item.key)));
     }
-    let path = crate::store::blob::blob_path(data_root, &digest);
+    let path = crate::blob::blob_path(data_root, &digest);
     if path.is_file() {
         return Ok(InstallOutcome::Installed); // verified no-op (C4 §4)
     }
@@ -193,12 +193,12 @@ fn install_blob(data_root: &Path, item: &SyncItem, bytes: &[u8]) -> Result<Insta
 /// `part` is left for the caller to discard, as it is on any error.
 pub fn install_blob_file(data_root: &Path, sha256: &str, part: &Path) -> Result<InstallOutcome, SyncError> {
     let sha256 = validated_id(sha256, IdClass::Session, "blob")?;
-    let digest = crate::store::blob::sha256_file(part)
+    let digest = crate::blob::sha256_file(part)
         .map_err(|e| SyncError { kind: SyncErrorKind::Io, message: format!("hashing {}: {e}", part.display()) })?;
     if digest != sha256 {
         return Err(malformed(format!("blob: requested {sha256}, received bytes hash to {digest}")));
     }
-    let path = crate::store::blob::blob_path(data_root, &digest);
+    let path = crate::blob::blob_path(data_root, &digest);
     if path.is_file() {
         return Ok(InstallOutcome::Installed);
     }
@@ -516,9 +516,9 @@ fn rederive_workbook_write(data_root: &Path, workbook_id: &str, peer_doc: &Workb
 fn install_track(data_root: &Path, bytes: &[u8]) -> Result<InstallOutcome, SyncError> {
     let peer: Track = parse_track(bytes).map_err(|e| malformed(format!("track: {e}")))?;
     let track_id = validated_id(&peer.id, IdClass::Uuid, "track")?;
-    joined_or_err(data_root, &["tracks", &format!("{track_id}.{}", crate::track_artifact::path::TRACK_EXT)])?;
-    let local_updated_at_ms = crate::track_artifact::path::existing_track_file(data_root, &track_id)
-        .and_then(|path| crate::track_artifact::read::read_track(&path).ok())
+    joined_or_err(data_root, &["tracks", &format!("{track_id}.{}", idl_rs::track_artifact::path::TRACK_EXT)])?;
+    let local_updated_at_ms = idl_rs::track_artifact::path::existing_track_file(data_root, &track_id)
+        .and_then(|path| idl_rs::track_artifact::read::read_track(&path).ok())
         .map(|t| t.updated_at_ms);
 
     if let Some(local_ms) = local_updated_at_ms {
@@ -544,12 +544,12 @@ fn install_profile(data_root: &Path, bytes: &[u8]) -> Result<InstallOutcome, Syn
             return Ok(InstallOutcome::KeptLocal);
         }
     }
-    crate::store::profile::save(data_root, &peer)?;
+    crate::profile::save(data_root, &peer)?;
     Ok(InstallOutcome::Installed)
 }
 
-fn bikelog_error(e: crate::store::bikelog::BikeLogError) -> SyncError {
-    let kind = if e.kind == crate::store::bikelog::BikeLogErrorKind::Io { SyncErrorKind::Io } else { SyncErrorKind::Malformed };
+fn bikelog_error(e: crate::bikelog::BikeLogError) -> SyncError {
+    let kind = if e.kind == crate::bikelog::BikeLogErrorKind::Io { SyncErrorKind::Io } else { SyncErrorKind::Malformed };
     SyncError { kind, message: e.message }
 }
 
@@ -558,19 +558,19 @@ fn bikelog_error(e: crate::store::bikelog::BikeLogError) -> SyncError {
 /// so no note from either side is lost. The bike's id must be the one asked
 /// for.
 fn install_bike(data_root: &Path, item: &SyncItem, bytes: &[u8]) -> Result<InstallOutcome, SyncError> {
-    let peer = crate::store::bikelog::BikeFile::from_slice(bytes).map_err(|e| malformed(format!("bike: {}", e.message)))?;
-    if peer.bike.bike_id != item.key || !crate::store::bikelog::is_valid_id(&peer.bike.bike_id) {
+    let peer = crate::bikelog::BikeFile::from_slice(bytes).map_err(|e| malformed(format!("bike: {}", e.message)))?;
+    if peer.bike.bike_id != item.key || !crate::bikelog::is_valid_id(&peer.bike.bike_id) {
         return Err(malformed(format!("bike: asked for {:?}, received {:?}", item.key, peer.bike.bike_id)));
     }
-    crate::store::bikelog::save_bike_file(data_root, &peer).map_err(bikelog_error)?;
+    crate::bikelog::save_bike_file(data_root, &peer).map_err(bikelog_error)?;
     Ok(InstallOutcome::Installed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::blob::read_blob;
-    use crate::store::sync::diff::SyncClass;
+    use crate::blob::read_blob;
+    use crate::sync::diff::SyncClass;
     use uuid::Uuid;
 
     fn temp_root() -> PathBuf {
@@ -905,7 +905,7 @@ mod tests {
         let root = temp_root();
         let mut initial_local = empty_session_json("0123456789abcdef");
         initial_local.venue_name = "Whistler".to_string();
-        crate::store::session_json::write_session_json(&root, "0123456789abcdef", &initial_local, None).unwrap();
+        idl_rs::store::session_json::write_session_json(&root, "0123456789abcdef", &initial_local, None).unwrap();
         let target = root.join("sessions").join("0123456789abcdef").join("session.json");
 
         let mut peer = empty_session_json("0123456789abcdef");
@@ -954,7 +954,7 @@ mod tests {
         // hardcoded `Installed`.
         let root = temp_root();
         let initial_local = empty_session_json("0123456789abcdef");
-        crate::store::session_json::write_session_json(&root, "0123456789abcdef", &initial_local, None).unwrap();
+        idl_rs::store::session_json::write_session_json(&root, "0123456789abcdef", &initial_local, None).unwrap();
         let target = root.join("sessions").join("0123456789abcdef").join("session.json");
 
         let mut peer = empty_session_json("0123456789abcdef");
@@ -993,7 +993,7 @@ mod tests {
         // Arrange
         let root = temp_root();
         let initial_local = empty_session_json("0123456789abcdef");
-        crate::store::session_json::write_session_json(&root, "0123456789abcdef", &initial_local, None).unwrap();
+        idl_rs::store::session_json::write_session_json(&root, "0123456789abcdef", &initial_local, None).unwrap();
         let target = root.join("sessions").join("0123456789abcdef").join("session.json");
 
         let mut peer = empty_session_json("0123456789abcdef");
@@ -1082,7 +1082,7 @@ mod tests {
     }
 
     fn track_bytes(track: &Track) -> Vec<u8> {
-        use crate::track_artifact::model::TrackArtifact;
+        use idl_rs::track_artifact::model::TrackArtifact;
         serde_json::to_vec(&TrackArtifact::from(track)).unwrap()
     }
 
@@ -1101,7 +1101,7 @@ mod tests {
 
         // Assert
         assert_eq!(outcome, InstallOutcome::KeptLocal);
-        let back = crate::track_artifact::read::read_track(&root.join("tracks").join(format!("{TRACK_ID}.idl1t"))).unwrap();
+        let back = idl_rs::track_artifact::read::read_track(&root.join("tracks").join(format!("{TRACK_ID}.idl1t"))).unwrap();
         assert_eq!(back.updated_at_ms, 100);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1122,7 +1122,7 @@ mod tests {
 
         // Assert
         assert_eq!(outcome, InstallOutcome::Installed);
-        let back = crate::track_artifact::read::read_track(&root.join("tracks").join(format!("{TRACK_ID}.idl1t"))).unwrap();
+        let back = idl_rs::track_artifact::read::read_track(&root.join("tracks").join(format!("{TRACK_ID}.idl1t"))).unwrap();
         assert_eq!(back.updated_at_ms, 100);
 
         let _ = std::fs::remove_dir_all(&root);

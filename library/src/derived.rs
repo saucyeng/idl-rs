@@ -14,7 +14,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use sha2::{Digest, Sha256};
 
-use crate::store::atomic::write_atomic;
+use idl_rs::store::atomic::write_atomic;
 
 /// Discriminant for [`DerivedStoreError`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +128,7 @@ pub struct DerivedOutput {
 /// not this store module, since only it knows which channels were actually
 /// consumed). If the target path already exists, this is a no-op and its
 /// existing bytes are authoritative (C1 §5 — content-addressed, same rule
-/// as [`crate::store::blob::write_blob`]).
+/// as [`crate::blob::write_blob`]).
 #[allow(clippy::too_many_arguments)]
 pub fn write_derived_parquet(
     data_root: &Path,
@@ -140,7 +140,7 @@ pub fn write_derived_parquet(
     computed_at_utc_ms: i64,
 ) -> Result<PathBuf, DerivedStoreError> {
     let config_json_bytes = canonical_config_json(config)?;
-    let hash_bytes = derived_file_hash(inputs, &config_json_bytes, crate::VERSION);
+    let hash_bytes = derived_file_hash(inputs, &config_json_bytes, idl_rs::VERSION);
     let filename_hex = hex(&hash_bytes);
     let target = data_root
         .join("sessions")
@@ -212,7 +212,7 @@ pub fn write_derived_parquet(
             "config_json".to_string(),
             String::from_utf8_lossy(&config_json_bytes).into_owned(),
         ),
-        parquet::file::metadata::KeyValue::new("engine_version".to_string(), crate::VERSION.to_string()),
+        parquet::file::metadata::KeyValue::new("engine_version".to_string(), idl_rs::VERSION.to_string()),
         parquet::file::metadata::KeyValue::new("computed_at_utc_ms".to_string(), computed_at_utc_ms.to_string()),
     ];
     let props = WriterProperties::builder().set_key_value_metadata(Some(all_kv)).build();
@@ -376,7 +376,7 @@ mod tests {
         let expected_inputs = format!(r#"[{{"channel_id":"IMU0_AccelX","column_hash":"{}"}}]"#, hex(&ih));
         assert_eq!(kv.get("inputs"), Some(&expected_inputs));
         assert_eq!(kv.get("config_json").map(String::as_str), Some(r#"{"gain":1.5}"#));
-        assert_eq!(kv.get("engine_version").map(String::as_str), Some(crate::VERSION));
+        assert_eq!(kv.get("engine_version").map(String::as_str), Some(idl_rs::VERSION));
         assert_eq!(kv.get("computed_at_utc_ms").map(String::as_str), Some("1234"));
 
         let _ = std::fs::remove_dir_all(&root);

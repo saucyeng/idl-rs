@@ -6,7 +6,7 @@
 //! entirely** (confirmed: `PathBuf::from(r"C:\data").join("tracks").join(
 //! format!("{}.idl0t", "C:evil"))` yields `C:evil.idl0t`, outside
 //! `data_root`). One validator, here in `core`, used by both `idl1-transport`
-//! (routing) and `idl-rs`'s own `store::sync::apply` (install), so no
+//! (routing) and `idl-rs`'s own `sync::apply` (install), so no
 //! id-addressed path is ever built from an unchecked string in either
 //! crate — plus [`safe_join`], a second, independent layer that checks the
 //! *result* of a join is still inside `data_root` regardless of whether the

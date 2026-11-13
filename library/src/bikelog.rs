@@ -16,7 +16,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::atomic::{sha256_hex, write_atomic_with_retry, AtomicWriteError};
+use idl_rs::store::atomic::{sha256_hex, write_atomic_with_retry, AtomicWriteError};
+
+// The session.json schema owns these two; re-exported so the bike log's own
+// path keeps working.
+pub use idl_rs::store::session_json::{RunningSheet, SessionBikeLog};
 
 /// One bike (spec §4): its name and which setup-sheet fields it has. The
 /// two parts merge separately, each by its own `*_updated_at_ms`.
@@ -240,42 +244,6 @@ impl BikeFile {
     }
 }
 
-/// The running setup sheet at one moment (spec §2).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct RunningSheet {
-    /// The confirmed sheet it starts from, or `None` before the first one.
-    #[serde(default)]
-    pub baseline: Option<String>,
-    /// Every value: the baseline's, with later notes' changes applied.
-    #[serde(default)]
-    pub values: BTreeMap<String, serde_json::Value>,
-    /// Notes since the baseline, in time order: their changes are applied,
-    /// and those without changes are the sheet's "changed since baseline"
-    /// list.
-    #[serde(default)]
-    pub since: Vec<String>,
-}
-
-/// What a session took from its bike's log, stored in its `session.json`
-/// (spec §4, §6).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct SessionBikeLog {
-    /// The entries attached, in time order.
-    #[serde(default)]
-    pub entry_ids: Vec<String>,
-    /// The window entries were taken from: after `after_ms` (the bike's
-    /// previous session's `until_ms`; `None` for its first) up to and
-    /// including `until_ms` (this session's end), UTC ms.
-    #[serde(default)]
-    pub after_ms: Option<i64>,
-    /// See [`SessionBikeLog::after_ms`].
-    pub until_ms: i64,
-    /// The running sheet at the session's start: R190's per-session
-    /// snapshot.
-    #[serde(default)]
-    pub setup_sheet: RunningSheet,
-}
-
 /// The running sheet at `at_ms`: the newest live confirmed sheet at or
 /// before `at_ms`, then the changes of every live note after it, up to and
 /// including `at_ms`, in `at_ms` order (ties by entry id). Deleted entries
@@ -416,8 +384,8 @@ pub fn bike_for_name(data_root: &Path, name: &str, now_ms: i64) -> Result<Bike, 
 /// `end_ms`, and the running sheet at `start_ms`. Running it again gives
 /// the same result for an unchanged log, so the ride form can re-run it
 /// after changing the bike.
-pub fn attach_session(data_root: &Path, session_id: &str, bike_id: &str, start_ms: i64, end_ms: i64) -> Result<crate::store::session_json::SessionJson, BikeLogError> {
-    use crate::store::session_json::{parse_session_json, write_session_json};
+pub fn attach_session(data_root: &Path, session_id: &str, bike_id: &str, start_ms: i64, end_ms: i64) -> Result<idl_rs::store::session_json::SessionJson, BikeLogError> {
+    use idl_rs::store::session_json::{parse_session_json, write_session_json};
     let io = |message: String| BikeLogError { kind: BikeLogErrorKind::Io, message };
     let file = read_bike_file(data_root, bike_id)?;
 
@@ -937,7 +905,7 @@ mod tests {
     #[test]
     fn attach_session_takes_entries_since_the_previous_session_and_the_sheet_at_start() {
         // Arrange
-        use crate::store::session_json::{empty_session_json, read_session_json, write_session_json};
+        use idl_rs::store::session_json::{empty_session_json, read_session_json, write_session_json};
         let root = temp_root();
         save_bike(&root, &gt()).unwrap();
         for e in [

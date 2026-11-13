@@ -7,7 +7,7 @@
 //! reorders a cell, and never mints a cell id).
 //!
 //! `base` is the last document both sides successfully synced (design
-//! §7.1); the caller (Task 5, then `store::sync::apply`) is responsible for
+//! §7.1); the caller (Task 5, then `idl_library::sync::apply`) is responsible for
 //! reading it from `<data>/workbooks/.sync-base/<id>.idl1wb` and for
 //! substituting the empty document when no cache exists yet (first-ever
 //! sync) — this module takes `base` as an ordinary parameter and is correct
@@ -246,7 +246,7 @@ fn recompute_derived_fields(
 ///
 /// `base` is the empty document (front matter only, zero cells,
 /// `trailing_prose: None`) when no `.sync-base` cache exists yet
-/// (first-ever sync) — see [`crate::store::sync::base_cache::read_base`].
+/// (first-ever sync) — see `idl_library::sync::base_cache::read_base`.
 /// `peer_name` is the human-readable label this merge's conflict markers
 /// name (C2 §7.1/§7.2).
 ///

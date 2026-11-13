@@ -1,5 +1,5 @@
 //! Catalog read API (contract C3 §3.2) — the seven read queries the
-//! `idl1-bridge` catalog commands wrap. `store::catalog` (L1) is
+//! `idl1-bridge` catalog commands wrap. `catalog` (L1) is
 //! write/rebuild only; this is a new file so none of it is edited (ledger
 //! R40). `get_session`/`get_track` read canonical files directly, never the
 //! catalog (C4 §5: "nothing reads the catalog for truth"); `list_laps`
@@ -21,13 +21,13 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::store::catalog::{open_catalog, rebuild_catalog, CatalogError, CatalogErrorKind, RebuildReport};
-use crate::store::parquet::{parse_source_format, read_channel_index, read_channel_sample_counts, read_session_metadata};
-use crate::store::session_json::{
+use crate::catalog::{open_catalog, rebuild_catalog, CatalogError, CatalogErrorKind, RebuildReport};
+use idl_rs::store::parquet::{parse_source_format, read_channel_index, read_channel_sample_counts, read_session_metadata};
+use idl_rs::store::session_json::{
     read_session_json, LapJson, NeutralZoneVisitJson, OverlayLapKeyJson, SectorJson, TrackVisitJson,
 };
-use crate::session::synthesis::plan_base_channels;
-use crate::track_artifact::read::read_track;
+use idl_rs::session::synthesis::plan_base_channels;
+use idl_rs::track_artifact::read::read_track;
 
 /// One row of the catalog `sessions` table (C4 §5), mirrored field for
 /// field per C3 §3.2's `SessionSummary`.
@@ -114,10 +114,10 @@ pub struct SessionDetail {
     pub bike_id: String,
     /// What the session took from its bike's log: the entries and the
     /// setup sheet at its start (C1 §6).
-    pub bike_log: Option<crate::store::bikelog::SessionBikeLog>,
+    pub bike_log: Option<crate::bikelog::SessionBikeLog>,
     /// Live linked videos, in `session.json` order, each with whether its
     /// file is on this device (C3 §3.12).
-    pub videos: Vec<crate::video::SessionVideo>,
+    pub videos: Vec<idl_rs::video::SessionVideo>,
 }
 
 /// Mirrors C1 §6 `session.json`'s `laps[]` object field for field — the
@@ -235,8 +235,8 @@ pub struct TrackSummary {
 /// The full `.idl0t` artifact content (C3 §3.2), decimal-degree domain
 /// types throughout — C3 §6 open question 10 (closed 2026-09-06, ruling
 /// R86): the four fields that used to be lifted as opaque `serde_json::Value`
-/// are now `crate::laps::model`/`crate::gps` types, taken from the same
-/// parsed [`Track`](crate::track_artifact::model::Track) as the scalars.
+/// are now `idl_rs::laps::model`/`idl_rs::gps` types, taken from the same
+/// parsed [`Track`](idl_rs::track_artifact::model::Track) as the scalars.
 #[derive(Debug, Clone)]
 pub struct TrackDetail {
     pub track_id: String,
@@ -244,10 +244,10 @@ pub struct TrackDetail {
     pub venue_name: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    pub lap_timing: Option<crate::laps::model::LapTiming>,
-    pub neutral_zones: Vec<crate::laps::model::NeutralZone>,
-    pub sector_gates: Vec<crate::laps::model::SectorGate>,
-    pub reference_polyline: Vec<crate::gps::GpsFix>,
+    pub lap_timing: Option<idl_rs::laps::model::LapTiming>,
+    pub neutral_zones: Vec<idl_rs::laps::model::NeutralZone>,
+    pub sector_gates: Vec<idl_rs::laps::model::SectorGate>,
+    pub reference_polyline: Vec<idl_rs::gps::GpsFix>,
 }
 
 /// A not-found-shaped [`CatalogError`] (ruling R46).
@@ -311,7 +311,7 @@ pub struct StaleSession {
     /// when it was (re)imported (C1 §4.3), SemVer as the importer stamps it.
     pub stored_version: String,
     /// The running build's `importer_version` for `importer_id`
-    /// ([`crate::import::current_importer_version`]), SemVer as the importer
+    /// ([`idl_rs::import::current_importer_version`]), SemVer as the importer
     /// stamps it.
     pub current_version: String,
 }
@@ -333,7 +333,7 @@ pub fn list_stale_sessions(conn: &Connection) -> Result<Vec<StaleSession>, Catal
     let mut out: Vec<StaleSession> = rows
         .into_iter()
         .filter_map(|(session_id, importer_id, stored_version)| {
-            let current_version = crate::import::current_importer_version(&importer_id)?;
+            let current_version = idl_rs::import::current_importer_version(&importer_id)?;
             if stored_version == current_version {
                 None
             } else {
@@ -405,11 +405,11 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
     }
     channels.extend(base_channel_summaries(&channels));
 
-    let videos = crate::store::video::session_videos(data_root, &doc);
+    let videos = crate::video::session_videos(data_root, &doc);
     Ok(SessionDetail {
         session_id: session_id.to_string(),
         device_id: metadata.device_id,
-        timestamp_utc_ms: crate::store::session_json::effective_start_ms(&doc, metadata.timestamp_utc_ms),
+        timestamp_utc_ms: idl_rs::store::session_json::effective_start_ms(&doc, metadata.timestamp_utc_ms),
         config_checksum: metadata.config_checksum,
         // Parsed and re-rendered, not passed through: a token that is not
         // one of C1 §4.3's four is a corrupt file and must fail here, as it
@@ -445,7 +445,7 @@ pub fn get_session(data_root: &Path, session_id: &str) -> Result<SessionDetail, 
 /// [`ChannelSummary`] rows, from the recorded channels' metadata alone, so
 /// a session's channel list names everything a workbook can reference
 /// (C3 §3.2). The rule is [`plan_base_channels`], the same one
-/// [`crate::session::synthesis::synthesize_base_channels`] builds them by.
+/// [`idl_rs::session::synthesis::synthesize_base_channels`] builds them by.
 /// A name the file already records is not listed twice.
 fn base_channel_summaries(recorded: &[ChannelSummary]) -> Vec<ChannelSummary> {
     let dims: Vec<(&str, f64, usize)> =
@@ -542,7 +542,7 @@ pub fn list_laps(data_root: &Path, session_id: &str) -> Result<Vec<LapSummary>, 
     Ok(out)
 }
 
-/// C3 §3.2 `rebuild_catalog()` — returns `store::catalog::RebuildReport`
+/// C3 §3.2 `rebuild_catalog()` — returns `catalog::RebuildReport`
 /// unchanged; the C3 four-field mapping and timing happen at the command
 /// boundary (`idl1-bridge`), not here.
 pub fn rebuild_catalog_report(data_root: &Path) -> Result<RebuildReport, CatalogError> {
@@ -578,14 +578,14 @@ pub fn list_tracks(data_root: &Path) -> Result<Vec<TrackSummary>, CatalogError> 
 
 /// C3 §3.2 `get_track(track_id)` — the full `<data>/tracks/<track_id>.idl1t` (or legacy `.idl0t`)
 /// artifact, read from disk (never on a hot path, C3 §4). Every field comes
-/// from the one parsed domain [`Track`](crate::track_artifact::model::Track)
+/// from the one parsed domain [`Track`](idl_rs::track_artifact::model::Track)
 /// — `track_artifact::read` already converts the file's degrees-x1e7 wire
 /// scale to decimal degrees, so nothing here re-lifts or re-scales.
 pub fn get_track(data_root: &Path, track_id: &str) -> Result<TrackDetail, CatalogError> {
     if track_id.contains('/') || track_id.contains('\\') || track_id.contains("..") {
         return Err(not_found(format!("track {track_id} not found")));
     }
-    let Some(path) = crate::track_artifact::path::existing_track_file(data_root, track_id) else {
+    let Some(path) = idl_rs::track_artifact::path::existing_track_file(data_root, track_id) else {
         return Err(not_found(format!("track {track_id} not found")));
     };
 
@@ -609,11 +609,11 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
-    use crate::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
-    use crate::store::blob::write_blob;
-    use crate::store::derived::{write_derived_parquet, DerivedOutput};
-    use crate::store::parquet::write_session_parquet;
-    use crate::store::session_json::{empty_session_json, write_session_json};
+    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
+    use crate::blob::write_blob;
+    use crate::derived::{write_derived_parquet, DerivedOutput};
+    use idl_rs::store::parquet::write_session_parquet;
+    use idl_rs::store::session_json::{empty_session_json, write_session_json};
 
     fn temp_root() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("idl-rs-test-{}", Uuid::new_v4()));
@@ -625,7 +625,7 @@ mod tests {
     /// fixed-rate channel), then rebuilds the catalog — the same tree shape
     /// `catalog.rs`'s own tests build (`write_full_session`), reimplemented
     /// locally per the brief (that helper is `#[cfg(test)]`-private there).
-    fn write_full_session(root: &Path, session_id: &str, timestamp_utc_ms: i64, doc: &crate::store::session_json::SessionJson) {
+    fn write_full_session(root: &Path, session_id: &str, timestamp_utc_ms: i64, doc: &idl_rs::store::session_json::SessionJson) {
         let blob_sha256 = write_blob(root, format!("raw bytes for {session_id}").as_bytes()).unwrap();
         write_session_json(root, session_id, doc, None).unwrap();
         let session = Session {
@@ -650,7 +650,7 @@ mod tests {
         // The running version, not a literal: the staleness tests below turn
         // on whether a row matches what this build would stamp, so a literal
         // here makes them lie the moment the importer version is bumped.
-        write_session_parquet(root, &session, crate::parse::IDL0_IMPORTER_VERSION).unwrap();
+        write_session_parquet(root, &session, idl_rs::parse::IDL0_IMPORTER_VERSION).unwrap();
     }
 
     #[test]
@@ -734,7 +734,7 @@ mod tests {
         assert_eq!(out[0].session_id, "s1");
         assert_eq!(out[0].importer_id, "idl0");
         assert_eq!(out[0].stored_version, "0.0.1");
-        assert_eq!(out[0].current_version, crate::parse::IDL0_IMPORTER_VERSION);
+        assert_eq!(out[0].current_version, idl_rs::parse::IDL0_IMPORTER_VERSION);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -809,7 +809,7 @@ mod tests {
         write_full_session(&root, "s1", 0, &doc);
 
         // Act
-        crate::store::session_json::set_session_start(&root, "s1", 1_700_000_000_000).unwrap();
+        idl_rs::store::session_json::set_session_start(&root, "s1", 1_700_000_000_000).unwrap();
         let detail = get_session(&root, "s1").unwrap();
 
         // Assert
@@ -1130,7 +1130,7 @@ mod tests {
         assert_eq!(detail.created_at_ms, 1111);
         assert_eq!(detail.updated_at_ms, 2222);
         match detail.lap_timing {
-            Some(crate::laps::model::LapTiming::Circuit { start_finish }) => {
+            Some(idl_rs::laps::model::LapTiming::Circuit { start_finish }) => {
                 assert_eq!(start_finish.lat1, 50.1163);
                 assert_eq!(start_finish.lon1, -122.9574);
             }
@@ -1161,7 +1161,7 @@ mod tests {
 
         // Assert
         match detail.lap_timing {
-            Some(crate::laps::model::LapTiming::PointToPoint { start, finish }) => {
+            Some(idl_rs::laps::model::LapTiming::PointToPoint { start, finish }) => {
                 assert_eq!(start.lat1, 0.000001);
                 assert_eq!(finish.lat1, 0.000005);
             }

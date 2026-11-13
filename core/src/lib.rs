@@ -45,12 +45,26 @@ pub mod workbook;
 /// over IPC so every device can prove it computes with the same engine.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The build's engine identity for persisted results (ruling Q4 of
+/// 2026-10-28): the git commit the engine was built from, stamped by
+/// `build.rs`, or `None` for a build made outside a git checkout — such a
+/// build does not use the disk cache.
+pub fn engine_identity() -> Option<&'static str> {
+    option_env!("IDL_RS_GIT_COMMIT").filter(|s| !s.is_empty())
+}
+
 /// Per-thread allocation counters for memory-shape tests (evaluation memory
 /// model, Phase 1). The counters are thread-local so the inline tests, which
 /// the harness runs in parallel, each measure only their own allocations; the
 /// evaluator is single-threaded per evaluation.
-#[cfg(test)]
-pub(crate) mod counting_alloc {
+///
+/// `pub` and `#[doc(hidden)]` so `idl-library`'s memory-shape tests can use
+/// it too; it exists only in test builds and under the `test-fixtures`
+/// feature. A test binary that wants real counts installs [`counting_alloc::Counting`]
+/// as its `#[global_allocator]`; `idl-rs`'s own tests do.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub mod counting_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
 
@@ -63,7 +77,7 @@ pub(crate) mod counting_alloc {
 
     /// The test build's global allocator: `System`, plus this thread's live
     /// and peak byte counts.
-    pub(crate) struct Counting;
+    pub struct Counting;
 
     // SAFETY: every call forwards to `System` unchanged; the counters only
     // observe sizes.
@@ -113,7 +127,7 @@ pub(crate) mod counting_alloc {
     /// Runs `f` and returns its result with the most bytes this thread held
     /// above where it started, at any instant during `f`. Bytes `f` returns
     /// (still live at the end) count; bytes allocated before `f` do not.
-    pub(crate) fn peak_of<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    pub fn peak_of<R>(f: impl FnOnce() -> R) -> (R, usize) {
         let base = LIVE.with(|l| l.get());
         PEAK.with(|p| p.set(base));
         let out = f();

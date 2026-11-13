@@ -9,20 +9,20 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::import::hook::PostImportHook;
-use crate::import::ImporterError;
-use crate::session::handle::SessionHandle;
-use crate::session::{ParseError, Session};
-use crate::store::atomic::sha256_hex;
-use crate::store::blob::{self, BlobStoreError};
-use crate::store::catalog::{index_session, open_catalog};
-use crate::store::derived::remove_session_derived;
-use crate::store::lap_index::{index_laps, LapIndexReport};
-use crate::store::parquet::{
+use idl_rs::import::hook::PostImportHook;
+use idl_rs::import::ImporterError;
+use idl_rs::session::handle::SessionHandle;
+use idl_rs::session::{ParseError, Session};
+use idl_rs::store::atomic::sha256_hex;
+use crate::blob::{self, BlobStoreError};
+use crate::catalog::{index_session, open_catalog};
+use crate::derived::remove_session_derived;
+use crate::lap_index::{index_laps, LapIndexReport};
+use idl_rs::store::parquet::{
     open_session_lazy, read_session_metadata, write_session_parquet, write_session_parquet_replacing, ParquetStoreError,
     SessionParquetMetadata,
 };
-use crate::store::session_json::{empty_session_json, write_session_json, SessionJsonError};
+use idl_rs::store::session_json::{empty_session_json, write_session_json, SessionJsonError};
 
 /// What [`plan_import`] decided to do, and (via [`ImportReport::plan`]) what
 /// [`import_idl0`] actually did — `Collision` never appears in a report; that
@@ -107,7 +107,7 @@ pub enum ImportErrorKind {
     ImportCsvMalformed,
     /// Mirrors `ImporterError::NotUtf8` (C3 §2 `import_not_utf8`).
     ImportNotUtf8,
-    /// [`crate::import::importer_for_extension`] returned `None` — no
+    /// [`idl_rs::import::importer_for_extension`] returned `None` — no
     /// importer covers this file extension. Core-internal: no C3 §2 row of
     /// its own (L5's Tauri layer maps this to C3's cross-cutting
     /// `invalid_argument` at that layer, not this one).
@@ -213,8 +213,8 @@ pub struct ImportReport {
     /// message, not treated as a hard failure.
     pub truncation_warning: Option<String>,
     /// Non-fatal advisory messages raised while importing — from
-    /// `crate::session::ParseResult::import_warnings` on the `.idl0` path,
-    /// or the importer's own `crate::import::ImporterWarning`s on the
+    /// `idl_rs::session::ParseResult::import_warnings` on the `.idl0` path,
+    /// or the importer's own `idl_rs::import::ImporterWarning`s on the
     /// [`import_file`] path. Never silently dropped (G0.6).
     pub import_warnings: Vec<String>,
     /// Outcome of the import-time lap-index step (IDL0_SPEC §17.4), run on
@@ -222,19 +222,19 @@ pub struct ImportReport {
     /// `Collision`, which never produces a report at all). `None` only when
     /// the step itself returned `Err`; see [`Self::lap_index_warning`].
     pub lap_index: Option<LapIndexReport>,
-    /// Set to [`crate::store::lap_index::LapIndexError`]'s `Display` when the
+    /// Set to [`crate::lap_index::LapIndexError`]'s `Display` when the
     /// lap-index step failed; the import itself still succeeds (this field
     /// and [`Self::lap_index`] are never both `Some`). Recoverable by
     /// `idl-rs rescan`.
     pub lap_index_warning: Option<String>,
-    /// Set to [`crate::store::catalog::CatalogError`]'s `Display` when
-    /// `catalog.sqlite` exists but [`crate::store::catalog::index_session`]
+    /// Set to [`crate::catalog::CatalogError`]'s `Display` when
+    /// `catalog.sqlite` exists but [`crate::catalog::index_session`]
     /// failed for this session (C4 §5, task L2b T4) — the import itself
     /// still succeeds; the catalog just falls behind until the next
     /// successful import or a `rebuild_catalog`. Always `None` when no
     /// catalog exists yet, since this pipeline never creates one.
     pub catalog_index_warning: Option<String>,
-    /// Set to [`crate::store::derived::DerivedStoreError`]'s `Display` when
+    /// Set to [`crate::derived::DerivedStoreError`]'s `Display` when
     /// [`reimport_session`]'s `derived/` cleanup step failed — the rebuild
     /// itself still succeeds; the stale `derived/` files just become
     /// harmless orphans (design doc §5) until the next successful rebuild.
@@ -244,17 +244,17 @@ pub struct ImportReport {
 }
 
 /// The importer version for a logger file's parsed format: `.idl1` files
-/// carry [`crate::parse::IDL1_IMPORTER_VERSION`], `.idl0` (and anything else
-/// reaching the logger entry point) [`crate::parse::IDL0_IMPORTER_VERSION`].
-fn device_importer_version(format: crate::session::SourceFormat) -> &'static str {
+/// carry [`idl_rs::parse::IDL1_IMPORTER_VERSION`], `.idl0` (and anything else
+/// reaching the logger entry point) [`idl_rs::parse::IDL0_IMPORTER_VERSION`].
+fn device_importer_version(format: idl_rs::session::SourceFormat) -> &'static str {
     match format {
-        crate::session::SourceFormat::Idl1 => crate::parse::IDL1_IMPORTER_VERSION,
-        _ => crate::parse::IDL0_IMPORTER_VERSION,
+        idl_rs::session::SourceFormat::Idl1 => idl_rs::parse::IDL1_IMPORTER_VERSION,
+        _ => idl_rs::parse::IDL0_IMPORTER_VERSION,
     }
 }
 
 /// Imports one logger file, `.idl0` or `.idl1` (told apart by its magic
-/// bytes, [`crate::parse::parse`]), into `data_root` (contract C4 §2 layout):
+/// bytes, [`idl_rs::parse::parse`]), into `data_root` (contract C4 §2 layout):
 /// writes the raw bytes to the CAS blob store, parses them, synthesizes the
 /// base `Time`/`Distance` channels, decides via [`plan_import`] whether
 /// `data.parquet` needs writing/skipping/regenerating, and creates an empty
@@ -266,10 +266,10 @@ pub fn import_idl0(data_root: &Path, bytes: &[u8]) -> Result<ImportReport, Impor
     // CAS (the hash is computed from `bytes` directly, independent of
     // parsing, so ordering here costs nothing on the success path but
     // avoids a permanent orphan blob on every failed import).
-    let mut result = crate::parse::parse(bytes)?;
+    let mut result = idl_rs::parse::parse(bytes)?;
     let blob_sha256 = blob::write_blob(data_root, bytes)?;
     result.session.blob_sha256 = blob_sha256.clone();
-    crate::session::synthesis::synthesize_base_channels(&mut result.session);
+    idl_rs::session::synthesis::synthesize_base_channels(&mut result.session);
 
     let truncation_warning = result.truncation_warning.map(|w| w.to_string());
     let import_warnings = result.import_warnings.iter().map(|w| w.message.clone()).collect();
@@ -337,21 +337,21 @@ pub fn import_file_path(data_root: &Path, extension: &str, path: &Path) -> Resul
 
 /// Imports one non-`.idl0` source buffer (FIT/GPX/CSV, ledger R23 L2-R13)
 /// into `data_root`, generalising [`import_idl0`]'s blob/parquet/
-/// `session.json` pipeline to any format [`crate::import::importer_for_extension`]
+/// `session.json` pipeline to any format [`idl_rs::import::importer_for_extension`]
 /// covers. Does not handle `"idl0"` — that stays [`import_idl0`]'s own entry
 /// point, called separately by whoever routes `.idl0` files.
 ///
 /// `extension` is a lowercase file extension without the dot (e.g. `"gpx"`).
 /// Preserves the R18-addendum write-ordering invariant: `bytes` is hashed
 /// and parsed before anything is written to the CAS, so a malformed buffer
-/// leaves nothing behind. Runs [`crate::session::synthesis::synthesize_base_channels`]
+/// leaves nothing behind. Runs [`idl_rs::session::synthesis::synthesize_base_channels`]
 /// on the parsed session (this is what makes the `Time` synthesis fallback,
 /// ledger R23 Q2, actually reach FIT/GPX/CSV sessions) and, on success,
-/// [`crate::import::hook::NoopPostImportHook::on_imported`] — the extension
+/// [`idl_rs::import::hook::NoopPostImportHook::on_imported`] — the extension
 /// point a real materialisation hook replaces at a future task; this
 /// function itself takes no hook parameter.
 pub fn import_file(data_root: &Path, extension: &str, bytes: &[u8]) -> Result<ImportReport, ImportError> {
-    let Some(importer) = crate::import::importer_for_extension(extension) else {
+    let Some(importer) = idl_rs::import::importer_for_extension(extension) else {
         return Err(ImportError::new(
             ImportErrorKind::UnknownExtension,
             format!("no importer covers file extension \"{extension}\""),
@@ -363,13 +363,13 @@ pub fn import_file(data_root: &Path, extension: &str, bytes: &[u8]) -> Result<Im
     // itself. One extra hash beyond what `import_idl0` needs (that path
     // only hashes once, inside `write_blob`, after parsing) — an accepted,
     // documented cost of this trait's pure signature.
-    let blob_sha256 = crate::store::atomic::sha256_hex(bytes);
+    let blob_sha256 = idl_rs::store::atomic::sha256_hex(bytes);
 
     // On `Err`, return immediately — nothing has been written to the CAS
     // yet (ordering preserved, R18 addendum).
     let mut outcome = importer.import(bytes, &blob_sha256)?;
-    crate::session::synthesis::synthesize_base_channels(&mut outcome.session);
-    crate::import::hook::NoopPostImportHook.on_imported(&outcome.session);
+    idl_rs::session::synthesis::synthesize_base_channels(&mut outcome.session);
+    idl_rs::import::hook::NoopPostImportHook.on_imported(&outcome.session);
 
     // Now writes; its returned digest is guaranteed identical to the one
     // computed above (same bytes, same hash function) — use it as the
@@ -437,7 +437,7 @@ fn finish_import(
         existing.as_ref(),
         &blob_sha256,
         importer_version,
-        crate::session::seam_correction::SEAM_CORRECTION_VERSION,
+        idl_rs::session::seam_correction::SEAM_CORRECTION_VERSION,
     );
 
     let outcome = match plan {
@@ -577,18 +577,18 @@ pub fn reimport_session(data_root: &Path, session_id: &str) -> Result<ImportRepo
     let blob_bytes = blob::read_blob(data_root, &existing_meta.blob_sha256)?;
 
     let mut session = if existing_meta.source_format == "idl0" || existing_meta.source_format == "idl1" {
-        let mut parsed = crate::parse::parse(&blob_bytes)?;
-        crate::session::synthesis::synthesize_base_channels(&mut parsed.session);
+        let mut parsed = idl_rs::parse::parse(&blob_bytes)?;
+        idl_rs::session::synthesis::synthesize_base_channels(&mut parsed.session);
         parsed.session
     } else {
-        let Some(importer) = crate::import::importer_for_id(&existing_meta.source_format) else {
+        let Some(importer) = idl_rs::import::importer_for_id(&existing_meta.source_format) else {
             return Err(ImportError::new(
                 ImportErrorKind::UnknownExtension,
                 format!("no importer covers source_format \"{}\"", existing_meta.source_format),
             ));
         };
         let mut outcome = importer.import(&blob_bytes, &existing_meta.blob_sha256)?;
-        crate::session::synthesis::synthesize_base_channels(&mut outcome.session);
+        idl_rs::session::synthesis::synthesize_base_channels(&mut outcome.session);
         outcome.session
     };
     session.blob_sha256 = existing_meta.blob_sha256.clone();
@@ -606,7 +606,7 @@ pub fn reimport_session(data_root: &Path, session_id: &str) -> Result<ImportRepo
         ));
     }
 
-    let current_version = crate::import::current_importer_version(&existing_meta.source_format).ok_or_else(|| {
+    let current_version = idl_rs::import::current_importer_version(&existing_meta.source_format).ok_or_else(|| {
         ImportError::new(
             ImportErrorKind::UnknownExtension,
             format!("no current importer version for source_format \"{}\"", existing_meta.source_format),
@@ -649,14 +649,14 @@ pub fn reimport_session(data_root: &Path, session_id: &str) -> Result<ImportRepo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gps::GpsFix;
-    use crate::laps::model::{Gate, LapTiming};
-    use crate::parse::test_buffers::*;
-    use crate::store::blob::blob_path;
-    use crate::store::derived::{write_derived_parquet, DerivedOutput};
-    use crate::store::parquet::read_session_parquet;
-    use crate::store::session_json::read_session_json;
-    use crate::track_artifact::{write_track, Track};
+    use idl_rs::gps::GpsFix;
+    use idl_rs::laps::model::{Gate, LapTiming};
+    use idl_rs::parse::test_buffers::*;
+    use crate::blob::blob_path;
+    use crate::derived::{write_derived_parquet, DerivedOutput};
+    use idl_rs::store::parquet::read_session_parquet;
+    use idl_rs::store::session_json::read_session_json;
+    use idl_rs::track_artifact::{write_track, Track};
     use uuid::Uuid;
 
     fn temp_root() -> PathBuf {
@@ -742,7 +742,7 @@ mod tests {
         // work happens; its would-be blob digest must never land in the CAS.
         let root = temp_root();
         let bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let would_be_digest = crate::store::atomic::sha256_hex(&bytes);
+        let would_be_digest = idl_rs::store::atomic::sha256_hex(&bytes);
 
         // Act
         let result = import_idl0(&root, &bytes);
@@ -752,7 +752,7 @@ mod tests {
             result,
             Err(ImportError { kind: ImportErrorKind::ParseInvalidMagicBytes, .. })
         ));
-        assert!(!crate::store::blob::blob_exists(&root, &would_be_digest));
+        assert!(!crate::blob::blob_exists(&root, &would_be_digest));
     }
 
     /// One minimal, valid `.idl0` v3 buffer: one IMU sample, session UUID
@@ -814,7 +814,7 @@ mod tests {
     fn import_idl0_an_idl1_file_imports_as_idl1_with_its_own_importer_version() {
         // Arrange — the logger entry point takes both formats by magic.
         let root = temp_root();
-        let mut b = crate::parse::idl1::tests::Builder::new();
+        let mut b = idl_rs::parse::idl1::test_builder::Builder::new();
         b.imu_axes(0, 480);
         b.imu_block(0, 0, 20_000, 920, &[[1; 6], [2; 6]], &[], &[(0, 0, 900)]);
         b.imu_block(0, 0, 40_000, 1840, &[[3; 6], [4; 6]], &[], &[(0, 0, 1820)]);
@@ -827,7 +827,7 @@ mod tests {
         // Assert
         let meta = read_session_metadata(&report.data_parquet).unwrap();
         assert_eq!(meta.source_format, "idl1");
-        assert_eq!(meta.importer_version, crate::parse::IDL1_IMPORTER_VERSION);
+        assert_eq!(meta.importer_version, idl_rs::parse::IDL1_IMPORTER_VERSION);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -839,7 +839,7 @@ mod tests {
         // without a word: each phone import failed with "missing from the
         // catalog immediately after import" (2026-11-02).
         let root = temp_root();
-        let mut b = crate::parse::idl1::tests::Builder::new();
+        let mut b = idl_rs::parse::idl1::test_builder::Builder::new();
         b.imu_axes(0, 480);
         b.imu_block(0, 0, 20_000, 920, &[[1; 6], [2; 6]], &[], &[(0, 0, 900)]);
         b.imu_block(0, 0, 40_000, 1840, &[[3; 6], [4; 6]], &[], &[(0, 0, 1820)]);
@@ -847,8 +847,8 @@ mod tests {
         let report = import_idl0(&root, &b.build()).unwrap();
 
         // Act
-        crate::store::catalog_read::rebuild_catalog_report(&root).unwrap();
-        let sessions = crate::store::catalog_read::list_sessions(&root).unwrap();
+        crate::catalog_read::rebuild_catalog_report(&root).unwrap();
+        let sessions = crate::catalog_read::list_sessions(&root).unwrap();
 
         // Assert
         let row = sessions.iter().find(|s| s.session_id == report.session_id).expect("the IDL1 session is catalogued");
@@ -863,10 +863,10 @@ mod tests {
         // written by an older importer_version than the running build's.
         let root = temp_root();
         let bytes = synthetic_idl0_bytes();
-        let mut parsed = crate::parse::parse(&bytes).unwrap();
+        let mut parsed = idl_rs::parse::parse(&bytes).unwrap();
         let blob_sha256 = blob::write_blob(&root, &bytes).unwrap();
         parsed.session.blob_sha256 = blob_sha256;
-        crate::session::synthesis::synthesize_base_channels(&mut parsed.session);
+        idl_rs::session::synthesis::synthesize_base_channels(&mut parsed.session);
         write_session_parquet(&root, &parsed.session, "0.0.1").unwrap();
 
         // Act
@@ -875,7 +875,7 @@ mod tests {
         // Assert
         assert_eq!(report.outcome, ImportOutcome::Regenerated);
         let meta = read_session_metadata(&report.data_parquet).unwrap();
-        assert_eq!(meta.importer_version, crate::parse::IDL0_IMPORTER_VERSION);
+        assert_eq!(meta.importer_version, idl_rs::parse::IDL0_IMPORTER_VERSION);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -920,18 +920,18 @@ mod tests {
         // was before this task.
         let root = temp_root();
         let bytes = synthetic_idl0_bytes();
-        let mut parsed = crate::parse::parse(&bytes).unwrap();
-        parsed.import_warnings.push(crate::session::ImportWarning {
-            kind: crate::session::ImportWarningKind::NonPositiveEffectivePeriod,
+        let mut parsed = idl_rs::parse::parse(&bytes).unwrap();
+        parsed.import_warnings.push(idl_rs::session::ImportWarning {
+            kind: idl_rs::session::ImportWarningKind::NonPositiveEffectivePeriod,
             message: "a burst-seam correction warning".to_string(),
         });
         let blob_sha256 = blob::write_blob(&root, &bytes).unwrap();
         parsed.session.blob_sha256 = blob_sha256.clone();
-        crate::session::synthesis::synthesize_base_channels(&mut parsed.session);
+        idl_rs::session::synthesis::synthesize_base_channels(&mut parsed.session);
         let import_warnings: Vec<String> = parsed.import_warnings.iter().map(|w| w.message.clone()).collect();
 
         // Act
-        let report = finish_import(&root, parsed.session, blob_sha256, crate::parse::IDL0_IMPORTER_VERSION, import_warnings).unwrap();
+        let report = finish_import(&root, parsed.session, blob_sha256, idl_rs::parse::IDL0_IMPORTER_VERSION, import_warnings).unwrap();
 
         // Assert
         assert_eq!(report.import_warnings, vec!["a burst-seam correction warning".to_string()]);
@@ -1042,7 +1042,7 @@ mod tests {
         // (`crates/idl1-bridge/src/session_source.rs::load_session`) does on every
         // read-back, proving Q2's fallback survives the parquet round trip.
         let mut session = read_session_parquet(&report.data_parquet).unwrap();
-        crate::session::synthesis::synthesize_base_channels(&mut session);
+        idl_rs::session::synthesis::synthesize_base_channels(&mut session);
         assert!(session.channels.iter().any(|c| c.channel_id == "Time"));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1060,7 +1060,7 @@ mod tests {
         // Assert — the GPX importer always assigns `SourceFile` (Task item 3).
         let sj_path = root.join("sessions").join(&report.session_id).join("session.json");
         let doc = read_session_json(&sj_path).unwrap();
-        assert_eq!(doc.timestamp_source, Some(crate::session::TimestampSource::SourceFile));
+        assert_eq!(doc.timestamp_source, Some(idl_rs::session::TimestampSource::SourceFile));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1086,7 +1086,7 @@ mod tests {
         // (`crates/idl1-bridge/src/session_source.rs::load_session`) does on every
         // read-back, proving Q2's fallback survives the parquet round trip.
         let mut session = read_session_parquet(&report.data_parquet).unwrap();
-        crate::session::synthesis::synthesize_base_channels(&mut session);
+        idl_rs::session::synthesis::synthesize_base_channels(&mut session);
         assert!(session.channels.iter().any(|c| c.channel_id == "Time"));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1113,7 +1113,7 @@ mod tests {
         // (`crates/idl1-bridge/src/session_source.rs::load_session`) does on every
         // read-back, proving Q2's fallback survives the parquet round trip.
         let mut session = read_session_parquet(&report.data_parquet).unwrap();
-        crate::session::synthesis::synthesize_base_channels(&mut session);
+        idl_rs::session::synthesis::synthesize_base_channels(&mut session);
         assert!(session.channels.iter().any(|c| c.channel_id == "Time"));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1137,7 +1137,7 @@ mod tests {
     //
     // A there-and-back-and-there GPS track: 3 legs of 100 one-second
     // trackpoints, lat sweeping 0.000→0.099→0.000→0.099 at a fixed longitude
-    // — the same geometry `store::lap_index`'s own tests use (not reachable
+    // — the same geometry `lap_index`'s own tests use (not reachable
     // from here: that module's fixtures live inside its own `#[cfg(test)]`),
     // duplicated minimally rather than reached into, same precedent as
     // `fit_crc16` above.
@@ -1272,10 +1272,10 @@ mod tests {
         let root = temp_root();
         write_track(&root, &circuit_track_fixture("loop-1")).unwrap();
         let bytes = gpx_three_lap_bytes();
-        let importer = crate::import::importer_for_extension("gpx").unwrap();
-        let blob_sha256 = crate::store::atomic::sha256_hex(&bytes);
+        let importer = idl_rs::import::importer_for_extension("gpx").unwrap();
+        let blob_sha256 = idl_rs::store::atomic::sha256_hex(&bytes);
         let mut outcome = importer.import(&bytes, &blob_sha256).unwrap();
-        crate::session::synthesis::synthesize_base_channels(&mut outcome.session);
+        idl_rs::session::synthesis::synthesize_base_channels(&mut outcome.session);
         let written_blob = blob::write_blob(&root, &bytes).unwrap();
         outcome.session.blob_sha256 = written_blob;
         write_session_parquet(&root, &outcome.session, "0.0.1").unwrap();
@@ -1299,14 +1299,14 @@ mod tests {
         // ordering test for the non-.idl0 path.
         let root = temp_root();
         let bytes: Vec<u8> = vec![0xFF, 0xFE, 0xFD];
-        let would_be_digest = crate::store::atomic::sha256_hex(&bytes);
+        let would_be_digest = idl_rs::store::atomic::sha256_hex(&bytes);
 
         // Act
         let result = import_file(&root, "gpx", &bytes);
 
         // Assert
         assert!(matches!(result, Err(ImportError { kind: ImportErrorKind::ImportNotUtf8, .. })));
-        assert!(!crate::store::blob::blob_exists(&root, &would_be_digest));
+        assert!(!crate::blob::blob_exists(&root, &would_be_digest));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1319,7 +1319,7 @@ mod tests {
         // itself (ruling R84) rather than rely on a prior `rebuild_catalog`
         // scan of the CAS.
         let root = temp_root();
-        crate::store::catalog::rebuild_catalog(&root).unwrap();
+        crate::catalog::rebuild_catalog(&root).unwrap();
         write_track(&root, &circuit_track_fixture("loop-1")).unwrap();
         let bytes = gpx_three_lap_bytes();
 
@@ -1330,7 +1330,7 @@ mod tests {
         // the laps are queryable immediately, with no intervening
         // `rebuild_catalog` call.
         assert!(report.catalog_index_warning.is_none());
-        let laps = crate::store::catalog_read::list_laps(&root, &report.session_id).unwrap();
+        let laps = crate::catalog_read::list_laps(&root, &report.session_id).unwrap();
         assert_eq!(laps.len(), 3);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1361,13 +1361,13 @@ mod tests {
         let session_id = report.session_id.clone();
 
         let json_path = root.join("sessions").join(&session_id).join("session.json");
-        let based_on = crate::store::atomic::sha256_hex(&std::fs::read(&json_path).unwrap());
+        let based_on = idl_rs::store::atomic::sha256_hex(&std::fs::read(&json_path).unwrap());
         let mut doc = read_session_json(&json_path).unwrap();
         doc.venue_name = "Cadwell Park".to_string();
         doc.long_comment = "front too soft on the mountain".to_string();
         doc.tag = "wet".to_string();
         doc.timestamp_utc_ms = Some(1_700_000_000_000);
-        doc.timestamp_source = Some(crate::session::TimestampSource::User);
+        doc.timestamp_source = Some(idl_rs::session::TimestampSource::User);
         write_session_json(&root, &session_id, &doc, Some(&based_on)).unwrap();
 
         (root, session_id)
@@ -1391,7 +1391,7 @@ mod tests {
         assert_eq!(doc.long_comment, "front too soft on the mountain");
         assert_eq!(doc.tag, "wet");
         assert_eq!(doc.timestamp_utc_ms, Some(1_700_000_000_000));
-        assert_eq!(doc.timestamp_source, Some(crate::session::TimestampSource::User));
+        assert_eq!(doc.timestamp_source, Some(idl_rs::session::TimestampSource::User));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1459,7 +1459,7 @@ mod tests {
     /// `seconds` of IMU0 at 480 Hz drained every 20 ms with a timestamp word
     /// every 32 samples, as the logger writes it, plus 5 Hz GPS.
     fn long_idl1(seconds: usize) -> Vec<u8> {
-        let mut b = crate::parse::idl1::tests::Builder::new();
+        let mut b = idl_rs::parse::idl1::test_builder::Builder::new();
         b.imu_axes(0, 480);
         let tick_us = 21.75_f64;
         let period_us = 1e6 / 480.0;
@@ -1492,9 +1492,9 @@ mod tests {
         let bytes = long_idl1(600);
         let samples = 600 * 480;
 
-        let (_, parse_peak) = crate::counting_alloc::peak_of(|| crate::parse::parse(&bytes).unwrap());
+        let (_, parse_peak) = idl_rs::counting_alloc::peak_of(|| idl_rs::parse::parse(&bytes).unwrap());
         let root = temp_root();
-        let (_, import_peak) = crate::counting_alloc::peak_of(|| import_idl0(&root, &bytes).unwrap());
+        let (_, import_peak) = idl_rs::counting_alloc::peak_of(|| import_idl0(&root, &bytes).unwrap());
 
         println!(
             "file {} B, {} samples ({:.1} B/sample); parse peak {} B ({:.1}x file, {:.0} B/sample); import peak {} B ({:.1}x file, {:.0} B/sample)",
@@ -1516,7 +1516,7 @@ mod tests {
     fn import_memory_probe_file() {
         let path = std::env::var("IDL_PROBE_FILE").expect("IDL_PROBE_FILE names the log to import");
         let bytes = std::fs::read(&path).unwrap();
-        let (parsed, parse_peak) = crate::counting_alloc::peak_of(|| crate::parse::parse(&bytes));
+        let (parsed, parse_peak) = idl_rs::counting_alloc::peak_of(|| idl_rs::parse::parse(&bytes));
         match &parsed {
             Ok(r) => {
                 println!("parse ok");
@@ -1528,7 +1528,7 @@ mod tests {
         }
         drop(parsed);
         let root = temp_root();
-        let (imported, import_peak) = crate::counting_alloc::peak_of(|| import_idl0(&root, &bytes).map(|_| ()));
+        let (imported, import_peak) = idl_rs::counting_alloc::peak_of(|| import_idl0(&root, &bytes).map(|_| ()));
         println!("import: {imported:?}");
         println!(
             "file {} B; parse peak {} B ({:.1}x file); import peak {} B ({:.1}x file)",

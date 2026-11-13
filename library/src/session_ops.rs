@@ -4,15 +4,15 @@
 //! Filtering and the metadata patch are pure functions over already-read
 //! values, so they are unit-testable without a data directory; only
 //! [`set_session_meta`] touches the filesystem, and it does so through the
-//! same read-hash-write path [`crate::store::session_json::set_session_start`]
+//! same read-hash-write path [`idl_rs::store::session_json::set_session_start`]
 //! uses, so two writers racing the same `session.json` still lose one write
 //! loudly rather than silently.
 
 use std::path::Path;
 
-use crate::store::atomic::sha256_hex;
-use crate::store::catalog_read::{SessionDetail, SessionSummary};
-use crate::store::session_json::{
+use idl_rs::store::atomic::sha256_hex;
+use crate::catalog_read::{SessionDetail, SessionSummary};
+use idl_rs::store::session_json::{
     parse_session_json, write_session_json, SessionJson, SessionJsonError, SessionJsonErrorKind,
 };
 
@@ -199,7 +199,7 @@ pub fn set_session_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::session_json::empty_session_json;
+    use idl_rs::store::session_json::empty_session_json;
 
     fn summary(venue: &str, tag: &str, timestamp_utc_ms: i64) -> SessionSummary {
         SessionSummary {

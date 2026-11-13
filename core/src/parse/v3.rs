@@ -309,7 +309,7 @@ pub fn parse_v3(bytes: &[u8]) -> Result<ParseResult, ParseError> {
             // decoded record stream, not the raw file bytes it came from.
             // `SessionHandle::from_bytes` computes `sha256(bytes)` (the
             // `sha2` dependency, Task 1) and overwrites this field after
-            // `parse()` returns, before synthesis runs (see store::blob,
+            // `parse()` returns, before synthesis runs (see idl_library::blob,
             // Task 8).
             blob_sha256: String::new(),
             channels,

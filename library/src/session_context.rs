@@ -6,9 +6,9 @@
 
 use std::path::Path;
 
-use crate::math::eval::{LapSpan, MathLapContext};
-use crate::store::parquet::{read_time_axis_bounds, ParquetStoreError};
-use crate::store::session_json::{LapJson, SessionJson};
+use idl_rs::math::eval::{LapSpan, MathLapContext};
+use idl_rs::store::parquet::{read_time_axis_bounds, ParquetStoreError};
+use idl_rs::store::session_json::{LapJson, SessionJson};
 
 /// One [`LapJson`] as the `[lap]` axis reads it (C2 §3.6.1, ruling R233).
 /// `lap_time_secs` comes from the recorded `lap_time_ms`, **not** from the
@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn whole_session_context_without_data_every_lap_and_never_a_row() {
         // Arrange
-        let mut doc = crate::store::session_json::empty_session_json("s");
+        let mut doc = idl_rs::store::session_json::empty_session_json("s");
         doc.laps = vec![lap(1, 5.0, 10.0), lap(2, 10.0, 20.0)];
 
         // Act

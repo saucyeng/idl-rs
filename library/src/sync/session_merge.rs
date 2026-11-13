@@ -8,7 +8,7 @@
 //!
 //! `local_updated_at_ms`/`peer_updated_at_ms` are each side's `session.json`
 //! file's own last-modified time
-//! (`store::sync::manifest::SessionJsonEntry::updated_at_ms` — C1 §6's
+//! (`sync::manifest::SessionJsonEntry::updated_at_ms` — C1 §6's
 //! schema carries no such field of its own, confirmed by that entry's own
 //! doc comment). [`merge_session_json`] takes them as plain parameters
 //! rather than reading either file's metadata itself, to stay pure
@@ -24,15 +24,15 @@
 //! reads the brief's own "equal to neither side's default" wording
 //! literally: a user-owned field's *type default* (`""` for a string,
 //! `None` for an option, `[]` for a list — exactly
-//! [`crate::store::session_json::empty_session_json`]'s own values) stands
+//! [`idl_rs::store::session_json::empty_session_json`]'s own values) stands
 //! in for "never touched," since every field's real-world unset state
 //! already coincides with its zero value (C1 §6: "`""` = not set, no null
 //! representation"). This resolves every field without needing the brief's
 //! "differs from the receiver's current value" no-base fallback — noted
 //! here rather than invoked.
 
-use crate::store::session_json::SessionJson;
-use crate::video::VideoLink;
+use idl_rs::store::session_json::SessionJson;
+use idl_rs::video::VideoLink;
 
 /// One user-owned field's per-field merge (C4 §6): "changed" means "not
 /// equal to this type's zero value" (see this module's doc comment); a
@@ -143,7 +143,7 @@ pub fn merge_session_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::session_json::{empty_session_json, LapJson};
+    use idl_rs::store::session_json::{empty_session_json, LapJson};
 
     #[test]
     fn merge_session_json_peer_set_rider_local_set_venue_both_survive() {
@@ -234,7 +234,7 @@ mod tests {
             fps: 30.0,
             duration_s: 60.0,
             offset_s,
-            sync_method: crate::video::SyncMethod::Manual,
+            sync_method: idl_rs::video::SyncMethod::Manual,
             unlinked,
             updated_at_ms,
         }

@@ -44,8 +44,11 @@ impl Track {
 
 // ---- private wire DTOs (the `.idl0t` JSON shape == Dart Track.toJson) ----
 
+/// The `.idl0t` track file's JSON document (a `track_artifact_version` and the
+/// track). Public so `idl-library`'s sync tests can serialise a track the way
+/// the writer does; build one with `TrackArtifact::from(&track)`.
 #[derive(Serialize, Deserialize)]
-pub(crate) struct TrackArtifact {
+pub struct TrackArtifact {
     track_artifact_version: u32,
     track: TrackDto,
 }

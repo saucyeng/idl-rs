@@ -3,7 +3,7 @@
 //! session-wide-renumber the top-level lap list. Reads only a
 //! [`SessionHandle`] already in memory and a slice of [`Track`]s already read
 //! from disk — no filesystem access, no clock, no RNG, no writes.
-//! `store::import`/a future `reindex_laps` (Task 2) own the I/O around this.
+//! `import`/a future `reindex_laps` (Task 2) own the I/O around this.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -12,16 +12,16 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use crate::laps::{detect_laps, renumber_session_laps};
-use crate::session::handle::SessionHandle;
-use crate::store::atomic::sha256_hex;
-use crate::store::parquet::open_session_lazy;
-use crate::store::session_json::{
+use idl_rs::laps::{detect_laps, renumber_session_laps};
+use idl_rs::session::handle::SessionHandle;
+use idl_rs::store::atomic::sha256_hex;
+use idl_rs::store::parquet::open_session_lazy;
+use idl_rs::store::session_json::{
     empty_session_json, parse_session_json, write_session_json, LapJson, NeutralZoneVisitJson, SectorJson,
     TrackVisitJson,
 };
-use crate::track_artifact::{read_track, Track};
-use crate::tracks::detect_visits;
+use idl_rs::track_artifact::{read_track, Track};
+use idl_rs::tracks::detect_visits;
 
 /// Discriminant for [`LapIndexError`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,8 +78,8 @@ pub fn track_library_hash(tracks: &[Track]) -> String {
 /// version-rejected artifact is skipped, and a warning naming its file
 /// records why.
 pub fn load_track_library(data_root: &Path) -> Result<(Vec<Track>, Vec<String>), LapIndexError> {
-    let tracks_dir = crate::track_artifact::path::tracks_dir(data_root);
-    let paths = crate::track_artifact::path::list_track_files(&tracks_dir)
+    let tracks_dir = idl_rs::track_artifact::path::tracks_dir(data_root);
+    let paths = idl_rs::track_artifact::path::list_track_files(&tracks_dir)
         .map_err(|e| LapIndexError::new(LapIndexErrorKind::Io, format!("cannot read {}: {e}", tracks_dir.display())))?;
 
     let mut tracks: Vec<Track> = Vec::new();
@@ -149,7 +149,7 @@ pub fn compute_lap_index(handle: &SessionHandle, tracks: &[Track], ignored_lap_n
         return LapIndex { track_visits: Vec::new(), laps: Vec::new(), track_library_hash: hash, warnings };
     }
 
-    let refs: Vec<crate::tracks::TrackRef> = tracks.iter().map(Track::track_ref).collect();
+    let refs: Vec<idl_rs::tracks::TrackRef> = tracks.iter().map(Track::track_ref).collect();
     let windows = detect_visits(handle, &refs, Default::default());
 
     let mut track_visits: Vec<TrackVisitJson> = Vec::with_capacity(windows.len());
@@ -201,7 +201,7 @@ pub struct LapIndexReport {
 }
 
 /// Indexes laps for a session whose [`SessionHandle`] the caller already
-/// holds (the import path, `store::import::finish_import`) and merges the
+/// holds (the import path, `import::finish_import`) and merges the
 /// result into `session.json` (C1 §6). Never touches `data.parquet`;
 /// [`reindex_laps`] is the entry point that rebuilds `handle` from disk
 /// first.
@@ -245,7 +245,7 @@ fn session_json_path(data_root: &Path, session_id: &str) -> std::path::PathBuf {
 /// Whether `session_id`'s cached lap/track index is current against
 /// `fresh_library_hash` — the same staleness test [`index_laps`] makes, but
 /// reading only `session.json` (no `data.parquet`, no decode). The
-/// library-wide index job (`store::index_job`) calls this to skip a session
+/// library-wide index job (`index_job`) calls this to skip a session
 /// in microseconds rather than opening it (ruling R208.1: a restarted job
 /// "skips sessions whose stored `lap_detector_version`/
 /// `track_visits_library_hash` are current").
@@ -377,7 +377,7 @@ pub fn reindex_laps(data_root: &Path, session_id: &str) -> Result<LapIndexReport
 /// `list_math_builtins`'s unreachable branch) or whose matched track has no
 /// lap timing both return an empty `laps` and a warning; the visit is always
 /// returned (IDL0_SPEC §17.4's "visits present, laps absent").
-fn resolve_visit(handle: &SessionHandle, window: crate::tracks::VisitWindow, tracks: &[Track]) -> (TrackVisitJson, Option<String>) {
+fn resolve_visit(handle: &SessionHandle, window: idl_rs::tracks::VisitWindow, tracks: &[Track]) -> (TrackVisitJson, Option<String>) {
     let id = visit_id(&window.track_id, window.start_timestamp_ms, window.end_timestamp_ms);
     let track = tracks.iter().find(|t| t.id == window.track_id);
 
@@ -417,9 +417,9 @@ fn resolve_visit(handle: &SessionHandle, window: crate::tracks::VisitWindow, tra
     )
 }
 
-/// Converts an engine [`crate::laps::model::Lap`] into its `session.json`
+/// Converts an engine [`idl_rs::laps::model::Lap`] into its `session.json`
 /// wire DTO, field for field.
-fn lap_to_json(lap: crate::laps::model::Lap) -> LapJson {
+fn lap_to_json(lap: idl_rs::laps::model::Lap) -> LapJson {
     LapJson {
         lap_number: lap.lap_number,
         start_timestamp_ms: lap.start_ms,
@@ -433,8 +433,8 @@ fn lap_to_json(lap: crate::laps::model::Lap) -> LapJson {
     }
 }
 
-/// Converts an engine [`crate::laps::model::Sector`] into its wire DTO.
-fn sector_to_json(s: crate::laps::model::Sector) -> SectorJson {
+/// Converts an engine [`idl_rs::laps::model::Sector`] into its wire DTO.
+fn sector_to_json(s: idl_rs::laps::model::Sector) -> SectorJson {
     SectorJson {
         name: s.name,
         start_ms: s.start_ms,
@@ -444,22 +444,22 @@ fn sector_to_json(s: crate::laps::model::Sector) -> SectorJson {
     }
 }
 
-/// Converts an engine [`crate::laps::model::NeutralZoneVisit`] into its wire
+/// Converts an engine [`idl_rs::laps::model::NeutralZoneVisit`] into its wire
 /// DTO.
-fn neutral_zone_visit_to_json(z: crate::laps::model::NeutralZoneVisit) -> NeutralZoneVisitJson {
+fn neutral_zone_visit_to_json(z: idl_rs::laps::model::NeutralZoneVisit) -> NeutralZoneVisitJson {
     NeutralZoneVisitJson { name: z.name, enter_ms: z.enter_ms, exit_ms: z.exit_ms }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::laps::model::{Gate, LapTiming};
-    use crate::session::handle::{ChannelInput, SessionMetaInput};
-    use crate::gps::GpsFix;
-    use crate::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
-    use crate::store::parquet::write_session_parquet;
-    use crate::store::session_json::{read_session_json, OverlayLapKeyJson};
-    use crate::track_artifact::write_track;
+    use idl_rs::laps::model::{Gate, LapTiming};
+    use idl_rs::session::handle::{ChannelInput, SessionMetaInput};
+    use idl_rs::gps::GpsFix;
+    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
+    use idl_rs::store::parquet::write_session_parquet;
+    use idl_rs::store::session_json::{read_session_json, OverlayLapKeyJson};
+    use idl_rs::track_artifact::write_track;
     use uuid::Uuid;
 
     fn temp_root() -> std::path::PathBuf {
@@ -712,7 +712,7 @@ mod tests {
         // end-to-end scenario that cannot occur; see `resolve_visit`'s doc
         // comment.
         let handle = handle_from_fixes(&[]);
-        let window = crate::tracks::VisitWindow {
+        let window = idl_rs::tracks::VisitWindow {
             track_id: "loop-1".to_string(),
             start_timestamp_ms: 0,
             end_timestamp_ms: 1000,

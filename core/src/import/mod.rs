@@ -49,7 +49,7 @@ pub trait Importer {
 /// non-fatal warnings raised while recovering readable data. Never silently
 /// drops a warning-worthy condition and never panics on it either
 /// (CLAUDE.md §5). Renamed from the plan's original `ImportOutcome` to avoid
-/// a name collision with landed [`crate::store::import::ImportOutcome`]
+/// a name collision with landed `idl_library::import::ImportOutcome`
 /// (SPEC §15a.1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportedSession {
@@ -99,7 +99,7 @@ pub fn session_id_from_blob_hash(blob_sha256: &str) -> String {
 
 /// One importer this module can run, enumerable for C3 §3.3's
 /// `list_importers()`. Deliberately does **not** include `.idl0` — that
-/// source has its own entry point (`crate::store::import::import_idl0`),
+/// source has its own entry point (`idl_library::import::import_idl0`),
 /// outside this trait's scope (SPEC §15a.1) and outside `core::import`'s
 /// dispatch; L5's `import_file` Tauri command adds an `"idl0"` row of its
 /// own when building the full `list_importers()` response (ledger R51 Q1).

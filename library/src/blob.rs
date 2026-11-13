@@ -6,7 +6,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::store::atomic::{sha256_hex, write_atomic, AtomicWriteError};
+use idl_rs::store::atomic::{sha256_hex, write_atomic, AtomicWriteError};
 
 /// Discriminant for [`BlobStoreError`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +103,7 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// who want extra paranoia beyond the fast-path existence check.
 pub fn verify_blob(data_root: &Path, sha256_hex: &str) -> Result<(), BlobStoreError> {
     let bytes = read_blob(data_root, sha256_hex)?;
-    let actual = crate::store::atomic::sha256_hex(&bytes);
+    let actual = idl_rs::store::atomic::sha256_hex(&bytes);
     if actual != sha256_hex {
         return Err(BlobStoreError::new(
             BlobStoreErrorKind::HashMismatch,

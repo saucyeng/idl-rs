@@ -1,5 +1,5 @@
 //! The session-set runner (session-sets spec §4.1, §4.5; ruling Q8 of
-//! 2026-10-28: it lives in core, beside [`crate::store::index_job`], so the
+//! 2026-10-28: it lives in core, beside [`crate::index_job`], so the
 //! app and the CLI cannot schedule members differently).
 //!
 //! For each member, in set order, **one at a time** (phase 1, P = 1):
@@ -13,7 +13,7 @@
 //! 3. store the results, in that member's own transaction.
 //!
 //! Then combine every member's results into the set tables
-//! ([`crate::workbook::v3::set_eval::set_tables`]).
+//! ([`idl_rs::workbook::v3::set_eval::set_tables`]).
 //!
 //! Members are independent, so a member that cannot be evaluated is reported
 //! and the run continues. Cancellation is checked at member boundaries.
@@ -22,31 +22,25 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::session::handle::{ChannelSource, SessionHandle, SessionMetaInput};
-use crate::session::{Channel, ChannelSamples};
-use crate::store::eval_cache::{catalog_identity, open_catalog_read_only, EvalCache, PRUNE_ABOVE_BYTES};
-use crate::store::index_job::{MemoryBudget, NeverFits};
-use crate::store::parquet::{
+use idl_rs::session::handle::{ChannelSource, SessionHandle, SessionMetaInput};
+use idl_rs::session::{Channel, ChannelSamples};
+use crate::eval_cache::{catalog_identity, open_catalog_read_only, EvalCache, PRUNE_ABOVE_BYTES};
+use crate::index_job::{MemoryBudget, NeverFits};
+use idl_rs::store::parquet::{
     axis_bytes_ceiling, open_session_lazy_with, read_session_metadata, ParquetStoreErrorKind, SessionColumnReader,
 };
-use crate::workbook::v3::plan::{PlanInputs, ESTIMATE_MARGIN};
-use crate::workbook::v3::EvalObserver;
-use crate::store::session_context::{whole_session_bounds, whole_session_context_without_data, window_lap_context};
-use crate::store::session_json::{parse_session_json, SessionJson};
-use crate::workbook::v3::session_set::{default_member_label, SessionSet};
-use crate::workbook::v3::set_eval::{
+use idl_rs::workbook::v3::plan::{PlanInputs, ESTIMATE_MARGIN};
+use idl_rs::workbook::v3::EvalObserver;
+use crate::session_context::{whole_session_bounds, whole_session_context_without_data, window_lap_context};
+use idl_rs::store::session_json::{parse_session_json, SessionJson};
+use idl_rs::workbook::v3::session_set::{default_member_label, SessionSet};
+use idl_rs::workbook::v3::set_eval::{
     evaluate_member, evaluate_member_planned, laps_identity, member_eval_plan, member_key, plan_set, set_tables, CombineMember, MemberAbsence, MemberResults,
     PlanScope, SetPlan, SetTable, SetWarning,
 };
-use crate::workbook::v3::WorkbookDoc;
+use idl_rs::workbook::v3::WorkbookDoc;
 
-/// The build's engine identity for persisted results (ruling Q4 of
-/// 2026-10-28): the git commit the engine was built from, stamped by
-/// `build.rs`, or `None` for a build made outside a git checkout — such a
-/// build does not use the disk cache.
-pub fn engine_identity() -> Option<&'static str> {
-    option_env!("IDL_RS_GIT_COMMIT").filter(|s| !s.is_empty())
-}
+pub use idl_rs::engine_identity;
 
 /// What one run does.
 #[derive(Clone, Copy)]
@@ -67,7 +61,7 @@ pub struct SetJobOptions<'a> {
     /// The memory ledger each member is admitted against before it decodes
     /// (evaluation-memory spec §4.2.G): its planned estimate is held for the
     /// member's evaluation and released when the member ends. The app passes
-    /// its `SessionCache`, the CLI a [`crate::store::index_job::ByteBudget`];
+    /// its `SessionCache`, the CLI a [`crate::index_job::ByteBudget`];
     /// `None` admits everything (tests).
     pub budget: Option<&'a dyn MemoryBudget>,
 }
@@ -281,7 +275,7 @@ fn no_data_handle(session_id: &str) -> SessionHandle {
 /// SHA-256 hex of the resolved set and the plan's maths text.
 fn set_key(set: &SessionSet, plan: &SetPlan) -> String {
     let set_text = serde_yaml_ng::to_string(&set.to_yaml()).unwrap_or_default();
-    crate::store::atomic::sha256_hex(format!("{set_text}\u{1e}{}", plan.maths_text).as_bytes())
+    idl_rs::store::atomic::sha256_hex(format!("{set_text}\u{1e}{}", plan.maths_text).as_bytes())
 }
 
 /// Evaluates `set` over `doc` against the library at `data_dir` (spec §4.1):
@@ -591,8 +585,8 @@ fn evaluate_with_data(
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use crate::workbook::v3::parse_workbook;
-    use crate::workbook::v3::session_set::parse_session_set;
+    use idl_rs::workbook::v3::parse_workbook;
+    use idl_rs::workbook::v3::session_set::parse_session_set;
 
     fn temp_root() -> PathBuf {
         let d = std::env::temp_dir().join(format!("idl-rs-set-job-{}", uuid::Uuid::new_v4()));
@@ -603,7 +597,7 @@ mod tests {
     /// Writes `sessions/<id>/data.parquet` with one 1 Hz `Fork` channel and a
     /// `session.json` with one lap of `lap_s` seconds.
     fn seed(root: &Path, id: &str, fork: Vec<f64>, lap_s: f64) {
-        use crate::session::{RawColumn, Session, SourceFormat, TimestampSource};
+        use idl_rs::session::{RawColumn, Session, SourceFormat, TimestampSource};
         let dir = root.join("sessions").join(id);
         let session = Session {
             session_id: id.to_string(),
@@ -624,9 +618,9 @@ mod tests {
                 gaps: Vec::new(),
             }],
         };
-        crate::store::parquet::write_session_parquet(root, &session, "0.1.0").unwrap();
-        let mut doc = crate::store::session_json::empty_session_json(id);
-        doc.laps = vec![crate::store::session_json::LapJson {
+        idl_rs::store::parquet::write_session_parquet(root, &session, "0.1.0").unwrap();
+        let mut doc = idl_rs::store::session_json::empty_session_json(id);
+        doc.laps = vec![idl_rs::store::session_json::LapJson {
             lap_number: 1,
             start_timestamp_ms: 0,
             end_timestamp_ms: 0,
@@ -776,7 +770,7 @@ mod tests {
         // Arrange
         let root = temp_root();
         seed(&root, "s1", vec![1.0; 4], 10.0);
-        let tiny = crate::store::index_job::ByteBudget::new(1);
+        let tiny = crate::index_job::ByteBudget::new(1);
 
         // Act
         let report = run(&root, MD, SetJobOptions { budget: Some(&tiny), ..options(false) });
@@ -793,7 +787,7 @@ mod tests {
         // Arrange
         let root = temp_root();
         seed(&root, "s1", vec![1.0, 4.0], 10.0);
-        let budget = crate::store::index_job::ByteBudget::new(1 << 30);
+        let budget = crate::index_job::ByteBudget::new(1 << 30);
 
         // Act
         let report = run(&root, MD, SetJobOptions { budget: Some(&budget), ..options(false) });

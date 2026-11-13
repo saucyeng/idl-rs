@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::atomic::{sha256_hex, write_atomic_with_retry, AtomicWriteError};
+use idl_rs::store::atomic::{sha256_hex, write_atomic_with_retry, AtomicWriteError};
 
 /// One rider/bike profile snapshot (C4 §2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

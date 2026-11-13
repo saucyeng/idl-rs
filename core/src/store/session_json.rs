@@ -1,6 +1,7 @@
 //! `session.json` (contract C1 §6) — replaces `.idl0w`. Metadata, lap gates,
 //! cached laps, lap flags, and track visits for one session.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
@@ -106,7 +107,7 @@ pub struct SessionJson {
     /// `schema_version`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_source: Option<crate::session::TimestampSource>,
-    /// The `store::lap_index::LAP_DETECTOR_VERSION` stamped by whichever
+    /// The `idl_library::lap_index::LAP_DETECTOR_VERSION` stamped by whichever
     /// import/rescan last wrote [`SessionJson::laps`]/
     /// [`SessionJson::track_visits`], if any. Additive C1 §6 field (ruling
     /// R83 Q2) — an older file with no `lap_detector_version` parses
@@ -124,7 +125,7 @@ pub struct SessionJson {
     /// What this session took from its bike's log (bike-log spec §6).
     /// Additive, added 2026-10-16.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bike_log: Option<crate::store::bikelog::SessionBikeLog>,
+    pub bike_log: Option<SessionBikeLog>,
     /// Videos linked to this session, tombstones included (C1 §6, video
     /// spec §3.2). Additive, added 2026-10-16; omitted when empty. Sync
     /// merges it by entry, keyed by `blob_sha256` (C4 §6).
@@ -407,6 +408,42 @@ pub fn set_session_start(
     write_session_json(data_root, session_id, &doc, Some(&based_on_hash))?;
 
     Ok(doc)
+}
+
+/// The running setup sheet at one moment (spec §2).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct RunningSheet {
+    /// The confirmed sheet it starts from, or `None` before the first one.
+    #[serde(default)]
+    pub baseline: Option<String>,
+    /// Every value: the baseline's, with later notes' changes applied.
+    #[serde(default)]
+    pub values: BTreeMap<String, serde_json::Value>,
+    /// Notes since the baseline, in time order: their changes are applied,
+    /// and those without changes are the sheet's "changed since baseline"
+    /// list.
+    #[serde(default)]
+    pub since: Vec<String>,
+}
+
+/// What a session took from its bike's log, stored in its `session.json`
+/// (spec §4, §6).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SessionBikeLog {
+    /// The entries attached, in time order.
+    #[serde(default)]
+    pub entry_ids: Vec<String>,
+    /// The window entries were taken from: after `after_ms` (the bike's
+    /// previous session's `until_ms`; `None` for its first) up to and
+    /// including `until_ms` (this session's end), UTC ms.
+    #[serde(default)]
+    pub after_ms: Option<i64>,
+    /// See [`SessionBikeLog::after_ms`].
+    pub until_ms: i64,
+    /// The running sheet at the session's start: R190's per-session
+    /// snapshot.
+    #[serde(default)]
+    pub setup_sheet: RunningSheet,
 }
 
 #[cfg(test)]

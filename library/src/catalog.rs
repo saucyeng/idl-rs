@@ -13,12 +13,12 @@ use parquet::arrow::ProjectionMask;
 use rusqlite::Connection;
 use uuid::Uuid;
 
-use crate::store::atomic::{sha256_hex, write_atomic_with_retry};
-use crate::store::blob::{blob_path, verify_blob};
-use crate::store::catalog_read::WorkbookSummary;
-use crate::store::session_json::{read_session_json, LapJson, TrackVisitJson};
-use crate::track_artifact::read::read_track;
-use crate::workbook::v3::front_matter::parse_front_matter;
+use idl_rs::store::atomic::{sha256_hex, write_atomic_with_retry};
+use crate::blob::{blob_path, verify_blob};
+use crate::catalog_read::WorkbookSummary;
+use idl_rs::store::session_json::{read_session_json, LapJson, TrackVisitJson};
+use idl_rs::track_artifact::read::read_track;
+use idl_rs::workbook::v3::front_matter::parse_front_matter;
 
 /// Schema version this build of `idl-rs` writes/expects for `catalog.sqlite`
 /// (C4 §5). A mismatch on open means the catalog is deleted and rebuilt, not
@@ -305,7 +305,7 @@ pub struct RebuildProgress {
 /// Rebuilds `<data_root>/catalog.sqlite` from a full tree scan (C4 §5).
 /// Never mutates the live catalog in place — builds
 /// `tmp/catalog-rebuild-<uuid>.sqlite`, then atomically swaps it over
-/// `catalog.sqlite` via [`crate::store::atomic::write_atomic_with_retry`]
+/// `catalog.sqlite` via [`idl_rs::store::atomic::write_atomic_with_retry`]
 /// (the WAL sidecars are checkpointed into the main file before the swap, so
 /// no `-wal`/`-shm` files need to move separately; any stale sidecars left
 /// beside the *previous* `catalog.sqlite` are removed after a successful
@@ -332,7 +332,7 @@ pub fn rebuild_catalog(data_root: &Path) -> Result<RebuildReport, CatalogError> 
 /// `(sha256, size_bytes, mtime_ms)` still matches its row is carried across
 /// without re-reading the blob's bytes. Only new paths, and paths whose size
 /// or mtime moved, are hashed. The full hash of every blob is
-/// [`crate::store::verify::verify_data_dir`]'s job (C4 §7 #1), not the
+/// [`crate::verify::verify_data_dir`]'s job (C4 §7 #1), not the
 /// rebuild's — on a 159-session library the hash pass alone took minutes.
 pub fn rebuild_catalog_with_progress(
     data_root: &Path,
@@ -356,9 +356,9 @@ pub fn rebuild_catalog_with_progress(
     }
 
     // 2. tracks
-    let tracks_dir = crate::track_artifact::path::tracks_dir(data_root);
+    let tracks_dir = idl_rs::track_artifact::path::tracks_dir(data_root);
     if tracks_dir.is_dir() {
-        let track_paths = crate::track_artifact::path::list_track_files(&tracks_dir).map_err(io_err)?;
+        let track_paths = idl_rs::track_artifact::path::list_track_files(&tracks_dir).map_err(io_err)?;
         let tracks_total = track_paths.len();
         for (done, path) in track_paths.into_iter().enumerate() {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
@@ -648,7 +648,7 @@ fn index_session_body(
     // the parquet origin for display/sorting (R194); every other source
     // catalogues the parquet value unchanged.
     let effective_timestamp_utc_ms =
-        crate::store::session_json::effective_start_ms(&doc, fields.timestamp_utc_ms);
+        idl_rs::store::session_json::effective_start_ms(&doc, fields.timestamp_utc_ms);
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO sessions (session_id, blob_sha256, source_format, device_id, config_checksum, importer_version, seam_correction_version, engine_version, timestamp_utc_ms, created_at_ms, rider, bike, venue_name, event_name, event_session, short_comment, tag, lap_count, duration_ms) \
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
@@ -935,12 +935,12 @@ fn index_lap_summary(
 
 /// The `sessions` DDL columns that live in `data.parquet`'s own file-level
 /// key-value metadata (C1 §4.3), read once per session. `pub(crate)` (not
-/// private): `store::verify`'s checks #3 (missing blob) and #4 (session_id
+/// private): `verify`'s checks #3 (missing blob) and #4 (session_id
 /// identity) reuse this same read rather than a second, parallel parse of
 /// the same file-level metadata (decisions.md R15 item 4).
 pub(crate) struct DataParquetSessionFields {
     /// `data.parquet`'s own `session_id` metadata key — compared against
-    /// the containing directory's name by `store::verify` check #4.
+    /// the containing directory's name by `verify` check #4.
     pub(crate) session_id: String,
     pub(crate) blob_sha256: String,
     /// One of `"idl0"`/`"fit"`/`"gpx"`/`"csv"` (the `sessions.source_format`
@@ -955,7 +955,7 @@ pub(crate) struct DataParquetSessionFields {
     timestamp_utc_ms: i64,
 }
 
-// TODO(idl0): delegate to store::parquet::read_session_metadata (R18 item 3)
+// TODO(idl0): delegate to idl_rs::store::parquet::read_session_metadata (R18 item 3)
 /// Reads `data.parquet`'s file-level key-value metadata (C1 §4.3) — no
 /// row-group/column materialization — into the fields the `sessions` DDL
 /// requires. `Sql`-kind [`CatalogError`] when the file doesn't parse as
@@ -994,7 +994,7 @@ pub(crate) fn read_data_parquet_session_fields(path: &Path) -> Result<DataParque
 
 /// Session length: `round((max(t) - min(t)) / 1000)` ms over `data.parquet`'s
 /// own `t` column (session-relative µs, C1 §4.1) — mirrors
-/// [`crate::session::Channel::duration_ms`] exactly, so this is a real
+/// [`idl_rs::session::Channel::duration_ms`] exactly, so this is a real
 /// elapsed-time value, never an epoch-scale timestamp. Reads only the `t`
 /// column via [`ProjectionMask`] (no other column is materialized), and
 /// only the first and last row it reads (batches stream in `t`-ascending
@@ -1119,7 +1119,7 @@ pub fn update_session_timestamp(conn: &Connection, session_id: &str, timestamp_u
 /// Upserts one `tracks` row for `track` (C4 §5, ruling R86 §4 — `save_track`
 /// calls this only when `catalog.sqlite` already exists). `full_json` is the
 /// exact `.idl0t` file text just written by
-/// [`write_track`](crate::track_artifact::write::write_track), matching
+/// [`write_track`](idl_rs::track_artifact::write::write_track), matching
 /// `rebuild_catalog`'s own `full_json` column verbatim.
 ///
 /// Deliberately `INSERT ... ON CONFLICT(track_id) DO UPDATE`, never a
@@ -1128,7 +1128,7 @@ pub fn update_session_timestamp(conn: &Connection, session_id: &str, timestamp_u
 /// row — even to immediately reinsert it — would null out every lap that
 /// already names this track. `ON CONFLICT DO UPDATE` never deletes the row,
 /// so that cascade never fires on an edit.
-pub fn upsert_track(conn: &Connection, track: &crate::track_artifact::Track, full_json: &str) -> Result<(), CatalogError> {
+pub fn upsert_track(conn: &Connection, track: &idl_rs::track_artifact::Track, full_json: &str) -> Result<(), CatalogError> {
     conn.execute(
         "INSERT INTO tracks (track_id, name, venue_name, created_at_ms, updated_at_ms, full_json) VALUES (?1,?2,?3,?4,?5,?6) \
          ON CONFLICT(track_id) DO UPDATE SET name = excluded.name, venue_name = excluded.venue_name, \
@@ -1215,11 +1215,11 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use crate::store::blob::write_blob;
-    use crate::store::derived::{write_derived_parquet, DerivedOutput};
-    use crate::store::parquet::write_session_parquet;
-    use crate::store::session_json::{empty_session_json, write_session_json, LapJson, TrackVisitJson};
-    use crate::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
+    use crate::blob::write_blob;
+    use crate::derived::{write_derived_parquet, DerivedOutput};
+    use idl_rs::store::parquet::write_session_parquet;
+    use idl_rs::store::session_json::{empty_session_json, write_session_json, LapJson, TrackVisitJson};
+    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
 
     fn temp_root() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("idl-rs-test-{}", Uuid::new_v4()));
@@ -1254,7 +1254,7 @@ mod tests {
         root: &Path,
         session_id: &str,
         timestamp_utc_ms: i64,
-        doc: &crate::store::session_json::SessionJson,
+        doc: &idl_rs::store::session_json::SessionJson,
         blob_sha256: String,
     ) {
         write_session_json(root, session_id, doc, None).unwrap();
@@ -1284,7 +1284,7 @@ mod tests {
     /// and its `data.parquet` (whose `blob_sha256` file metadata matches the
     /// just-written blob, satisfying the `sessions` table's foreign key
     /// under `PRAGMA foreign_keys = ON`, C4 §5).
-    fn write_full_session(root: &Path, session_id: &str, timestamp_utc_ms: i64, doc: &crate::store::session_json::SessionJson) {
+    fn write_full_session(root: &Path, session_id: &str, timestamp_utc_ms: i64, doc: &idl_rs::store::session_json::SessionJson) {
         let blob_sha256 = write_blob(root, format!("raw bytes for {session_id}").as_bytes()).unwrap();
         write_full_session_with_blob(root, session_id, timestamp_utc_ms, doc, blob_sha256);
     }
@@ -1417,7 +1417,7 @@ mod tests {
     #[test]
     fn rebuild_catalog_with_progress_reports_every_phase_in_c4_scan_order() {
         // Arrange
-        use crate::workbook::v3::front_matter::{render_front_matter, FrontMatter};
+        use idl_rs::workbook::v3::front_matter::{render_front_matter, FrontMatter};
 
         let root = temp_root();
         write_full_session(&root, "s1", 0, &empty_session_json("s1"));
@@ -1531,7 +1531,7 @@ mod tests {
     fn rebuild_catalog_indexes_two_valid_workbooks_and_skips_one_malformed() {
         // Arrange — C4 §5 step 6: two valid `.idl1wb` front-matter files and
         // one that fails to parse (no `---`-delimited block at all).
-        use crate::workbook::v3::front_matter::{render_front_matter, FrontMatter};
+        use idl_rs::workbook::v3::front_matter::{render_front_matter, FrontMatter};
 
         let root = temp_root();
         let workbooks_dir = root.join("workbooks");
@@ -1564,7 +1564,7 @@ mod tests {
         assert_eq!(report.skipped.len(), 1);
         assert!(report.skipped[0].contains("Broken.idl1wb"));
 
-        let rows = crate::store::catalog_read::list_workbooks(&root).unwrap();
+        let rows = crate::catalog_read::list_workbooks(&root).unwrap();
         assert_eq!(rows.len(), 2);
         // C3 §3.2 `list_workbooks` orders by `name` ASC.
         assert_eq!(rows[0].name, "Fork tuning");
@@ -1581,7 +1581,7 @@ mod tests {
         let root = temp_root();
         let conn = open_catalog(&root.join("catalog.sqlite")).unwrap();
         create_schema(&conn).unwrap();
-        let row = crate::store::catalog_read::WorkbookSummary {
+        let row = crate::catalog_read::WorkbookSummary {
             workbook_id: "wb-1".to_string(),
             file_name: "Old name".to_string(),
             name: "Old name".to_string(),
@@ -1591,7 +1591,7 @@ mod tests {
         upsert_workbook(&conn, &row).unwrap();
 
         // Act — same `workbook_id`, new `file_name`/`name` (a rename).
-        let renamed = crate::store::catalog_read::WorkbookSummary {
+        let renamed = crate::catalog_read::WorkbookSummary {
             workbook_id: "wb-1".to_string(),
             file_name: "New name".to_string(),
             name: "New name".to_string(),
@@ -1805,11 +1805,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Minimal domain `Track` for [`upsert_track`] tests — `store::catalog`
+    /// Minimal domain `Track` for [`upsert_track`] tests — `catalog`
     /// has no reason to exercise gate/timing fields, only the five scalar
     /// columns `upsert_track` writes.
-    fn minimal_track(id: &str, name: &str) -> crate::track_artifact::Track {
-        crate::track_artifact::Track {
+    fn minimal_track(id: &str, name: &str) -> idl_rs::track_artifact::Track {
+        idl_rs::track_artifact::Track {
             id: id.to_string(),
             name: name.to_string(),
             venue: "Whistler".to_string(),

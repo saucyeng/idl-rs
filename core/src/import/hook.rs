@@ -5,7 +5,7 @@
 //! is L1/L3's, once the materialised-channel store exists. See
 //! `docs/IDL0_SPEC.md` §15a.5 and this plan's Open Questions. Per L2-R12,
 //! this file does not include an `import_with_hook` call-site wrapper — the
-//! one real call site (`crate::store::import::import_file`) wires
+//! one real call site (`idl_library::import::import_file`) wires
 //! [`NoopPostImportHook`] directly.
 
 use crate::session::Session;

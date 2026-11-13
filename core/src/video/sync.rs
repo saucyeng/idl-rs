@@ -6,7 +6,7 @@
 //! `session_time_s` is the session's `*_time_secs` clock (t = 0 at its first
 //! sample). Estimation prefers the GPMF UTC anchor, then the container
 //! creation time; with neither it is idl0's `Parse` error, which the
-//! linking code (`store::video`) turns into a manual offset of 0. A video
+//! linking code (`idl_library::video`) turns into a manual offset of 0. A video
 //! whose span misses the session is refused.
 //!
 //! The session's clock is [`SessionClock`]: `GPS_EpochMs` samples paired

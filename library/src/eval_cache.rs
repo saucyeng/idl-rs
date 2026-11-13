@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OpenFlags};
 
-use crate::math::units::UnitLabel;
-use crate::math::{MathEvalError, MathEvalErrorKind};
-use crate::workbook::v3::set_eval::{result_key, MemberResult, MemberResults, MemberValue};
+use idl_rs::math::units::UnitLabel;
+use idl_rs::math::{MathEvalError, MathEvalErrorKind};
+use idl_rs::workbook::v3::set_eval::{result_key, MemberResult, MemberResults, MemberValue};
 
 /// Bytes above which [`EvalCache::prune`] evicts least-recently-used rows:
 /// 256 MiB (spec §4.3).

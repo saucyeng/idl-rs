@@ -14,15 +14,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use sha2::{Digest, Sha256};
 
-use crate::store::atomic::{sha256_hex, write_atomic_with_retry};
-use crate::store::blob::{blob_exists, blob_path};
-use crate::store::parquet::{read_session_metadata, read_time_axis_bounds};
-use crate::store::sync::ids::{is_valid_id, IdClass};
-use crate::store::session_json::{effective_start_ms, parse_session_json, read_session_json, SessionJson};
-use crate::video::gpmf::{parse_gpmf, VideoTelemetry};
-use crate::video::mp4box::{probe_path, Mp4Info};
-use crate::video::sync::{estimate_sync, video_span_utc_ms, SessionClock, SyncEstimate};
-use crate::video::{SessionVideo, SyncMethod, VideoError, VideoErrorKind, VideoLink};
+use idl_rs::store::atomic::{sha256_hex, write_atomic_with_retry};
+use crate::blob::{blob_exists, blob_path};
+use idl_rs::store::parquet::{read_session_metadata, read_time_axis_bounds};
+use crate::sync::ids::{is_valid_id, IdClass};
+use idl_rs::store::session_json::{effective_start_ms, parse_session_json, read_session_json, SessionJson};
+use idl_rs::video::gpmf::{parse_gpmf, VideoTelemetry};
+use idl_rs::video::mp4box::{probe_path, Mp4Info};
+use idl_rs::video::sync::{estimate_sync, video_span_utc_ms, SessionClock, SyncEstimate};
+use idl_rs::video::{SessionVideo, SyncMethod, VideoError, VideoErrorKind, VideoLink};
 
 /// Bytes read and written per step of the streaming copy.
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
@@ -462,7 +462,7 @@ pub fn match_videos(data_root: &Path, paths: &[PathBuf]) -> Vec<VideoMatch> {
                     path: path.clone(),
                     session_ids: Vec::new(),
                     video_span_utc_ms: None,
-                    error: Some(VideoError::new(VideoErrorKind::NoTime, crate::video::NO_TIME_MESSAGE)),
+                    error: Some(VideoError::new(VideoErrorKind::NoTime, idl_rs::video::NO_TIME_MESSAGE)),
                 },
                 Ok(Some((v0, v1))) => VideoMatch {
                     path: path.clone(),
@@ -478,11 +478,11 @@ pub fn match_videos(data_root: &Path, paths: &[PathBuf]) -> Vec<VideoMatch> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
-    use crate::store::parquet::write_session_parquet;
-    use crate::store::session_json::{empty_session_json, write_session_json};
-    use crate::video::mp4box::fixture::synthetic_mp4;
-    use crate::video::VideoErrorDetail;
+    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
+    use idl_rs::store::parquet::write_session_parquet;
+    use idl_rs::store::session_json::{empty_session_json, write_session_json};
+    use idl_rs::video::mp4box::fixture::synthetic_mp4;
+    use idl_rs::video::VideoErrorDetail;
     use uuid::Uuid;
 
     /// Seconds between the MP4 epoch (1904) and the Unix epoch (1970).
@@ -521,7 +521,7 @@ mod tests {
                 gaps: Vec::new(),
             }],
         };
-        write_session_parquet(root, &session, crate::parse::IDL0_IMPORTER_VERSION).unwrap();
+        write_session_parquet(root, &session, idl_rs::parse::IDL0_IMPORTER_VERSION).unwrap();
     }
 
     /// A 10 s synthetic MP4 created at `created_utc_ms` (0 = no creation

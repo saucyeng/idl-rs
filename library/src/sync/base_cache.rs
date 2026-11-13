@@ -1,5 +1,5 @@
 //! The `.sync-base` cache (C2 §7's `base` parameter to
-//! [`crate::workbook::merge::merge`]): the last workbook document both this
+//! [`idl_rs::workbook::merge::merge`]): the last workbook document both this
 //! device and a peer successfully synced, cached at
 //! `<data>/workbooks/.sync-base/<workbook_id>.idl1wb` so the next sync has a
 //! three-way merge base instead of only two documents to compare. Excluded
@@ -8,9 +8,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::store::atomic::{sha256_hex, write_atomic};
-use crate::store::sync::manifest::{SyncError, SyncErrorKind};
-use crate::workbook::v3::{parse_workbook, WorkbookDoc};
+use idl_rs::store::atomic::{sha256_hex, write_atomic};
+use crate::sync::manifest::{SyncError, SyncErrorKind};
+use idl_rs::workbook::v3::{parse_workbook, WorkbookDoc};
 
 /// `<data_root>/workbooks/.sync-base/<workbook_id>.idl1wb` (C2 §7). Does not
 /// itself validate `workbook_id` — callers that write through this path
@@ -22,7 +22,7 @@ pub fn base_cache_path(data_root: &Path, workbook_id: &str) -> PathBuf {
 
 /// Rejects a `workbook_id` that would escape `.sync-base/` once joined with
 /// `.idl1wb` — a path separator (`/` or `\`) or a `..` segment. The same
-/// guard [`crate::track_artifact::write::write_track`] uses for `track_id`.
+/// guard [`idl_rs::track_artifact::write::write_track`] uses for `track_id`.
 fn validate_workbook_id(workbook_id: &str) -> Result<(), SyncError> {
     if workbook_id.contains('/') || workbook_id.contains('\\') || workbook_id.contains("..") {
         return Err(SyncError {
@@ -39,7 +39,7 @@ fn validate_workbook_id(workbook_id: &str) -> Result<(), SyncError> {
 /// but is not valid UTF-8 or fails [`parse_workbook`]'s front-matter-fatal
 /// checks: a corrupt cache is never allowed to block a sync, so it is
 /// treated exactly like an absent one rather than surfacing an error. A
-/// document that parses with non-fatal [`crate::workbook::v3::WorkbookError`]s
+/// document that parses with non-fatal [`idl_rs::workbook::v3::WorkbookError`]s
 /// (e.g. a duplicate cell id) is still `Some` — those are collected, not
 /// fatal (see `parse_workbook`'s own doc comment).
 pub fn read_base(data_root: &Path, workbook_id: &str) -> Result<Option<WorkbookDoc>, SyncError> {

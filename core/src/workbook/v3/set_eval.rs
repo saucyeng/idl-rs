@@ -13,8 +13,8 @@
 //!   in set order. It reads no session data.
 //!
 //! The member key ([`member_key`]) addresses one member's results in the
-//! on-disk cache (`store::eval_cache`); the runner that walks the members is
-//! `store::set_job`.
+//! on-disk cache (`idl_library::eval_cache`); the runner that walks the members is
+//! `idl_library::set_job`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 

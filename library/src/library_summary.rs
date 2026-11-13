@@ -16,7 +16,7 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::store::catalog::CATALOG_SCHEMA_VERSION;
+use crate::catalog::CATALOG_SCHEMA_VERSION;
 
 /// `schema_version` of the summary document.
 pub const LIBRARY_SUMMARY_SCHEMA_VERSION: u32 = 1;
@@ -198,13 +198,13 @@ fn read_workbooks(conn: &Connection) -> Result<Vec<LibraryWorkbook>, rusqlite::E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
-    use crate::store::blob::write_blob;
-    use crate::store::catalog::{open_catalog, rebuild_catalog, upsert_workbook};
-    use crate::store::catalog_read::WorkbookSummary;
-    use crate::store::derived::{write_derived_parquet, DerivedOutput};
-    use crate::store::parquet::write_session_parquet;
-    use crate::store::session_json::{empty_session_json, write_session_json};
+    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
+    use crate::blob::write_blob;
+    use crate::catalog::{open_catalog, rebuild_catalog, upsert_workbook};
+    use crate::catalog_read::WorkbookSummary;
+    use crate::derived::{write_derived_parquet, DerivedOutput};
+    use idl_rs::store::parquet::write_session_parquet;
+    use idl_rs::store::session_json::{empty_session_json, write_session_json};
 
     fn temp_root() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("idl-rs-libsum-{}", uuid::Uuid::new_v4()));
@@ -238,7 +238,7 @@ mod tests {
                 gaps: Vec::new(),
             }],
         };
-        write_session_parquet(root, &session, crate::parse::IDL0_IMPORTER_VERSION).unwrap();
+        write_session_parquet(root, &session, idl_rs::parse::IDL0_IMPORTER_VERSION).unwrap();
         raw.len() as u64
     }
 

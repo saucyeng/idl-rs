@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use clap::ArgMatches;
 use serde_json::{json, Value};
 
-use idl_rs::store::bikelog::{self, BikeLogError, BikeLogErrorKind, Entry};
+use idl_library::bikelog::{self, BikeLogError, BikeLogErrorKind, Entry};
 
 use super::{many, opt_integer, opt_text, text, Ctx, VerbOutput};
 use crate::envelope::{CliError, ErrorKind};

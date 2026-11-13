@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::atomic::{sha256_hex, write_atomic_with_retry, AtomicWriteError};
+use idl_rs::store::atomic::{sha256_hex, write_atomic_with_retry, AtomicWriteError};
 
 /// Rider-facing unit system (C4 §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

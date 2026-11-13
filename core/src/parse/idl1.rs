@@ -971,24 +971,29 @@ pub fn read_idl1_gps_config(bytes: &[u8]) -> Option<GpsConfig> {
     None
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// Builds `.idl1` files for tests (spec §4). Exposed under the `test-fixtures`
+/// feature so `idl-library`'s import tests can build logger files.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod test_builder {
     use super::*;
 
     /// Builds `.idl1` files for tests (spec §4).
-    pub(crate) struct Builder {
+    pub struct Builder {
         registry: Vec<Vec<u8>>,
         records: Vec<u8>,
-        pub(crate) session_start_ms: i64,
+        /// Session start written to the header, UTC ms.
+        pub session_start_ms: i64,
     }
 
     impl Builder {
-        pub(crate) fn new() -> Self {
+        /// Test builder step `new` (see the `.idl1` spec §4 for the record it writes).
+        pub fn new() -> Self {
             Self { registry: Vec::new(), records: Vec::new(), session_start_ms: 1_760_000_000_000 }
         }
 
+        /// Test builder step `channel` (see the `.idl1` spec §4 for the record it writes).
         #[allow(clippy::too_many_arguments)]
-        pub(crate) fn channel(&mut self, id: u16, data_type: u8, kind: u8, source: u8, axis: u8, path: u8, rate_hz: u32, scale: f32, name: &str, units: &str) -> &mut Self {
+        pub fn channel(&mut self, id: u16, data_type: u8, kind: u8, source: u8, axis: u8, path: u8, rate_hz: u32, scale: f32, name: &str, units: &str) -> &mut Self {
             let mut e = Vec::new();
             e.extend(id.to_le_bytes());
             e.extend([data_type, kind, source, axis, path, 0]);
@@ -1007,7 +1012,7 @@ pub(crate) mod tests {
         }
 
         /// The six low-g/gyro axes of IMU `imu` at `rate_hz`.
-        pub(crate) fn imu_axes(&mut self, imu: u8, rate_hz: u32) -> &mut Self {
+        pub fn imu_axes(&mut self, imu: u8, rate_hz: u32) -> &mut Self {
             let names = ["AccelX", "AccelY", "AccelZ", "GyroX", "GyroY", "GyroZ"];
             for (a, n) in names.iter().enumerate() {
                 let (scale, units) = if a < 3 { (0.000488f32, "g") } else { (0.07f32, "dps") };
@@ -1017,7 +1022,7 @@ pub(crate) mod tests {
         }
 
         /// The three high-g axes of IMU `imu` at `rate_hz`, ±64 g.
-        pub(crate) fn hg_axes(&mut self, imu: u8, rate_hz: u32) -> &mut Self {
+        pub fn hg_axes(&mut self, imu: u8, rate_hz: u32) -> &mut Self {
             for (a, n) in ["X", "Y", "Z"].iter().enumerate() {
                 self.channel(18 + imu as u16 * 3 + a as u16, 4, KIND_IMU_AXIS, imu, a as u8, PATH_HIGH_G, rate_hz, 0.001952, &format!("IMU{imu}_HgAccel{n}"), "g");
             }
@@ -1033,7 +1038,7 @@ pub(crate) mod tests {
 
         /// An IMU_BLOCK with `samples` (6 axes each), `hg` triplets and
         /// timestamp words `(after_sample, after_hg, chip_ts)`.
-        pub(crate) fn imu_block(&mut self, imu: u8, flags: u8, read_us: i64, read_chip: u32, samples: &[[i16; 6]], hg: &[[i16; 3]], ts: &[(u16, u16, u32)]) -> &mut Self {
+        pub fn imu_block(&mut self, imu: u8, flags: u8, read_us: i64, read_chip: u32, samples: &[[i16; 6]], hg: &[[i16; 3]], ts: &[(u16, u16, u32)]) -> &mut Self {
             let mut p = vec![imu, flags];
             p.extend(read_us.to_le_bytes());
             p.extend(read_chip.to_le_bytes());
@@ -1058,14 +1063,16 @@ pub(crate) mod tests {
             self.record(REC_IMU_BLOCK, &p)
         }
 
-        pub(crate) fn channel_sample_u32(&mut self, id: u16, ts_us: i64, value: u32) -> &mut Self {
+        /// Test builder step `channel_sample_u32` (see the `.idl1` spec §4 for the record it writes).
+        pub fn channel_sample_u32(&mut self, id: u16, ts_us: i64, value: u32) -> &mut Self {
             let mut p = id.to_le_bytes().to_vec();
             p.extend(ts_us.to_le_bytes());
             p.extend(value.to_le_bytes());
             self.record(REC_CHANNEL_SAMPLE, &p)
         }
 
-        pub(crate) fn gps_fix(&mut self, epoch_ms: i64, device_us: i64, hdop_x100: u16) -> &mut Self {
+        /// Test builder step `gps_fix` (see the `.idl1` spec §4 for the record it writes).
+        pub fn gps_fix(&mut self, epoch_ms: i64, device_us: i64, hdop_x100: u16) -> &mut Self {
             let mut p = epoch_ms.to_le_bytes().to_vec();
             p.extend(device_us.to_le_bytes());
             p.extend(515_250_000i32.to_le_bytes());
@@ -1078,7 +1085,8 @@ pub(crate) mod tests {
             self.record(REC_GPS_FIX, &p)
         }
 
-        pub(crate) fn logger_event(&mut self, code: u8, source: u16, count: u32, ts_us: i64) -> &mut Self {
+        /// Test builder step `logger_event` (see the `.idl1` spec §4 for the record it writes).
+        pub fn logger_event(&mut self, code: u8, source: u16, count: u32, ts_us: i64) -> &mut Self {
             let mut p = vec![code];
             p.extend(source.to_le_bytes());
             p.extend(count.to_le_bytes());
@@ -1089,7 +1097,7 @@ pub(crate) mod tests {
         /// A GPS_CONFIG record, laid out as idl1-firmware's
         /// `idl1_format_gps_config` writes it: 8 Hz GPS+Galileo+BeiDou,
         /// automotive, factory filters.
-        pub(crate) fn gps_config(&mut self, result: u8, applied_rate_hz: u8) -> &mut Self {
+        pub fn gps_config(&mut self, result: u8, applied_rate_hz: u8) -> &mut Self {
             let mut p = vec![1u8, result, 8, applied_rate_hz, 0x07 | 0x10 | 0x20, 4, 5, 6, 3, 32, 0, 0];
             p.extend(250u16.to_le_bytes());
             p.extend(100u16.to_le_bytes());
@@ -1100,11 +1108,13 @@ pub(crate) mod tests {
             self.record(REC_GPS_CONFIG, &p)
         }
 
-        pub(crate) fn end(&mut self) -> &mut Self {
+        /// Test builder step `end` (see the `.idl1` spec §4 for the record it writes).
+        pub fn end(&mut self) -> &mut Self {
             self.record(REC_SESSION_END, &[])
         }
 
-        pub(crate) fn build(&self) -> Vec<u8> {
+        /// Test builder step `build` (see the `.idl1` spec §4 for the record it writes).
+        pub fn build(&self) -> Vec<u8> {
             let header_len = FIXED_HEADER_BYTES + self.registry.len() * REGISTRY_ENTRY_BYTES + HEADER_CRC_BYTES;
             let mut h = b"IDL1".to_vec();
             h.extend(IDL1_FORMAT_VERSION.to_le_bytes());
@@ -1128,6 +1138,13 @@ pub(crate) mod tests {
             h
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) use super::test_builder::Builder;
 
     /// `seconds` of one IMU at 480 Hz, chip tick 21.75 µs, drained every
     /// 20 ms (10 samples per read at this rate, rounding), a timestamp word

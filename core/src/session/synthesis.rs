@@ -8,7 +8,7 @@ use crate::session::{Channel, RawColumn, Session};
 
 /// What [`synthesize_base_channels`] adds to a session, decided from each
 /// channel's id, nominal rate (Hz) and sample count alone — so a reader that
-/// has only a file's metadata (`store::catalog_read::get_session`) lists the
+/// has only a file's metadata (`idl_library::catalog_read::get_session`) lists the
 /// same base channels the engine will build, without decoding anything.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BasePlan {

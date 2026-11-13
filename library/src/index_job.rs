@@ -5,9 +5,9 @@
 //!
 //! 1. **tracks** — detect this session's track visits and the laps within
 //!    them against the track library, and merge the result into
-//!    `session.json` (`store::lap_index::index_laps_with_tracks`);
+//!    `session.json` (`lap_index::index_laps_with_tracks`);
 //! 2. **laps** — refresh that session's `sessions`/`laps`/`lap_summary` rows
-//!    in `catalog.sqlite` (`store::catalog::index_session`), in that
+//!    in `catalog.sqlite` (`catalog::index_session`), in that
 //!    session's own transaction.
 //!
 //! Both commit per session, so a killed process loses at most the session in
@@ -19,7 +19,7 @@
 //! never exceed the process's memory budget (ruling R208.1 item 3). Workers
 //! **wait** for memory; they never fail for it (ruling R211).
 //!
-//! This module never blocks a user: `store::index_job` is what the app runs
+//! This module never blocks a user: `index_job` is what the app runs
 //! in the background and what the CLI runs at the end of a fold-in. Opening
 //! one session's workbook goes through [`index_one_session`], which indexes
 //! exactly that session.
@@ -31,12 +31,12 @@ use std::sync::{Condvar, Mutex};
 
 use rusqlite::Connection;
 
-use crate::store::catalog::{index_session, open_catalog, CatalogError};
-use crate::store::lap_index::{
+use crate::catalog::{index_session, open_catalog, CatalogError};
+use crate::lap_index::{
     index_laps_with_tracks, load_track_library, session_index_is_current, track_library_hash, LapIndexError,
 };
-use crate::store::parquet::{estimate_channel_bytes, open_session_lazy};
-use crate::track_artifact::Track;
+use idl_rs::store::parquet::{estimate_channel_bytes, open_session_lazy};
+use idl_rs::track_artifact::Track;
 
 /// The channels track-visit and lap detection read (`gps::fixes_from`), and
 /// therefore the only ones one session's indexing decodes. Sized for the
@@ -180,7 +180,7 @@ impl std::error::Error for NeverFits {}
 
 /// The process's one memory ledger, as an evaluation sees it
 /// (evaluation-memory spec §4.2.G): an evaluation reserves its planned
-/// estimate ([`crate::workbook::v3::EvalPlan`]) before it starts and gives it
+/// estimate ([`idl_rs::workbook::v3::EvalPlan`]) before it starts and gives it
 /// back by dropping the guard.
 ///
 /// Callable per unit of work from any thread — one workbook evaluation, or
@@ -570,7 +570,7 @@ fn index_bytes(session_dir: &Path) -> u64 {
     if total == 0 {
         // Distinguish "no GPS columns" (cheap, and `read_channel_index`
         // succeeded) from "footer unreadable" (unknown, charge the guess).
-        if crate::store::parquet::estimate_session_bytes(session_dir).is_err() {
+        if idl_rs::store::parquet::estimate_session_bytes(session_dir).is_err() {
             return UNKNOWN_SESSION_BYTES;
         }
     }
@@ -630,13 +630,13 @@ fn index_one(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gps::GpsFix;
-    use crate::laps::model::{Gate, LapTiming};
-    use crate::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
-    use crate::store::blob::write_blob;
-    use crate::store::parquet::write_session_parquet;
-    use crate::store::session_json::read_session_json;
-    use crate::track_artifact::write_track;
+    use idl_rs::gps::GpsFix;
+    use idl_rs::laps::model::{Gate, LapTiming};
+    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
+    use crate::blob::write_blob;
+    use idl_rs::store::parquet::write_session_parquet;
+    use idl_rs::store::session_json::read_session_json;
+    use idl_rs::track_artifact::write_track;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -664,10 +664,10 @@ mod tests {
         fixes
     }
 
-    fn circuit_track(id: &str) -> crate::track_artifact::Track {
+    fn circuit_track(id: &str) -> idl_rs::track_artifact::Track {
         let polyline: Vec<GpsFix> =
             (0..=100).map(|i| GpsFix { timestamp_ms: i * 1000, lat: i as f64 * 0.001, lon: 0.0005 }).collect();
-        crate::track_artifact::Track {
+        idl_rs::track_artifact::Track {
             id: id.to_string(),
             name: "Loop".to_string(),
             venue: String::new(),

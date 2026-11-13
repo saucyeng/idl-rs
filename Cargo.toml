@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "cli"]
+members = ["core", "library", "cli"]
 
 # Dev builds (tauri dev) use the cargo dev profile.
 # The engine must still run at release-grade speed — parse/DSP at opt-level 0
@@ -19,4 +19,7 @@ debug = "line-tables-only"
 opt-level = 3
 
 [profile.dev.package.idl-rs]
+opt-level = 3
+
+[profile.dev.package.idl-library]
 opt-level = 3

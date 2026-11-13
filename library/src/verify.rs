@@ -28,7 +28,7 @@ pub struct Finding {
 /// current `data.parquet` plus the *live* estimator config to recompute the
 /// expected hash (materialisation-time knowledge this store module has no
 /// generic way to know; left to the estimator glue that calls
-/// `store::derived::write_derived_parquet`, which already has everything
+/// `derived::write_derived_parquet`, which already has everything
 /// needed to recompute and compare), #7 needs C2/L3's `.idl1wb` parser (out
 /// of L1's scope), #9 needs a live catalog connection cross-referenced
 /// against every table's file-reference columns (mechanically
@@ -61,7 +61,7 @@ fn check_blobs(data_root: &Path, out: &mut Vec<Finding>) {
             let prefix = shard.file_name().to_string_lossy().into_owned();
             let suffix = entry.file_name().to_string_lossy().into_owned();
             let digest = format!("{prefix}{suffix}");
-            if let Err(e) = crate::store::blob::verify_blob(data_root, &digest) {
+            if let Err(e) = crate::blob::verify_blob(data_root, &digest) {
                 out.push(Finding { severity: Severity::Error, path: entry.path(), message: e.to_string() });
             }
         }
@@ -81,7 +81,7 @@ fn check_sessions(data_root: &Path, out: &mut Vec<Finding>) {
         if !sj_path.is_file() {
             continue; // transient import state, C4 §2 — not corruption
         }
-        if let Err(e) = crate::store::session_json::read_session_json(&sj_path) {
+        if let Err(e) = idl_rs::store::session_json::read_session_json(&sj_path) {
             out.push(Finding { severity: Severity::Error, path: sj_path, message: e.to_string() }); // #2
         }
 
@@ -89,7 +89,7 @@ fn check_sessions(data_root: &Path, out: &mut Vec<Finding>) {
         if !dp_path.is_file() {
             continue; // transient import state, C4 §2 — not corruption (also, #3/#4 need data.parquet)
         }
-        match crate::store::catalog::read_data_parquet_session_fields(&dp_path) {
+        match crate::catalog::read_data_parquet_session_fields(&dp_path) {
             Ok(fields) => {
                 if fields.session_id != dir_session_id {
                     out.push(Finding {
@@ -101,7 +101,7 @@ fn check_sessions(data_root: &Path, out: &mut Vec<Finding>) {
                         ),
                     }); // #4
                 }
-                if !crate::store::blob::blob_exists(data_root, &fields.blob_sha256) {
+                if !crate::blob::blob_exists(data_root, &fields.blob_sha256) {
                     out.push(Finding {
                         severity: Severity::Warning,
                         path: dp_path,
@@ -132,7 +132,7 @@ fn check_derived(data_root: &Path, out: &mut Vec<Finding>) {
             let path = entry.path();
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
             let Ok(bytes) = std::fs::read(&path) else { continue };
-            let actual = crate::store::atomic::sha256_hex(&bytes);
+            let actual = idl_rs::store::atomic::sha256_hex(&bytes);
             if actual != stem {
                 out.push(Finding {
                     severity: Severity::Error,
@@ -145,7 +145,7 @@ fn check_derived(data_root: &Path, out: &mut Vec<Finding>) {
             // recompute the expected hash — this is a materialisation-time
             // concern (which estimator, which config) this store module has
             // no way to know generically; left to the estimator glue that
-            // calls store::derived::write_derived_parquet in the first
+            // calls derived::write_derived_parquet in the first
             // place (it already has everything needed to recompute and
             // compare). Flagged, not silently dropped — see this fn's doc.
         }
@@ -153,11 +153,11 @@ fn check_derived(data_root: &Path, out: &mut Vec<Finding>) {
 }
 
 fn check_tracks(data_root: &Path, out: &mut Vec<Finding>) {
-    let dir = crate::track_artifact::path::tracks_dir(data_root);
-    let Ok(paths) = crate::track_artifact::path::list_track_files(&dir) else { return };
+    let dir = idl_rs::track_artifact::path::tracks_dir(data_root);
+    let Ok(paths) = idl_rs::track_artifact::path::list_track_files(&dir) else { return };
     for path in paths {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-        match crate::track_artifact::read::read_track(&path) {
+        match idl_rs::track_artifact::read::read_track(&path) {
             Ok(track) if track.id == stem => {}
             Ok(_) => out.push(Finding {
                 severity: Severity::Error,
@@ -230,7 +230,7 @@ fn is_lower_hex(s: &str, len: usize) -> bool {
 
 /// Runs [`verify`] and then repairs C4 §7's two auto-repairable findings —
 /// a corrupted blob (#1) or a corrupted derived parquet (#5) — by moving
-/// each into quarantine via [`crate::store::quarantine::quarantine_file`].
+/// each into quarantine via [`crate::quarantine::quarantine_file`].
 /// `verify` itself is unchanged and stays read-only; this is the only
 /// caller of quarantine's repair path (C4 §7, ruling R86 Q1/Q8 —
 /// `verify_data_dir(repair: true)`, C3 §3.10). `ids` mints one `entry_id`
@@ -250,7 +250,7 @@ pub fn verify_and_repair(
     data_root: &Path,
     ids: &mut dyn FnMut() -> String,
     now_ms: i64,
-) -> (Vec<Finding>, Vec<crate::store::quarantine::QuarantineEntry>) {
+) -> (Vec<Finding>, Vec<crate::quarantine::QuarantineEntry>) {
     let findings = verify(data_root);
     let mut quarantined = Vec::new();
 
@@ -259,7 +259,7 @@ pub fn verify_and_repair(
             continue;
         }
         let entry_id = ids();
-        if let Ok(entry) = crate::store::quarantine::quarantine_file(data_root, &finding.path, &finding.message, &entry_id, now_ms)
+        if let Ok(entry) = crate::quarantine::quarantine_file(data_root, &finding.path, &finding.message, &entry_id, now_ms)
         {
             quarantined.push(entry);
         }
@@ -317,13 +317,13 @@ fn walk_unexpected(data_root: &Path, dir: &Path, out: &mut Vec<Finding>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
-    use crate::store::blob::write_blob;
-    use crate::store::derived::{write_derived_parquet, DerivedOutput};
-    use crate::store::parquet::write_session_parquet;
-    use crate::store::session_json::{empty_session_json, write_session_json};
-    use crate::track_artifact::model::Track;
-    use crate::track_artifact::write::write_track;
+    use idl_rs::session::{Channel, RawColumn, Session, SourceFormat, TimestampSource};
+    use crate::blob::write_blob;
+    use crate::derived::{write_derived_parquet, DerivedOutput};
+    use idl_rs::store::parquet::write_session_parquet;
+    use idl_rs::store::session_json::{empty_session_json, write_session_json};
+    use idl_rs::track_artifact::model::Track;
+    use idl_rs::track_artifact::write::write_track;
     use uuid::Uuid;
 
     fn temp_root() -> PathBuf {
@@ -379,7 +379,7 @@ mod tests {
         // Arrange
         let root = temp_root();
         let digest = write_blob(&root, b"original").unwrap();
-        std::fs::write(crate::store::blob::blob_path(&root, &digest), b"corrupted").unwrap();
+        std::fs::write(crate::blob::blob_path(&root, &digest), b"corrupted").unwrap();
 
         // Act
         let findings = verify(&root);
@@ -597,7 +597,7 @@ mod tests {
         // Arrange
         let root = temp_root();
         let digest = write_blob(&root, b"original").unwrap();
-        let blob_path = crate::store::blob::blob_path(&root, &digest);
+        let blob_path = crate::blob::blob_path(&root, &digest);
         std::fs::write(&blob_path, b"corrupted").unwrap();
         let mut ids = fixed_ids("1");
 
@@ -627,7 +627,7 @@ mod tests {
         // Assert
         assert!(findings.is_empty());
         assert!(quarantined.is_empty());
-        assert!(crate::store::quarantine::list_quarantine(&root).unwrap().is_empty());
+        assert!(crate::quarantine::list_quarantine(&root).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }

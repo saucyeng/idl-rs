@@ -812,21 +812,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "idl-library"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "idl-rs",
+ "memmap2",
+ "num_cpus",
+ "parquet",
+ "rayon",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
 name = "idl-rs"
 version = "0.1.0"
 dependencies = [
  "approx",
  "arrow",
  "fitparser",
- "memmap2",
  "nalgebra",
- "num_cpus",
  "parquet",
  "pulldown-cmark",
  "quick-xml",
- "rayon",
  "realfft",
- "rusqlite",
  "rustfft",
  "sci-rs",
  "serde",
@@ -841,6 +855,7 @@ name = "idl-rs-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "idl-library",
  "idl-rs",
  "serde",
  "serde_json",

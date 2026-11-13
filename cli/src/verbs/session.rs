@@ -5,18 +5,18 @@
 //! Every function here is a wrapper: read the arguments the table declared,
 //! make one `idl_rs` call, project the result into the two renderings
 //! [`VerbOutput`] carries. The filtering and the metadata patch live in
-//! `idl_rs::commands::session_ops`, not here (R230: no CLI-only logic).
+//! `idl_library::session_ops`, not here (R230: no CLI-only logic).
 
 use clap::ArgMatches;
 use serde_json::{json, Value};
 
-use idl_rs::commands::session_ops::{
+use idl_library::session_ops::{
     filter_sessions, set_session_meta, visited_track, SessionFilter, SessionMetaPatch,
 };
-use idl_rs::store::catalog_read::{
+use idl_library::catalog_read::{
     get_session, list_laps, list_sessions, LapSummary, SessionDetail, SessionSummary,
 };
-use idl_rs::store::import::{import_file_path, import_idl0_path};
+use idl_library::import::{import_file_path, import_idl0_path};
 use idl_rs::store::session_json::{set_session_start, SessionJson};
 use idl_rs::calibration::json::CalibrationJson;
 use idl_rs::calibration::rigid;

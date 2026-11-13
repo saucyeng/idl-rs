@@ -25,14 +25,14 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use idl_rs::store::atomic::sha256_hex;
-use idl_rs::store::blob::blob_exists;
-use idl_rs::store::catalog::{self, CatalogError};
-use idl_rs::store::index_job::{
+use idl_library::blob::blob_exists;
+use idl_library::catalog::{self, CatalogError};
+use idl_library::index_job::{
     self, ByteBudget, IndexJobError, IndexJobOptions, IndexJobReport, IndexPhase, IndexProgress,
 };
-use idl_rs::store::catalog_read::{list_stale_sessions, StaleSession};
-use idl_rs::store::import::{self, ImportError, ImportOutcome};
-use idl_rs::store::scan::{scan_folder_with_blob_check, ScanEntry, ScanError};
+use idl_library::catalog_read::{list_stale_sessions, StaleSession};
+use idl_library::import::{self, ImportError, ImportOutcome};
+use idl_library::scan::{scan_folder_with_blob_check, ScanEntry, ScanError};
 
 /// The `library` sub-actions.
 #[derive(Subcommand)]
@@ -850,7 +850,7 @@ mod index_tests {
             total: 2,
             indexed: 1,
             skipped_up_to_date: 0,
-            failed: vec![idl_rs::store::index_job::IndexFailure {
+            failed: vec![idl_library::index_job::IndexFailure {
                 session_id: "ghost".to_string(),
                 message: "no data.parquet".to_string(),
             }],
@@ -870,7 +870,7 @@ mod index_tests {
     fn index_json_a_setup_failure_is_one_error_string_not_a_count_of_zero() {
         // Arrange -- the run never started, so there are no counts at all.
         let report: Result<IndexJobReport, IndexJobError> = Err(IndexJobError {
-            kind: idl_rs::store::index_job::IndexJobErrorKind::Catalog,
+            kind: idl_library::index_job::IndexJobErrorKind::Catalog,
             message: "catalog.sqlite is locked".to_string(),
         });
 

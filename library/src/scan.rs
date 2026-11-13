@@ -20,10 +20,10 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::import::importer_for_extension;
-use crate::parse::peek_session_start_ms;
-use crate::store::atomic::sha256_hex;
-use crate::store::blob::blob_exists;
+use idl_rs::import::importer_for_extension;
+use idl_rs::parse::peek_session_start_ms;
+use idl_rs::store::atomic::sha256_hex;
+use crate::blob::blob_exists;
 
 /// Discriminant for [`ScanError`] — the C3 §3.3 error kinds `scan_folder`
 /// may return (`internal` is L5's, never raised here).
@@ -194,7 +194,7 @@ fn read_head(path: &Path) -> Option<Vec<u8>> {
 /// Extension (lowercase, no dot) → importer id, unifying `.idl0`'s own entry
 /// point with the importer table's extensions exactly as `list_importers`
 /// does (`.idl0` is deliberately outside that table —
-/// [`crate::import::ImporterInfo`]).
+/// [`idl_rs::import::ImporterInfo`]).
 fn importer_id_for_extension(ext: &str) -> Option<String> {
     if ext == "idl0" || ext == "idl1" {
         return Some(ext.to_string());
@@ -205,7 +205,7 @@ fn importer_id_for_extension(ext: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::test_buffers::*;
+    use idl_rs::parse::test_buffers::*;
     use uuid::Uuid;
 
     fn temp_dir() -> PathBuf {
@@ -276,7 +276,7 @@ mod tests {
         let data_root = temp_dir();
         let folder = temp_dir();
         let bytes = idl0_bytes(0);
-        crate::store::import::import_idl0(&data_root, &bytes).unwrap();
+        crate::import::import_idl0(&data_root, &bytes).unwrap();
         std::fs::write(folder.join("a.idl0"), &bytes).unwrap();
         std::fs::write(folder.join("b.idl0"), idl0_bytes(1_700_000_000_000)).unwrap();
 
@@ -298,7 +298,7 @@ mod tests {
         let data_root = temp_dir();
         let folder = temp_dir();
         let bytes = idl0_bytes(0);
-        crate::store::import::import_idl0(&data_root, &bytes).unwrap();
+        crate::import::import_idl0(&data_root, &bytes).unwrap();
         std::fs::write(folder.join("a.idl0"), &bytes).unwrap();
 
         // Act

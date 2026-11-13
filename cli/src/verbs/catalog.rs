@@ -7,10 +7,10 @@
 use clap::ArgMatches;
 use serde_json::{json, Value};
 
-use idl_rs::store::catalog::{rebuild_catalog, RebuildReport};
-use idl_rs::store::catalog_read::{list_tracks, TrackSummary};
-use idl_rs::store::lap_index::{self, LapIndexReport};
-use idl_rs::store::verify::{self, Finding, Severity};
+use idl_library::catalog::{rebuild_catalog, RebuildReport};
+use idl_library::catalog_read::{list_tracks, TrackSummary};
+use idl_library::lap_index::{self, LapIndexReport};
+use idl_library::verify::{self, Finding, Severity};
 
 use crate::envelope::CliError;
 use crate::verbs::{text, Ctx, VerbOutput};
