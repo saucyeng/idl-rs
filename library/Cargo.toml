@@ -4,12 +4,16 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "The idl-rs ride library: catalog, content-addressed blob store, import and index jobs, bike log, sync model."
+repository = "https://github.com/saucyeng/idl-rs"
+readme = "README.md"
+keywords = ["telemetry", "datalogger", "parquet", "imu", "catalog"]
+categories = ["science", "database"]
 
 [lib]
 name = "idl_library"
 
 [dependencies]
-idl-rs = { path = "../core" }
+idl-rs = { path = "../core", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 arrow = "59.3.0"
@@ -26,4 +30,4 @@ rayon = "1"
 num_cpus = "1"
 
 [dev-dependencies]
-idl-rs = { path = "../core", features = ["test-fixtures"] }
+idl-rs = { path = "../core", version = "0.1.0", features = ["test-fixtures"] }

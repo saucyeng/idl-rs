@@ -3,17 +3,22 @@ name = "idl-rs-cli"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
+description = "The idl-rs command-line tool: import IDL telemetry logs, evaluate workbooks, generate synthetic rides."
+repository = "https://github.com/saucyeng/idl-rs"
+readme = "README.md"
+keywords = ["telemetry", "datalogger", "parquet", "imu", "cli"]
+categories = ["command-line-utilities", "science"]
 
 [[bin]]
 name = "idl-rs"
 path = "src/main.rs"
 
 [dependencies]
-idl-rs = { path = "../core" }
-idl-library = { path = "../library" }
+idl-rs = { path = "../core", version = "0.1.0" }
+idl-library = { path = "../library", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-idl-rs = { path = "../core", features = ["test-fixtures"] }
+idl-rs = { path = "../core", version = "0.1.0", features = ["test-fixtures"] }

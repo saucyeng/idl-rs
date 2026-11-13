@@ -139,7 +139,7 @@ not keep notes in it.
 The engine ships as `idl-rs`, grammar `idl-rs <noun> <verb>`. Every command
 takes `--json` (typed JSON out, typed errors on stderr) and `--data-dir`
 (this folder; or set `IDL1_DATA_DIR`). `--help` on any command is
-authoritative; the full table is `docs/CLI-REFERENCE.md` in the source repo.
+authoritative; the full table is `docs/CLI-REFERENCE.md` in the idl-rs repository.
 
 ```
 idl-rs session list [--venue V --since MS --until MS]   # rides, newest first
@@ -232,7 +232,7 @@ and can undo everything you add.
 
 The full language reference — every math builtin with its signature, unit
 rule and shape, the definition annotations, the `js` cell's host variables,
-and the chart grammar — is `docs/WORKBOOK-REFERENCE.md` in the idl1 source
+and the chart grammar — is `docs/WORKBOOK-REFERENCE.md` in the idl-rs
 repository, and is bundled into the app (Help ▸ Workbook reference, or `F1`
 in the code editor). Read it before writing a `math` or `js` cell; the
 function names follow scipy/numpy where the behaviour matches and
@@ -366,6 +366,6 @@ mod tests {
         let text = render_agents_md("0.1.0");
 
         // Assert
-        assert!(text.contains("docs/WORKBOOK-REFERENCE.md"));
+        assert!(text.contains("docs/WORKBOOK-REFERENCE.md` in the idl-rs"));
     }
 }

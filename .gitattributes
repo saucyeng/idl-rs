@@ -6,3 +6,5 @@ core/tests/fixtures/*.idl0 binary
 core/tests/fixtures/*.truth.json text eol=lf
 *.idl1 binary
 *.idl0 binary
+docs/CLI-REFERENCE.md text eol=lf
+docs/WORKBOOK-REFERENCE.md text eol=lf

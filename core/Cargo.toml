@@ -3,6 +3,11 @@ name = "idl-rs"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
+description = "Signal processing, .idl0 log parsing, importers, math-channel evaluation and Parquet storage for IDL telemetry."
+repository = "https://github.com/saucyeng/idl-rs"
+readme = "README.md"
+keywords = ["telemetry", "signal-processing", "parquet", "datalogger", "imu"]
+categories = ["science", "parser-implementations"]
 
 [lib]
 name = "idl_rs"
