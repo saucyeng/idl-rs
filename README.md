@@ -39,7 +39,7 @@ cargo run -p idl-rs --example math_channel
 
 | Crate | Directory | What |
 |-------|-----------|------|
-| `idl-rs` | `core/` | Filters, FFT, integration, rotation, statistics, `.idl0` parsing, importers, math-channel evaluator, Parquet store, suspension-kinematics estimation. No Tauri, no network; file I/O through `std::fs` only. |
+| `idl-rs` | `core/` | Filters, FFT, integration, rotation, statistics, `.idl0` parsing, importers, math-channel evaluator, Parquet store, suspension-kinematics estimation. No network; file I/O through `std::fs` only. |
 | `idl-library` | `library/` | Ride library manager: SQLite catalog, content-addressed blob store, import and index jobs, bike log, LAN-sync model. Depends on `idl-rs`. |
 | `idl-rs-cli` | `cli/` | The `idl-rs` binary, grammar `idl-rs <noun> <verb>`. Depends on `idl-rs` and `idl-library`. |
 
@@ -52,10 +52,10 @@ cargo run -p idl-rs --example math_channel
 ## Build and test
 
 ```
-cargo test -p idl-rs -p idl-library -p idl-rs-cli
+cargo test
 ```
 
-Never `--workspace`. The two reference files above are generated; see `docs/reference-src/` for the hand-written parts.
+The two reference files above are generated; see `docs/reference-src/` for the hand-written parts.
 
 ## License
 

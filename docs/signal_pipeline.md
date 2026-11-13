@@ -1,6 +1,6 @@
 # Signal Pipeline
 
-Mathematical reference for the IDL0 Rust processing layer (`rust/core/src/`).
+Mathematical reference for the idl-rs engine (`core/src/`).
 Each section documents what an operation does physically, which sci-rs / nalgebra /
 rustfft call backs it and why, and the input/output units. Tests in the
 corresponding `#[cfg(test)]` modules verify the wiring against known inputs.
@@ -10,7 +10,7 @@ corresponding `#[cfg(test)]` modules verify the wiring against known inputs.
 ## Welch Spectral Estimation (FFT chart)
 
 The FFT chart estimates the one-sided spectrum with Welch's method, implemented in
-[`rust/core/src/fft.rs`](../rust/core/src/fft.rs) `welch()`. sci-rs 0.4 exposes no
+[`core/src/fft.rs`](../core/src/fft.rs) `welch()`. sci-rs 0.4 exposes no
 spectral-density API, so `welch()` is composed directly on `rustfft`, reusing the
 `window_weights` helper that also backs the legacy `fft()` function.
 
@@ -79,7 +79,7 @@ suspension and tire content.
 ## Short-Time Fourier Transform (STFT)
 
 `welch()` and `spectrogram()` share one `stft()` primitive in
-[`rust/core/src/fft.rs`](../rust/core/src/fft.rs). The primitive:
+[`core/src/fft.rs`](../core/src/fft.rs). The primitive:
 
 1. **Segment.** Slice the input into overlapping frames of length `L = nperseg`,
    advancing by `step = L − noverlap` each time.
