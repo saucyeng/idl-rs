@@ -5,6 +5,7 @@
 //! so a note written here and one written on the phone meanwhile both
 //! survive.
 
+use idl_rs::time::now_ms;
 use std::collections::BTreeMap;
 
 use clap::ArgMatches;
@@ -25,11 +26,6 @@ impl From<BikeLogError> for CliError {
         };
         CliError::new(kind, e.message)
     }
-}
-
-/// UTC milliseconds now.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 /// One entry as the CLI prints it: the stored entry plus its current text,

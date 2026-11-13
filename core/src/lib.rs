@@ -34,6 +34,7 @@ pub mod statistics;
 pub mod store;
 pub mod synth;
 pub mod table;
+pub mod time;
 pub mod track_artifact;
 pub mod track_projection;
 pub mod tracks;

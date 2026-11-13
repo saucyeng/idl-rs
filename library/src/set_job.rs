@@ -18,6 +18,7 @@
 //! Members are independent, so a member that cannot be evaluated is reported
 //! and the run continues. Cancellation is checked at member boundaries.
 
+use idl_rs::time::now_ms;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -255,13 +256,6 @@ impl ChannelSource for MemberSource {
             }
         }
     }
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// An empty session for a member evaluated from `session.json` alone.

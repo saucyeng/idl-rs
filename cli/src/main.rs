@@ -1245,7 +1245,7 @@ fn cmd_verify(data_dir: &Path) -> ExitCode {
 /// still be the live derived file for its column set; see C4 §7 check #6,
 /// deferred). Dry-run by default.
 fn cmd_prune(data_dir: &Path, older_than_days: u32, confirm: bool) -> ExitCode {
-    let cutoff_ms = chrono_free_now_ms() - i64::from(older_than_days) * 86_400_000;
+    let cutoff_ms = idl_rs::time::now_ms() - i64::from(older_than_days) * 86_400_000;
     let sessions_dir = data_dir.join("sessions");
     let mut candidates = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
@@ -1282,16 +1282,6 @@ fn cmd_prune(data_dir: &Path, older_than_days: u32, confirm: bool) -> ExitCode {
         println!("(dry run — pass --confirm to delete)");
     }
     ExitCode::SUCCESS
-}
-
-/// Milliseconds since the Unix epoch, `std`-only (no date/time crate pinned
-/// in this workspace — see `session::filename`'s module doc for the same
-/// constraint).
-fn chrono_free_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
