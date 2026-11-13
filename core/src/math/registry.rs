@@ -13,8 +13,8 @@
 //! and evaluates through [`crate::math::eval::eval_with`]. The generated
 //! references read only idl-rs's own set.
 //!
-//! Prototype: the converted builtins live in `math::builtins`; every other
-//! name still falls through to `eval::call_function`'s match.
+//! idl-rs's own builtins are registered in `math::builtins`, in the catalog's
+//! order (C2 §3.3), which the generated references keep.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -78,6 +78,12 @@ impl<'a> Ctx<'a> {
     /// names listed in [`BuiltinMeta::kwargs`] ever reach the body.
     pub fn kwarg(&self, key: &str) -> Option<&'a Value> {
         self.kwargs.get(key)
+    }
+
+    /// Every keyword argument the call passed, for the evaluator's own
+    /// keyword helpers (`kwarg_string`, `take_kwarg`).
+    pub(crate) fn kwargs(&self) -> &'a Kwargs {
+        self.kwargs
     }
 }
 
@@ -224,12 +230,42 @@ into_builtin!(A, B, C, D);
 into_builtin!(A, B, C, D, E);
 into_builtin!(A, B, C, D, E, G);
 
+/// How a builtin's positional arguments are counted.
+#[derive(Debug, Clone, Copy)]
+enum Arity {
+    /// `(min, max)` from the parameter types, checked before the body runs.
+    Typed(usize, usize),
+    /// The valid counts, declared at registration; the body checks them,
+    /// because its arity errors name its own call forms.
+    Declared(&'static [u32]),
+}
+
 /// One registered builtin.
 struct Entry {
     meta: BuiltinMeta,
-    arity: (usize, usize),
+    arity: Arity,
+    status: MathBuiltinStatus,
+    /// Listed in [`Registry::catalog`] (false only for `main`, a table-cell form).
+    documented: bool,
     body: Body,
 }
+
+/// Why a builtin could not be registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryError {
+    /// A builtin with this spelling is already registered.
+    DuplicateName(&'static str),
+}
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegistryError::DuplicateName(name) => write!(f, "builtin \"{name}\" is already registered"),
+        }
+    }
+}
+
+impl std::error::Error for RegistryError {}
 
 /// The set of builtins an evaluation can call, in registration order.
 #[derive(Default)]
@@ -252,7 +288,7 @@ impl Registry {
     /// references use.
     pub fn builtins() -> Self {
         let mut registry = Self::new();
-        crate::math::builtins::register(&mut registry);
+        crate::math::builtins::register(&mut registry).expect("idl-rs builtins have distinct names");
         registry
     }
 
@@ -263,41 +299,77 @@ impl Registry {
         SHARED.get_or_init(Registry::builtins)
     }
 
-    /// Adds `f` under `meta.name`; a name already registered is replaced, so a
-    /// program can override one of idl-rs's builtins with its own.
-    pub fn add<M, F: IntoBuiltin<M>>(&mut self, meta: BuiltinMeta, f: F) -> &mut Self {
-        let entry = Entry { meta, arity: F::arity(), body: f.into_body() };
-        match self.index.get(meta.name) {
-            Some(&i) => self.entries[i] = entry,
-            None => {
-                self.index.insert(meta.name, self.entries.len());
-                self.entries.push(entry);
-            }
+    /// Adds `f` under `meta.name`, its arity taken from its parameter types.
+    ///
+    /// # Errors
+    /// [`RegistryError::DuplicateName`] when the name is already registered.
+    pub fn add<M, F: IntoBuiltin<M>>(&mut self, meta: BuiltinMeta, f: F) -> Result<&mut Self, RegistryError> {
+        let (min, max) = F::arity();
+        self.push(meta, Arity::Typed(min, max), MathBuiltinStatus::Implemented, true, f.into_body())
+    }
+
+    /// Adds a body over the raw positional arguments, for a function with
+    /// several call forms whose arity errors name those forms: `arity` lists
+    /// the valid counts for the catalog, and the body checks them itself.
+    ///
+    /// # Errors
+    /// [`RegistryError::DuplicateName`] when the name is already registered.
+    pub fn add_raw<F>(&mut self, meta: BuiltinMeta, arity: &'static [u32], f: F) -> Result<&mut Self, RegistryError>
+    where
+        F: Fn(&Ctx<'_>, &[Value]) -> Result<Value, MathEvalError> + Send + Sync + 'static,
+    {
+        self.push(meta, Arity::Declared(arity), MathBuiltinStatus::Implemented, true, Box::new(f))
+    }
+
+    /// Adds a name the language reserves but does not implement yet: it
+    /// parses, and evaluating it is a `NotImplemented` error naming it.
+    ///
+    /// # Errors
+    /// [`RegistryError::DuplicateName`] when the name is already registered.
+    pub fn add_not_implemented(&mut self, meta: BuiltinMeta, arity: &'static [u32]) -> Result<&mut Self, RegistryError> {
+        let body: Body = Box::new(|ctx: &Ctx<'_>, _: &[Value]| {
+            Err(err(MathEvalErrorKind::NotImplemented, format!("not yet implemented: {}", ctx.name)))
+        });
+        self.push(meta, Arity::Declared(arity), MathBuiltinStatus::NotImplemented, true, body)
+    }
+
+    /// [`Registry::add_raw`] for a callable name left out of the catalog.
+    pub(crate) fn add_undocumented<F>(&mut self, name: &'static str, arity: &'static [u32], f: F) -> Result<&mut Self, RegistryError>
+    where
+        F: Fn(&Ctx<'_>, &[Value]) -> Result<Value, MathEvalError> + Send + Sync + 'static,
+    {
+        let meta = BuiltinMeta { name, category: "", signature: "", unit_rule: "", shape: "", description: "", example: "", kwargs: &[] };
+        self.push(meta, Arity::Declared(arity), MathBuiltinStatus::Implemented, false, Box::new(f))
+    }
+
+    fn push(&mut self, meta: BuiltinMeta, arity: Arity, status: MathBuiltinStatus, documented: bool, body: Body) -> Result<&mut Self, RegistryError> {
+        if self.index.contains_key(meta.name) {
+            return Err(RegistryError::DuplicateName(meta.name));
         }
-        self
+        self.index.insert(meta.name, self.entries.len());
+        self.entries.push(Entry { meta, arity, status, documented, body });
+        Ok(self)
     }
 
-    /// The registered builtins' metadata, in registration order.
+    /// The documented builtins' metadata, in registration order.
     pub fn metas(&self) -> impl Iterator<Item = &BuiltinMeta> {
-        self.entries.iter().map(|e| &e.meta)
+        self.entries.iter().filter(|e| e.documented).map(|e| &e.meta)
     }
 
-    /// `name`'s catalog row (documentation plus derived arity), `None` when
-    /// `name` is not registered.
-    pub fn catalog_entry(&self, name: &str) -> Option<MathBuiltin> {
-        let e = &self.entries[*self.index.get(name)?];
-        let m = e.meta;
-        Some(MathBuiltin {
-            name: m.name,
-            arity: &COUNTS[e.arity.0..=e.arity.1],
-            status: MathBuiltinStatus::Implemented,
-            category: m.category,
-            signature: m.signature,
-            unit_rule: m.unit_rule,
-            shape: m.shape,
-            description: m.description,
-            example: m.example,
-        })
+    /// The documented builtins as catalog rows, in registration order: what
+    /// the generated references and the editor's catalog render.
+    pub fn catalog(&self) -> Vec<MathBuiltin> {
+        self.entries.iter().filter(|e| e.documented).map(|e| {
+            let m = e.meta;
+            let arity = match e.arity {
+                Arity::Typed(min, max) => &COUNTS[min..=max],
+                Arity::Declared(counts) => counts,
+            };
+            MathBuiltin {
+                name: m.name, arity, status: e.status, category: m.category, signature: m.signature,
+                unit_rule: m.unit_rule, shape: m.shape, description: m.description, example: m.example,
+            }
+        }).collect()
     }
 
     /// Calls `name`, `None` when it is not registered. Keyword arguments are
@@ -329,14 +401,15 @@ impl Entry {
         if self.meta.kwargs.is_empty() {
             reject_any_kwargs(name, kwargs)?;
         }
-        let (min, max) = self.arity;
-        if min == max {
-            require_arg_count(name, args, min)?;
-        } else if args.len() < min || args.len() > max {
-            return Err(err(
-                MathEvalErrorKind::ArgCount,
-                format!("{name}: expected {min} to {max} argument(s), got {}", args.len()),
-            ));
+        match self.arity {
+            Arity::Typed(min, max) if min == max => require_arg_count(name, args, min)?,
+            Arity::Typed(min, max) if args.len() < min || args.len() > max => {
+                return Err(err(
+                    MathEvalErrorKind::ArgCount,
+                    format!("{name}: expected {min} to {max} argument(s), got {}", args.len()),
+                ));
+            }
+            _ => {}
         }
         if !self.meta.kwargs.is_empty() {
             reject_unknown_kwargs(name, kwargs, self.meta.kwargs)?;
@@ -351,30 +424,44 @@ mod tests {
 
     use super::*;
     use crate::math::catalog::math_builtin_catalog;
-    use crate::math::eval::{eval_with, require_channel, require_scalar, require_string, LookupChannel};
+    use crate::math::eval::{eval_with, require_channel, require_scalar, require_string, LapSpan, LookupChannel, MathOverlay};
     use crate::math::parse::parse;
     use crate::math::value::ValueAxis;
     use crate::session::handle::SessionHandle;
 
     /// The committed synthetic fixture, with the channel names the documented
-    /// examples use mapped onto its own (the examples are written for a real
-    /// bike; the generated reference prints them unchanged).
+    /// examples use mapped onto its own sensors (the examples are written for
+    /// a real bike; the generated reference prints them unchanged).
     struct ExampleLookup(SessionHandle);
 
     impl ChannelLookup for ExampleLookup {
         fn lookup(&self, name: &str) -> Option<LookupChannel> {
-            match name {
-                "Fork" | "AccelZ" => self.0.lookup("IMU0_AccelZ"),
-                // The fixture has no wheel sensor: its GPS fixes stand in as a
-                // pulse event channel, the same samples at their recorded times
-                // with no rate.
-                "WheelFront" => self.0.lookup("GPS_SpeedKmh").map(|c| LookupChannel { sample_rate_hz: 0.0, ..c }),
-                other => self.0.lookup(other),
-            }
+            let stand_in = match name {
+                "Fork" | "AccelZ" | "Speed" => "IMU0_AccelZ",
+                "Shock" | "AccelY" => "IMU0_AccelY",
+                "AccelX" | "Ratio" | "Power" | "gap_ratio" => "IMU0_AccelX",
+                "Roll" => "IMU0_GyroX",
+                "Pitch" => "IMU0_GyroY",
+                "Yaw" => "IMU0_GyroZ",
+                // No wheel sensor on the fixture: its GPS fixes stand in as a
+                // pulse event channel, the same samples at their recorded
+                // times with no rate.
+                "WheelFront" => return self.0.lookup("GPS_SpeedKmh").map(|c| LookupChannel { sample_rate_hz: 0.0, ..c }),
+                other => other,
+            };
+            self.0.lookup(stand_in)
         }
 
         fn estimator_channel(&self, channel_id: &str) -> Option<LookupChannel> {
             self.0.estimator_channel(channel_id)
+        }
+
+        fn best_time_base_dims(&self) -> Option<(usize, f64)> {
+            self.0.best_time_base_dims()
+        }
+
+        fn channel_dims(&self, name: &str) -> Option<(usize, f64)> {
+            self.0.channel_dims(name)
         }
     }
 
@@ -392,31 +479,113 @@ mod tests {
         ExampleLookup(SessionHandle::from_path(path).expect("committed fixture is present"))
     }
 
-    fn run(registry: &Registry, lookup: &dyn ChannelLookup, src: &str) -> Result<Value, MathEvalError> {
-        eval_with(&parse(src)?, registry, lookup, &MathLapContext::empty())
+    /// Three equal laps of two sectors each over the fixture's span, lap 1
+    /// the main lap and the whole fixture again as the overlay, so every lap
+    /// builtin has something to read.
+    fn fixture_laps(lookup: &ExampleLookup) -> MathLapContext {
+        let t_us = lookup.lookup("IMU0_AccelZ").expect("the fixture has IMU0").t_us;
+        let end = *t_us.last().expect("the fixture is not empty") as f64 / 1e6;
+        let laps: Vec<LapSpan> = (0..3u32)
+            .map(|k| {
+                let (start, stop) = (end * k as f64 / 3.0, end * (k + 1) as f64 / 3.0);
+                let mid = (start + stop) / 2.0;
+                LapSpan { lap_number: k + 1, start_secs: start, end_secs: stop, lap_time_secs: stop - start, sectors: vec![(start, mid), (mid, stop)] }
+            })
+            .collect();
+        MathLapContext {
+            main_lap_bounds: laps.iter().map(|l| (l.start_secs, l.end_secs)).collect(),
+            main_sectors: laps.iter().flat_map(|l| l.sectors.clone()).collect(),
+            main_lap_number: Some(1),
+            overlay: vec![MathOverlay { lookup: Arc::new(fixture()), lap_start_ms: f64::MIN, lap_end_ms: f64::MAX, lap_start_uniform_sec: 0.0 }],
+            laps,
+            ..MathLapContext::empty()
+        }
     }
 
-    /// Positional parameters in a signature's first call form: top-level
-    /// commas inside its parentheses, keyword parameters (`k=v`) not counted.
-    fn positional_count(signature: &str) -> usize {
-        let open = signature.find('(').expect("a signature opens a parenthesis");
+    fn run(registry: &Registry, lookup: &dyn ChannelLookup, laps: &MathLapContext, src: &str) -> Result<Value, MathEvalError> {
+        eval_with(&parse(src)?, registry, lookup, laps)
+    }
+
+    /// An example with its bare placeholder names (`accel`, `a`, `b`,
+    /// `kernel`, `sos` — definitions a real workbook would hold, not channels)
+    /// replaced by an expression of that kind, so it can run.
+    fn runnable(example: &str) -> String {
+        let (mut out, mut word, mut quoted, mut bracketed) = (String::new(), String::new(), false, false);
+        for c in example.chars().chain(std::iter::once('\0')) {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                word.push(c);
+                continue;
+            }
+            let stand_in = match word.as_str() {
+                _ if quoted || bracketed || c == '(' => None,
+                "accel" | "a" | "b" => Some("vec([AccelX], [AccelY], [AccelZ])"),
+                "kernel" => Some("[Fork]"),
+                "sos" => Some("1"),
+                _ => None,
+            };
+            out.push_str(stand_in.unwrap_or(&word));
+            word.clear();
+            match c {
+                '"' => quoted = !quoted,
+                '[' => bracketed = true,
+                ']' => bracketed = false,
+                _ => {}
+            }
+            if c != '\0' {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// A call's top-level arguments: the text between its first `(` and the
+    /// matching `)`, split on commas outside nested parentheses.
+    fn top_level_args(call: &str) -> Vec<&str> {
+        let open = call.find('(').expect("a call opens a parenthesis");
         let (mut depth, mut start, mut parts) = (0, open + 1, Vec::new());
-        for (i, c) in signature.char_indices().skip(open + 1) {
+        for (i, c) in call.char_indices().skip(open + 1) {
             match c {
                 '(' => depth += 1,
                 ')' if depth == 0 => {
-                    parts.push(&signature[start..i]);
+                    parts.push(&call[start..i]);
                     break;
                 }
                 ')' => depth -= 1,
                 ',' if depth == 0 => {
-                    parts.push(&signature[start..i]);
+                    parts.push(&call[start..i]);
                     start = i + 1;
                 }
                 _ => {}
             }
         }
-        parts.iter().filter(|p| !p.trim().is_empty() && !p.contains('=')).count()
+        parts.into_iter().map(str::trim).filter(|p| !p.is_empty()).collect()
+    }
+
+    /// A value each declared keyword accepts.
+    fn kwarg_value(name: &str, key: &str) -> &'static str {
+        match (name, key) {
+            ("mean", "window") => "64",
+            (_, "window") => "\"hann\"",
+            (_, "detrend") => "\"linear\"",
+            (_, "scaling") => "\"spectrum\"",
+            (_, "average") => "\"median\"",
+            (_, "nperseg") => "128",
+            (_, "noverlap") => "64",
+            (_, "max_fraction") => "0.35",
+            _ => panic!("{name}: no test value for keyword {key}"),
+        }
+    }
+
+    /// The declared shapes a value can be: `[f]` and `[t,f]` are carried as a
+    /// time-axis channel too, so a channel on the time axis answers to all three.
+    fn shapes_of(v: &Value) -> &'static [&'static str] {
+        match v {
+            Value::Channel(c) if c.axis == ValueAxis::Lap => &["[lap]"],
+            Value::Channel(_) => &["[t]", "[f]", "[t,f]"],
+            Value::Scalar(_) => &["scalar"],
+            Value::Vec3(_) => &["Vec3"],
+            Value::Str(_) => &["string"],
+        }
     }
 
     /// An outside function: a program's own builtin, not one of idl-rs's.
@@ -437,25 +606,27 @@ mod tests {
     }
 
     #[test]
-    fn registry_every_example_on_the_fixture_evaluates_to_its_declared_shape() {
+    fn registry_every_example_on_the_fixture_evaluates_to_its_declared_shape_or_says_not_implemented() {
         // Arrange
         let registry = Registry::builtins();
         let lookup = fixture();
+        let laps = fixture_laps(&lookup);
 
-        for meta in registry.metas() {
+        for e in registry.entries.iter().filter(|e| e.documented) {
             // Act
-            let value = run(&registry, &lookup, meta.example);
+            let example = runnable(e.meta.example);
+            let value = run(&registry, &lookup, &laps, &example);
 
             // Assert
-            let shape = match value {
-                Ok(Value::Channel(c)) if c.axis == ValueAxis::Time => "[t]",
-                Ok(Value::Channel(_)) => "[lap]",
-                Ok(Value::Scalar(_)) => "scalar",
-                Ok(Value::Vec3(_)) => "Vec3",
-                Ok(Value::Str(_)) => "string",
-                Err(e) => panic!("{}: {e:?}", meta.example),
-            };
-            assert_eq!(shape, meta.shape, "{}", meta.example);
+            match (e.status, value) {
+                (MathBuiltinStatus::NotImplemented, Err(error)) => assert_eq!(error.kind, MathEvalErrorKind::NotImplemented, "{example}: {error:?}"),
+                (MathBuiltinStatus::NotImplemented, Ok(_)) => panic!("{example}: a not-implemented builtin returned a value"),
+                (MathBuiltinStatus::Implemented, Err(error)) => panic!("{example}: {error:?}"),
+                (MathBuiltinStatus::Implemented, Ok(v)) => {
+                    let declared: Vec<&str> = e.meta.shape.split('|').map(str::trim).collect();
+                    assert!(declared.iter().any(|d| shapes_of(&v).contains(d)), "{example}: declared {}, got {:?}", e.meta.shape, shapes_of(&v));
+                }
+            }
         }
     }
 
@@ -464,13 +635,19 @@ mod tests {
         // Arrange
         let registry = Registry::builtins();
         let lookup = fixture();
+        let laps = fixture_laps(&lookup);
 
         for meta in registry.metas() {
-            let open = &meta.example[..meta.example.len() - 1];
+            let example = runnable(meta.example);
+            let open = &example[..example.len() - 1];
+            let first = top_level_args(&example).first().map(|a| a.to_string()).unwrap_or_default();
 
-            // Act — every declared keyword today (`max_fraction`) is a scalar.
-            let accepted: Vec<_> = meta.kwargs.iter().map(|k| run(&registry, &lookup, &format!("{open}, {k}=0.35)"))).collect();
-            let refused = run(&registry, &lookup, &format!("{open}, zzz=1)")).unwrap_err();
+            // Act
+            let accepted: Vec<_> = meta.kwargs.iter()
+                .map(|k| run(&registry, &lookup, &laps, &format!("{}({first}, {k}={})", meta.name, kwarg_value(meta.name, k))))
+                .collect();
+            let refused = if open.ends_with('(') { format!("{open}zzz=1)") } else { format!("{open}, zzz=1)") };
+            let refused = run(&registry, &lookup, &laps, &refused).unwrap_err();
 
             // Assert
             for result in accepted {
@@ -481,7 +658,7 @@ mod tests {
             } else {
                 format!("{}: unknown keyword argument \"zzz\" (accepts: {})", meta.name, meta.kwargs.join(", "))
             };
-            assert_eq!(refused.kind, MathEvalErrorKind::Runtime);
+            assert_eq!(refused.kind, MathEvalErrorKind::Runtime, "{}", meta.name);
             assert_eq!(refused.message, expected);
         }
     }
@@ -491,28 +668,43 @@ mod tests {
         // Arrange
         let registry = Registry::builtins();
 
-        for e in &registry.entries {
-            // Act
-            let n = positional_count(e.meta.signature);
+        for e in registry.entries.iter().filter(|e| e.documented) {
+            // Act — the first call form's positional parameters (`k=v` is a keyword).
+            let n = top_level_args(e.meta.signature).iter().filter(|p| !p.contains('=')).count();
 
             // Assert
-            assert!(e.arity.0 <= n && n <= e.arity.1, "{}: signature has {n}, arity {:?}", e.meta.name, e.arity);
+            let within = match e.arity {
+                Arity::Typed(min, max) => min <= n && n <= max,
+                Arity::Declared(counts) => counts.contains(&(n as u32)),
+            };
+            assert!(within, "{}: signature has {n}, arity {:?}", e.meta.name, e.arity);
         }
     }
 
     #[test]
-    fn registry_every_name_takes_exactly_one_row_of_the_catalog() {
+    fn registry_catalog_is_every_documented_builtin_in_registration_order() {
         // Arrange
         let registry = Registry::builtins();
 
-        for meta in registry.metas() {
-            // Act
-            let rows: Vec<&MathBuiltin> = math_builtin_catalog().iter().filter(|b| b.name == meta.name).collect();
+        // Act
+        let names: Vec<&str> = math_builtin_catalog().iter().map(|b| b.name).collect();
 
-            // Assert — once, and with the registry's documentation, not a placeholder.
-            assert_eq!(rows.len(), 1, "{}", meta.name);
-            assert_eq!(rows[0].signature, meta.signature, "{}", meta.name);
-        }
+        // Assert — `main` is callable but table-cell only, so not listed.
+        assert_eq!(names, registry.metas().map(|m| m.name).collect::<Vec<_>>());
+        assert!(!names.contains(&"main"));
+        assert!(registry.index.contains_key("main"));
+    }
+
+    #[test]
+    fn registry_add_of_a_name_already_registered_is_a_duplicate_name_error() {
+        // Arrange
+        let mut registry = Registry::builtins();
+
+        // Act
+        let result = registry.add(outside_meta("butter"), double_it).map(|_| ());
+
+        // Assert
+        assert_eq!(result, Err(RegistryError::DuplicateName("butter")));
     }
 
     #[test]
@@ -559,7 +751,7 @@ mod tests {
         let registry = Registry::builtins();
 
         // Act
-        let e = run(&registry, &NoChannels, "butter(2, 5)").unwrap_err();
+        let e = run(&registry, &NoChannels, &MathLapContext::empty(), "butter(2, 5)").unwrap_err();
 
         // Assert
         assert_eq!(e.kind, MathEvalErrorKind::ArgCount);
@@ -570,10 +762,10 @@ mod tests {
     fn registry_outside_function_evaluates_and_is_absent_from_the_generated_references() {
         // Arrange
         let mut registry = Registry::builtins();
-        registry.add(outside_meta("double_it"), double_it);
+        registry.add(outside_meta("double_it"), double_it).expect("a new name");
 
         // Act
-        let v = run(&registry, &NoChannels, "double_it(21)");
+        let v = run(&registry, &NoChannels, &MathLapContext::empty(), "double_it(21)");
         let reference = crate::docs::render_workbook_reference(&[]);
         let json = crate::docs::workbook_catalog_json().to_string();
 
@@ -588,12 +780,13 @@ mod tests {
     fn registry_trailing_option_parameter_lowers_the_minimum_arity() {
         // Arrange
         let mut registry = Registry::new();
-        registry.add(outside_meta("scale"), scale);
+        registry.add(outside_meta("scale"), scale).expect("a new name");
+        let laps = MathLapContext::empty();
 
         // Act
-        let one = run(&registry, &NoChannels, "scale(2)");
-        let two = run(&registry, &NoChannels, "scale(2, 3)");
-        let none = run(&registry, &NoChannels, "scale()").unwrap_err();
+        let one = run(&registry, &NoChannels, &laps, "scale(2)");
+        let two = run(&registry, &NoChannels, &laps, "scale(2, 3)");
+        let none = run(&registry, &NoChannels, &laps, "scale()").unwrap_err();
 
         // Assert
         assert_eq!(one, Ok(Value::Scalar(2.0)));

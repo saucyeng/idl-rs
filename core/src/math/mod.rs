@@ -29,7 +29,7 @@ pub use eval::{
     eval_with, evaluate, evaluate_scalar, ChannelLookup, EvalOutput, LookupChannel, MathLapContext,
     MathOverlay,
 };
-pub use registry::{BuiltinMeta, Ctx, FromArg, IntoBuiltin, Registry};
+pub use registry::{BuiltinMeta, Ctx, FromArg, IntoBuiltin, Registry, RegistryError};
 pub use resolve::{channel_refs, resolve_dependencies};
 pub use value::{ChannelValue, Value, ValueAxis, Vec3Value};
 
