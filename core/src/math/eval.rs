@@ -281,7 +281,7 @@ pub struct MathLapContext {
 impl MathLapContext {
     /// 1-based lap number containing session-relative time `t_s` (seconds),
     /// `0` outside every lap.
-    fn lap_number_at(&self, t_s: f64) -> u32 {
+    pub(crate) fn lap_number_at(&self, t_s: f64) -> u32 {
         match &self.session_laps {
             None => crate::variance::current_lap_at(&self.main_lap_bounds, t_s),
             Some(laps) => {
@@ -292,7 +292,7 @@ impl MathLapContext {
 
     /// Start (seconds) of lap `n`: by real lap number in [`Self::session_laps`]
     /// when `Some`, else by position in `main_lap_bounds`. `NaN` when absent.
-    fn lap_start_secs(&self, n: u32) -> f64 {
+    pub(crate) fn lap_start_secs(&self, n: u32) -> f64 {
         match &self.session_laps {
             None => crate::variance::lap_start_time(&self.main_lap_bounds, n),
             Some(laps) => laps.iter().find(|l| l.lap_number == n).map_or(f64::NAN, |l| l.start_secs),
@@ -301,7 +301,7 @@ impl MathLapContext {
 
     /// Sectors `(start_s, end_s)` flattened across laps in arrival order:
     /// from [`Self::session_laps`] when `Some`, else `main_sectors`.
-    fn numbering_sectors(&self) -> Vec<(f64, f64)> {
+    pub(crate) fn numbering_sectors(&self) -> Vec<(f64, f64)> {
         match &self.session_laps {
             None => self.main_sectors.clone(),
             Some(laps) => laps.iter().flat_map(|l| l.sectors.iter().copied()).collect(),
