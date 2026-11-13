@@ -5,6 +5,8 @@
 //!
 //!   cargo run -q --example estimate_trace -- <session.idl0> > trace.csv
 //!
+//! With no path it runs on `tests/fixtures/walden-60s.idl0`, 60 s of a moto at Walden MX.
+//!
 //! Columns: t, front_drive, rear_drive, accel0_norm, front_diff_mag, rear_diff_mag,
 //! stationary, eng_front_mm, eng_rear_mm  (drives m/s², travel mm).
 
@@ -14,9 +16,7 @@ use idl_rs::session::handle::SessionHandle;
 use std::io::Write;
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .expect("usage: estimate_trace <session.idl0>  (writes CSV to stdout)");
+    let path = std::env::args().nth(1).unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").to_string() + "/tests/fixtures/walden-60s.idl0");
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let handle = SessionHandle::from_bytes(&bytes).expect("parse .idl0");
     let input = EstimatorInput::from_lookup(&handle).expect("session has IMU0 channels");

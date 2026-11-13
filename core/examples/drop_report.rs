@@ -6,6 +6,8 @@
 //! span drift that the per-step reconciler used to accumulate.
 //!
 //!   cargo run -q --example drop_report -- <session.idl0> [more.idl0 ...]
+//!
+//! With no path it runs on `tests/fixtures/walden-60s.idl0`, 60 s of a moto at Walden MX.
 
 use std::convert::TryInto;
 
@@ -55,10 +57,9 @@ fn read_imu_timestamps(b: &[u8]) -> Option<(u16, [Vec<i64>; 3])> {
 }
 
 fn main() {
-    let paths: Vec<String> = std::env::args().skip(1).collect();
+    let mut paths: Vec<String> = std::env::args().skip(1).collect();
     if paths.is_empty() {
-        eprintln!("usage: cargo run -q --example drop_report -- <session.idl0> [...]");
-        std::process::exit(2);
+        paths.push(env!("CARGO_MANIFEST_DIR").to_string() + "/tests/fixtures/walden-60s.idl0");
     }
     for path in &paths {
         let name = path.rsplit(['/', '\\']).next().unwrap_or(path);

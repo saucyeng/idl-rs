@@ -2555,4 +2555,20 @@ mod lazy_shared_tests {
         assert_eq!(dims, Some((3, 100.0)));
         assert_eq!(copies, 0, "no owned Channel is built for the evaluator's accessors");
     }
+
+    #[test]
+    fn walden_60s_fixture_parses_to_three_imus_and_one_hz_gps() {
+        // Arrange
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/walden-60s.idl0");
+
+        // Act
+        let handle = SessionHandle::from_path(path).expect("the committed Walden excerpt parses");
+
+        // Assert: 60 s at 833 Hz per IMU (drops allowed) and one GPS fix a second.
+        for imu in ["IMU0_AccelX", "IMU1_AccelX", "IMU2_AccelX"] {
+            let n = handle.channel_meta(imu).expect(imu).length;
+            assert!((45_000..=50_100).contains(&n), "{imu}: {n} samples");
+        }
+        assert_eq!(handle.channel_meta("GPS_Latitude").expect("GPS").length, 61);
+    }
 }

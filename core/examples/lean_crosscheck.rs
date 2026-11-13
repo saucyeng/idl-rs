@@ -7,6 +7,8 @@
 //!
 //!   cargo run -q --release --example lean_crosscheck -- <session.idl0>
 //!
+//! With no path it runs on `tests/fixtures/walden-60s.idl0`, 60 s of a moto at Walden MX.
+//!
 //! Prints one row per second of steady turning: t, estimator roll (deg),
 //! geometric roll (deg), difference (deg).
 
@@ -16,9 +18,7 @@ use idl_rs::session::handle::SessionHandle;
 use nalgebra::Vector3;
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .expect("usage: lean_crosscheck <session.idl0>");
+    let path = std::env::args().nth(1).unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").to_string() + "/tests/fixtures/walden-60s.idl0");
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let handle = SessionHandle::from_bytes(&bytes).expect("parse .idl0");
 

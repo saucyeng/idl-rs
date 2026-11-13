@@ -7,6 +7,8 @@
 //! whether its slope ≈ g/sag.
 //!
 //!   cargo run -q --example diag_coupling -- <session.idl0> > coupling.csv
+//!
+//! With no path it runs on `tests/fixtures/walden-60s.idl0`, 60 s of a moto at Walden MX.
 
 use idl_rs::estimate::geometry::BikeGeometry;
 use idl_rs::estimate::run::{run, EstimatorConfig, EstimatorInput};
@@ -31,7 +33,7 @@ fn central_diff(v: &[f64], dt: f64) -> Vec<f64> {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: diag_coupling <session.idl0>");
+    let path = std::env::args().nth(1).unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").to_string() + "/tests/fixtures/walden-60s.idl0");
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let handle = SessionHandle::from_bytes(&bytes).expect("parse .idl0");
     let input = EstimatorInput::from_lookup(&handle).expect("session has IMU0 channels");
