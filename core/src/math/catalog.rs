@@ -107,20 +107,31 @@ pub struct MathBuiltin {
 /// Returns the full 75-entry math builtin catalog (C2 §3.3, minus
 /// `main(col[])` and the `and`/`or`/`not` grammar keywords — see module
 /// doc). Order matches C2 §3.3's table row order.
+/// Builtins converted to the registry (spec 2026-11-13 v2) take their row
+/// from [`crate::math::registry::Registry::builtins`], at their place in
+/// [`ROWS`].
 pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
+    static CATALOG: std::sync::OnceLock<Vec<MathBuiltin>> = std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let registry = crate::math::registry::Registry::shared();
+        ROWS.iter().map(|b| registry.catalog_entry(b.name).unwrap_or(*b)).collect()
+    })
+}
+
+impl MathBuiltin {
+    /// A [`ROWS`] placeholder for a builtin the registry documents: only its
+    /// name and its position in the table are kept here.
+    const fn registered(name: &'static str) -> Self {
+        let status = MathBuiltinStatus::Implemented;
+        Self { name, arity: &[], status, category: "", signature: "", unit_rule: "", shape: "", description: "", example: "" }
+    }
+}
+
+/// Every catalog row in C2 §3.3 order; converted builtins are placeholders.
+const ROWS: &[MathBuiltin] = {
     use MathBuiltinStatus::{Implemented as I, NotImplemented as N};
     &[
-        MathBuiltin {
-            name: "butter",
-            arity: &[4],
-            status: I,
-            category: "Filter",
-            signature: "butter(order, cutoff_hz, \"low\"|\"lowpass\"|\"high\"|\"highpass\", ch)",
-            unit_rule: "SameAsArg(3)",
-            shape: "[t]",
-            description: "Zero-phase Butterworth low- or high-pass filter; designs and applies the filter in one call. Needs a fixed-rate channel: put an event channel on a grid first, `resample(x, [Time])`.",
-            example: "butter(2, 5, \"low\", [Fork])",
-        },
+        MathBuiltin::registered("butter"),
         MathBuiltin {
             name: "sosfilt",
             arity: &[2],
@@ -143,28 +154,8 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             description: "Reconstructs samples lost to clipping; designed for accelerometer data clipped at +/-32 g. Needs a fixed-rate channel.",
             example: "declip([AccelZ])",
         },
-        MathBuiltin {
-            name: "cumulative_trapezoid",
-            arity: &[1],
-            status: I,
-            category: "Time-domain",
-            signature: "cumulative_trapezoid(ch)",
-            unit_rule: "Product(SameAsArg(0), Fixed(s))",
-            shape: "[t]",
-            description: "Cumulative trapezoidal integral of a channel with respect to time. A fixed-rate channel steps by its rate; an event channel (GPS, wheel pulses) by its recorded sample times.",
-            example: "cumulative_trapezoid([AccelZ])",
-        },
-        MathBuiltin {
-            name: "cumtrapz",
-            arity: &[1],
-            status: I,
-            category: "Time-domain",
-            signature: "cumtrapz(ch)",
-            unit_rule: "Product(SameAsArg(0), Fixed(s))",
-            shape: "[t]",
-            description: "A permanent second spelling of `cumulative_trapezoid`, as scipy itself carries both.",
-            example: "cumtrapz([AccelZ])",
-        },
+        MathBuiltin::registered("cumulative_trapezoid"),
+        MathBuiltin::registered("cumtrapz"),
         MathBuiltin {
             name: "differentiate",
             arity: &[1],
@@ -605,28 +596,8 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             description: "Convolution of a channel with a kernel. Not implemented.",
             example: "convolve([Fork], kernel)",
         },
-        MathBuiltin {
-            name: "resample",
-            arity: &[2],
-            status: I,
-            category: "Resampling",
-            signature: "resample(x, onto)",
-            unit_rule: "SameAsArg(0)",
-            shape: "[t]",
-            description: "Linear interpolation of `x` onto the per-sample recorded times of `onto`; the result carries `onto`'s time axis, rate and length, so the two can then be combined. Times outside `x`'s span are `NaN` -- never extrapolated. The explicit way to combine two channels recorded on different clocks; nothing resamples implicitly.",
-            example: "resample([IMU2_AccelZ], [IMU1_AccelZ])",
-        },
-        MathBuiltin {
-            name: "deglitch_pulses",
-            arity: &[1],
-            status: I,
-            category: "Resampling",
-            signature: "deglitch_pulses(pulses, max_fraction=0.35)",
-            unit_rule: "SameAsArg(0)",
-            shape: "[t]",
-            description: "A wheel-pulse event channel without the extra edges a marginal sensor adds: a pulse is dropped when the gap ending at it is under `max_fraction` of both the gap before and the gap after, so it reads as an extra edge inside one ordinary gap. Comparing both sides means the first pulses after a locked wheel spins up, and the growing gaps of hard braking, are never dropped. The result is renumbered 1, 2, 3, ... from the first kept pulse, at the kept pulses' recorded times.",
-            example: "deglitch_pulses([WheelFront])",
-        },
+        MathBuiltin::registered("resample"),
+        MathBuiltin::registered("deglitch_pulses"),
         MathBuiltin {
             name: "keep",
             arity: &[2],
@@ -753,50 +724,10 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             description: "Main lap minus overlay lap, arc-length-matched. Retired name: `variance_dist`.",
             example: "lap_delta_dist([Speed])",
         },
-        MathBuiltin {
-            name: "attitude",
-            arity: &[1],
-            status: I,
-            category: "Estimator (diagnostic)",
-            signature: "attitude(\"roll\"|\"pitch\")",
-            unit_rule: "Fixed(deg)",
-            shape: "[t]",
-            description: "Bike attitude estimated by the AHRS filter, in degrees.",
-            example: "attitude(\"roll\")",
-        },
-        MathBuiltin {
-            name: "body_accel",
-            arity: &[1],
-            status: I,
-            category: "Estimator (diagnostic)",
-            signature: "body_accel(\"long\"|\"lat\")",
-            unit_rule: "Fixed(g)",
-            shape: "[t]",
-            description: "Gravity-compensated body-frame acceleration, in g.",
-            example: "body_accel(\"long\")",
-        },
-        MathBuiltin {
-            name: "wheel_travel",
-            arity: &[1],
-            status: I,
-            category: "Estimator",
-            signature: "wheel_travel(\"front\"|\"rear\")",
-            unit_rule: "Fixed(mm)",
-            shape: "[t]",
-            description: "Suspension travel at the named wheel, in mm.",
-            example: "wheel_travel(\"front\")",
-        },
-        MathBuiltin {
-            name: "wheel_velocity",
-            arity: &[1],
-            status: I,
-            category: "Estimator",
-            signature: "wheel_velocity(\"front\"|\"rear\")",
-            unit_rule: "Fixed(mm/s)",
-            shape: "[t]",
-            description: "Suspension velocity at the named wheel, in mm/s.",
-            example: "wheel_velocity(\"front\")",
-        },
+        MathBuiltin::registered("attitude"),
+        MathBuiltin::registered("body_accel"),
+        MathBuiltin::registered("wheel_travel"),
+        MathBuiltin::registered("wheel_velocity"),
         MathBuiltin {
             name: "vec",
             arity: &[3],
@@ -963,7 +894,7 @@ pub fn math_builtin_catalog() -> &'static [MathBuiltin] {
             example: "rotate_euler(a, [Roll], [Pitch], [Yaw])",
         },
     ]
-}
+};
 
 #[cfg(test)]
 mod tests {

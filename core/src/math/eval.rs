@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::math::parse::{Ast, BinOp, UnOp};
+use crate::math::registry::Registry;
 use crate::math::value::{stored_scalar, ChannelValue, Spacing, Value, ValueAxis};
 use crate::math::{MathEvalError, MathEvalErrorKind};
 
@@ -363,7 +364,7 @@ pub struct SharedEvalOutput {
     pub axis: ValueAxis,
 }
 
-fn err(kind: MathEvalErrorKind, msg: impl Into<String>) -> MathEvalError {
+pub(super) fn err(kind: MathEvalErrorKind, msg: impl Into<String>) -> MathEvalError {
     MathEvalError::new(kind, msg)
 }
 
@@ -462,9 +463,20 @@ pub fn evaluate_scalar(
     }
 }
 
-/// Evaluates a single AST node.
+/// Evaluates a single AST node against idl-rs's own builtins.
 pub fn eval(
     ast: &Ast,
+    lookup: &dyn ChannelLookup,
+    lap_ctx: &MathLapContext,
+) -> Result<Value, MathEvalError> {
+    eval_with(ast, Registry::shared(), lookup, lap_ctx)
+}
+
+/// Evaluates a single AST node, calling functions from `registry` first (a
+/// program's own builtins added to [`Registry::builtins`]).
+pub fn eval_with(
+    ast: &Ast,
+    registry: &Registry,
     lookup: &dyn ChannelLookup,
     lap_ctx: &MathLapContext,
 ) -> Result<Value, MathEvalError> {
@@ -529,27 +541,27 @@ pub fn eval(
             }
         }
         Ast::Unary { op, expr } => {
-            let v = eval(expr, lookup, lap_ctx)?;
+            let v = eval_with(expr, registry, lookup, lap_ctx)?;
             match op {
                 UnOp::Neg => map_value(v, |x| -x),
                 UnOp::Not => map_value(v, |x| if x != 0.0 { 0.0 } else { 1.0 }),
             }
         }
         Ast::Binary { op, left, right } => {
-            let l = eval(left, lookup, lap_ctx)?;
-            let r = eval(right, lookup, lap_ctx)?;
+            let l = eval_with(left, registry, lookup, lap_ctx)?;
+            let r = eval_with(right, registry, lookup, lap_ctx)?;
             apply_binary(*op, l, r)
         }
         Ast::Call { name, args, kwargs } => {
             let argv: Vec<Value> = args
                 .iter()
-                .map(|a| eval(a, lookup, lap_ctx))
+                .map(|a| eval_with(a, registry, lookup, lap_ctx))
                 .collect::<Result<_, _>>()?;
             let kwargv: Kwargs = kwargs
                 .iter()
-                .map(|(k, a)| Ok((k.clone(), eval(a, lookup, lap_ctx)?)))
+                .map(|(k, a)| Ok((k.clone(), eval_with(a, registry, lookup, lap_ctx)?)))
                 .collect::<Result<_, _>>()?;
-            call_function(name, argv, &kwargv, lookup, lap_ctx)
+            call_function_with(registry, name, argv, &kwargv, lookup, lap_ctx)
         }
     }
 }
@@ -845,7 +857,7 @@ fn keep_where(x: &ChannelValue, cond: &Value) -> Result<Value, MathEvalError> {
 /// is deliberately *not* the shape-polymorphism of `lap_time()` and friends:
 /// those produce one value per lap from lap-scoped data, whereas `resample`
 /// interpolates along a continuous coordinate, which only `[t]` is.
-fn resample_onto(x: &ChannelValue, onto: &ChannelValue) -> Result<Value, MathEvalError> {
+pub(super) fn resample_onto(x: &ChannelValue, onto: &ChannelValue) -> Result<Value, MathEvalError> {
     if x.axis != ValueAxis::Time || onto.axis != ValueAxis::Time {
         return Err(err(
             MathEvalErrorKind::Type,
@@ -966,7 +978,7 @@ fn type_name(v: &Value) -> &'static str {
 
 // ---- Argument helpers ----
 
-fn require_arg_count(name: &str, args: &[Value], expected: usize) -> Result<(), MathEvalError> {
+pub(super) fn require_arg_count(name: &str, args: &[Value], expected: usize) -> Result<(), MathEvalError> {
     if args.len() != expected {
         return Err(err(
             MathEvalErrorKind::ArgCount,
@@ -976,7 +988,7 @@ fn require_arg_count(name: &str, args: &[Value], expected: usize) -> Result<(), 
     Ok(())
 }
 
-fn require_channel(v: &Value, ctx: &str) -> Result<ChannelValue, MathEvalError> {
+pub(super) fn require_channel(v: &Value, ctx: &str) -> Result<ChannelValue, MathEvalError> {
     match v {
         Value::Channel(c) => Ok(c.clone()),
         // A scalar where a channel is expected is its one-sample, untimed
@@ -997,7 +1009,7 @@ fn require_channel(v: &Value, ctx: &str) -> Result<ChannelValue, MathEvalError> 
     }
 }
 
-fn require_scalar(v: &Value, ctx: &str) -> Result<f64, MathEvalError> {
+pub(super) fn require_scalar(v: &Value, ctx: &str) -> Result<f64, MathEvalError> {
     match v {
         Value::Scalar(x) => Ok(*x),
         other => Err(err(
@@ -1043,7 +1055,7 @@ fn one_channel_windowed(
     Ok((ch.samples, start, end))
 }
 
-fn require_string<'a>(v: &'a Value, ctx: &str) -> Result<&'a str, MathEvalError> {
+pub(super) fn require_string<'a>(v: &'a Value, ctx: &str) -> Result<&'a str, MathEvalError> {
     match v {
         Value::Str(s) => Ok(s),
         other => Err(err(
@@ -1055,7 +1067,7 @@ fn require_string<'a>(v: &'a Value, ctx: &str) -> Result<&'a str, MathEvalError>
 
 /// Map an estimator-backed function call onto its canonical stored channel
 /// name. Errors list the accepted arguments so a typo says what to type.
-fn estimator_channel_id(name: &str, arg: &str) -> Result<&'static str, MathEvalError> {
+pub(super) fn estimator_channel_id(name: &str, arg: &str) -> Result<&'static str, MathEvalError> {
     let expected = match name {
         "wheel_travel" | "wheel_velocity" => "\"front\" or \"rear\"",
         "attitude" => "\"roll\" or \"pitch\"",
@@ -1132,7 +1144,7 @@ fn lap_shaped(
 
 /// A derived `[t]` channel. The overwhelming majority of results: everything
 /// that operates on session samples stays on the time axis.
-fn channel(samples: Vec<f64>, sample_rate_hz: f64, t_us: Arc<[i64]>) -> Value {
+pub(super) fn channel(samples: Vec<f64>, sample_rate_hz: f64, t_us: Arc<[i64]>) -> Value {
     channel_shared(Arc::from(samples), sample_rate_hz, t_us)
 }
 
@@ -1257,7 +1269,7 @@ fn channel_window(lap_ctx: &MathLapContext, ch: &ChannelValue) -> (usize, usize)
 ///
 /// # Errors
 /// A typed runtime error naming `name` for a value with no time axis.
-fn timed<'a>(ch: &'a ChannelValue, name: &str) -> Result<Spacing<'a>, MathEvalError> {
+pub(super) fn timed<'a>(ch: &'a ChannelValue, name: &str) -> Result<Spacing<'a>, MathEvalError> {
     match ch.spacing() {
         Spacing::Untimed => Err(err(
             MathEvalErrorKind::Runtime,
@@ -1273,7 +1285,7 @@ fn timed<'a>(ch: &'a ChannelValue, name: &str) -> Result<Spacing<'a>, MathEvalEr
 /// # Errors
 /// An event channel or an untimed value, as a typed runtime error that says
 /// how to get a grid: resample onto a fixed-rate channel first.
-fn uniform_rate(ch: &ChannelValue, name: &str) -> Result<f64, MathEvalError> {
+pub(super) fn uniform_rate(ch: &ChannelValue, name: &str) -> Result<f64, MathEvalError> {
     match ch.spacing() {
         Spacing::Uniform(rate) => Ok(rate),
         Spacing::Recorded(_) => Err(err(
@@ -1292,7 +1304,7 @@ fn uniform_rate(ch: &ChannelValue, name: &str) -> Result<f64, MathEvalError> {
 }
 
 /// `[Name]` for a direct channel reference, "this value" for a derived one.
-fn describe_channel(ch: &ChannelValue) -> String {
+pub(super) fn describe_channel(ch: &ChannelValue) -> String {
     ch.channel_id.as_deref().map_or_else(|| "this value".to_string(), |id| format!("[{id}]"))
 }
 
@@ -1449,7 +1461,7 @@ fn dart_sign(x: f64) -> f64 {
 /// evaluated to [`Value`]s — `Ast::Call::kwargs` after `eval` has run each
 /// value expression. Empty for a call written with none; keyword arguments
 /// are always additive, never required.
-type Kwargs = HashMap<String, Value>;
+pub(super) type Kwargs = HashMap<String, Value>;
 
 /// Looks up `key` in `kwargs`, requiring it not *also* be supplied
 /// positionally in the same call (`positional_present`) — C2 §3.2's "bound
@@ -1476,7 +1488,7 @@ fn take_kwarg<'a>(
 /// one of `accepted` — an unknown keyword is a typed error, never silently
 /// dropped (a false friend in parameter form, plan §2). Call once per
 /// function, before inspecting any individual keyword.
-fn reject_unknown_kwargs(fn_name: &str, kwargs: &Kwargs, accepted: &[&str]) -> Result<(), MathEvalError> {
+pub(super) fn reject_unknown_kwargs(fn_name: &str, kwargs: &Kwargs, accepted: &[&str]) -> Result<(), MathEvalError> {
     for key in kwargs.keys() {
         if !accepted.contains(&key.as_str()) {
             return Err(err(
@@ -1492,7 +1504,7 @@ fn reject_unknown_kwargs(fn_name: &str, kwargs: &Kwargs, accepted: &[&str]) -> R
 /// tasks add one (`dim=` reductions, task 12). Every other function rejects
 /// any `kwargs` outright in [`call_function`]'s entry guard below, rather
 /// than each arm needing its own "I take no keywords" check.
-const KWARG_AWARE_FUNCTIONS: &[&str] = &["mean", "periodogram", "welch", "deglitch_pulses"];
+const KWARG_AWARE_FUNCTIONS: &[&str] = &["mean", "periodogram", "welch"];
 
 /// A keyword argument's string value, or `default` when the caller didn't
 /// supply it. Every `periodogram`/`welch` keyword is optional (scipy-style
@@ -1574,16 +1586,9 @@ fn parse_fft_averaging(s: &str, fn_name: &str) -> Result<crate::fft::Averaging, 
     }
 }
 
-/// Function-call dispatch. Arms are grouped by task (A6 DSP; A7 stats; A8
-/// elementwise/trig; A9 clamp/if/stubs; A10 lap-aware).
-fn call_function(
-    name: &str,
-    args: Vec<Value>,
-    kwargs: &Kwargs,
-    lookup: &dyn ChannelLookup,
-    lap_ctx: &MathLapContext,
-) -> Result<Value, MathEvalError> {
-    if !kwargs.is_empty() && !KWARG_AWARE_FUNCTIONS.contains(&name) {
+/// Refuses any keyword argument for `name`, a function with no keyword form.
+pub(super) fn reject_any_kwargs(name: &str, kwargs: &Kwargs) -> Result<(), MathEvalError> {
+    if !kwargs.is_empty() {
         let mut unknown: Vec<&str> = kwargs.keys().map(String::as_str).collect();
         unknown.sort_unstable();
         return Err(err(
@@ -1591,73 +1596,40 @@ fn call_function(
             format!("{name}: unknown keyword argument \"{}\" — {name} takes no keyword arguments", unknown[0]),
         ));
     }
+    Ok(())
+}
+
+/// [`call_function_with`] against idl-rs's own builtins.
+#[cfg(test)]
+fn call_function(
+    name: &str,
+    args: Vec<Value>,
+    kwargs: &Kwargs,
+    lookup: &dyn ChannelLookup,
+    lap_ctx: &MathLapContext,
+) -> Result<Value, MathEvalError> {
+    call_function_with(Registry::shared(), name, args, kwargs, lookup, lap_ctx)
+}
+
+/// Function-call dispatch: `registry` first, then the arms not yet converted
+/// to it, grouped by task (A6 DSP; A7 stats; A8 elementwise/trig; A9
+/// clamp/if/stubs; A10 lap-aware).
+fn call_function_with(
+    registry: &Registry,
+    name: &str,
+    args: Vec<Value>,
+    kwargs: &Kwargs,
+    lookup: &dyn ChannelLookup,
+    lap_ctx: &MathLapContext,
+) -> Result<Value, MathEvalError> {
+    if let Some(result) = registry.call(name, &args, kwargs, lookup, lap_ctx) {
+        return result;
+    }
+    if !KWARG_AWARE_FUNCTIONS.contains(&name) {
+        reject_any_kwargs(name, kwargs)?;
+    }
     match name {
         // ---- A6: DSP-backed ----
-        // `cumtrapz` is a permanent second spelling, not a deprecated one —
-        // scipy itself carries both (`scipy.integrate.cumulative_trapezoid`
-        // and the older `cumtrapz`), so matching that costs nothing (R151
-        // item 6). Retired from `integrate` (R143): gratuitous rename, no
-        // behaviour change.
-        "cumulative_trapezoid" | "cumtrapz" => {
-            require_arg_count(name, &args, 1)?;
-            let ch = require_channel(&args[0], name)?;
-            let integrated = match timed(&ch, name)? {
-                Spacing::Uniform(rate) => crate::integration::integrate(&ch.samples, rate),
-                Spacing::Recorded(t_us) => crate::integration::integrate_at_times(&ch.samples, t_us),
-                Spacing::Untimed => unreachable!("timed() refuses an untimed channel"),
-            };
-            Ok(channel(
-                integrated,
-                ch.sample_rate_hz,
-                ch.t_us,
-            ))
-        }
-        // ---- Estimator-backed virtual sensors ----
-        // The offline geometry-constrained estimator (`estimate::run`) is run
-        // once per session by the lookup and cached; these are store reads.
-        "wheel_travel" | "wheel_velocity" | "attitude" | "body_accel" => {
-            require_arg_count(name, &args, 1)?;
-            let arg = require_string(&args[0], name)?;
-            let channel_id = estimator_channel_id(name, arg)?;
-            let ch = lookup.estimator_channel(channel_id).ok_or_else(|| {
-                err(
-                    MathEvalErrorKind::Runtime,
-                    format!(
-                        "{name}(\"{arg}\"): the suspension/attitude estimator could not run for \
-                         this session — it needs IMU0 accel and gyro channels"
-                    ),
-                )
-            })?;
-            Ok(channel(ch.samples.to_vec(), ch.sample_rate_hz, ch.t_us))
-        }
-        "butter" => {
-            require_arg_count(name, &args, 4)?;
-            let order = require_scalar(&args[0], name)?;
-            let cutoff = require_scalar(&args[1], name)?;
-            let ftype = require_string(&args[2], name)?;
-            let ch = require_channel(&args[3], name)?;
-            let order = order.round() as usize;
-            match ftype {
-                "high" | "highpass" => {
-                    let out = crate::filters::highpass(&ch.samples, order, cutoff, uniform_rate(&ch, name)?)
-                        .map_err(|e| err(MathEvalErrorKind::Runtime, e.to_string()))?;
-                    Ok(channel(out, ch.sample_rate_hz, ch.t_us))
-                }
-                "low" | "lowpass" => {
-                    let out = crate::filters::lowpass(&ch.samples, order, cutoff, uniform_rate(&ch, name)?)
-                        .map_err(|e| err(MathEvalErrorKind::Runtime, e.to_string()))?;
-                    Ok(channel(out, ch.sample_rate_hz, ch.t_us))
-                }
-                "band" => Err(err(
-                    MathEvalErrorKind::Runtime,
-                    "butter: band-pass filter not yet implemented",
-                )),
-                other => Err(err(
-                    MathEvalErrorKind::Runtime,
-                    format!("butter: unknown type \"{other}\"; expected \"low\" or \"high\""),
-                )),
-            }
-        }
         // `fft` is retired (R146/R151 item 1, plan §1 row 3): it was never a
         // true FFT surface, it was one un-normalised windowed magnitude
         // spectrum with no segmentation or averaging — a false friend on
@@ -2041,52 +2013,6 @@ fn call_function(
                 }
             })?;
             Ok(channel_shared(out, cond.sample_rate_hz, t_us))
-        }
-        // R242: the explicit, and only, way two channels recorded on different
-        // clocks come together. Never implicit — C2 §3.6.2 rule 4 ("never an
-        // implicit resample") is the contract this satisfies rather than
-        // weakens.
-        "resample" => {
-            require_arg_count(name, &args, 2)?;
-            if let Value::Scalar(n) = &args[1] {
-                // `resample(ch, num)` — the scipy-style target-sample-count
-                // form C2 §3.3 reserved until R242. Named explicitly so an
-                // author who wrote it gets the reason, not "expected channel".
-                return Err(err(
-                    MathEvalErrorKind::NotImplemented,
-                    format!(
-                        "resample(x, onto): the second argument is the channel whose time axis \
-                         to resample onto, not a sample count (got {n}). The count form \
-                         (`scipy.signal.resample`) is not implemented."
-                    ),
-                ));
-            }
-            let x = require_channel(&args[0], "resample(x, onto) — x")?;
-            let onto = require_channel(&args[1], "resample(x, onto) — onto")?;
-            resample_onto(&x, &onto)
-        }
-        // A wheel-pulse event channel with split gaps merged back (2026-11-05,
-        // `crate::pulse`): the kept pulses at their own recorded times, the
-        // running count renumbered so `differentiate` gives 1 / gap.
-        "deglitch_pulses" => {
-            require_arg_count(name, &args, 1)?;
-            reject_unknown_kwargs(name, kwargs, &["max_fraction"])?;
-            let ch = require_channel(&args[0], name)?;
-            let Spacing::Recorded(t_us) = ch.spacing() else {
-                return Err(err(
-                    MathEvalErrorKind::Runtime,
-                    format!("{name} takes a pulse event channel (samples at recorded times), and {} is not one", describe_channel(&ch)),
-                ));
-            };
-            let max_fraction = match kwargs.get("max_fraction") {
-                Some(v) => require_scalar(v, name)?,
-                None => crate::pulse::DEFAULT_MAX_FRACTION,
-            };
-            let kept = crate::pulse::deglitch(t_us, max_fraction);
-            let first = ch.samples.first().copied().unwrap_or(0.0);
-            let samples: Vec<f64> = (0..kept.len()).map(|k| first + k as f64).collect();
-            let times: Arc<[i64]> = kept.iter().map(|&i| t_us[i]).collect();
-            Ok(channel(samples, 0.0, times))
         }
         "keep" => {
             require_arg_count(name, &args, 2)?;
