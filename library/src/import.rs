@@ -225,7 +225,7 @@ pub struct ImportReport {
     /// Set to [`crate::lap_index::LapIndexError`]'s `Display` when the
     /// lap-index step failed; the import itself still succeeds (this field
     /// and [`Self::lap_index`] are never both `Some`). Recoverable by
-    /// `idl-rs rescan`.
+    /// `idl-rs track detect`.
     pub lap_index_warning: Option<String>,
     /// Set to [`crate::catalog::CatalogError`]'s `Display` when
     /// `catalog.sqlite` exists but [`crate::catalog::index_session`]
@@ -498,7 +498,7 @@ fn finish_import(
 
     // Lap indexing (IDL0_SPEC §17.4), non-fatal (mirrors idl0's
     // `_detectAndSaveVisits`): a failure here must not fail the import, and
-    // recovers on the next import or an explicit `rescan`. Runs with
+    // recovers on the next import or an explicit `track detect`. Runs with
     // `force = false` on every plan reaching this point (`Collision` already
     // returned above) — on `Skip` this costs one hash + one read and lets a
     // session imported before this lane pick up laps on its next import.

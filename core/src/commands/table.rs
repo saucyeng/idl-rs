@@ -13,14 +13,12 @@
 //! for; adding one means editing [`VERBS_RULED`] and naming the ruling,
 //! which is deliberate rather than accidental.
 //!
-//! # Deprecated rows
+//! # Legacy verbs
 //!
-//! The verbs that predate R230 (`idl-rs info`, `idl-rs fft`, top-level
-//! `import`, …) are not in the table: they are noun-less and R230's grammar
-//! has no place for them. They stay registered by the CLI as deprecated
-//! aliases — R230 allows breaking changes only at a major version, and sets
-//! the precedent itself for top-level `import`. A row that *is* in the table
-//! but superseded carries [`Status::Deprecated`] and is skipped by the
+//! The verbs that predate R230 (`idl-rs info`, `idl-rs fft`, …) are not in
+//! the table: they are noun-less and R230's grammar has no place for them.
+//! The CLI declares them by hand. A row that *is* in the table but
+//! superseded carries [`Status::Deprecated`] and is skipped by the
 //! vocabulary test.
 //!
 //! # Uniform behaviour

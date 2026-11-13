@@ -199,8 +199,7 @@ pub fn import(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
     // `import_file` covers the converted formats only and answers "no
     // importer covers file extension" for it, while `--dry-run` above
     // (rightly) said it would import. Routing is this verb's job (see
-    // `import_file`'s doc), and this is the same entry point the deprecated
-    // top-level `import` command uses.
+    // `import_file`'s doc).
     let report = if extension == "idl0" || extension == "idl1" {
         import_idl0_path(root, &file)?
     } else {

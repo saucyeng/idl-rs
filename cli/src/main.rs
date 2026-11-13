@@ -16,7 +16,6 @@ mod docs_cmd;
 mod envelope;
 mod library;
 mod recover;
-mod table_cmd;
 mod verbs;
 
 use std::fs::File;
@@ -35,7 +34,6 @@ use idl_rs::math::MathLapContext;
 use idl_rs::session::handle::{ChannelMeta, SessionHandle, SessionMeta};
 use idl_rs::session::Channel;
 use idl_library::lap_index::{self, LapIndexErrorKind};
-use idl_library::{catalog, import, verify};
 use idl_rs::track_artifact::{self, Track};
 use idl_rs::tracks::{detect_visits, VisitParams, VisitWindow};
 use idl_rs::workbook::{self, ApplyReport};
@@ -261,38 +259,6 @@ enum Command {
         #[arg(long)]
         scan_limit: Option<u64>,
     },
-    /// Evaluate, list, or validate a workbook's tables (the `table` group).
-    Table {
-        #[command(subcommand)]
-        action: table_cmd::TableAction,
-    },
-    /// Imports an `.idl0` log into a C4 §2 data directory: writes the raw
-    /// bytes to the CAS blob store, writes `data.parquet` (contract C1 §4),
-    /// creates an empty `session.json` if none exists yet (contract C1 §6),
-    /// and rebuilds the catalog (contract C4 §5).
-    Import {
-        /// Path to the `.idl0` log file to import.
-        file: PathBuf,
-        /// Data directory root (contract C4 §1's `<data>` — this CLI has no
-        /// Tauri `app_data_dir()` resolver, so the path is explicit here;
-        /// the app layer, L5, resolves the platform default and passes it in
-        /// the same way when it shells out or reuses this code as a library).
-        #[arg(long)]
-        data_dir: PathBuf,
-    },
-    /// Rebuilds the catalog from `data_dir` and lists every indexed session.
-    Sessions {
-        #[arg(long)]
-        data_dir: PathBuf,
-        #[arg(long, value_enum, default_value_t = OutFormat::Text)]
-        format: OutFormat,
-    },
-    /// Runs contract C4 §7's `verify` checks against `data_dir` and prints
-    /// every finding.
-    Verify {
-        #[arg(long)]
-        data_dir: PathBuf,
-    },
     /// Lists (or, with `--confirm`, deletes) `derived/*.parquet` files older
     /// than `--older-than` days (contract C4 §7; default 30 — the contract's
     /// own proposal, C4 §8 item 5). **Age-based only, not orphan-verified**
@@ -307,20 +273,6 @@ enum Command {
         /// only lists what it would delete.
         #[arg(long)]
         confirm: bool,
-    },
-    /// IDL0_SPEC §17.4's "Rescan Tracks": re-runs lap indexing for one
-    /// already-imported session, rebuilding its handle from `data.parquet`
-    /// and always recomputing (`force = true`) so newly-added or
-    /// newly-edited tracks take effect immediately.
-    Rescan {
-        /// Data directory root (contract C4 §1's `<data>`).
-        data_root: PathBuf,
-        /// The session id to rescan (its `sessions/<id>/data.parquet` must
-        /// already exist).
-        #[arg(long)]
-        session: String,
-        #[arg(long, value_enum, default_value_t = OutFormat::Text)]
-        format: OutFormat,
     },
 }
 
@@ -451,32 +403,6 @@ impl ScalingArg {
 /// pre-dispatch usage errors itself (exit 2, native stderr message);
 /// everything past parse goes through the JSON envelope.
 
-/// The pre-R230 spelling of a command, and the noun-rooted one that
-/// replaces it.
-///
-/// R230 allows breaking changes only at a major version, so every one of
-/// these still runs; it prints a one-line notice to stderr first, which
-/// keeps a script's stdout byte-identical while telling whoever reads the
-/// terminal what to type instead. The list is exactly the legacy commands a
-/// table row supersedes — `info`, `channels`, `fft` and the rest have no
-/// noun-rooted replacement yet and so are not deprecated.
-const DEPRECATED: &[(&str, &str)] = &[
-    ("import", "session import"),
-    ("sessions", "session list"),
-    ("verify", "catalog verify"),
-    ("rescan", "track detect"),
-    ("table eval", "workbook eval"),
-    ("table list", "workbook cells"),
-    ("table check", "workbook check"),
-];
-
-/// Prints the deprecation notice for `command`, if it has one.
-fn warn_if_deprecated(command: &str) {
-    if let Some((_, replacement)) = DEPRECATED.iter().find(|(old, _)| *old == command) {
-        eprintln!("note: `idl-rs {command}` is deprecated; use `idl-rs {replacement}`");
-    }
-}
-
 fn main() -> ExitCode {
     // The noun-rooted surface is generated from the one command table
     // (ruling R230); the legacy noun-less verbs are still the derive's.
@@ -491,19 +417,6 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(e) => e.exit(),
     };
-
-    match &cli.command {
-        Command::Import { .. } => warn_if_deprecated("import"),
-        Command::Sessions { .. } => warn_if_deprecated("sessions"),
-        Command::Verify { .. } => warn_if_deprecated("verify"),
-        Command::Rescan { .. } => warn_if_deprecated("rescan"),
-        Command::Table { action } => warn_if_deprecated(match action {
-            table_cmd::TableAction::Eval { .. } => "table eval",
-            table_cmd::TableAction::List { .. } => "table list",
-            table_cmd::TableAction::Check { .. } => "table check",
-        }),
-        _ => {}
-    }
 
     match cli.command {
         Command::Info { file, format } => emit_structured("info", cmd_info(&file, format)),
@@ -615,20 +528,11 @@ fn main() -> ExitCode {
             "scan",
             recover::scan_all(&device, out_dir.as_deref(), scan_limit.unwrap_or(u64::MAX)),
         ),
-        Command::Table { action } => table_cmd::run(action),
-        Command::Import { file, data_dir } => cmd_import(&file, &data_dir),
-        Command::Sessions { data_dir, format } => cmd_sessions(&data_dir, format),
-        Command::Verify { data_dir } => cmd_verify(&data_dir),
         Command::Prune {
             data_dir,
             older_than,
             confirm,
         } => cmd_prune(&data_dir, older_than, confirm),
-        Command::Rescan {
-            data_root,
-            session,
-            format,
-        } => emit_structured("rescan", cmd_rescan(&data_root, &session, format)),
     }
 }
 
@@ -779,45 +683,6 @@ impl From<lap_index::LapIndexError> for CliError {
             LapIndexErrorKind::Track => ErrorKind::InvalidInput,
         };
         CliError::new(kind, e.message)
-    }
-}
-
-/// Builds `rescan`'s `data.rescan` JSON object from a [`lap_index::LapIndexReport`].
-fn rescan_report_json(report: &lap_index::LapIndexReport) -> Value {
-    json!({
-        "session_id": report.session_id,
-        "visits_indexed": report.visits_indexed,
-        "laps_indexed": report.laps_indexed,
-        "skipped_up_to_date": report.skipped_up_to_date,
-        "flags_cleared": report.flags_cleared,
-        "warnings": report.warnings,
-    })
-}
-
-/// `rescan` — IDL0_SPEC §17.4's "Rescan Tracks": re-runs lap indexing for a
-/// session already imported into `data_root`, via [`lap_index::reindex_laps`]
-/// (always `force = true`).
-fn cmd_rescan(data_root: &Path, session_id: &str, format: OutFormat) -> Result<Structured, CliError> {
-    let report = lap_index::reindex_laps(data_root, session_id)?;
-    match format {
-        OutFormat::Text => {
-            if report.skipped_up_to_date {
-                println!("rescan {}: up to date, nothing recomputed", report.session_id);
-            } else {
-                println!("rescan {}: {} visits, {} laps", report.session_id, report.visits_indexed, report.laps_indexed);
-            }
-            if !report.flags_cleared.is_empty() {
-                println!("  cleared: {}", report.flags_cleared.join(", "));
-            }
-            for w in &report.warnings {
-                println!("  warning: {w}");
-            }
-            Ok(Structured::Text)
-        }
-        OutFormat::Json => Ok(Structured::Json {
-            data: json!({ "rescan": rescan_report_json(&report) }),
-            warnings: Vec::new(),
-        }),
     }
 }
 
@@ -1112,133 +977,11 @@ fn cmd_fit(
 }
 
 // ---------------------------------------------------------------------------
-// Store commands (`import`/`sessions`/`verify`/`prune`) — these speak plain
+// Store command (`prune`) — speaks plain
 // stdout/stderr text, not the JSON envelope above: they operate over a data
 // directory (contract C4), not a single `.idl0` file, and have no natural
 // "success payload" shape the envelope's `Structured`/bulk-artifact split fits.
 // ---------------------------------------------------------------------------
-
-/// Imports `file` into `data_dir` via [`import::import_idl0_path`] — which
-/// maps the log rather than copying it onto the heap (ruling R203.3) — and
-/// rebuilds the catalog so the import is immediately queryable.
-fn cmd_import(file: &Path, data_dir: &Path) -> ExitCode {
-    let report = match import::import_idl0_path(data_dir, file) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: import: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Some(w) = &report.truncation_warning {
-        eprintln!("warning: {w}");
-    }
-    match report.outcome {
-        import::ImportOutcome::Written => println!("imported {} -> {}", file.display(), report.data_parquet.display()),
-        import::ImportOutcome::Skipped => println!("already imported (skip): {}", report.data_parquet.display()),
-        import::ImportOutcome::Regenerated => println!("regenerated: {}", report.data_parquet.display()),
-    }
-
-    match catalog::rebuild_catalog(data_dir) {
-        Ok(rr) => {
-            println!(
-                "catalog: {} sessions, {} blobs ({} carried, {} hashed), {} laps ({} skipped)",
-                rr.sessions_indexed,
-                rr.blobs_indexed,
-                rr.blobs_carried,
-                rr.blobs_hashed,
-                rr.laps_indexed,
-                rr.skipped.len()
-            );
-            for s in &rr.skipped {
-                eprintln!("  skipped: {s}");
-            }
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("error: catalog rebuild: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// Rebuilds the catalog then lists every indexed session. No `.expect()` on
-/// any `rusqlite` call (CLAUDE.md §5) — a corrupt catalog is data the
-/// operator needs to see reported, not a bug this binary should crash on.
-fn cmd_sessions(data_dir: &Path, format: OutFormat) -> ExitCode {
-    let report = match catalog::rebuild_catalog(data_dir) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let conn = match catalog::open_catalog(&data_dir.join("catalog.sqlite")) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut stmt = match conn
-        .prepare("SELECT session_id, timestamp_utc_ms, rider, bike, venue_name, lap_count FROM sessions ORDER BY timestamp_utc_ms DESC")
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mapped = match stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let rows: Vec<(String, i64, String, String, String, Option<i64>)> = match mapped.collect() {
-        Ok(rows) => rows,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    match format {
-        OutFormat::Text => {
-            for (id, ts, rider, bike, venue, laps) in &rows {
-                println!("{id}  {ts}  {rider}  {bike}  {venue}  laps={}", laps.unwrap_or(0));
-            }
-            println!("({} session(s), {} catalog issue(s))", rows.len(), report.skipped.len());
-        }
-        OutFormat::Json => {
-            let json = json!({ "sessions": rows.iter().map(|(id, ts, rider, bike, venue, laps)| {
-                json!({ "session_id": id, "timestamp_utc_ms": ts, "rider": rider, "bike": bike, "venue_name": venue, "lap_count": laps })
-            }).collect::<Vec<_>>() });
-            match serde_json::to_string_pretty(&json) {
-                Ok(s) => println!("{s}"),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-/// Runs contract C4 §7's `verify` checks and prints every finding.
-fn cmd_verify(data_dir: &Path) -> ExitCode {
-    let findings = verify::verify(data_dir);
-    for f in &findings {
-        println!("[{:?}] {}: {}", f.severity, f.path.display(), f.message);
-    }
-    println!("{} finding(s)", findings.len());
-    if findings.iter().any(|f| f.severity == verify::Severity::Error) {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
-}
 
 /// Lists (or, with `confirm`, deletes) `derived/*.parquet` files older than
 /// `older_than_days`. Age-based only — not orphan-verified (a candidate may
@@ -1546,14 +1289,8 @@ fn display_or_dash(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use idl_rs::gps::GpsFix;
-    use idl_rs::laps::model::{Gate, LapTiming};
     use idl_rs::session::handle::{ChannelInput, SessionMetaInput};
-    use idl_rs::session::{RawColumn, Session, SourceFormat};
-    use idl_rs::store::parquet::write_session_parquet;
-    use idl_rs::track_artifact::write_track;
     use idl_rs::workbook::ChannelApplyResult;
-    use std::path::PathBuf;
 
     /// Synthetic uniform `t_us` at `rate_hz` for `len` samples — matches
     /// `Channel::from_f64`'s own formula (`core/src/session/handle.rs`'s
@@ -1909,116 +1646,5 @@ mod tests {
         );
         assert_eq!(FitSport::from(SportArg::Running), FitSport::Running);
         assert_eq!(FitSport::from(SportArg::Generic), FitSport::Generic);
-    }
-
-    // ---- rescan tests -----------------------------------------------------
-    //
-    // Fixtures duplicated minimally from `idl-rs`'s own `store::lap_index`/
-    // `store::import` test modules (private `#[cfg(test)]` items, not
-    // reachable from this crate) rather than reached into.
-
-    fn temp_data_root() -> PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("idl-rs-cli-test-rescan-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// A there-and-back-and-there GPS session: 3 legs of 100 one-second
-    /// fixes, lat sweeping 0.000→0.099→0.000→0.099, crossing lat 0.05 three
-    /// times.
-    fn three_lap_session(session_id: &str) -> Session {
-        let mut fixes: Vec<GpsFix> = Vec::new();
-        for (leg, up) in [(0i64, true), (1, false), (2, true)] {
-            for i in 0..100i64 {
-                let lat = if up { i as f64 * 0.001 } else { 0.099 - i as f64 * 0.001 };
-                fixes.push(GpsFix { timestamp_ms: leg * 100_000 + i * 1000, lat, lon: 0.0005 });
-            }
-        }
-        let lat: Vec<f64> = fixes.iter().map(|f| f.lat).collect();
-        let lon: Vec<f64> = fixes.iter().map(|f| f.lon).collect();
-        let epoch: Vec<f64> = fixes.iter().map(|f| f.timestamp_ms as f64).collect();
-        let ch = |id: &str, s: Vec<f64>| {
-            let t_us: Vec<i64> = (0..s.len() as i64).map(|i| i * 1_000_000).collect();
-            Channel {
-                channel_id: id.to_string(),
-                t_us,
-                t_recorded_us: None,
-                nominal_rate_hz: 1.0,
-                column: RawColumn::F64(s),
-                source_kind: id.to_lowercase(),
-                unit: String::new(),
-                gaps: Vec::new(),
-            }
-        };
-        Session {
-            session_id: session_id.to_string(),
-            device_id: None,
-            timestamp_utc_ms: 0,
-            timestamp_source: idl_rs::session::TimestampSource::SourceFile,
-            config_checksum: None,
-            source_format: SourceFormat::Gpx,
-            blob_sha256: String::new(),
-            channels: vec![ch("GPS_Latitude", lat), ch("GPS_Longitude", lon), ch("GPS_EpochMs", epoch)],
-        }
-    }
-
-    fn circuit_track(id: &str) -> Track {
-        let polyline: Vec<GpsFix> =
-            (0..=100).map(|i| GpsFix { timestamp_ms: i * 1000, lat: i as f64 * 0.001, lon: 0.0005 }).collect();
-        Track {
-            id: id.to_string(),
-            name: "Loop".to_string(),
-            venue: String::new(),
-            timing: Some(LapTiming::Circuit { start_finish: Gate { lat1: 0.05, lon1: -0.001, lat2: 0.05, lon2: 0.001 } }),
-            sector_gates: Vec::new(),
-            neutral_zones: Vec::new(),
-            reference_polyline: polyline,
-            created_at_ms: 0,
-            updated_at_ms: 1,
-        }
-    }
-
-    #[test]
-    fn cmd_rescan_json_maps_lap_index_report_into_the_rescan_envelope() {
-        // Arrange — a data root with data.parquet + a track library already
-        // in place, no session.json yet.
-        let root = temp_data_root();
-        write_track(&root, &circuit_track("loop-1")).unwrap();
-        let session = three_lap_session("s1");
-        write_session_parquet(&root, &session, "0.1.0").unwrap();
-
-        // Act
-        let result = cmd_rescan(&root, "s1", OutFormat::Json);
-
-        // Assert
-        let Structured::Json { data, warnings } = result.unwrap() else {
-            panic!("expected Structured::Json");
-        };
-        assert!(warnings.is_empty());
-        let rescan = &data["rescan"];
-        assert_eq!(rescan["session_id"], "s1");
-        assert_eq!(rescan["visits_indexed"], 1);
-        assert_eq!(rescan["laps_indexed"], 3);
-        assert_eq!(rescan["skipped_up_to_date"], false);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn cmd_rescan_missing_data_parquet_maps_to_io_error() {
-        // Arrange — a data root with no `sessions/` at all.
-        let root = temp_data_root();
-
-        // Act
-        let result = cmd_rescan(&root, "nope", OutFormat::Text);
-
-        // Assert
-        let Err(err) = result else { panic!("expected an error") };
-        assert_eq!(err.kind, ErrorKind::Io);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

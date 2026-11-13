@@ -115,8 +115,7 @@ impl Ctx {
 
 /// Adds one clap subcommand per noun in the table to `cmd`.
 ///
-/// The nouns that predate R230 and are not in the table (`table`, and the
-/// noun-less legacy verbs) are declared by `main.rs`'s derive as before;
+/// The noun-less legacy verbs that predate R230 are declared by `main.rs`'s derive as before;
 /// this only ever adds.
 pub fn augment(cmd: ClapCommand) -> ClapCommand {
     let mut cmd = cmd;

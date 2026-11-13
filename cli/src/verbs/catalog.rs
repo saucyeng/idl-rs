@@ -1,8 +1,7 @@
 //! The `track` and `catalog` verbs (ruling R229): `track list`,
 //! `track detect`, `catalog verify`, `catalog rebuild`.
 //!
-//! `track detect` is the noun-rooted spelling of what the legacy top-level
-//! `rescan` does, and calls the same `lap_index::reindex_laps`.
+//! `track detect` re-runs lap indexing through `lap_index::reindex_laps`.
 
 use clap::ArgMatches;
 use serde_json::{json, Value};
@@ -165,7 +164,7 @@ fn track_json(track: &TrackSummary) -> Value {
     })
 }
 
-/// `LapIndexReport`, the same shape the legacy `rescan --format json` emits.
+/// `LapIndexReport` as the `track detect` JSON object.
 fn index_json(report: &LapIndexReport) -> Value {
     json!({
         "session_id": report.session_id,
