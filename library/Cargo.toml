@@ -1,6 +1,6 @@
 [package]
 name = "idl-library"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "The idl-rs ride library: catalog, content-addressed blob store, import and index jobs, bike log, sync model."

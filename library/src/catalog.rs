@@ -151,9 +151,15 @@ CREATE INDEX idx_lap_summary_channel ON lap_summary(channel_id);
 
 /// Opens (or creates) the catalog at `path`, applying C4 §5's PRAGMAs on
 /// every connection (they are per-connection, not persisted by SQLite).
-/// Does not create the schema — callers that may be opening a brand-new,
-/// empty file call [`create_schema`] (internal) via [`rebuild_catalog`].
+/// The live `<data>/catalog.sqlite` is rebuilt from `<data>` when it is
+/// missing or of another schema version (C4 §5: an index, deletable and
+/// rebuildable), so sessions already on disk are listed; any other path
+/// that is new (a rebuild's staging file) gets an empty schema.
 pub fn open_catalog(path: &Path) -> Result<Connection, CatalogError> {
+    let live = path.file_name().is_some_and(|n| n == "catalog.sqlite");
+    if live && !path.exists() {
+        rebuild_live_catalog(path, |p| Ok(!p.exists()))?;
+    }
     let conn = Connection::open(path)?;
     // busy_timeout first: the journal_mode switch and the bootstrap below
     // take locks, and a second connection opening the same fresh file must
@@ -184,23 +190,34 @@ pub fn open_catalog(path: &Path) -> Result<Connection, CatalogError> {
     let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if user_version == 0 {
         create_schema(&conn)?;
-    } else if user_version != CATALOG_SCHEMA_VERSION && path.file_name().is_some_and(|n| n == "catalog.sqlite") {
+    } else if user_version != CATALOG_SCHEMA_VERSION && live {
         // C4 §5: a catalog of another schema version is not migrated in
         // place; it is rebuilt from `<data>`. Only the live
         // `<data>/catalog.sqlite` — a rebuild's own staging file is always
         // fresh (version 0, above).
         drop(conn);
-        let data_root = path.parent().ok_or_else(|| CatalogError { kind: CatalogErrorKind::Io, message: format!("{} has no parent directory", path.display()) })?;
-        let _guard = STALE_CATALOG_REBUILD.lock().unwrap_or_else(|e| e.into_inner());
-        // Another caller may have rebuilt it while this one waited.
-        let still_stale = Connection::open(path)?.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?
-            != CATALOG_SCHEMA_VERSION;
-        if still_stale {
-            rebuild_catalog(data_root)?;
-        }
+        rebuild_live_catalog(path, |p| {
+            Ok(Connection::open(p)?.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?
+                != CATALOG_SCHEMA_VERSION)
+        })?;
         return open_catalog(path);
     }
     Ok(conn)
+}
+
+/// Rebuilds the live catalog at `path` from its parent `<data>` directory,
+/// one caller at a time, if `still_needed` still says so once this caller
+/// holds the lock (another may have rebuilt it while this one waited).
+fn rebuild_live_catalog(
+    path: &Path,
+    still_needed: impl Fn(&Path) -> Result<bool, CatalogError>,
+) -> Result<(), CatalogError> {
+    let data_root = path.parent().ok_or_else(|| CatalogError { kind: CatalogErrorKind::Io, message: format!("{} has no parent directory", path.display()) })?;
+    let _guard = STALE_CATALOG_REBUILD.lock().unwrap_or_else(|e| e.into_inner());
+    if still_needed(path)? {
+        rebuild_catalog(data_root)?;
+    }
+    Ok(())
 }
 
 /// Creates the schema and sets `user_version` on an empty database, inside
@@ -1312,6 +1329,24 @@ mod tests {
         assert_eq!(sessions, 1);
         let ddl: String = conn.query_row("SELECT sql FROM sqlite_master WHERE name = 'sessions'", [], |r| r.get(0)).unwrap();
         assert!(ddl.contains("'idl1'"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_catalog_a_missing_catalog_over_a_session_on_disk_is_rebuilt_with_that_session() {
+        // Arrange — `session import` into a fresh folder writes the session
+        // but no catalog; `session list` then listed 0 (idl-rs-cli 0.1.0).
+        let root = temp_root();
+        write_full_session(&root, "s1", 0, &empty_session_json("s1"));
+        let path = root.join("catalog.sqlite");
+
+        // Act
+        let conn = open_catalog(&path).unwrap();
+
+        // Assert
+        let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(sessions, 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

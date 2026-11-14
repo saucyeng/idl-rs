@@ -658,7 +658,7 @@ fn fold_summary_json(summary: &FoldSummary) -> Value {
 // ── stale / rebuild ──────────────────────────────────────────────────────────
 
 /// [`list_stale_sessions`] against `<data>/catalog.sqlite`. The catalog is an
-/// index: this reads it, never rebuilds it.
+/// index: this reads it, and rebuilds it only when it is missing.
 pub fn stale(data_root: &Path) -> Result<Vec<StaleSession>, LibraryError> {
     let conn = catalog::open_catalog(&data_root.join("catalog.sqlite"))?;
     Ok(list_stale_sessions(&conn)?)
