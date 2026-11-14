@@ -20,6 +20,7 @@
 //! app's `eval_session_set` uses. A repeated `--session` is an ad-hoc
 //! one-group set.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use clap::ArgMatches;
@@ -250,24 +251,46 @@ pub fn eval(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
 
     let results = eval_cells(&doc, &structural, &handle, &lap_ctx);
 
+    // Each table's rows (`eval_cells` holds only definitions): a grid under
+    // its line, and `table` in its JSON cell, as `workbook data` prints one.
+    let definitions = definition_values(&results);
+    let tables: HashMap<&str, (TableModel, Vec<Vec<CellResult>>)> = doc
+        .cells
+        .iter()
+        .filter_map(|c| c.table.as_ref().map(|model| (c.id.as_str(), evaluate_table_in_window(model, &definitions, &handle, &lap_ctx))))
+        .collect();
+
     let text = if values {
         value_lines(&results).join("\n")
     } else {
         results
             .iter()
-            .map(|cell| {
-                let values = cell.defs.iter().filter(|d| d.value.is_some()).count();
-                let errors = cell.defs.iter().filter(|d| d.error.is_some()).count() + cell.errors.len();
-                format!("{}  {}  {values} value(s), {errors} error(s)", cell.cell_id, kind_name(cell.kind))
+            .map(|cell| match tables.get(cell.cell_id.as_str()) {
+                Some((planned, rows)) => format!("{}  table  {} row(s)\n{}\n", cell.cell_id, rows.len(), render_plain_table(planned, rows)),
+                None => {
+                    let values = cell.defs.iter().filter(|d| d.value.is_some()).count();
+                    let errors = cell.defs.iter().filter(|d| d.error.is_some()).count() + cell.errors.len();
+                    format!("{}  {}  {values} value(s), {errors} error(s)", cell.cell_id, kind_name(cell.kind))
+                }
             })
             .collect::<Vec<_>>()
             .join("\n")
     };
 
+    let cells: Vec<Value> = results
+        .iter()
+        .map(|cell| {
+            let mut out = eval_cell_json(cell);
+            if let Some((planned, rows)) = tables.get(cell.cell_id.as_str()) {
+                out["table"] = json!({ "model": planned, "results": rows });
+            }
+            out
+        })
+        .collect();
     let mut data = json!({
         "file": file.display().to_string(),
         "session_id": handle.metadata().session_id,
-        "cells": results.iter().map(eval_cell_json).collect::<Vec<_>>(),
+        "cells": cells,
     });
     if values {
         data["values"] = Value::Array(value_json(&results));
@@ -768,7 +791,11 @@ fn render_plain_table(model: &TableModel, rows: &[Vec<CellResult>]) -> String {
         .chain(model.columns.iter().map(|c| c.name.clone().unwrap_or_else(|| c.id.clone())))
         .collect::<Vec<_>>()];
     for (r, row) in model.rows.iter().zip(rows) {
-        grid.push(std::iter::once(r.id.clone()).chain(row.iter().map(cell_text)).collect());
+        let label = match r.context.as_ref().and_then(|c| c.lap_number) {
+            Some(n) => format!("Lap {n}"),
+            None => r.id.clone(),
+        };
+        grid.push(std::iter::once(label).chain(row.iter().map(cell_text)).collect());
     }
     align(&grid).join("\n")
 }
@@ -996,6 +1023,26 @@ mod tests {
         // Assert — the fault is the flag pair, not the file.
         assert_eq!(err.kind, ErrorKind::Usage);
         assert!(err.message.contains("--main-lap needs --track"), "{}", err.message);
+    }
+
+    #[test]
+    fn render_plain_table_a_lap_row_is_labelled_by_its_lap_number_and_an_authored_row_by_its_id() {
+        // Arrange
+        let model: TableModel = serde_json::from_value(json!({
+            "columns": [{ "id": "c0", "name": "Lap time", "template": "lap_time()" }],
+            "rows": [{ "id": "s1#2", "context": { "sessionId": "s1", "lapNumber": 2 } }, { "id": "mine" }],
+            "cells": [],
+        }))
+        .unwrap();
+        let rows = vec![vec![CellResult { value: Some(61.5), error: None }], vec![CellResult { value: None, error: None }]];
+
+        // Act
+        let text = render_plain_table(&model, &rows);
+
+        // Assert
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].starts_with("Lap 2"), "{text}");
+        assert!(lines[2].starts_with("mine"), "{text}");
     }
 
     #[test]
