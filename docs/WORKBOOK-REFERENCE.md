@@ -78,6 +78,7 @@ Applies a second-order-section filter to a channel. Not implemented.
 Example:
 
 ```
+sos = 1
 result = sosfilt(sos, [Fork])
 ```
 
@@ -1001,6 +1002,7 @@ Convolution of a channel with a kernel. Not implemented.
 Example:
 
 ```
+kernel = [Fork]
 result = convolve([Fork], kernel)
 ```
 
@@ -1414,6 +1416,7 @@ The x component of a Vec3.
 Example:
 
 ```
+accel = vec([AccelX], [AccelY], [AccelZ])
 result = vx(accel)
 ```
 
@@ -1435,6 +1438,7 @@ The y component of a Vec3.
 Example:
 
 ```
+accel = vec([AccelX], [AccelY], [AccelZ])
 result = vy(accel)
 ```
 
@@ -1456,6 +1460,7 @@ The z component of a Vec3.
 Example:
 
 ```
+accel = vec([AccelX], [AccelY], [AccelZ])
 result = vz(accel)
 ```
 
@@ -1477,6 +1482,8 @@ Component-wise sum of two Vec3s.
 Example:
 
 ```
+a = vec([AccelX], [AccelY], [AccelZ])
+b = vec([AccelY], [AccelZ], [AccelX])
 result = vadd(a, b)
 ```
 
@@ -1498,6 +1505,8 @@ Component-wise difference of two Vec3s.
 Example:
 
 ```
+a = vec([AccelX], [AccelY], [AccelZ])
+b = vec([AccelY], [AccelZ], [AccelX])
 result = vsub(a, b)
 ```
 
@@ -1519,6 +1528,7 @@ Scales a Vec3 by a scalar.
 Example:
 
 ```
+accel = vec([AccelX], [AccelY], [AccelZ])
 result = vscale(accel, 9.81)
 ```
 
@@ -1540,6 +1550,8 @@ Cross product of two Vec3s.
 Example:
 
 ```
+a = vec([AccelX], [AccelY], [AccelZ])
+b = vec([AccelY], [AccelZ], [AccelX])
 result = cross(a, b)
 ```
 
@@ -1561,6 +1573,8 @@ Dot product of two Vec3s.
 Example:
 
 ```
+a = vec([AccelX], [AccelY], [AccelZ])
+b = vec([AccelY], [AccelZ], [AccelX])
 result = dot(a, b)
 ```
 
@@ -1582,6 +1596,7 @@ Euclidean length of a Vec3.
 Example:
 
 ```
+accel = vec([AccelX], [AccelY], [AccelZ])
 result = norm(accel)
 ```
 
@@ -1603,6 +1618,7 @@ Unit vector in the same direction as `v`.
 Example:
 
 ```
+accel = vec([AccelX], [AccelY], [AccelZ])
 result = normalize(accel)
 ```
 
@@ -1624,6 +1640,8 @@ Angle between two Vec3s, in radians, in [0, pi]. Retired name: `angle`.
 Example:
 
 ```
+a = vec([AccelX], [AccelY], [AccelZ])
+b = vec([AccelY], [AccelZ], [AccelX])
 result = angle_between(a, b)
 ```
 
@@ -1647,6 +1665,7 @@ Rotates a Vec3 by a row-major 3x3 matrix.
 Example:
 
 ```
+a = vec([AccelX], [AccelY], [AccelZ])
 result = rotate_mat(a, 1, 0, 0, 0, 1, 0, 0, 0, 1)
 ```
 
@@ -1668,6 +1687,7 @@ Rotates a Vec3 about an axis by an angle in radians.
 Example:
 
 ```
+a = vec([AccelX], [AccelY], [AccelZ])
 result = rotate_axis(a, 0, 0, 1, 1.5708)
 ```
 
@@ -1689,6 +1709,7 @@ Rotates a Vec3 by roll/pitch/yaw in radians; the angles may be channels, giving 
 Example:
 
 ```
+a = vec([AccelX], [AccelY], [AccelZ])
 result = rotate_euler(a, [Roll], [Pitch], [Yaw])
 ```
 

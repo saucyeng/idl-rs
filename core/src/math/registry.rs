@@ -418,6 +418,59 @@ impl Entry {
     }
 }
 
+/// The bare names builtin examples use for definitions a real workbook would
+/// hold (not channels), each with the definition the reference prints above
+/// the example and the registry test substitutes into it.
+const EXAMPLE_PLACEHOLDERS: &[(&str, &str)] = &[
+    ("accel", "vec([AccelX], [AccelY], [AccelZ])"),
+    ("a", "vec([AccelX], [AccelY], [AccelZ])"),
+    ("b", "vec([AccelY], [AccelZ], [AccelX])"),
+    ("kernel", "[Fork]"),
+    ("sos", "1"),
+];
+
+/// Rewrites each placeholder name in `example` (a bare word: not quoted, not
+/// inside `[…]`, not a call) to `on(name, definition)`; other text is kept.
+pub(crate) fn rewrite_example_placeholders(example: &str, mut on: impl FnMut(&'static str, &'static str) -> String) -> String {
+    let (mut out, mut word, mut quoted, mut bracketed) = (String::new(), String::new(), false, false);
+    for c in example.chars().chain(std::iter::once('\0')) {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            word.push(c);
+            continue;
+        }
+        let placeholder = EXAMPLE_PLACEHOLDERS.iter().find(|(name, _)| !quoted && !bracketed && c != '(' && word == *name);
+        match placeholder {
+            Some((name, definition)) => out.push_str(&on(name, definition)),
+            None => out.push_str(&word),
+        }
+        word.clear();
+        match c {
+            '"' => quoted = !quoted,
+            '[' => bracketed = true,
+            ']' => bracketed = false,
+            _ => {}
+        }
+        if c != '\0' {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The definition lines (`accel = vec(…)`) an example needs above it to run
+/// as written, in first-use order, one per placeholder.
+pub(crate) fn example_definitions(example: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    rewrite_example_placeholders(example, |name, definition| {
+        let line = format!("{name} = {definition}");
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+        name.to_string()
+    });
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -506,36 +559,22 @@ mod tests {
         eval_with(&parse(src)?, registry, lookup, laps)
     }
 
-    /// An example with its bare placeholder names (`accel`, `a`, `b`,
-    /// `kernel`, `sos` — definitions a real workbook would hold, not channels)
-    /// replaced by an expression of that kind, so it can run.
+    /// An example with its placeholder names replaced by their definitions,
+    /// so it can run as one expression.
     fn runnable(example: &str) -> String {
-        let (mut out, mut word, mut quoted, mut bracketed) = (String::new(), String::new(), false, false);
-        for c in example.chars().chain(std::iter::once('\0')) {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                word.push(c);
-                continue;
-            }
-            let stand_in = match word.as_str() {
-                _ if quoted || bracketed || c == '(' => None,
-                "accel" | "a" | "b" => Some("vec([AccelX], [AccelY], [AccelZ])"),
-                "kernel" => Some("[Fork]"),
-                "sos" => Some("1"),
-                _ => None,
-            };
-            out.push_str(stand_in.unwrap_or(&word));
-            word.clear();
-            match c {
-                '"' => quoted = !quoted,
-                '[' => bracketed = true,
-                ']' => bracketed = false,
-                _ => {}
-            }
-            if c != '\0' {
-                out.push(c);
-            }
-        }
-        out
+        rewrite_example_placeholders(example, |_, definition| definition.to_string())
+    }
+
+    #[test]
+    fn example_definitions_lists_each_placeholder_once_in_first_use_order_and_skips_channels_and_calls() {
+        // Arrange
+        let example = "angle_between(b, a) + vx(a) + [a] + a(1)";
+
+        // Act
+        let lines = example_definitions(example);
+
+        // Assert
+        assert_eq!(lines, vec!["b = vec([AccelY], [AccelZ], [AccelX])".to_string(), "a = vec([AccelX], [AccelY], [AccelZ])".to_string()]);
     }
 
     /// A call's top-level arguments: the text between its first `(` and the

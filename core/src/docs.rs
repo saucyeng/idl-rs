@@ -170,7 +170,9 @@ fn render_builtins(out: &mut String) {
                 a.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" or ")
             };
             out.push_str(&format!("| Arguments | {} |\n\n", arity));
-            out.push_str(&format!("Example:\n\n```\nresult = {}\n```\n\n", entry.example));
+            let mut lines = crate::math::registry::example_definitions(entry.example);
+            lines.push(format!("result = {}", entry.example));
+            out.push_str(&format!("Example:\n\n```\n{}\n```\n\n", lines.join("\n")));
         }
     }
 }
