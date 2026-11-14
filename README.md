@@ -10,10 +10,10 @@ idl-rs is an FFmpeg-inspired, cross-platform tool that puts a full toolbox of sc
 
 ## Quick start
 
-Install the `idl-rs` command-line tool from a checkout (publishing to crates.io is coming):
+Install the `idl-rs` command-line tool:
 
 ```
-cargo install --path cli
+cargo install idl-rs-cli
 ```
 
 Generate a synthetic ride (with a ground-truth JSON beside it), import it into a data directory, where it becomes `sessions/<id>/data.parquet`, and list what is there:
