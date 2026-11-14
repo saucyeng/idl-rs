@@ -123,11 +123,15 @@ pub fn detect_laps(
                 neutral_zone_visits: Vec::new(),
             }
         });
-    let laps: Vec<Lap> = if neutral_zones.is_empty() {
+    let mut laps: Vec<Lap> = if neutral_zones.is_empty() {
         laps.collect()
     } else {
         laps.map(|l| apply_neutral_zones(l, &gps, neutral_zones)).collect()
     };
+    // A point-to-point track's runs are separate descents, not a lap series.
+    if matches!(timing, LapTiming::Circuit { .. }) {
+        crate::laps::model::mark_long_laps(&mut laps);
+    }
     fill_time_secs(handle, laps)
 }
 

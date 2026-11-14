@@ -173,7 +173,9 @@ pub fn compute_lap_index(handle: &SessionHandle, tracks: &[Track], ignored_lap_n
 ///
 /// `"2"` (2026-11-13): visits from gate crossings confirmed by the polyline,
 /// out/in laps, and no lap before a circuit's first start/finish crossing.
-pub const LAP_DETECTOR_VERSION: &str = "2";
+/// `"3"` (2026-11-14): a circuit lap over 1.6x the median normal lap is
+/// `long` (a missed start/finish crossing merges two laps).
+pub const LAP_DETECTOR_VERSION: &str = "3";
 
 /// Outcome of one [`index_laps`]/[`reindex_laps`] call.
 #[derive(Debug)]
