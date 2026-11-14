@@ -408,7 +408,7 @@ pub const COMMANDS: &[CommandRow] = &[
         verb: "list",
         args: &[],
         flags: &[
-            Flag::value("venue", ValueKind::Text, "Only sessions whose venue matches, case-insensitively"),
+            Flag::value("venue", ValueKind::Text, "Only sessions whose venue contains this text, case-insensitively"),
             Flag::value("track", ValueKind::Text, "Only sessions that visited this track id"),
             Flag::value("since", ValueKind::Integer, "Only sessions starting at or after this Unix epoch millisecond"),
             Flag::value("until", ValueKind::Integer, "Only sessions starting at or before this Unix epoch millisecond"),

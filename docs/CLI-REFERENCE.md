@@ -30,7 +30,7 @@ List catalogued sessions, most recent first.
 
 | Flag | Value | Meaning |
 | --- | --- | --- |
-| `--venue` | text | Only sessions whose venue matches, case-insensitively |
+| `--venue` | text | Only sessions whose venue contains this text, case-insensitively |
 | `--track` | text | Only sessions that visited this track id |
 | `--since` | integer | Only sessions starting at or after this Unix epoch millisecond |
 | `--until` | integer | Only sessions starting at or before this Unix epoch millisecond |

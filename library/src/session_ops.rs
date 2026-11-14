@@ -20,7 +20,8 @@ use idl_rs::store::session_json::{
 /// filter with every field `None` keeps every row.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionFilter {
-    /// Matches [`SessionSummary::venue_name`], case-insensitively, whole.
+    /// Keeps rows whose [`SessionSummary::venue_name`] contains this text,
+    /// case-insensitively (a search: `broome` finds "Broome-Tioga Sports Center").
     pub venue: Option<String>,
     /// Matches [`SessionSummary::tag`], case-insensitively, whole.
     pub tag: Option<String>,
@@ -42,7 +43,7 @@ impl SessionFilter {
     /// Whether one row survives this filter.
     pub fn matches(&self, row: &SessionSummary) -> bool {
         if let Some(venue) = &self.venue {
-            if !row.venue_name.eq_ignore_ascii_case(venue) {
+            if !row.venue_name.to_lowercase().contains(&venue.to_lowercase()) {
                 return false;
             }
         }
@@ -271,16 +272,17 @@ mod tests {
     }
 
     #[test]
-    fn the_venue_filter_does_not_match_a_prefix() {
+    fn the_venue_filter_matches_part_of_the_venue_name() {
         // Arrange
-        let rows = vec![summary("Cadwell Park", "", 1_000)];
-        let filter = SessionFilter { venue: Some("Cadwell".to_string()), ..Default::default() };
+        let rows = vec![summary("Broome-Tioga Sports Center", "", 1_000), summary("Walden MX", "", 2_000)];
+        let filter = SessionFilter { venue: Some("broome".to_string()), ..Default::default() };
 
         // Act
         let kept = filter_sessions(&rows, &filter);
 
-        // Assert — whole-value matching, so a filter never quietly widens.
-        assert!(kept.is_empty());
+        // Assert
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].venue_name, "Broome-Tioga Sports Center");
     }
 
     #[test]
