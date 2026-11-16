@@ -7,6 +7,10 @@
 
 use nalgebra::{Matrix3, Vector3};
 
+use crate::calibration::bike::{
+    forward_direction, steer_axis, still_sensors, BikeCalibrationError, CalibrationFit, ImuFit, BIKE_CALIBRATION_VERSION,
+    HAND_TUMBLE_MIN_RATE_RAD_S,
+};
 use crate::calibration::rigid::{
     Body, CalibrationInput, CalibrationRecord, MountOrigin, SensorStream, GRAVITY_M_S2,
 };
@@ -221,6 +225,112 @@ pub fn calibration_input_from_session_with(
     })
 }
 
+/// The windows of the hand protocol a bike calibration is fitted over, each
+/// `[from, to)` in seconds from the first sample every IMU has. Named by the
+/// caller: nothing is segmented automatically.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolWindows {
+    /// The bike turned about by hand as one body: the swingarm pod's fit.
+    pub rigid_s: (f64, f64),
+    /// The same with the bars not turning: the fork pod's fit. None = `rigid_s`.
+    pub fork_rigid_s: Option<(f64, f64)>,
+    /// Frame still, bars swung: the steering axis. None = no axis.
+    pub steer_s: Option<(f64, f64)>,
+}
+
+/// Fits a bike's calibration from its recordings (see
+/// [`crate::calibration::bike`]): `up` and the gyro offsets from `still_s` of
+/// `still`, and, when `protocol` is given, each pod's rotation and lever arm
+/// and the steering axis from its windows. With no `protocol`, or a recording
+/// that has only IMU0, the fit carries `up` alone.
+///
+/// # Errors
+///
+/// [`BikeCalibrationError`] when the still window was not still, or a pod
+/// present in the protocol recording could not be fitted over its window.
+pub fn fit_bike_calibration(
+    still: &Session,
+    still_s: (f64, f64),
+    protocol: Option<(&Session, &ProtocolWindows)>,
+) -> Result<CalibrationFit, BikeCalibrationError> {
+    let select = |session: &Session, imus: Option<Vec<u8>>, rigid: Vec<u8>, window_s: (f64, f64)| {
+        calibration_input_from_session_with(
+            session,
+            &CalibrationSelection {
+                imus,
+                rigid_with_chassis: rigid,
+                window_s: Some(window_s),
+                min_median_rate_rad_s: Some(HAND_TUMBLE_MIN_RATE_RAD_S),
+            },
+        )
+        .map_err(|_| BikeCalibrationError::NoImu0)
+    };
+    let at_rest = still_sensors(&select(still, None, Vec::new(), still_s)?)?;
+    let rest_of = |index: u8| at_rest.iter().find(|s| s.imu_index == index);
+    let imu0 = rest_of(0).ok_or(BikeCalibrationError::NoImu0)?;
+    let arr = |v: &Vector3<f64>| [v.x, v.y, v.z];
+
+    let mut imus = Vec::new();
+    let mut steer = None;
+    if let Some((session, windows)) = protocol {
+        for index in [1_u8, 2] {
+            let window = if index == 1 { windows.fork_rigid_s.unwrap_or(windows.rigid_s) } else { windows.rigid_s };
+            // The pod alone with IMU0, as one rigid body; absent from the
+            // recording, it is simply not fitted.
+            let Ok(input) = select(session, Some(vec![0, index]), vec![index], window) else { continue };
+            if input.sensors.len() < 2 {
+                continue;
+            }
+            let failed = |reason: String| BikeCalibrationError::RigidFitFailed { imu_index: index, reason };
+            let record = crate::calibration::rigid::calibrate(&input).map_err(|e| failed(e.to_string()))?;
+            let sensor = record.sensors.iter().find(|s| s.imu_index == index);
+            let (Some(sensor), Some(lever)) = (sensor, sensor.and_then(|s| s.lever_m)) else {
+                let gates = record.quality.shortfalls.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("; ");
+                return Err(failed(if gates.is_empty() { "no lever arm".into() } else { gates }));
+            };
+            if sensor.mount_origin != MountOrigin::Measured {
+                return Err(failed("its rotation was not observed".into()));
+            }
+            let up_disagreement_deg = rest_of(index).map_or(f64::NAN, |rest| (sensor.mount * rest.up).angle(&imu0.up).to_degrees());
+            let q = sensor.mount;
+            imus.push(ImuFit {
+                imu_index: index,
+                mount: [q.w, q.i, q.j, q.k],
+                lever_m: arr(&lever),
+                rate_residual_rad_s: record.quality.rear_body_residual_rad_s,
+                up_disagreement_deg,
+            });
+        }
+        let fork = imus.iter().find(|i| i.imu_index == 1);
+        if let (Some(fork), Some(window), Some(fork_rest)) = (fork, windows.steer_s, rest_of(1)) {
+            if let Ok(input) = select(session, Some(vec![0, 1]), Vec::new(), window) {
+                let stream = |index: u8, bias: &Vector3<f64>| {
+                    input
+                        .sensors
+                        .iter()
+                        .find(|s| s.imu_index == index)
+                        .map(|s| s.gyro_rad_s.iter().map(|g| g - bias).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                };
+                let m = fork.mount;
+                let fork_to_frame = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(m[0], m[1], m[2], m[3]));
+                steer = steer_axis(&stream(0, &imu0.gyro_bias), &stream(1, &fork_rest.gyro_bias), &fork_to_frame, &imu0.up);
+            }
+        }
+    }
+    let fork_lever = imus.iter().find(|i| i.imu_index == 1).map(|i| Vector3::new(i.lever_m[0], i.lever_m[1], i.lever_m[2]));
+    let forward = forward_direction(&imu0.up, steer.as_ref(), fork_lever.as_ref());
+    Ok(CalibrationFit {
+        version: BIKE_CALIBRATION_VERSION,
+        up: arr(&imu0.up),
+        forward: forward.map(|(f, _)| arr(&f)),
+        forward_from: forward.map(|(_, from)| from),
+        steer_axis: steer.as_ref().map(arr),
+        imu0_gyro_bias_rad_s: arr(&imu0.gyro_bias),
+        imus,
+    })
+}
+
 /// The worst error in each fitted quantity against a `session synth` truth
 /// file. Every field is a magnitude, so zero is perfect and larger is worse.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -329,6 +439,93 @@ mod tests {
         assert_eq!(input.sensors[0].body, Body::Rear);
         let resting = input.sensors[0].accel_m_s2[0].norm();
         assert!((resting - GRAVITY_M_S2).abs() < 2.0, "resting specific force {resting} m/s²");
+    }
+
+    /// The protocol at a real sensor's noise level: `generated()` scales the noise
+    /// up to the spec's random-walk budget, which no still window survives.
+    fn generated_quiet() -> (Vec<u8>, Truth) {
+        let config = SynthConfig { protocol: Protocol::Calibration, imu_rate_hz: 833, noise_scale: 1.0, ..SynthConfig::default() };
+        let out = synth::generate(&config).expect("generated");
+        (out.log, out.truth)
+    }
+
+    /// A truth rotation matrix (body → sensor) as nalgebra.
+    fn body_to_sensor(truth: &Truth, index: u8) -> Matrix3<f64> {
+        let m = truth.sensors.iter().find(|s| s.index == index).expect("sensor").rotation_body_to_sensor;
+        Matrix3::new(m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2])
+    }
+
+    fn lever(truth: &Truth, index: u8) -> Vector3<f64> {
+        let l = truth.sensors.iter().find(|s| s.index == index).expect("sensor").lever_arm_m;
+        Vector3::new(l[0], l[1], l[2])
+    }
+
+    #[test]
+    fn fit_bike_calibration_generated_protocol_recovers_the_swingarm_pod_in_imu0_axes_and_refuses_a_steering_axis_swung_mid_tumble() {
+        // Arrange — rest, tumble with the bars straight, then the bars swung
+        // while the tumble carries on (the 2026-09-10 spec's protocol; the hand
+        // protocol holds the frame still for the swing). The windows are the
+        // generator's own, trimmed clear of its ramps.
+        let (log, truth) = generated_quiet();
+        let session = parse::parse(&log).expect("parses").session;
+        let hinge = truth.hinge.clone().expect("a calibration truth has a hinge");
+        let inside = |w: [f64; 2]| (w[0] + 1.5, w[1] - 1.5);
+        let windows = ProtocolWindows {
+            rigid_s: inside(hinge.datum_window_s),
+            fork_rigid_s: None,
+            steer_s: Some(inside(hinge.steer_window_s)),
+        };
+
+        // Act
+        let fit = fit_bike_calibration(&session, inside(hinge.rest_window_s), Some((&session, &windows))).expect("fits");
+
+        // Assert — everything is stated in IMU0's own axes.
+        let r0 = body_to_sensor(&truth, 0);
+        let pod = fit.imus.iter().find(|i| i.imu_index == 2).expect("the swingarm pod is fitted");
+        let expected_lever = r0 * (lever(&truth, 2) - lever(&truth, 0));
+        let fitted_lever = Vector3::new(pod.lever_m[0], pod.lever_m[1], pod.lever_m[2]);
+        assert!((fitted_lever - expected_lever).norm() < 0.02, "lever {fitted_lever:?} vs {expected_lever:?}");
+        let expected_mount = r0 * body_to_sensor(&truth, 2).transpose();
+        let q = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(pod.mount[0], pod.mount[1], pod.mount[2], pod.mount[3]));
+        let trace = (q.to_rotation_matrix().matrix().transpose() * expected_mount).trace();
+        let mount_error_deg = ((trace - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees();
+        assert!(mount_error_deg < 1.0, "mount off by {mount_error_deg} deg");
+        assert!(fit.imus.iter().any(|i| i.imu_index == 1), "the fork pod is fitted over the bars-straight tumble");
+        // With the frame turning too, the fork's rotation relative to it is not
+        // about one axis as this fit reads it, so no axis is claimed and forward
+        // falls back to the fork pod.
+        assert!(fit.steer_axis.is_none(), "{:?}", fit.steer_axis);
+        assert_eq!(fit.forward_from, Some(crate::calibration::bike::ForwardFrom::ForkPod));
+    }
+
+    #[test]
+    fn fit_bike_calibration_still_window_alone_gives_up_and_no_forward() {
+        // Arrange
+        let (log, truth) = generated_quiet();
+        let session = parse::parse(&log).expect("parses").session;
+        let rest = truth.hinge.expect("hinge").rest_window_s;
+
+        // Act
+        let fit = fit_bike_calibration(&session, (rest[0] + 1.0, rest[1] - 1.0), None).expect("fits");
+
+        // Assert — one still recording fixes the tilt and nothing else.
+        let up = Vector3::new(fit.up[0], fit.up[1], fit.up[2]);
+        assert!((up.norm() - 1.0).abs() < 1e-9);
+        assert!(fit.imus.is_empty() && fit.steer_axis.is_none() && fit.forward.is_none());
+    }
+
+    #[test]
+    fn fit_bike_calibration_still_window_over_the_tumble_is_refused_as_not_still() {
+        // Arrange
+        let (log, truth) = generated_quiet();
+        let session = parse::parse(&log).expect("parses").session;
+        let tumble = truth.hinge.expect("hinge").datum_window_s;
+
+        // Act
+        let err = fit_bike_calibration(&session, (tumble[0] + 3.0, tumble[1] - 3.0), None).expect_err("refused");
+
+        // Assert
+        assert!(matches!(err, BikeCalibrationError::NotStill { .. }), "{err}");
     }
 
     #[test]

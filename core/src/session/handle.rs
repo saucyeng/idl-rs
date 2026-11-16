@@ -192,6 +192,9 @@ pub struct SessionHandle {
     import_warnings: Vec<String>,
     derived: RwLock<HashMap<DerivedKey, Channel>>,
     lazy: Option<Lazy>,
+    /// The bike's calibration for the estimator builtins, when the opener set
+    /// one ([`SessionHandle::set_bike_calibration`]).
+    calibration: RwLock<Option<crate::calibration::bike::CalibrationFit>>,
 }
 
 impl Clone for SessionHandle {
@@ -202,6 +205,7 @@ impl Clone for SessionHandle {
             truncation_warning: self.truncation_warning.clone(),
             import_warnings: self.import_warnings.clone(),
             derived: RwLock::new(self.derived.read().unwrap().clone()),
+            calibration: RwLock::new(self.calibration.read().unwrap().clone()),
             // The source and the decoded-channel store are shared, not
             // copied — a clone of a lazy handle is for an overlay lap
             // reading the same file (`load_lap_context`'s `MathOverlay`),
@@ -232,6 +236,24 @@ pub enum SliceRole {
 /// triple. Because the two are different variants, a lap slice can never occupy
 /// a math output's key (or vice-versa): the cross-kind collision the old flat
 /// string store allowed is impossible by construction.
+/// Every channel one estimator run stores, by id. One list, so the run and
+/// the calibration setter that invalidates it cannot disagree.
+const ESTIMATOR_CHANNELS: [&str; 13] = [
+    "Front travel (mm)",
+    "Front velocity (mm/s)",
+    "Rear travel (mm)",
+    "Rear velocity (mm/s)",
+    "Roll (deg)",
+    "Pitch (deg)",
+    "Longitudinal accel (g)",
+    "Lateral accel (g)",
+    "Heading (deg)",
+    "Heading uncertainty (deg)",
+    "Course (deg)",
+    "Slip (deg)",
+    "Slip uncertainty (deg)",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum DerivedKey {
     /// A math-channel output, addressed by its workbook name.
@@ -329,6 +351,7 @@ impl SessionHandle {
             // reader is `SessionMeta::import_warnings`, text-only).
             import_warnings: import_warnings.into_iter().map(|w| w.message).collect(),
             derived: RwLock::new(HashMap::new()),
+            calibration: RwLock::new(None),
             lazy: None,
         })
     }
@@ -380,6 +403,7 @@ impl SessionHandle {
             // always empty on this path.
             import_warnings: Vec::new(),
             derived: RwLock::new(HashMap::new()),
+            calibration: RwLock::new(None),
             lazy: None,
         }
     }
@@ -399,6 +423,7 @@ impl SessionHandle {
             truncation_warning: None,
             import_warnings: Vec::new(),
             derived: RwLock::new(HashMap::new()),
+            calibration: RwLock::new(None),
             lazy: None,
         }
     }
@@ -432,6 +457,7 @@ impl SessionHandle {
             truncation_warning: None,
             import_warnings: Vec::new(),
             derived: RwLock::new(HashMap::new()),
+            calibration: RwLock::new(None),
             lazy: Some(Lazy {
                 index,
                 source,
@@ -560,8 +586,10 @@ impl SessionHandle {
     /// call sees `Roll (deg)` already resident and returns immediately. Two
     /// threads racing the first call would both run it and upsert identical
     /// values — wasteful but correct, and evaluation is sequential per session.
-    /// Geometry is `reference_bike()` and tuning is `EstimatorConfig::default()`
-    /// (design doc D3).
+    /// Tuning is `EstimatorConfig::default()` (design doc D3). Geometry is the
+    /// bike's calibration applied to `reference_bike()` when one was set
+    /// ([`Self::set_bike_calibration`]); with none, or one that does not apply,
+    /// it is `reference_bike()` with IMU0's mount fitted from the riding.
     fn run_estimator_once(&self) -> bool {
         if self.with_channel("Roll (deg)", |_| ()).is_some() {
             return true;
@@ -569,25 +597,52 @@ impl SessionHandle {
         let Some(input) = crate::estimate::run::EstimatorInput::from_lookup(self) else {
             return false;
         };
-        let est = crate::estimate::run::run(
-            &input,
-            &crate::estimate::geometry::BikeGeometry::reference_bike(),
-            &crate::estimate::run::EstimatorConfig::default(),
-        );
+        use crate::estimate::run::{EstimatorConfig, Imu0Mount};
+        let reference = crate::estimate::geometry::BikeGeometry::reference_bike();
+        let calibrated = self.calibration.read().unwrap().as_ref().and_then(|fit| {
+            let source = if fit.has_forward() { Imu0Mount::Geometry } else { Imu0Mount::GeometryTilt };
+            fit.apply_to(&reference).ok().map(|geometry| (geometry, source))
+        });
+        let (geometry, imu0_mount) = calibrated.unwrap_or((reference, Imu0Mount::Riding));
+        let est = crate::estimate::run::run(&input, &geometry, &EstimatorConfig { imu0_mount, ..EstimatorConfig::default() });
         let rate_hz = if est.dt > 0.0 { 1.0 / est.dt } else { 0.0 };
+        // The outputs live on the estimator's own grid, which starts at IMU0's
+        // first recorded sample and not at 0.
+        let t_us: Vec<i64> =
+            (0..est.len()).map(|i| ((input.t0_s + i as f64 * est.dt) * 1e6).round() as i64).collect();
         // Travel/velocity cross the boundary in mm and mm/s, matching the
         // bridge's existing conversion; attitude is already deg and body
         // acceleration already g.
         let mm = |v: &[f64]| v.iter().map(|x| x * 1000.0).collect::<Vec<f64>>();
-        self.store_math("Front travel (mm)", rate_hz, mm(&est.front_travel));
-        self.store_math("Front velocity (mm/s)", rate_hz, mm(&est.front_velocity));
-        self.store_math("Rear travel (mm)", rate_hz, mm(&est.rear_travel));
-        self.store_math("Rear velocity (mm/s)", rate_hz, mm(&est.rear_velocity));
-        self.store_math("Roll (deg)", rate_hz, est.roll);
-        self.store_math("Pitch (deg)", rate_hz, est.pitch);
-        self.store_math("Longitudinal accel (g)", rate_hz, est.accel_long);
-        self.store_math("Lateral accel (g)", rate_hz, est.accel_lat);
+        let store = |id: &str, v: Vec<f64>| self.store_math_with_times(id, rate_hz, v, t_us.clone());
+        store("Front travel (mm)", mm(&est.front_travel));
+        store("Front velocity (mm/s)", mm(&est.front_velocity));
+        store("Rear travel (mm)", mm(&est.rear_travel));
+        store("Rear velocity (mm/s)", mm(&est.rear_velocity));
+        store("Roll (deg)", est.roll);
+        store("Pitch (deg)", est.pitch);
+        store("Longitudinal accel (g)", est.accel_long);
+        store("Lateral accel (g)", est.accel_lat);
+        store("Heading (deg)", est.heading);
+        store("Heading uncertainty (deg)", est.heading_sigma);
+        store("Course (deg)", est.course);
+        store("Slip (deg)", est.slip);
+        store("Slip uncertainty (deg)", est.slip_sigma);
         true
+    }
+
+    /// Gives the estimator builtins (`attitude`, `wheel_travel`, …) the bike's
+    /// calibration, or takes it away with `None`. Estimator outputs already
+    /// computed with a different calibration are dropped, so the next
+    /// evaluation runs the estimator again.
+    pub fn set_bike_calibration(&self, calibration: Option<crate::calibration::bike::CalibrationFit>) {
+        let mut current = self.calibration.write().unwrap();
+        if *current == calibration {
+            return;
+        }
+        *current = calibration;
+        let mut derived = self.derived.write().unwrap();
+        derived.retain(|key, _| !matches!(key, DerivedKey::Math(id) if ESTIMATOR_CHANNELS.contains(&id.as_str())));
     }
 
     /// Metadata for one channel by id, **including** derived (math /

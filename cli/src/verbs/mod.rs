@@ -228,6 +228,7 @@ pub fn dispatch(noun: &str, matches: &ArgMatches) -> Option<ExitCode> {
         ("bike", "list") => bike::list(&ctx, m),
         ("bike", "show") => bike::show(&ctx, m),
         ("bike", "note") => bike::note(&ctx, m),
+        ("bike", "calibrate") => bike::calibrate(&ctx, m),
         ("catalog", "verify") => catalog::verify(&ctx, m),
         ("catalog", "rebuild") => catalog::rebuild(&ctx, m),
         ("library", _) => return Some(store::library(row, &ctx, m)),

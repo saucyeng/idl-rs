@@ -359,6 +359,34 @@ Add a note to a bike's log; its changes update the setup sheet.
 
 Calls `idl_library::bikelog::save_entry`; `--json` emits `Entry`.
 
+### `idl-rs bike calibrate <bike_id>`
+
+Fit a bike's IMU calibration from its recordings and save it in the bike's file; sessions on that bike then use it.
+
+| Argument | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `bike_id` | text | yes | Bike id, as `bike list` prints it |
+
+| Flag | Value | Meaning |
+| --- | --- | --- |
+| `--still` | text | Session id (or its first characters) of a recording with the bike still and level |
+| `--still-from-ms` | integer | Start of the still window, ms from the recording's first common sample; default 1000 |
+| `--still-to-ms` | integer | End of the still window; default the end of the recording |
+| `--protocol` | text | Session id of the hand-protocol recording (bars swung, bike turned about); default the `--still` session when any window below is given |
+| `--rigid-from-ms` | integer | Start of the window where the bike was turned about as one body |
+| `--rigid-to-ms` | integer | End of that window |
+| `--fork-from-ms` | integer | Start of the part of it where the bars did not turn; default the rigid window |
+| `--fork-to-ms` | integer | End of that part |
+| `--steer-from-ms` | integer | Start of the window with the frame still and the bars swung |
+| `--steer-to-ms` | integer | End of that window |
+| `--note` | text | Free text kept with the calibration |
+| `--delete` | text | Remove this calibration id instead of fitting one |
+| `--data-dir` | path | Data directory root (contract C4 §1's <data>); defaults to $IDL1_DATA_DIR |
+| `--dry-run` | switch | Report what would change and write nothing |
+| `--json` | switch | Emit the result as JSON on stdout (schema_version 1); errors become typed JSON on stderr |
+
+Calls `idl_rs::commands::calibration_ops::fit_bike_calibration`; `--json` emits `BikeCalibration`.
+
 ## `catalog`
 
 ### `idl-rs catalog verify`

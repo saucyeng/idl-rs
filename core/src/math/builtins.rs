@@ -252,8 +252,8 @@ pub(super) fn register(r: &mut Registry) -> Result<(), RegistryError> {
         description: "Main lap minus overlay lap, arc-length-matched. Retired name: `variance_dist`.",
         example: "lap_delta_dist([Speed])" }, laps::lap_delta_dist)?;
     r.add(BuiltinMeta { name: "attitude", category: "Estimator (diagnostic)", unit_rule: "Fixed(deg)", shape: "[t]", kwargs: &[],
-        signature: "attitude(\"roll\"|\"pitch\")",
-        description: "Bike attitude estimated by the AHRS filter, in degrees.",
+        signature: "attitude(\"roll\"|\"pitch\"|\"heading\"|\"heading_sigma\"|\"course\"|\"slip\"|\"slip_sigma\")",
+        description: "Bike attitude from the estimator, in degrees. `roll` and `pitch` are about the bike's own axes. `heading` is where the frame points and `course` where the rear wheel is travelling, both clockwise from north; `slip` is heading minus course (positive = nose right of travel). `heading_sigma` and `slip_sigma` are the estimator's own 1-sigma uncertainties. Heading, course and slip are blank until the bike first moves, and course and slip below 3 m/s.",
         example: "attitude(\"roll\")" }, signal::estimator)?;
     r.add(BuiltinMeta { name: "body_accel", category: "Estimator (diagnostic)", unit_rule: "Fixed(g)", shape: "[t]", kwargs: &[],
         signature: "body_accel(\"long\"|\"lat\")",

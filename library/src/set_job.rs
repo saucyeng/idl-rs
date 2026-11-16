@@ -329,14 +329,29 @@ pub fn run_session_set(
         // a lagging row would key a stale result. The catalog row speaks only
         // for a member whose data is elsewhere. An unreadable footer is no
         // identity at all (no cache), never the catalog's.
+        let metadata = has_data.then(|| read_session_metadata(&parquet).ok()).flatten();
         let identity = if has_data {
-            read_session_metadata(&parquet)
-                .ok()
-                .map(|m| format!("{}|{}|{}", m.blob_sha256, m.importer_version, m.seam_correction_version))
+            metadata.as_ref().map(|m| format!("{}|{}|{}", m.blob_sha256, m.importer_version, m.seam_correction_version))
         } else {
             catalog_row.as_ref().map(|(i, _)| i.clone())
         };
         let start_utc_ms = catalog_row.as_ref().map(|(_, t)| *t);
+        // The bike's calibration feeds the estimator builtins, so it is part of
+        // what a result was computed from: a new or changed calibration must
+        // not be answered from the cache.
+        let calibration = match (&json, &metadata) {
+            (Some(j), Some(m)) => crate::bikelog::calibration_for_session(
+                data_dir,
+                j,
+                idl_rs::store::session_json::effective_start_ms(j, m.timestamp_utc_ms),
+            )
+            .map(|(c, _)| c),
+            _ => None,
+        };
+        let identity = identity.map(|i| match &calibration {
+            Some(c) => format!("{i}|calibration:{}:{}", c.calibration_id, c.updated_at_ms),
+            None => i,
+        });
         let label = member
             .label
             .clone()
@@ -391,7 +406,7 @@ pub fn run_session_set(
             Ok(evaluate_member(&plan, &doc.constants, &no_data_handle(&member.id), &ctx))
         } else {
             progress(&SetProgress { done, total, session_id: member.id.clone(), phase: SetPhase::Decoding });
-            match evaluate_with_data(&dir, &plan, doc, json.as_ref(), &options, &mut report, |phase| {
+            match evaluate_with_data(&dir, &plan, doc, json.as_ref(), calibration.as_ref(), &options, &mut report, |phase| {
                 progress(&SetProgress { done, total, session_id: member.id.clone(), phase })
             }) {
                 Ok(r) => Ok(r),
@@ -492,6 +507,7 @@ fn evaluate_with_data(
     plan: &SetPlan,
     doc: &WorkbookDoc,
     json: Option<&SessionJson>,
+    calibration: Option<&idl_rs::calibration::bike::BikeCalibration>,
     options: &SetJobOptions,
     report: &mut MemberReport,
     mut phase: impl FnMut(SetPhase),
@@ -542,6 +558,7 @@ fn evaluate_with_data(
     });
     let handle = open_session_lazy_with(dir, source.clone() as Arc<dyn ChannelSource>)
         .map_err(|e| io(format!("reading {}: {}", dir.join("data.parquet").display(), e.message)))?;
+    handle.set_bike_calibration(calibration.map(|c| c.fit.clone()));
     let bounds = whole_session_bounds(dir).map_err(|e| io(e.message))?;
     let ctx = window_lap_context(json, bounds);
     report.timing.open_ms = opened.elapsed().as_secs_f64() * 1e3;

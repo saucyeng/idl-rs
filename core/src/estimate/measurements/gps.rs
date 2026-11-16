@@ -75,6 +75,38 @@ impl MeasurementModel<MtbState> for GpsVelocity {
     }
 }
 
+/// Vertical velocity anchor from the GPS altitude slope. 1-DOF on the up (`z`)
+/// component of `v_chassis`; without it nothing observes that component while
+/// moving and it drifts without bound.
+#[derive(Debug, Clone, Copy)]
+pub struct VerticalVelocity {
+    /// Measured vertical velocity, m/s, positive up.
+    pub measured: f64,
+    /// Measurement std-dev, m/s.
+    pub sigma: f64,
+}
+
+impl MeasurementModel<MtbState> for VerticalVelocity {
+    fn dim(&self) -> usize {
+        1
+    }
+
+    /// Residual `measured − v_chassis.z` (m/s).
+    fn residual(&self, x: &MtbState) -> DVector<f64> {
+        DVector::from_row_slice(&[self.measured - x.v_chassis.z])
+    }
+
+    fn jacobian(&self, _x: &MtbState) -> DMatrix<f64> {
+        let mut h = DMatrix::zeros(1, MtbState::DOF);
+        h[(0, I_V + 2)] = -1.0;
+        h
+    }
+
+    fn noise(&self, _x: &MtbState) -> DMatrix<f64> {
+        DMatrix::identity(1, 1) * self.sigma.powi(2)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +129,33 @@ mod tests {
             psi: 0.0,
             dpsi: 0.0,
         }
+    }
+
+    #[test]
+    fn vertical_velocity_residual_is_measured_minus_estimated_up_velocity() {
+        // Arrange — state v.z = −0.1; altitude slope says +0.4 m/s.
+        let m = VerticalVelocity { measured: 0.4, sigma: 1.0 };
+        let x = moving_state();
+
+        // Act
+        let r = m.residual(&x);
+
+        // Assert
+        assert_eq!(r.len(), 1);
+        assert_relative_eq!(r[0], 0.5, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn vertical_velocity_jacobian_matches_finite_difference() {
+        // Arrange
+        let m = VerticalVelocity { measured: 0.4, sigma: 1.0 };
+        let x = moving_state();
+
+        // Act
+        let (analytic, numeric) = (m.jacobian(&x), finite_difference_jacobian(&m, &x));
+
+        // Assert
+        assert_relative_eq!(analytic, numeric, epsilon = 1e-6);
     }
 
     #[test]

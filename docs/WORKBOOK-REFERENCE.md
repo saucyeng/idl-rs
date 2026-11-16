@@ -1292,10 +1292,10 @@ result = lap_delta_dist([Speed])
 #### attitude
 
 ```
-attitude("roll"|"pitch")
+attitude("roll"|"pitch"|"heading"|"heading_sigma"|"course"|"slip"|"slip_sigma")
 ```
 
-Bike attitude estimated by the AHRS filter, in degrees.
+Bike attitude from the estimator, in degrees. `roll` and `pitch` are about the bike's own axes. `heading` is where the frame points and `course` where the rear wheel is travelling, both clockwise from north; `slip` is heading minus course (positive = nose right of travel). `heading_sigma` and `slip_sigma` are the estimator's own 1-sigma uncertainties. Heading, course and slip are blank until the bike first moves, and course and slip below 3 m/s.
 
 | | |
 |---|---|

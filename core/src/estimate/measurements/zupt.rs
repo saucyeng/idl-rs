@@ -54,7 +54,7 @@ pub enum GyroBias {
 }
 
 impl GyroBias {
-    fn col(self) -> usize {
+    pub(crate) fn col(self) -> usize {
         match self {
             GyroBias::Imu0 => I_BG0,
             GyroBias::Imu1 => I_BG1,
@@ -62,7 +62,7 @@ impl GyroBias {
         }
     }
 
-    fn bias_of(self, x: &MtbState) -> Vector3<f64> {
+    pub(crate) fn bias_of(self, x: &MtbState) -> Vector3<f64> {
         match self {
             GyroBias::Imu0 => x.b_g0,
             GyroBias::Imu1 => x.b_g1,

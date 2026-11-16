@@ -9,7 +9,7 @@
 //! are already in the chassis frame (mount applied by the caller).
 
 use crate::rotation::rotation_between;
-use nalgebra::{UnitQuaternion, Vector3};
+use nalgebra::{Matrix3, Rotation3, UnitQuaternion, Vector3};
 
 /// Initial attitude + per-IMU gyro biases resolved from a stationary window.
 #[derive(Debug, Clone)]
@@ -96,6 +96,151 @@ pub fn refine_mount_from_window(
         return coarse;
     }
     refine_mount_tilt(coarse, mean(&accel_sensor[lo..hi]), up_ref)
+}
+
+/// Why [`fit_imu0_mount_from_riding`] did or did not replace the reference mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountFitReason {
+    /// The riding mount passed every gate and is in use.
+    Fitted,
+    /// Under [`RIDING_MIN_STRAIGHT_S`] of straight-line riding above
+    /// [`RIDING_MIN_SPEED_MPS`] (or no GPS speed at all).
+    TooLittleStraightRiding,
+    /// The forward axis did not correlate with the GPS longitudinal acceleration
+    /// (|correlation| under [`RIDING_MIN_CORR`]), so its sign is not trusted.
+    WeakForwardCorrelation,
+    /// The riding "up" is [`RIDING_MAX_UP_ANGLE_DEG`] or more from the reference
+    /// mount's +Z: the coarse pick is for a different installation.
+    UpFarFromReference,
+}
+
+/// IMU0's sensor→chassis mount fitted from riding data, with the evidence for it.
+#[derive(Debug, Clone, Copy)]
+pub struct MountFit {
+    /// The mount to use: the fitted one when `used`, else the coarse one passed in.
+    pub mount: UnitQuaternion<f64>,
+    /// Straight-line riding the fit had to work with, s.
+    pub straight_s: f64,
+    /// Correlation between the forward-axis acceleration and the GPS longitudinal
+    /// acceleration over the straight-line samples (−1..1; its sign set forward).
+    pub corr: f64,
+    /// Whether `mount` is the fitted mount.
+    pub used: bool,
+    /// Why, either way.
+    pub reason: MountFitReason,
+}
+
+/// Riding mask: GPS speed above this, m/s (15 km/h).
+pub const RIDING_MIN_SPEED_MPS: f64 = 15.0 / 3.6;
+/// Straight-line mask: lateral acceleration `|v · (ω·u)|` below this fraction of g.
+pub const RIDING_STRAIGHT_LAT_G: f64 = 0.1;
+/// Minimum straight-line riding for the fit to be used, s.
+pub const RIDING_MIN_STRAIGHT_S: f64 = 30.0;
+/// Minimum |correlation| for the forward sign to be trusted.
+pub const RIDING_MIN_CORR: f64 = 0.1;
+/// The riding "up" must be within this of the coarse mount's +Z, degrees.
+pub const RIDING_MAX_UP_ANGLE_DEG: f64 = 80.0;
+
+/// Fits IMU0's sensor→chassis mount from riding data
+/// (`2026-11-08-idl1-imu0-riding-mount-DRAFT.md` §2, M-1 … M-5), so the chassis
+/// frame is the bike's and not the sensor's: +Z is the mean specific force while
+/// riding straight, +X is the coarse mount's forward made perpendicular to it,
+/// signed by agreement with the GPS longitudinal acceleration.
+///
+/// `accel` (m/s²) and `gyro` (rad/s) are IMU0 in its **sensor frame** on a
+/// uniform grid of period `dt` (s); `speed` is the GPS speed on that grid, m/s,
+/// NaN where there is none; `path_pitch` is the slope of the path there, rad,
+/// positive climbing, NaN where unknown; `coarse` is the reference mount. Mount
+/// yaw about "up" is not fitted (it stays the coarse mount's).
+///
+/// **Slope.** The mean specific force is gravity, and gravity is only the
+/// chassis +Z on level ground. A trail ride is fast mostly downhill (measured on
+/// one: the riding "up" sat 9° behind the true chassis +Z), so the fitted axes
+/// are pitched back by the mean `path_pitch` over the straight-line samples.
+/// With no known `path_pitch` the correction is zero (a closed MX lap needs none).
+///
+/// Falls back to `coarse` (`used: false`) with the reason when a gate fails.
+pub fn fit_imu0_mount_from_riding(
+    accel: &[Vector3<f64>],
+    gyro: &[Vector3<f64>],
+    speed: &[f64],
+    path_pitch: &[f64],
+    dt: f64,
+    coarse: UnitQuaternion<f64>,
+) -> MountFit {
+    let fallback = |straight_s: f64, corr: f64, reason: MountFitReason| MountFit {
+        mount: coarse,
+        straight_s,
+        corr,
+        used: false,
+        reason,
+    };
+    let n = accel.len().min(gyro.len()).min(speed.len());
+    let unit_mean = |mask: &dyn Fn(usize) -> bool| -> Option<(Vector3<f64>, usize)> {
+        let (mut sum, mut count) = (Vector3::zeros(), 0usize);
+        for i in (0..n).filter(|&i| mask(i)) {
+            sum += accel[i];
+            count += 1;
+        }
+        sum.try_normalize(1e-9).map(|u| (u, count))
+    };
+    // (M-1) riding, (M-2) up: all riding first, then straight-line riding only so
+    // a track with more left than right turns does not tilt it.
+    let riding = |i: usize| speed[i] > RIDING_MIN_SPEED_MPS;
+    let Some((u_all, _)) = unit_mean(&riding) else {
+        return fallback(0.0, 0.0, MountFitReason::TooLittleStraightRiding);
+    };
+    const G: f64 = 9.80665;
+    let straight: Vec<bool> = (0..n)
+        .map(|i| riding(i) && (speed[i] * gyro[i].dot(&u_all)).abs() / G < RIDING_STRAIGHT_LAT_G)
+        .collect();
+    let Some((u, count)) = unit_mean(&|i| straight[i]) else {
+        return fallback(0.0, 0.0, MountFitReason::TooLittleStraightRiding);
+    };
+    let straight_s = count as f64 * dt;
+    if straight_s < RIDING_MIN_STRAIGHT_S {
+        return fallback(straight_s, 0.0, MountFitReason::TooLittleStraightRiding);
+    }
+    let coarse_up = coarse.inverse() * Vector3::z();
+    if u.angle(&coarse_up).to_degrees() >= RIDING_MAX_UP_ANGLE_DEG {
+        return fallback(straight_s, 0.0, MountFitReason::UpFarFromReference);
+    }
+    // (M-3) forward: the coarse forward with its `u` part removed.
+    let f0 = coarse.inverse() * Vector3::x();
+    let Some(c) = (f0 - u * f0.dot(&u)).try_normalize(1e-6) else {
+        return fallback(straight_s, 0.0, MountFitReason::UpFarFromReference);
+    };
+    let rate = 1.0 / dt;
+    let lp = |v: Vec<f64>, cutoff: f64| crate::filters::lowpass(&v, 2, cutoff, rate).unwrap_or(v);
+    let a_fwd = lp(accel[..n].iter().map(|a| a.dot(&c)).collect(), 1.5);
+    let v_lp = lp(speed[..n].iter().map(|v| if v.is_finite() { *v } else { 0.0 }).collect(), 0.4);
+    let a_gps = crate::statistics::gradient(&v_lp, rate);
+    let idx: Vec<usize> = (0..n).filter(|&i| straight[i]).collect();
+    let m = idx.len() as f64;
+    let (ma, mg) = (idx.iter().map(|&i| a_fwd[i]).sum::<f64>() / m, idx.iter().map(|&i| a_gps[i]).sum::<f64>() / m);
+    let (mut sag, mut saa, mut sgg) = (0.0, 0.0, 0.0);
+    for &i in &idx {
+        let (da, dg) = (a_fwd[i] - ma, a_gps[i] - mg);
+        sag += da * dg;
+        saa += da * da;
+        sgg += dg * dg;
+    }
+    let corr = if saa > 0.0 && sgg > 0.0 { sag / (saa * sgg).sqrt() } else { 0.0 };
+    if corr.abs() < RIDING_MIN_CORR {
+        return fallback(straight_s, corr, MountFitReason::WeakForwardCorrelation);
+    }
+    // Gravity seen from a chassis pitched up by p is (sin p, 0, cos p), so with the
+    // mean path pitch p̄ the level-ground axes are the measured pair turned by −p̄.
+    let level = c * corr.signum();
+    let known: Vec<f64> = idx.iter().filter_map(|&i| path_pitch.get(i).copied().filter(|p| p.is_finite())).collect();
+    let mean_pitch = if known.is_empty() { 0.0 } else { known.iter().sum::<f64>() / known.len() as f64 };
+    let (sp, cp) = mean_pitch.sin_cos();
+    let (f, u) = (level * cp + u * sp, u * cp - level * sp);
+    // (M-4) rows (forward, left, up) take a sensor vector to the chassis frame.
+    let left = u.cross(&f);
+    let rows = Matrix3::from_rows(&[f.transpose(), left.transpose(), u.transpose()]);
+    let mount = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(rows));
+    MountFit { mount, straight_s, corr, used: true, reason: MountFitReason::Fitted }
 }
 
 /// Fits initial attitude + gyro biases from the stationary sample window
@@ -267,6 +412,129 @@ mod tests {
         let error_rad = refined.angle_to(&true_mount);
         assert!((error_rad - 8_f64.to_radians()).abs() < 0.2_f64.to_radians(),
             "expected ~8° mount error, got {:.4}°", error_rad.to_degrees());
+    }
+
+    /// IMU0 as a sensor mounted by `true_mount` would record `seconds` of straight
+    /// riding at 100 Hz on a path pitched `pitch` rad (positive climbing): speed
+    /// 8 ± 2 m/s at 0.08 Hz, so there is longitudinal acceleration to sign forward
+    /// with. Returns (accel, gyro, speed, dt).
+    fn straight_ride(
+        true_mount: UnitQuaternion<f64>,
+        seconds: f64,
+        pitch: f64,
+    ) -> (Vec<Vector3<f64>>, Vec<Vector3<f64>>, Vec<f64>, f64) {
+        let dt = 0.01;
+        let n = (seconds / dt) as usize;
+        let (mut accel, mut speed) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        for i in 0..n {
+            let t = i as f64 * dt;
+            speed.push(8.0 + 2.0 * (0.5 * t).sin());
+            let a_long = 2.0 * 0.5 * (0.5 * t).cos();
+            // Gravity seen from a chassis pitched up by p is g·(sin p, 0, cos p).
+            let chassis = Vector3::new(a_long + 9.81 * pitch.sin(), 0.0, 9.81 * pitch.cos());
+            accel.push(true_mount.inverse() * chassis);
+        }
+        (accel, vec![Vector3::zeros(); n], speed, dt)
+    }
+
+    /// The reference bike's IMU0 pick: X rearward, Y right, Z up.
+    fn coarse_mount() -> UnitQuaternion<f64> {
+        UnitQuaternion::from_axis_angle(&Vector3::z_axis(), std::f64::consts::PI)
+    }
+
+    #[test]
+    fn riding_mount_synthetic_imu_tilted_57_degrees_about_y_recovers_the_tilt_and_forward_sign() {
+        // Arrange — the sensor is the coarse pick tilted 57° about the chassis Y.
+        let true_mount = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 57_f64.to_radians()) * coarse_mount();
+        let (accel, gyro, speed, dt) = straight_ride(true_mount, 60.0, 0.0);
+        let level = vec![0.0; accel.len()];
+
+        // Act
+        let fit = fit_imu0_mount_from_riding(&accel, &gyro, &speed, &level, dt, coarse_mount());
+
+        // Assert
+        assert!(fit.used, "fit rejected: {:?}", fit.reason);
+        assert_eq!(fit.reason, MountFitReason::Fitted);
+        assert!(fit.corr > 0.5, "forward correlation {}", fit.corr);
+        assert!(fit.mount.angle_to(&true_mount).to_degrees() < 0.5, "off by {}°", fit.mount.angle_to(&true_mount).to_degrees());
+    }
+
+    #[test]
+    fn riding_mount_coarse_pick_facing_backwards_the_forward_sign_flips() {
+        // Arrange — the coarse pick has forward and rearward swapped.
+        let true_mount = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 20_f64.to_radians()) * coarse_mount();
+        let backwards = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), std::f64::consts::PI) * coarse_mount();
+        let (accel, gyro, speed, dt) = straight_ride(true_mount, 60.0, 0.0);
+        let level = vec![0.0; accel.len()];
+
+        // Act
+        let fit = fit_imu0_mount_from_riding(&accel, &gyro, &speed, &level, dt, backwards);
+
+        // Assert — the correlation is negative and the fitted forward is the true one.
+        assert!(fit.used);
+        assert!(fit.corr < -0.5, "forward correlation {}", fit.corr);
+        assert!(fit.mount.angle_to(&true_mount).to_degrees() < 0.5);
+    }
+
+    #[test]
+    fn riding_mount_under_30_s_of_straight_riding_falls_back_to_the_reference_mount() {
+        // Arrange
+        let true_mount = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 57_f64.to_radians()) * coarse_mount();
+        let (accel, gyro, speed, dt) = straight_ride(true_mount, 20.0, 0.0);
+        let level = vec![0.0; accel.len()];
+
+        // Act
+        let fit = fit_imu0_mount_from_riding(&accel, &gyro, &speed, &level, dt, coarse_mount());
+
+        // Assert
+        assert!(!fit.used);
+        assert_eq!(fit.reason, MountFitReason::TooLittleStraightRiding);
+        assert_relative_eq!(fit.mount.angle_to(&coarse_mount()), 0.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn riding_mount_no_gps_speed_falls_back_to_the_reference_mount() {
+        // Arrange — a ride with no GPS: speed unknown everywhere.
+        let (accel, gyro, _, dt) = straight_ride(coarse_mount(), 60.0, 0.0);
+        let unknown = vec![f64::NAN; accel.len()];
+
+        // Act
+        let fit = fit_imu0_mount_from_riding(&accel, &gyro, &unknown, &unknown, dt, coarse_mount());
+
+        // Assert
+        assert!(!fit.used);
+        assert_eq!(fit.reason, MountFitReason::TooLittleStraightRiding);
+    }
+
+    #[test]
+    fn riding_mount_all_fast_riding_downhill_known_slope_is_taken_out_of_up() {
+        // Arrange — every fast sample is on an 8° descent, as on a trail ride.
+        let true_mount = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 12_f64.to_radians()) * coarse_mount();
+        let slope = -8_f64.to_radians();
+        let (accel, gyro, speed, dt) = straight_ride(true_mount, 60.0, slope);
+        let path_pitch = vec![slope; accel.len()];
+
+        // Act
+        let fit = fit_imu0_mount_from_riding(&accel, &gyro, &speed, &path_pitch, dt, coarse_mount());
+
+        // Assert
+        assert!(fit.used);
+        assert!(fit.mount.angle_to(&true_mount).to_degrees() < 0.5, "off by {}°", fit.mount.angle_to(&true_mount).to_degrees());
+    }
+
+    #[test]
+    fn riding_mount_all_fast_riding_downhill_unknown_slope_tilts_up_by_the_slope() {
+        // Arrange — the same descent with no altitude to say so.
+        let true_mount = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 12_f64.to_radians()) * coarse_mount();
+        let (accel, gyro, speed, dt) = straight_ride(true_mount, 60.0, -8_f64.to_radians());
+        let unknown = vec![f64::NAN; accel.len()];
+
+        // Act
+        let fit = fit_imu0_mount_from_riding(&accel, &gyro, &speed, &unknown, dt, coarse_mount());
+
+        // Assert — the limit of the method without a slope: the frame is 8° out.
+        assert!(fit.used);
+        assert_relative_eq!(fit.mount.angle_to(&true_mount).to_degrees(), 8.0, epsilon = 0.5);
     }
 
     #[test]

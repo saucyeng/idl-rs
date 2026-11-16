@@ -19,6 +19,7 @@
 
 use nalgebra::Vector3;
 
+pub mod bike;
 pub mod json;
 pub mod rigid;
 

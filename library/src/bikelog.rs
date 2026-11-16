@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use idl_rs::calibration::bike::{calibration_for, merge_calibrations, BikeCalibration};
 use idl_rs::store::atomic::{sha256_hex, write_atomic_with_retry, AtomicWriteError};
 
 // The session.json schema owns these two; re-exported so the bike log's own
@@ -161,6 +162,10 @@ pub struct BikeFile {
     /// Every entry, deleted ones included, oldest first (by current `at_ms`,
     /// then id).
     pub entries: Vec<Entry>,
+    /// The bike's IMU calibrations, deleted ones included (as tombstones),
+    /// oldest capture first. Not part of the log: a calibration is a
+    /// measurement of where the sensors sit, not a setup change.
+    pub calibrations: Vec<BikeCalibration>,
 }
 
 /// An entry as written in the file: the current version's fields at the
@@ -182,12 +187,14 @@ struct StoredBikeFile {
     bike: Bike,
     #[serde(default)]
     entries: Vec<StoredEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    calibrations: Vec<BikeCalibration>,
 }
 
 impl BikeFile {
     /// A new bike with an empty log.
     pub fn new(bike: Bike) -> BikeFile {
-        BikeFile { bike, entries: Vec::new() }
+        BikeFile { bike, entries: Vec::new(), calibrations: Vec::new() }
     }
 
     /// Parses a bike file.
@@ -195,7 +202,7 @@ impl BikeFile {
         let stored: StoredBikeFile =
             serde_json::from_slice(bytes).map_err(|e| BikeLogError { kind: BikeLogErrorKind::Parse, message: e.to_string() })?;
         let bike_id = stored.bike.bike_id.clone();
-        let mut file = BikeFile { bike: stored.bike, entries: Vec::new() };
+        let mut file = BikeFile { bike: stored.bike, entries: Vec::new(), calibrations: merge_calibrations(&stored.calibrations, &[]) };
         for s in stored.entries {
             let mut versions = s.history;
             versions.push(s.current);
@@ -217,7 +224,7 @@ impl BikeFile {
                 Some(StoredEntry { entry_id: e.entry_id.clone(), kind: e.kind, current, history })
             })
             .collect();
-        serde_json::to_vec_pretty(&StoredBikeFile { bike: self.bike.clone(), entries })
+        serde_json::to_vec_pretty(&StoredBikeFile { bike: self.bike.clone(), entries, calibrations: self.calibrations.clone() })
             .map_err(|e| BikeLogError { kind: BikeLogErrorKind::Encode, message: e.to_string() })
     }
 
@@ -233,10 +240,15 @@ impl BikeFile {
     }
 
     /// Merges two copies of the same bike's file: the bike part by part,
-    /// the log as a union of entries and versions. Symmetric, so two devices
+    /// the log as a union of entries and versions, the calibrations as a
+    /// union with the copy changed last winning. Symmetric, so two devices
     /// converge once each has merged the other's copy.
     pub fn merge(&self, other: &BikeFile) -> BikeFile {
-        let mut out = BikeFile { bike: self.bike.merge(&other.bike), entries: self.entries.clone() };
+        let mut out = BikeFile {
+            bike: self.bike.merge(&other.bike),
+            entries: self.entries.clone(),
+            calibrations: merge_calibrations(&self.calibrations, &other.calibrations),
+        };
         for e in &other.entries {
             out.upsert(e);
         }
@@ -520,6 +532,47 @@ pub fn save_entry(data_root: &Path, entry: &Entry) -> Result<Entry, BikeLogError
     file.upsert(entry);
     let merged = save_bike_file(data_root, &file)?;
     Ok(merged.entries.into_iter().find(|e| e.entry_id == entry.entry_id).expect("just saved"))
+}
+
+/// Saves `calibration` (new, or a changed copy of one) into `bike_id`'s file,
+/// merged with what is there: the copy with the later `updated_at_ms` is
+/// kept. The bike must exist. Returns the stored copy.
+pub fn save_calibration(data_root: &Path, bike_id: &str, calibration: &BikeCalibration) -> Result<BikeCalibration, BikeLogError> {
+    let mut file = read_bike_file(data_root, bike_id)?;
+    file.entries.clear();
+    file.calibrations = vec![calibration.clone()];
+    let merged = save_bike_file(data_root, &file)?;
+    Ok(merged.calibrations.into_iter().find(|c| c.calibration_id == calibration.calibration_id).expect("just saved"))
+}
+
+/// The calibration the session described by `session` (starting at
+/// `session_start_ms`) uses, read from its bike's file: the session's own
+/// `bike_id`, then [`calibration_for`]'s rule. The flag is true when the
+/// calibration was captured after the session. None when the session names no
+/// bike, the bike's file does not read, or it holds no calibration.
+pub fn calibration_for_session(
+    data_root: &Path,
+    session: &idl_rs::store::session_json::SessionJson,
+    session_start_ms: i64,
+) -> Option<(BikeCalibration, bool)> {
+    let bike_id = Some(session.bike_id.as_str()).filter(|id| is_valid_id(id))?;
+    let file = read_bike_file(data_root, bike_id).ok()?;
+    calibration_for(&file.calibrations, session_start_ms).map(|(c, after)| (c.clone(), after))
+}
+
+/// Gives `handle`'s estimator builtins the calibration its session uses
+/// ([`calibration_for_session`]), or none. The one call an opener makes, so the
+/// CLI and the app cannot pick differently. Returns the calibration's id and
+/// whether it was captured after the session, for the opener to report.
+pub fn apply_session_calibration(
+    data_root: &Path,
+    session: &idl_rs::store::session_json::SessionJson,
+    handle: &idl_rs::session::handle::SessionHandle,
+) -> Option<(String, bool)> {
+    let start_ms = idl_rs::store::session_json::effective_start_ms(session, handle.metadata().timestamp_utc_ms);
+    let chosen = calibration_for_session(data_root, session, start_ms);
+    handle.set_bike_calibration(chosen.as_ref().map(|(c, _)| c.fit.clone()));
+    chosen.map(|(c, after)| (c.calibration_id, after))
 }
 
 /// Every bike, plus the files that didn't parse.
@@ -831,6 +884,94 @@ mod tests {
         assert_eq!(log.skipped.len(), 1);
         assert_eq!(bikes.skipped.len(), 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn calibration(id: &str, captured_at_ms: i64, updated_at_ms: i64) -> BikeCalibration {
+        use idl_rs::calibration::bike::{CalibrationFit, SourceWindow, BIKE_CALIBRATION_VERSION};
+        BikeCalibration {
+            calibration_id: id.into(),
+            captured_at_ms,
+            updated_at_ms,
+            deleted: false,
+            note: String::new(),
+            still: SourceWindow { session_id: "s".into(), from_s: 1.0, to_s: None },
+            rigid: None,
+            fork_rigid: None,
+            steer: None,
+            fit: CalibrationFit {
+                version: BIKE_CALIBRATION_VERSION,
+                up: [0.2, 0.0, 0.98],
+                forward: None,
+                forward_from: None,
+                steer_axis: None,
+                imu0_gyro_bias_rad_s: [0.0; 3],
+                imus: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn save_calibration_keeps_the_log_and_earlier_calibrations() {
+        // Arrange — a bike with a note and one calibration already.
+        let dir = temp_root();
+        let bike = bike_for_name(&dir, "GT Force", 1_000).unwrap();
+        let note = new_note(&bike.bike_id, "softer fork", BTreeMap::new(), 2_000, "cli", 2_000);
+        save_entry(&dir, &note).unwrap();
+        save_calibration(&dir, &bike.bike_id, &calibration("first", 100, 1)).unwrap();
+
+        // Act
+        save_calibration(&dir, &bike.bike_id, &calibration("second", 200, 1)).unwrap();
+
+        // Assert
+        let file = read_bike_file(&dir, &bike.bike_id).unwrap();
+        assert_eq!(file.entries.len(), 1);
+        assert_eq!(file.calibrations.iter().map(|c| c.calibration_id.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+    }
+
+    #[test]
+    fn save_calibration_older_copy_does_not_undo_a_removal() {
+        // Arrange — removed at t=9; a stale device still holds the t=5 copy.
+        let dir = temp_root();
+        let bike = bike_for_name(&dir, "GT Force", 1_000).unwrap();
+        let mut removed = calibration("a", 100, 9);
+        removed.deleted = true;
+        save_calibration(&dir, &bike.bike_id, &removed).unwrap();
+
+        // Act
+        let stored = save_calibration(&dir, &bike.bike_id, &calibration("a", 100, 5)).unwrap();
+
+        // Assert
+        assert!(stored.deleted);
+    }
+
+    #[test]
+    fn a_bike_file_without_calibrations_writes_no_calibrations_key() {
+        // Arrange
+        let file = BikeFile::new(Bike { bike_id: "b".into(), name: "B".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 0 });
+
+        // Act
+        let text = String::from_utf8(file.to_vec().unwrap()).unwrap();
+
+        // Assert — a file an older build wrote and this one rewrites is unchanged.
+        assert!(!text.contains("calibrations"), "{text}");
+    }
+
+    #[test]
+    fn calibration_for_session_reads_the_sessions_own_bike() {
+        // Arrange
+        let dir = temp_root();
+        let bike = bike_for_name(&dir, "GT Force", 1_000).unwrap();
+        save_calibration(&dir, &bike.bike_id, &calibration("a", 100, 1)).unwrap();
+        let mut session = idl_rs::store::session_json::empty_session_json("sess");
+        let none = calibration_for_session(&dir, &session, 500);
+        session.bike_id = bike.bike_id.clone();
+
+        // Act
+        let chosen = calibration_for_session(&dir, &session, 500);
+
+        // Assert — no bike named, no calibration; named, the bike's.
+        assert!(none.is_none());
+        assert_eq!(chosen.map(|(c, after)| (c.calibration_id, after)), Some(("a".to_string(), false)));
     }
 
     #[test]

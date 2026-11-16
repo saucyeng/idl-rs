@@ -55,7 +55,12 @@ impl Default for InitStd {
             attitude: 5_f64.to_radians(),
             velocity: 1.0,
             gyro_bias: 0.05,
-            accel_bias: 0.5,
+            // The zero-g offset spread of the two IMUs in use: ±20 mg (LSM6DSO32,
+            // LA_TyOff) and ±12 mg low-g (LSM6DSV320X), both datasheets' Table 3.
+            // 20 mg = 0.2 m/s². Looser than that and a tilt error hides in the bias
+            // (the two are inseparable at constant heading). The LSM6DSV320X high-g
+            // channel's ±1.5 g offset is not covered by this prior.
+            accel_bias: 0.2,
             wheel_travel: 0.05,
             wheel_velocity: 1.0,
             steer_angle: 0.2,
