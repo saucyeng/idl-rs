@@ -410,12 +410,13 @@ pub struct EstimatorConfig {
     /// receiver and 0.60 s on a 1 Hz one (rides `173461a2`, `4f3f3032`), and at
     /// a moto's turn rates 0.2 s of error is over 10° of direction.
     pub fit_gps_latency: bool,
-    /// Turn the chassis frame about its own up so that straight-line riding
-    /// reads zero slip ([`forward_trim`]). Default **true**: which way is
-    /// forward is known from a calibration or the riding fit only to several
-    /// degrees (5° on the GT Force's 2026-11-04 calibration), and "the bike
-    /// travels where it points when it goes straight" fixes it to a fraction of
-    /// that without constraining any one moment.
+    /// Turn the chassis frame about its own up so that this ride's straight-line
+    /// riding reads zero slip ([`forward_trim`]). Default **true**, for a bike
+    /// with no calibration: the riding fit knows forward only to several
+    /// degrees. A calibrated bike runs with this off — its forward lives in the
+    /// calibration, the same for every ride, so that what differs between two
+    /// rides is the riding and not the frame they are read in — and the trim is
+    /// still measured and reported ([`StateEstimate::forward_trim_deg`]).
     pub trim_forward: bool,
     /// Minimum GPS horizontal speed for a fix to be used, m/s. Below this the
     /// course (heading) is dominated by the GPS filter's own noise, so the derived
@@ -592,13 +593,17 @@ pub struct StateEstimate {
     pub gps_latency_s: f64,
     /// Whether `gps_latency_s` was measured from this session.
     pub gps_latency_fitted: bool,
-    /// How far the chassis frame was turned about its up so straight-line riding
-    /// reads zero slip, degrees, positive = forward moved to the left (the frame
-    /// had been reading to the right of travel). None
-    /// when the trim is off or the ride has too little straight riding. Roll,
-    /// pitch, heading, slip and the body accelerations are all in the trimmed
-    /// frame.
+    /// How far the chassis frame would have to turn about its up for this ride's
+    /// straight-line riding to read zero slip, degrees, positive = forward to
+    /// the left (the frame reads to the right of travel). None when the ride has
+    /// too little straight riding to say. With `forward_trim_applied` the
+    /// outputs are in the frame turned by it; without, it is a check on the
+    /// bike's calibration, whose forward was used as given.
     pub forward_trim_deg: Option<f64>,
+    /// Whether the outputs (roll, pitch, heading, slip, body accelerations) are
+    /// in the frame turned by `forward_trim_deg`
+    /// ([`EstimatorConfig::trim_forward`]).
+    pub forward_trim_applied: bool,
     /// Gravity-removed longitudinal acceleration per sample, g. Positive ⇒
     /// accelerating forward.
     pub accel_long: Vec<f64>,
@@ -1013,7 +1018,6 @@ fn apply_forward_trim(est: &mut StateEstimate, trim: f64) {
     x.r_chassis *= rz;
     x.b_g0 = rz.inverse() * x.b_g0;
     x.b_a0 = rz.inverse() * x.b_a0;
-    est.forward_trim_deg = Some(trim.to_degrees());
 }
 
 /// Where on the bike travel direction is read for [`StateEstimate::slip`], as an
@@ -1580,15 +1584,18 @@ fn run_with_trace(
         gps_latency_s,
         gps_latency_fitted,
         forward_trim_deg: None,
+        forward_trim_applied: false,
         accel_long,
         accel_lat,
         stationary: stationary.clone(),
         final_state,
         ledger,
     };
-    if config.trim_forward {
-        if let Some(trim) = forward_trim(&est.heading, &est.slip, &speed, dt) {
+    if let Some(trim) = forward_trim(&est.heading, &est.slip, &speed, dt) {
+        est.forward_trim_deg = Some(trim.to_degrees());
+        if config.trim_forward {
             apply_forward_trim(&mut est, trim);
+            est.forward_trim_applied = true;
         }
     }
     let trace = EstimatorTrace {
@@ -1743,6 +1750,7 @@ mod tests {
             gps_latency_s: 0.0,
             gps_latency_fitted: false,
             forward_trim_deg: None,
+            forward_trim_applied: false,
             accel_long: vec![0.0; 5],
             accel_lat: vec![0.0; 5],
             stationary: vec![true, true, false, false, false],
@@ -1778,6 +1786,7 @@ mod tests {
             gps_latency_s: 0.0,
             gps_latency_fitted: false,
             forward_trim_deg: None,
+            forward_trim_applied: false,
             accel_long: vec![0.0, 0.0],
             accel_lat: vec![0.0, 0.0],
             stationary: vec![true, true],
@@ -2590,7 +2599,7 @@ mod tests {
         assert!((est.roll[10].abs() - 0.87).abs() < 0.03, "roll {}", est.roll[10]);
         assert_relative_eq!(est.accel_long[10], 0.2 * 5_f64.to_radians().cos(), epsilon = 1e-12);
         assert_relative_eq!(est.accel_lat[10], 0.2 * 5_f64.to_radians().sin(), epsilon = 1e-12);
-        assert_eq!(est.forward_trim_deg, Some(5.0));
+        assert_eq!(est.forward_trim_deg, None, "the caller records the trim; this only restates the outputs");
     }
 
     #[test]

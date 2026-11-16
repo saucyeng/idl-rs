@@ -898,11 +898,13 @@ mod tests {
             rigid: None,
             fork_rigid: None,
             steer: None,
+            forward_ride: None,
             fit: CalibrationFit {
                 version: BIKE_CALIBRATION_VERSION,
                 up: [0.2, 0.0, 0.98],
                 forward: None,
                 forward_from: None,
+                forward_trim_deg: None,
                 steer_axis: None,
                 imu0_gyro_bias_rad_s: [0.0; 3],
                 imus: Vec::new(),

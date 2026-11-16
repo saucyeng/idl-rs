@@ -70,6 +70,9 @@ pub enum ForwardFrom {
     /// The level direction from IMU0 to the fork pod; off by the pod's sideways
     /// offset over its distance.
     ForkPod,
+    /// One of the above, then turned so that straight-line riding in one
+    /// session reads zero slip ([`CalibrationFit::with_forward_turned`]).
+    Riding,
 }
 
 /// One unsprung IMU relative to IMU0.
@@ -106,6 +109,11 @@ pub struct CalibrationFit {
     /// How `forward` was found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forward_from: Option<ForwardFrom>,
+    /// How far `forward` has been turned from the recordings' own answer to
+    /// match the direction the bike travels, degrees anticlockwise seen from
+    /// above (positive = forward moved to the left). Absent = not turned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_trim_deg: Option<f64>,
     /// Steering axis, unit vector pointing up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steer_axis: Option<[f64; 3]>,
@@ -144,6 +152,9 @@ pub struct BikeCalibration {
     /// The window (frame still, bars turning) the steering axis came from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steer: Option<SourceWindow>,
+    /// The ride `forward` was turned to match ([`ForwardFrom::Riding`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_ride: Option<String>,
     /// The fitted numbers.
     #[serde(flatten)]
     pub fit: CalibrationFit,
@@ -378,6 +389,28 @@ impl CalibrationFit {
         Ok(out)
     }
 
+    /// This calibration with `forward` turned about `up` by `trim_deg` more
+    /// (anticlockwise seen from above), so the bike's forward is the direction
+    /// it travels and not only what the recordings said. The turn is added to
+    /// any already made.
+    ///
+    /// # Errors
+    ///
+    /// [`BikeCalibrationError::Degenerate`] when there is no usable `forward`
+    /// to turn.
+    pub fn with_forward_turned(&self, trim_deg: f64) -> Result<CalibrationFit, BikeCalibrationError> {
+        let up = unit(&self.up, "up")?;
+        let forward = unit(self.forward.as_ref().ok_or(BikeCalibrationError::Degenerate("forward"))?, "forward")?;
+        let (sin, cos) = trim_deg.to_radians().sin_cos();
+        let turned = forward * cos + up.cross(&forward) * sin;
+        Ok(CalibrationFit {
+            forward: Some([turned.x, turned.y, turned.z]),
+            forward_from: Some(ForwardFrom::Riding),
+            forward_trim_deg: Some(self.forward_trim_deg.unwrap_or(0.0) + trim_deg),
+            ..self.clone()
+        })
+    }
+
     /// Whether the calibration fixes which way the bike points (it has a
     /// `forward`); without one only the tilt is the calibration's.
     pub fn has_forward(&self) -> bool {
@@ -450,6 +483,7 @@ mod tests {
             up: [up.x, up.y, up.z],
             forward: forward.map(|f| [f.x, f.y, f.z]),
             forward_from: forward.map(|_| ForwardFrom::SteerAxis),
+            forward_trim_deg: None,
             steer_axis: None,
             imu0_gyro_bias_rad_s: [0.0; 3],
             imus: Vec::new(),
@@ -467,6 +501,7 @@ mod tests {
             rigid: None,
             fork_rigid: None,
             steer: None,
+            forward_ride: None,
             fit: fit(Vector3::z(), Some(Vector3::x())),
         }
     }
@@ -651,6 +686,28 @@ mod tests {
         assert_relative_eq!(g.front_axis, g.steer_axis, epsilon = 1e-12);
         // Travel and sag are not a calibration's to change.
         assert_eq!(g.front_travel_max, base.front_travel_max);
+    }
+
+    #[test]
+    fn with_forward_turned_moves_forward_to_the_left_about_up_and_adds_to_an_earlier_turn() {
+        // Arrange — forward is chassis X in a sensor whose axes are the chassis's.
+        let f = fit(Vector3::z(), Some(Vector3::x()));
+
+        // Act
+        let once = f.with_forward_turned(5.0).unwrap();
+        let twice = once.with_forward_turned(-2.0).unwrap();
+
+        // Assert — 5° anticlockwise seen from above is toward +Y (left).
+        let forward = once.forward.unwrap();
+        assert_relative_eq!(forward[0], 5_f64.to_radians().cos(), epsilon = 1e-12);
+        assert_relative_eq!(forward[1], 5_f64.to_radians().sin(), epsilon = 1e-12);
+        assert_eq!(once.forward_from, Some(ForwardFrom::Riding));
+        assert_relative_eq!(twice.forward_trim_deg.unwrap(), 3.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn with_forward_turned_nothing_to_turn_is_refused() {
+        assert!(fit(Vector3::z(), None).with_forward_turned(5.0).is_err());
     }
 
     #[test]

@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use idl_library::bikelog::{self, BikeLogError, BikeLogErrorKind, Entry};
 use idl_library::catalog_read::{get_session, list_sessions, SessionDetail};
 use idl_rs::calibration::bike::{BikeCalibration, ForwardFrom, SourceWindow};
-use idl_rs::commands::calibration_ops::{fit_bike_calibration, ProtocolWindows};
+use idl_rs::commands::calibration_ops::{fit_bike_calibration, forward_trim_from_ride, ProtocolWindows};
 
 use super::{many, opt_integer, opt_text, text, Ctx, VerbOutput};
 use crate::envelope::{CliError, ErrorKind};
@@ -138,6 +138,7 @@ fn calibration_line(c: &BikeCalibration) -> String {
         match c.fit.forward_from {
             Some(ForwardFrom::SteerAxis) => "from the steering axis",
             Some(ForwardFrom::ForkPod) => "toward the fork pod",
+            Some(ForwardFrom::Riding) => "matched to a ride",
             None => "from each ride",
         },
     )
@@ -196,6 +197,33 @@ pub fn calibrate(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
         ));
     }
 
+    if let Some(ride_id) = opt_text(m, "forward-from") {
+        let Some(current) = file.calibrations.iter().filter(|c| !c.deleted).max_by_key(|c| (c.captured_at_ms, c.updated_at_ms)) else {
+            return Err(CliError::new(ErrorKind::NotFound, format!("{bike_id} has no calibration to turn; fit one with --still first")));
+        };
+        let ride = session_by_prefix(root, &ride_id)?;
+        let dir = root.join("sessions").join(&ride.session_id);
+        let handle = idl_rs::store::parquet::open_session_lazy(&dir)
+            .map_err(|e| CliError::io(format!("reading {}: {}", dir.join("data.parquet").display(), e.message)))?;
+        let trim = forward_trim_from_ride(&handle, &current.fit).ok_or_else(|| {
+            CliError::new(ErrorKind::InvalidInput, format!("{} has too little straight-line riding with GPS to say which way the bike travels", ride.session_id))
+        })?;
+        let fit = current.fit.with_forward_turned(trim).map_err(|e| CliError::new(ErrorKind::InvalidInput, e.to_string()))?;
+        let turned = BikeCalibration { fit, forward_ride: Some(ride.session_id.clone()), updated_at_ms: now.max(current.updated_at_ms + 1), ..current.clone() };
+        let line = format!(
+            "forward of calibration {} turned {:+.1} deg ({}) to match ride {}",
+            turned.calibration_id,
+            trim,
+            if trim >= 0.0 { "to the left" } else { "to the right" },
+            ride.session_id
+        );
+        if ctx.dry_run {
+            return Ok(VerbOutput::new(format!("would save: {line}"), json!({ "calibration": turned, "trim_deg": trim, "written": false })));
+        }
+        let saved = bikelog::save_calibration(root, &bike_id, &turned)?;
+        return Ok(VerbOutput::new(line, json!({ "calibration": saved, "trim_deg": trim, "written": true })));
+    }
+
     let still_id = opt_text(m, "still")
         .ok_or_else(|| CliError::usage("a calibration needs --still: a recording with the bike still and level"))?;
     let still_detail = session_by_prefix(root, &still_id)?;
@@ -242,6 +270,7 @@ pub fn calibrate(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
         rigid: protocol_window(has(2), rigid),
         fork_rigid: protocol_window(has(1), fork.or(rigid)),
         steer: protocol_window(fit.steer_axis.is_some(), steer),
+        forward_ride: None,
         fit,
     };
 

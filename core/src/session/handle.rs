@@ -604,7 +604,10 @@ impl SessionHandle {
             fit.apply_to(&reference).ok().map(|geometry| (geometry, source))
         });
         let (geometry, imu0_mount) = calibrated.unwrap_or((reference, Imu0Mount::Riding));
-        let est = crate::estimate::run::run(&input, &geometry, &EstimatorConfig { imu0_mount, ..EstimatorConfig::default() });
+        // A calibration that says which way is forward is used as given, the
+        // same for every ride; only a bike without one is trimmed per ride.
+        let trim_forward = imu0_mount != Imu0Mount::Geometry;
+        let est = crate::estimate::run::run(&input, &geometry, &EstimatorConfig { imu0_mount, trim_forward, ..EstimatorConfig::default() });
         let rate_hz = if est.dt > 0.0 { 1.0 / est.dt } else { 0.0 };
         // The outputs live on the estimator's own grid, which starts at IMU0's
         // first recorded sample and not at 0.
