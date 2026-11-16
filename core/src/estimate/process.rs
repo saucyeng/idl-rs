@@ -39,6 +39,14 @@ pub struct ProcessNoiseConfig {
     pub wheel_pos_rw: f64,
     /// Steer-rate driving noise, (rad/s²)/√s (frozen → contributes 0 in M2a).
     pub steer_rate_rw: f64,
+    /// Steer-angle random walk, rad/√s: how fast the angle integrated from the
+    /// two gyros is allowed to wander before the accelerometers pull it back.
+    /// The gyro difference along the steering axis is not only steer rate — a
+    /// few degrees of error in the axis or the fork pod's mount lets the
+    /// frame's own rotation leak in — and that error is not white, so it is
+    /// carried here and not in the rate's noise. 0.03 gives the accelerometer
+    /// reference about a 4 s hold.
+    pub steer_angle_rw: f64,
 }
 
 impl ProcessNoiseConfig {
@@ -56,6 +64,7 @@ impl ProcessNoiseConfig {
             wheel_vel_rw: 5.0,  // suspension acceleration is energetic
             wheel_pos_rw: 1.0e-3,
             steer_rate_rw: 1.0,
+            steer_angle_rw: 0.03,
         }
     }
 }
@@ -177,7 +186,7 @@ impl ProcessModel<MtbState> for MtbProcess {
         q[(19, 19)] = gate("dw_f", self.noise.wheel_vel_rw.powi(2) * dt);
         q[(20, 20)] = gate("w_r", self.noise.wheel_pos_rw.powi(2) * dt);
         q[(21, 21)] = gate("dw_r", self.noise.wheel_vel_rw.powi(2) * dt);
-        q[(22, 22)] = gate("psi", self.noise.wheel_pos_rw.powi(2) * dt);
+        q[(22, 22)] = gate("psi", self.noise.steer_angle_rw.powi(2) * dt);
         q[(23, 23)] = gate("dpsi", self.noise.steer_rate_rw.powi(2) * dt);
 
         (f, q)

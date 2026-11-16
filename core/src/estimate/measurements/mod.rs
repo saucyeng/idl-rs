@@ -20,6 +20,7 @@
 pub mod gps;
 pub mod gravity;
 pub mod prior;
+pub mod steer;
 pub mod zupt;
 
 /// Error-state column offsets — the fixed [`crate::estimate::state::MtbState`]
@@ -34,11 +35,7 @@ pub(crate) const I_WF: usize = 18;
 pub(crate) const I_DWF: usize = 19;
 pub(crate) const I_WR: usize = 20;
 pub(crate) const I_DWR: usize = 21;
-// Forward-looking entries used by the deferred steering factors (M2b); kept here so
-// the column map is complete and authoritative in one place.
-#[allow(dead_code)]
 pub(crate) const I_PSI: usize = 22;
-#[allow(dead_code)]
 pub(crate) const I_DPSI: usize = 23;
 
 /// Central-difference Jacobian of a factor's residual w.r.t. the error state, used

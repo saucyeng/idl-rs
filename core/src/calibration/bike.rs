@@ -117,6 +117,13 @@ pub struct CalibrationFit {
     /// Steering axis, unit vector pointing up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steer_axis: Option<[f64; 3]>,
+    /// What the steer angle read with the bike going straight, degrees (positive
+    /// = bars to the left), before this was taken out: how far from straight the
+    /// bars were held while the fork pod was fitted. The fork pod's mount is
+    /// turned by it about the steering axis, so straight-line riding reads
+    /// zero. Absent = not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_zero_deg: Option<f64>,
     /// IMU0's gyro offset in the still window, rad/s.
     pub imu0_gyro_bias_rad_s: [f64; 3],
     /// The unsprung IMUs that were fitted, ascending by index.
@@ -369,9 +376,17 @@ impl CalibrationFit {
         let base_forward = base.imu0.mount.inverse() * Vector3::x();
         let m0 = self.imu0_mount(&base_forward)?;
         let shift = m0 * base.imu0.mount.inverse();
+        // The fork pod was fitted with the bars wherever they were held; the
+        // steering zero turns its mount to where they are straight.
+        let steer_zero = match (&self.steer_axis, self.steer_zero_deg) {
+            (Some(axis), Some(zero)) => {
+                UnitQuaternion::from_axis_angle(&nalgebra::Unit::new_normalize(unit(axis, "steer_axis")?), zero.to_radians())
+            }
+            _ => UnitQuaternion::identity(),
+        };
         let pose = |index: u8, fallback: &ImuPose| match self.imus.iter().find(|i| i.imu_index == index) {
             Some(fit) => ImuPose {
-                mount: m0 * quat(&fit.mount),
+                mount: m0 * if index == 1 { steer_zero * quat(&fit.mount) } else { quat(&fit.mount) },
                 lever: m0 * Vector3::new(fit.lever_m[0], fit.lever_m[1], fit.lever_m[2]),
             },
             None => ImuPose { mount: shift * fallback.mount, lever: fallback.lever },
@@ -409,6 +424,20 @@ impl CalibrationFit {
             forward_trim_deg: Some(self.forward_trim_deg.unwrap_or(0.0) + trim_deg),
             ..self.clone()
         })
+    }
+
+    /// This calibration with the steering zero moved by `zero_deg` more: the
+    /// steer angle one ride read going straight
+    /// ([`crate::estimate::run::StateEstimate::steer_zero_deg`]). Added to any
+    /// already set.
+    pub fn with_steer_zero(&self, zero_deg: f64) -> CalibrationFit {
+        CalibrationFit { steer_zero_deg: Some(self.steer_zero_deg.unwrap_or(0.0) + zero_deg), ..self.clone() }
+    }
+
+    /// Whether steering can be estimated from this calibration: it has the
+    /// steering axis and the fork pod's mount.
+    pub fn has_steering(&self) -> bool {
+        self.steer_axis.is_some() && self.imus.iter().any(|i| i.imu_index == 1)
     }
 
     /// Whether the calibration fixes which way the bike points (it has a
@@ -485,6 +514,7 @@ mod tests {
             forward_from: forward.map(|_| ForwardFrom::SteerAxis),
             forward_trim_deg: None,
             steer_axis: None,
+            steer_zero_deg: None,
             imu0_gyro_bias_rad_s: [0.0; 3],
             imus: Vec::new(),
         }
@@ -708,6 +738,29 @@ mod tests {
     #[test]
     fn with_forward_turned_nothing_to_turn_is_refused() {
         assert!(fit(Vector3::z(), None).with_forward_turned(5.0).is_err());
+    }
+
+    #[test]
+    fn apply_to_with_a_steering_zero_turns_the_fork_pod_about_the_steering_axis_only() {
+        // Arrange — sensor axes are the chassis's; a vertical steering axis; the
+        // fork pod fitted with the bars 6° to the right (it read −6° going straight).
+        let mut f = fit(Vector3::z(), Some(Vector3::x()));
+        f.steer_axis = Some([0.0, 0.0, 1.0]);
+        f.imus = vec![
+            ImuFit { imu_index: 1, mount: [1.0, 0.0, 0.0, 0.0], lever_m: [0.8, 0.0, -0.2], rate_residual_rad_s: None, up_disagreement_deg: 0.0 },
+            ImuFit { imu_index: 2, mount: [1.0, 0.0, 0.0, 0.0], lever_m: [-0.4, 0.0, -0.3], rate_residual_rad_s: None, up_disagreement_deg: 0.0 },
+        ];
+        let base = BikeGeometry::reference_bike();
+        let before = f.apply_to(&base).unwrap();
+
+        // Act
+        let after = f.with_steer_zero(-6.0).apply_to(&base).unwrap();
+
+        // Assert — the fork pod's mount turns 6° about up; the swingarm pod's does not.
+        let turn = before.imu1.mount.inverse() * after.imu1.mount;
+        assert_relative_eq!(turn.angle().to_degrees(), 6.0, epsilon = 1e-9);
+        assert_relative_eq!(turn.axis().unwrap().z.abs(), 1.0, epsilon = 1e-9);
+        assert_relative_eq!(before.imu2.unwrap().mount.angle_to(&after.imu2.unwrap().mount), 0.0, epsilon = 1e-12);
     }
 
     #[test]

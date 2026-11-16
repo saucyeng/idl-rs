@@ -379,7 +379,7 @@ Fit a bike's IMU calibration from its recordings and save it in the bike's file;
 | `--fork-to-ms` | integer | End of that part |
 | `--steer-from-ms` | integer | Start of the window with the frame still and the bars swung |
 | `--steer-to-ms` | integer | End of that window |
-| `--forward-from` | text | Session id of a ride: turn the newest calibration's forward so that ride's straight-line riding reads zero slip, instead of fitting a new calibration |
+| `--forward-from` | text | Session id of a ride: set the newest calibration's forward and steering zero so that ride's straight-line riding reads zero slip and zero steer, instead of fitting a new calibration |
 | `--note` | text | Free text kept with the calibration |
 | `--delete` | text | Remove this calibration id instead of fitting one |
 | `--data-dir` | path | Data directory root (contract C4 §1's <data>); defaults to $IDL1_DATA_DIR |

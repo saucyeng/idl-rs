@@ -16,7 +16,8 @@ use crate::estimate::iekf::{FilterState, Iekf, InitStd};
 use crate::estimate::ledger::ObservabilityLedger;
 use crate::estimate::measurements::gravity::GravityLeveling;
 use crate::estimate::measurements::gps::{GpsVelocity, VerticalVelocity};
-use crate::estimate::measurements::{I_THETA, I_V};
+use crate::estimate::measurements::steer::{steer_level_angle, SteerLevel, SteerRate};
+use crate::estimate::measurements::{I_PSI, I_THETA, I_V};
 use crate::estimate::measurements::prior::{SagPrior, TopoutReference, TravelBarrier, Wheel};
 use crate::estimate::measurements::zupt::{GyroBias, ZeroAngularRate, ZeroVelocity, ZeroWheelVelocity};
 use crate::estimate::model::{ImuInput, SampleContext};
@@ -457,6 +458,14 @@ pub struct EstimatorConfig {
     pub heading_init_sigma: f64,
     /// Std-dev of the GPS-altitude vertical velocity ([`GpsSample::up_mps`]), m/s.
     pub gps_up_sigma: f64,
+    /// Std-dev of the fork gyro less the frame gyro along the steering axis
+    /// ([`SteerRate`]), rad/s. Used when `estimate_steering` is on.
+    pub steer_rate_sigma: f64,
+    /// How far the frame's and the fork's slow specific forces are taken to
+    /// disagree for reasons other than the steer angle ([`SteerLevel`]), m/s²:
+    /// accelerometer offsets, the fork pod's lever arm being a little off, the
+    /// fork flexing.
+    pub steer_level_sigma: f64,
     /// How long after a fused GPS fix the run still counts as GPS-aided, s. While
     /// GPS-aided and moving, gravity-leveling is off: it assumes the specific
     /// force is gravity, which is false in a corner (it reads a leaned bike as
@@ -525,6 +534,8 @@ impl Default for EstimatorConfig {
             heading_init_sigma: 10_f64.to_radians(),
             // A slope over ±2.5 s of metre-level altitude noise.
             gps_up_sigma: 1.0,
+            steer_rate_sigma: 0.02,
+            steer_level_sigma: 0.5,
             gps_hold_s: 2.0,
         }
     }
@@ -579,6 +590,19 @@ pub struct StateEstimate {
     /// heading's and the travel direction's, combined as independent. `NaN`
     /// wherever `slip` is.
     pub slip_sigma: Vec<f64>,
+    /// Steer angle per sample, degrees, positive = bars to the left: the fork's
+    /// rotation about the steering axis relative to the frame, zero where the
+    /// geometry's fork mount says the bars are straight. `NaN` throughout when
+    /// [`EstimatorConfig::estimate_steering`] is off or there is no fork IMU.
+    pub steer: Vec<f64>,
+    /// The filter's own 1-sigma uncertainty of `steer` per sample, degrees.
+    /// `NaN` wherever `steer` is.
+    pub steer_sigma: Vec<f64>,
+    /// The median of `steer` over this ride's straight-line riding, degrees:
+    /// what the bars read when the bike goes straight, which is the error in
+    /// the geometry's bars-straight fork mount. None when steering is not
+    /// estimated or the ride has too little straight riding to say.
+    pub steer_zero_deg: Option<f64>,
     /// The riding-data fit of IMU0's mount ([`fit_imu0_mount_from_riding`]) and
     /// whether its gates passed. It is the mount in use only under
     /// [`Imu0Mount::Riding`]; otherwise it is a check on the calibration.
@@ -958,7 +982,42 @@ const FORWARD_TRIM_MAX: f64 = 0.35;
 /// [`crate::estimate::orient::RIDING_MIN_STRAIGHT_S`] of such riding, or when
 /// the answer is beyond [`FORWARD_TRIM_MAX`].
 fn forward_trim(heading: &[f64], slip: &[f64], speed: &[f64], dt: f64) -> Option<f64> {
+    let trim = straight_riding_median(heading, slip, speed, dt)?.to_radians();
+    (trim.abs() <= FORWARD_TRIM_MAX).then_some(trim)
+}
+
+/// Cut-off of the low-pass the two specific forces are compared through for
+/// [`SteerLevel`], Hz. Below it the frame and the fork move as one; above it
+/// the fork is bouncing on its own.
+const STEER_LEVEL_HZ: f64 = 1.0;
+/// How often a [`SteerLevel`] update is made, s.
+const STEER_LEVEL_PERIOD_S: f64 = 0.1;
+/// Smallest part of the specific force across the steering axis for the steer
+/// angle to be read from it, m/s² (a quarter of g; upright it is 0.44 g).
+const STEER_LEVEL_MIN_LEVER: f64 = 0.25 * GRAVITY;
+
+/// Each axis of `v` through a zero-phase second-order low-pass at `cutoff_hz`;
+/// `v` itself when the filter cannot be built (too few samples, or a cut-off
+/// at or above half the sample rate).
+fn lowpass_vectors(v: &[Vector3<f64>], cutoff_hz: f64, dt: f64) -> Vec<Vector3<f64>> {
+    let axis = |k: usize| {
+        let x: Vec<f64> = v.iter().map(|s| s[k]).collect();
+        crate::filters::lowpass(&x, 2, cutoff_hz, 1.0 / dt).ok().filter(|y| y.len() == x.len())
+    };
+    match (axis(0), axis(1), axis(2)) {
+        (Some(x), Some(y), Some(z)) => (0..v.len()).map(|i| Vector3::new(x[i], y[i], z[i])).collect(),
+        _ => v.to_vec(),
+    }
+}
+
+/// The median of `values` (any unit) over the samples riding straight
+/// ([`FORWARD_TRIM_MAX_TURN_RATE`], from `heading` in degrees over one second)
+/// at or above [`crate::estimate::orient::RIDING_MIN_SPEED_MPS`], skipping
+/// non-finite ones. None with less than
+/// [`crate::estimate::orient::RIDING_MIN_STRAIGHT_S`] of such riding.
+fn straight_riding_median(heading: &[f64], values: &[f64], speed: &[f64], dt: f64) -> Option<f64> {
     use crate::estimate::orient::{RIDING_MIN_SPEED_MPS, RIDING_MIN_STRAIGHT_S};
+    let slip = values;
     let n = heading.len().min(slip.len()).min(speed.len());
     let half = ((0.5 / dt).round() as usize).max(1);
     // A sample every 20 ms is plenty for a median and keeps the sort small.
@@ -977,8 +1036,7 @@ fn forward_trim(heading: &[f64], slip: &[f64], speed: &[f64], dt: f64) -> Option
         return None;
     }
     straight.sort_by(f64::total_cmp);
-    let trim = straight[straight.len() / 2].to_radians();
-    (trim.abs() <= FORWARD_TRIM_MAX).then_some(trim)
+    Some(straight[straight.len() / 2])
 }
 
 /// Re-states `est` in the chassis frame turned by `trim` (rad, anticlockwise
@@ -1268,6 +1326,25 @@ fn run_with_trace(
 
     let front_axis = geometry.front_tangent();
     let dt = input.dt;
+    // Steering: the frame's and the fork's slow specific forces, both in the
+    // chassis frame and both as felt at IMU0 (the fork pod's lever-arm terms
+    // taken out), low-passed so that what is left is what the two bodies share.
+    let steer_forces = match (&input.imu1, config.estimate_steering) {
+        (Some(s), true) => {
+            let at_imu0: Vec<Vector3<f64>> = (0..n)
+                .map(|i| {
+                    let omega0 = imu0_gyro[i] - fit.b_g0;
+                    imu1_mount * s.accel[i] - lever_arm_accel(Vector3::zeros(), omega0, omega0_dot[i], geometry.imu1.lever)
+                })
+                .collect();
+            Some((lowpass_vectors(&imu0_accel, STEER_LEVEL_HZ, dt), lowpass_vectors(&at_imu0, STEER_LEVEL_HZ, dt)))
+        }
+        _ => None,
+    };
+    let steer_level_every = ((STEER_LEVEL_PERIOD_S / dt).round() as usize).max(1);
+    // One low-passed sample says little its neighbours did not: the noise of an
+    // update every `STEER_LEVEL_PERIOD_S` is spread over the filter's memory.
+    let steer_level_inflate = ((1.0 / STEER_LEVEL_HZ) / (steer_level_every as f64 * dt)).max(1.0).sqrt();
     // Airborne / topout (design §5 topout event). The raw per-sample flag below is
     // gated twice before it can fire the topout reference: a *sustained* run of at
     // least `AIRBORNE_MIN_DURATION_S` (a single low-g instant — a rebound crest, a
@@ -1337,6 +1414,8 @@ fn run_with_trace(
     let mut course = Vec::with_capacity(n);
     let mut slip = Vec::with_capacity(n);
     let mut slip_sigma = Vec::with_capacity(n);
+    let mut steer = Vec::with_capacity(n);
+    let mut steer_sigma = Vec::with_capacity(n);
     let slip_lever = slip_reference(geometry);
     // Heading is unknown until the first fix fast enough to give a course; until
     // then no GPS velocity is fused. `last_gps` is the sample of the last fused fix.
@@ -1403,6 +1482,18 @@ fn run_with_trace(
             }
         }
         let air = airborne[i];
+        if let (Some((frame_force, fork_force)), Some(s)) = (&steer_forces, &input.imu1) {
+            let axis = geometry.steer_axis;
+            let rate = SteerRate { frame_rate: gyro0, fork_rate: imu1_mount * s.gyro[i], axis, sigma: config.steer_rate_sigma };
+            fs = filter.update(&fs, &rate, &c);
+            if i % steer_level_every == 0 && !air {
+                let (angle, lever) = steer_level_angle(&frame_force[i], &fork_force[i], &axis);
+                if lever >= STEER_LEVEL_MIN_LEVER {
+                    let sigma = config.steer_level_sigma / lever * steer_level_inflate;
+                    fs = filter.update(&fs, &SteerLevel { angle, sigma }, &c);
+                }
+            }
+        }
         // Gravity-leveling (M2a: kinematic compensation off — a_kin from v̇ is M3 tuning).
         // GATED OFF in free fall: airborne ⇒ specific force → 0 ⇒ there is no gravity
         // direction to level against. Running it there normalizes a ~0 vector (NaN, or
@@ -1493,6 +1584,13 @@ fn run_with_trace(
         pitch.push(pitch_deg);
         heading.push(if heading_set { heading_deg(&fs.x.r_chassis) } else { f64::NAN });
         heading_sigma.push(if heading_set { heading_sigma_rad(&fs).to_degrees() } else { f64::NAN });
+        if steer_forces.is_some() {
+            steer.push(fs.x.psi.to_degrees());
+            steer_sigma.push(fs.p[(I_PSI, I_PSI)].max(0.0).sqrt().to_degrees());
+        } else {
+            steer.push(f64::NAN);
+            steer_sigma.push(f64::NAN);
+        }
         let travel = heading_set
             .then(|| travel_direction(&fs, gyro0 - fs.x.b_g0, slip_lever, config.heading_init_min_speed_mps))
             .flatten();
@@ -1579,6 +1677,9 @@ fn run_with_trace(
         course,
         slip,
         slip_sigma,
+        steer,
+        steer_sigma,
+        steer_zero_deg: None,
         imu0_mount: mount_fit,
         imu0_riding_check_deg,
         gps_latency_s,
@@ -1591,6 +1692,7 @@ fn run_with_trace(
         final_state,
         ledger,
     };
+    est.steer_zero_deg = straight_riding_median(&est.heading, &est.steer, &speed, dt);
     if let Some(trim) = forward_trim(&est.heading, &est.slip, &speed, dt) {
         est.forward_trim_deg = Some(trim.to_degrees());
         if config.trim_forward {
@@ -1745,6 +1847,9 @@ mod tests {
             course: vec![f64::NAN; 5],
             slip: vec![f64::NAN; 5],
             slip_sigma: vec![f64::NAN; 5],
+            steer: vec![f64::NAN; 5],
+            steer_sigma: vec![f64::NAN; 5],
+            steer_zero_deg: None,
             imu0_mount: None,
             imu0_riding_check_deg: None,
             gps_latency_s: 0.0,
@@ -1781,6 +1886,9 @@ mod tests {
             course: vec![f64::NAN; 2],
             slip: vec![f64::NAN; 2],
             slip_sigma: vec![f64::NAN; 2],
+            steer: vec![f64::NAN; 2],
+            steer_sigma: vec![f64::NAN; 2],
+            steer_zero_deg: None,
             imu0_mount: None,
             imu0_riding_check_deg: None,
             gps_latency_s: 0.0,
@@ -2648,6 +2756,63 @@ mod tests {
         let forward = m * (heading.inverse() * Vector3::x());
         assert_relative_eq!(forward.y, 0.0, epsilon = 1e-12);
         assert!(forward.x > 0.9);
+    }
+
+    #[test]
+    fn run_bars_swung_while_the_frame_yaws_steer_follows_the_fork_within_3_degrees() {
+        // Arrange — 60 s at 100 Hz: 3 s at rest (the gyro offsets are read there),
+        // then the frame stays level and yaws back and forth (so it is not
+        // flagged stationary) while the fork turns ±17° about the steering axis
+        // on top of that, every 5 s. Both pods sit at IMU0, so no lever-arm
+        // terms enter.
+        let (dt, n) = (0.01, 6000);
+        let mut geometry = BikeGeometry::reference_bike();
+        geometry.imu0.mount = UnitQuaternion::identity();
+        geometry.imu1 = crate::estimate::geometry::ImuPose { mount: UnitQuaternion::identity(), lever: Vector3::zeros() };
+        geometry.imu2.as_mut().unwrap().mount = UnitQuaternion::identity();
+        let axis = nalgebra::Unit::new_normalize(geometry.steer_axis);
+        let up = Vector3::new(0.0, 0.0, GRAVITY);
+        let moving = |t: f64| (t - 3.0).max(0.0);
+        let frame_rate = |t: f64| Vector3::new(0.0, 0.0, 0.4 * (moving(t) * 1.3).sin());
+        let psi = |t: f64| 0.3 * (moving(t) * std::f64::consts::TAU / 5.0).sin();
+        let (mut gyro0, mut gyro1, mut accel1) = (vec![], vec![], vec![]);
+        for i in 0..n {
+            let t = i as f64 * dt;
+            let fork_from_frame = UnitQuaternion::from_axis_angle(&axis, psi(t)).inverse();
+            gyro0.push(frame_rate(t));
+            gyro1.push(fork_from_frame * frame_rate(t) + axis.into_inner() * (psi(t + dt) - psi(t)) / dt);
+            accel1.push(fork_from_frame * up);
+        }
+        let frame = || ImuSeries { gyro: gyro0.clone(), accel: vec![up; n] };
+        let input = EstimatorInput {
+            dt,
+            t0_s: 0.0,
+            imu0: frame(),
+            imu1: Some(ImuSeries { gyro: gyro1, accel: accel1 }),
+            imu2: Some(frame()),
+            gps: vec![],
+        };
+        let config = EstimatorConfig { imu0_mount: Imu0Mount::Geometry, estimate_steering: true, ..EstimatorConfig::default() };
+
+        // Act
+        let est = run(&input, &geometry, &config);
+
+        // Assert — after the first 10 s, the steer angle is the fork's.
+        let worst = (1000..n).map(|i| (est.steer[i] - psi(i as f64 * dt).to_degrees()).abs()).fold(0.0, f64::max);
+        assert!(worst < 3.0, "worst steer error {worst} deg");
+        assert!(est.steer_sigma[3000] > 0.0 && est.steer_sigma[3000] < 10.0, "sigma {}", est.steer_sigma[3000]);
+    }
+
+    #[test]
+    fn run_steering_off_leaves_steer_blank() {
+        // Arrange
+        let input = static_input(200, 0.01);
+
+        // Act
+        let est = run(&input, &BikeGeometry::reference_bike(), &EstimatorConfig::default());
+
+        // Assert
+        assert!(est.steer.iter().all(|s| s.is_nan()) && est.steer_zero_deg.is_none());
     }
 
     /// A filter state with every gyro-bias block known to `sigma` rad/s.

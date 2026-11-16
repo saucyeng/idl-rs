@@ -327,25 +327,46 @@ pub fn fit_bike_calibration(
         forward_from: forward.map(|(_, from)| from),
         forward_trim_deg: None,
         steer_axis: steer.as_ref().map(arr),
+        steer_zero_deg: None,
         imu0_gyro_bias_rad_s: arr(&imu0.gyro_bias),
         imus,
     })
 }
 
-/// How far `fit`'s forward is from the direction the bike travels on one ride,
-/// degrees anticlockwise seen from above, for
-/// [`CalibrationFit::with_forward_turned`]: the estimator is run over the ride
-/// with the calibration as it stands and the median slip over its straight-line
-/// riding is read off ([`crate::estimate::run::StateEstimate::forward_trim_deg`]).
-/// None when the ride has no IMU0, the calibration does not apply, or there is
-/// too little straight riding to say.
-pub fn forward_trim_from_ride(ride: &dyn crate::math::eval::ChannelLookup, fit: &CalibrationFit) -> Option<f64> {
+/// What one ride's straight-line riding says is left to correct in a
+/// calibration.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RideTrims {
+    /// How far forward is from the direction the bike travels, degrees
+    /// anticlockwise seen from above, for
+    /// [`CalibrationFit::with_forward_turned`]. None with too little straight
+    /// riding to say.
+    pub forward_deg: Option<f64>,
+    /// What the steer angle reads going straight, degrees, for
+    /// [`CalibrationFit::with_steer_zero`]. None likewise, or when the
+    /// calibration has no steering.
+    pub steer_zero_deg: Option<f64>,
+}
+
+/// Runs the estimator over one ride with `fit` as it stands and reads off what
+/// its straight-line riding says is left to correct: the median slip
+/// ([`crate::estimate::run::StateEstimate::forward_trim_deg`]) and the median
+/// steer angle ([`crate::estimate::run::StateEstimate::steer_zero_deg`]). None
+/// when the ride has no IMU0 or the calibration does not apply.
+pub fn ride_trims(ride: &dyn crate::math::eval::ChannelLookup, fit: &CalibrationFit) -> Option<RideTrims> {
     use crate::estimate::run::{run, EstimatorConfig, EstimatorInput, Imu0Mount};
     let input = EstimatorInput::from_lookup(ride)?;
     let geometry = fit.apply_to(&crate::estimate::geometry::BikeGeometry::reference_bike()).ok()?;
-    // The trim is measured, not applied: the answer is what is left to turn.
-    let config = EstimatorConfig { imu0_mount: Imu0Mount::Geometry, trim_forward: false, smooth: false, ..EstimatorConfig::default() };
-    run(&input, &geometry, &config).forward_trim_deg
+    // Measured, not applied: the answers are what is left to turn.
+    let config = EstimatorConfig {
+        imu0_mount: Imu0Mount::Geometry,
+        trim_forward: false,
+        estimate_steering: fit.has_steering(),
+        smooth: false,
+        ..EstimatorConfig::default()
+    };
+    let est = run(&input, &geometry, &config);
+    Some(RideTrims { forward_deg: est.forward_trim_deg, steer_zero_deg: est.steer_zero_deg })
 }
 
 /// The worst error in each fitted quantity against a `session synth` truth

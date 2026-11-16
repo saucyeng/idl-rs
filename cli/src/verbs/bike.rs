@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use idl_library::bikelog::{self, BikeLogError, BikeLogErrorKind, Entry};
 use idl_library::catalog_read::{get_session, list_sessions, SessionDetail};
 use idl_rs::calibration::bike::{BikeCalibration, ForwardFrom, SourceWindow};
-use idl_rs::commands::calibration_ops::{fit_bike_calibration, forward_trim_from_ride, ProtocolWindows};
+use idl_rs::commands::calibration_ops::{fit_bike_calibration, ride_trims, ProtocolWindows};
 
 use super::{many, opt_integer, opt_text, text, Ctx, VerbOutput};
 use crate::envelope::{CliError, ErrorKind};
@@ -205,23 +205,29 @@ pub fn calibrate(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
         let dir = root.join("sessions").join(&ride.session_id);
         let handle = idl_rs::store::parquet::open_session_lazy(&dir)
             .map_err(|e| CliError::io(format!("reading {}: {}", dir.join("data.parquet").display(), e.message)))?;
-        let trim = forward_trim_from_ride(&handle, &current.fit).ok_or_else(|| {
+        let too_little = || {
             CliError::new(ErrorKind::InvalidInput, format!("{} has too little straight-line riding with GPS to say which way the bike travels", ride.session_id))
-        })?;
-        let fit = current.fit.with_forward_turned(trim).map_err(|e| CliError::new(ErrorKind::InvalidInput, e.to_string()))?;
+        };
+        let trims = ride_trims(&handle, &current.fit).ok_or_else(too_little)?;
+        let trim = trims.forward_deg.ok_or_else(too_little)?;
+        let mut fit = current.fit.with_forward_turned(trim).map_err(|e| CliError::new(ErrorKind::InvalidInput, e.to_string()))?;
+        if let Some(zero) = trims.steer_zero_deg {
+            fit = fit.with_steer_zero(zero);
+        }
         let turned = BikeCalibration { fit, forward_ride: Some(ride.session_id.clone()), updated_at_ms: now.max(current.updated_at_ms + 1), ..current.clone() };
         let line = format!(
-            "forward of calibration {} turned {:+.1} deg ({}) to match ride {}",
+            "calibration {} matched to ride {}: forward turned {:+.1} deg ({}){}",
             turned.calibration_id,
+            ride.session_id,
             trim,
             if trim >= 0.0 { "to the left" } else { "to the right" },
-            ride.session_id
+            trims.steer_zero_deg.map_or(String::new(), |z| format!("; steering zero moved {z:+.1} deg")),
         );
         if ctx.dry_run {
-            return Ok(VerbOutput::new(format!("would save: {line}"), json!({ "calibration": turned, "trim_deg": trim, "written": false })));
+            return Ok(VerbOutput::new(format!("would save: {line}"), json!({ "calibration": turned, "trim_deg": trim, "steer_zero_deg": trims.steer_zero_deg, "written": false })));
         }
         let saved = bikelog::save_calibration(root, &bike_id, &turned)?;
-        return Ok(VerbOutput::new(line, json!({ "calibration": saved, "trim_deg": trim, "written": true })));
+        return Ok(VerbOutput::new(line, json!({ "calibration": saved, "trim_deg": trim, "steer_zero_deg": trims.steer_zero_deg, "written": true })));
     }
 
     let still_id = opt_text(m, "still")

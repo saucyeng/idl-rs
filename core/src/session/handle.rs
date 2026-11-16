@@ -238,7 +238,7 @@ pub enum SliceRole {
 /// string store allowed is impossible by construction.
 /// Every channel one estimator run stores, by id. One list, so the run and
 /// the calibration setter that invalidates it cannot disagree.
-const ESTIMATOR_CHANNELS: [&str; 13] = [
+const ESTIMATOR_CHANNELS: [&str; 15] = [
     "Front travel (mm)",
     "Front velocity (mm/s)",
     "Rear travel (mm)",
@@ -252,6 +252,8 @@ const ESTIMATOR_CHANNELS: [&str; 13] = [
     "Course (deg)",
     "Slip (deg)",
     "Slip uncertainty (deg)",
+    "Steer (deg)",
+    "Steer uncertainty (deg)",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -601,13 +603,15 @@ impl SessionHandle {
         let reference = crate::estimate::geometry::BikeGeometry::reference_bike();
         let calibrated = self.calibration.read().unwrap().as_ref().and_then(|fit| {
             let source = if fit.has_forward() { Imu0Mount::Geometry } else { Imu0Mount::GeometryTilt };
-            fit.apply_to(&reference).ok().map(|geometry| (geometry, source))
+            fit.apply_to(&reference).ok().map(|geometry| (geometry, source, fit.has_steering()))
         });
-        let (geometry, imu0_mount) = calibrated.unwrap_or((reference, Imu0Mount::Riding));
+        // Steering needs the bike's own steering axis and fork-pod mount: the
+        // reference bike's are not this bike's, so without them it stays blank.
+        let (geometry, imu0_mount, estimate_steering) = calibrated.unwrap_or((reference, Imu0Mount::Riding, false));
         // A calibration that says which way is forward is used as given, the
         // same for every ride; only a bike without one is trimmed per ride.
         let trim_forward = imu0_mount != Imu0Mount::Geometry;
-        let est = crate::estimate::run::run(&input, &geometry, &EstimatorConfig { imu0_mount, trim_forward, ..EstimatorConfig::default() });
+        let est = crate::estimate::run::run(&input, &geometry, &EstimatorConfig { imu0_mount, trim_forward, estimate_steering, ..EstimatorConfig::default() });
         let rate_hz = if est.dt > 0.0 { 1.0 / est.dt } else { 0.0 };
         // The outputs live on the estimator's own grid, which starts at IMU0's
         // first recorded sample and not at 0.
@@ -631,6 +635,8 @@ impl SessionHandle {
         store("Course (deg)", est.course);
         store("Slip (deg)", est.slip);
         store("Slip uncertainty (deg)", est.slip_sigma);
+        store("Steer (deg)", est.steer);
+        store("Steer uncertainty (deg)", est.steer_sigma);
         true
     }
 
