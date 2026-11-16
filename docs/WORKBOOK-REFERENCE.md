@@ -1292,10 +1292,10 @@ result = lap_delta_dist([Speed])
 #### attitude
 
 ```
-attitude("roll"|"pitch"|"heading"|"heading_sigma"|"course"|"slip"|"slip_sigma"|"steer"|"steer_sigma")
+attitude("roll"|"pitch"|"heading"|"heading_sigma"|"course"|"slip"|"slip_sigma"|"steer"|"steer_sigma"|"steer_needed"|"understeer")
 ```
 
-Bike attitude from the estimator, in degrees. `roll` and `pitch` are about the bike's own axes. `heading` is where the frame points and `course` where the rear wheel is travelling, both clockwise from north; `slip` is heading minus course (positive = nose right of travel). `heading_sigma` and `slip_sigma` are the estimator's own 1-sigma uncertainties. `steer` is the bar angle about the steering axis, positive to the left, and needs the bike to have a calibration with a steering axis (blank otherwise). Heading, course and slip are blank until the bike first moves, and course and slip below 3 m/s.
+Bike attitude from the estimator, in degrees. `roll` and `pitch` are about the bike's own axes. `heading` is where the frame points and `course` where the rear wheel is travelling, both clockwise from north; `slip` is heading minus course (positive = nose right of travel). `heading_sigma` and `slip_sigma` are the estimator's own 1-sigma uncertainties. `steer` is the bar angle about the steering axis, positive to the left, and needs the bike to have a calibration with a steering axis (blank otherwise). `steer_needed` is the bar angle a bike that does not slide needs for its speed and turn rate, and `understeer` is the measured steering angle less that, on the ground and toward the turn: positive = understeer, negative = oversteer (blank going straight); both also need the bike's wheelbase. Heading, course and slip are blank until the bike first moves, and course and slip below 3 m/s.
 
 | | |
 |---|---|

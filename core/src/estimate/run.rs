@@ -603,6 +603,21 @@ pub struct StateEstimate {
     /// the geometry's bars-straight fork mount. None when steering is not
     /// estimated or the ride has too little straight riding to say.
     pub steer_zero_deg: Option<f64>,
+    /// The bar angle a bike that does not slide needs for its speed and turn
+    /// rate, per sample, degrees, positive = left ([`kinematic_steer`]): what
+    /// `steer` would read with no tyre slip at either end. `NaN` when steering
+    /// is not estimated, the geometry has no wheelbase, or the rear wheel is
+    /// moving slower than [`EstimatorConfig::heading_init_min_speed_mps`].
+    pub steer_needed: Vec<f64>,
+    /// Understeer angle per sample, degrees: the steering angle measured, less
+    /// the one a non-sliding bike needs, both on the ground plane and taken
+    /// toward the turn. It is the front tyre's slip angle less the rear's:
+    /// positive = understeer (more lock than the turn needs; the front is
+    /// pushing), negative = oversteer (less, or opposite lock; the rear is
+    /// stepping out). `NaN` wherever `steer_needed` is and while turning slower
+    /// than [`UNDERSTEER_MIN_TURN_RATE`], where there is no turn to take it
+    /// toward.
+    pub understeer: Vec<f64>,
     /// The riding-data fit of IMU0's mount ([`fit_imu0_mount_from_riding`]) and
     /// whether its gates passed. It is the mount in use only under
     /// [`Imu0Mount::Riding`]; otherwise it is a check on the calibration.
@@ -1078,6 +1093,35 @@ fn apply_forward_trim(est: &mut StateEstimate, trim: f64) {
     x.b_a0 = rz.inverse() * x.b_a0;
 }
 
+/// Slowest turn (rad/s about the vertical) the understeer angle is given for.
+/// Below it "toward the turn" has no direction and the angle needed is too
+/// small to compare anything with.
+pub const UNDERSTEER_MIN_TURN_RATE: f64 = 0.05;
+
+/// The bar angle a bike that does not slide needs, rad (left positive), and the
+/// understeer angle, rad (None while turning slower than
+/// [`UNDERSTEER_MIN_TURN_RATE`]).
+///
+/// A bike of wheelbase `p` following a circle with neither tyre slipping has
+/// its front wheel steered, on the ground, by `Δ = atan(p·Ω / v)`, for turn rate
+/// `Ω` about the vertical and rear-wheel speed `v`. The bars turn about an axis
+/// leaning back by the caster angle `ε`, on a bike leaned by `φ`, and to first
+/// order `Δ = δ·cos ε / cos φ` for bar angle `δ` — the kinematic steering angle
+/// of a motorcycle (as given in the motorcycle dynamics texts; from memory, and
+/// with the trail and tyre-section corrections left out). So the bar angle
+/// needed is `Δ·cos φ / cos ε`, and the understeer angle is the measured `δ`
+/// put on the ground, less `Δ`, taken toward the turn.
+///
+/// `wheelbase` is the topped-out one; a compressed fork shortens it (by about
+/// `sin ε` of the fork travel), which is not allowed for.
+pub fn kinematic_steer(wheelbase: f64, turn_rate: f64, speed: f64, lean: f64, caster: f64, steer: f64) -> (f64, Option<f64>) {
+    let on_ground = (wheelbase * turn_rate / speed).atan();
+    let bars_per_ground = lean.cos() / caster.cos();
+    let needed = on_ground * bars_per_ground;
+    let under = (turn_rate.abs() >= UNDERSTEER_MIN_TURN_RATE).then(|| (steer / bars_per_ground - on_ground) * turn_rate.signum());
+    (needed, under)
+}
+
 /// Where on the bike travel direction is read for [`StateEstimate::slip`], as an
 /// offset from IMU0 in the chassis frame, m: the swingarm pod, which sits by the
 /// rear axle. A yawing frame sweeps its front sideways, so the angle between
@@ -1416,6 +1460,10 @@ fn run_with_trace(
     let mut slip_sigma = Vec::with_capacity(n);
     let mut steer = Vec::with_capacity(n);
     let mut steer_sigma = Vec::with_capacity(n);
+    let mut steer_needed = Vec::with_capacity(n);
+    let mut understeer = Vec::with_capacity(n);
+    // Angle of the steering axis from the chassis vertical (the caster angle).
+    let caster = geometry.steer_axis.z.clamp(-1.0, 1.0).acos();
     let slip_lever = slip_reference(geometry);
     // Heading is unknown until the first fix fast enough to give a course; until
     // then no GPS velocity is fused. `last_gps` is the sample of the last fused fix.
@@ -1591,6 +1639,28 @@ fn run_with_trace(
             steer.push(f64::NAN);
             steer_sigma.push(f64::NAN);
         }
+        let kinematic = match (steer_forces.is_some(), geometry.wheelbase) {
+            (true, Some(wheelbase)) => {
+                let rate = gyro0 - fs.x.b_g0;
+                // Turn rate about the vertical, anticlockwise (left) positive, and
+                // the rear wheel's speed over the ground.
+                let turn_rate = (fs.x.r_chassis * rate).z;
+                let speed = (fs.x.v_chassis + fs.x.r_chassis * rate.cross(&slip_lever)).xy().norm();
+                (speed >= config.heading_init_min_speed_mps)
+                    .then(|| kinematic_steer(wheelbase, turn_rate, speed, roll_deg.to_radians(), caster, fs.x.psi))
+            }
+            _ => None,
+        };
+        match kinematic {
+            Some((needed, under)) => {
+                steer_needed.push(needed.to_degrees());
+                understeer.push(under.map_or(f64::NAN, f64::to_degrees));
+            }
+            None => {
+                steer_needed.push(f64::NAN);
+                understeer.push(f64::NAN);
+            }
+        }
         let travel = heading_set
             .then(|| travel_direction(&fs, gyro0 - fs.x.b_g0, slip_lever, config.heading_init_min_speed_mps))
             .flatten();
@@ -1680,6 +1750,8 @@ fn run_with_trace(
         steer,
         steer_sigma,
         steer_zero_deg: None,
+        steer_needed,
+        understeer,
         imu0_mount: mount_fit,
         imu0_riding_check_deg,
         gps_latency_s,
@@ -1850,6 +1922,8 @@ mod tests {
             steer: vec![f64::NAN; 5],
             steer_sigma: vec![f64::NAN; 5],
             steer_zero_deg: None,
+            steer_needed: vec![f64::NAN; 5],
+            understeer: vec![f64::NAN; 5],
             imu0_mount: None,
             imu0_riding_check_deg: None,
             gps_latency_s: 0.0,
@@ -1889,6 +1963,8 @@ mod tests {
             steer: vec![f64::NAN; 2],
             steer_sigma: vec![f64::NAN; 2],
             steer_zero_deg: None,
+            steer_needed: vec![f64::NAN; 5],
+            understeer: vec![f64::NAN; 5],
             imu0_mount: None,
             imu0_riding_check_deg: None,
             gps_latency_s: 0.0,
@@ -2804,6 +2880,73 @@ mod tests {
     }
 
     #[test]
+    fn kinematic_steer_upright_vertical_axis_is_the_bicycle_model_angle() {
+        // Arrange — 1.2 m wheelbase, 6 m/s round a 12 m circle to the left
+        // (0.5 rad/s): the front wheel is steered atan(1.2/12) = 5.71°.
+        let needed_deg = (1.2_f64 / 12.0).atan().to_degrees();
+
+        // Act — the bars at exactly that.
+        let (needed, under) = kinematic_steer(1.2, 0.5, 6.0, 0.0, 0.0, needed_deg.to_radians());
+
+        // Assert
+        assert_relative_eq!(needed.to_degrees(), needed_deg, epsilon = 1e-12);
+        assert_relative_eq!(under.unwrap(), 0.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn kinematic_steer_more_lock_than_the_turn_needs_is_understeer_either_way_round() {
+        // Arrange — the same turn to the left and to the right, with 2° more
+        // lock into the turn than it needs.
+        let needed = (1.2_f64 / 12.0).atan();
+        let extra = 2_f64.to_radians();
+
+        // Act
+        let (_, left) = kinematic_steer(1.2, 0.5, 6.0, 0.0, 0.0, needed + extra);
+        let (_, right) = kinematic_steer(1.2, -0.5, 6.0, 0.0, 0.0, -(needed + extra));
+
+        // Assert
+        assert_relative_eq!(left.unwrap().to_degrees(), 2.0, epsilon = 1e-9);
+        assert_relative_eq!(right.unwrap().to_degrees(), 2.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn kinematic_steer_opposite_lock_is_oversteer() {
+        // Arrange — turning left with the bars 3° to the right.
+        let needed = (1.2_f64 / 12.0).atan();
+
+        // Act
+        let (_, under) = kinematic_steer(1.2, 0.5, 6.0, 0.0, 0.0, -3_f64.to_radians());
+
+        // Assert — short of what the turn needs by all of it and 3° more.
+        assert_relative_eq!(under.unwrap(), -(needed + 3_f64.to_radians()), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn kinematic_steer_leaned_with_a_raked_axis_needs_less_bar_for_the_same_turn() {
+        // Arrange — 30° of lean, the axis raked 26°.
+        let (lean, caster) = (30_f64.to_radians(), 26_f64.to_radians());
+        let on_ground = (1.2_f64 / 12.0).atan();
+
+        // Act — bars at the angle this says is needed.
+        let (needed, _) = kinematic_steer(1.2, 0.5, 6.0, lean, caster, 0.0);
+        let (_, under) = kinematic_steer(1.2, 0.5, 6.0, lean, caster, needed);
+
+        // Assert — cos 30° / cos 26° = 0.964 of the ground angle, and no understeer.
+        assert_relative_eq!(needed, on_ground * lean.cos() / caster.cos(), epsilon = 1e-12);
+        assert!(needed < on_ground);
+        assert_relative_eq!(under.unwrap(), 0.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn kinematic_steer_going_straight_has_no_understeer_angle() {
+        // Act — 0.01 rad/s is not a turn.
+        let (needed, under) = kinematic_steer(1.2, 0.01, 6.0, 0.0, 0.0, 0.02);
+
+        // Assert
+        assert!(needed.abs() < 0.01 && under.is_none());
+    }
+
+    #[test]
     fn run_steering_off_leaves_steer_blank() {
         // Arrange
         let input = static_input(200, 0.01);
@@ -2813,6 +2956,7 @@ mod tests {
 
         // Assert
         assert!(est.steer.iter().all(|s| s.is_nan()) && est.steer_zero_deg.is_none());
+        assert!(est.steer_needed.iter().all(|s| s.is_nan()) && est.understeer.iter().all(|s| s.is_nan()));
     }
 
     /// A filter state with every gyro-bias block known to `sigma` rad/s.

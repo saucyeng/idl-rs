@@ -328,6 +328,7 @@ pub fn fit_bike_calibration(
         forward_trim_deg: None,
         steer_axis: steer.as_ref().map(arr),
         steer_zero_deg: None,
+        wheelbase_m: None,
         imu0_gyro_bias_rad_s: arr(&imu0.gyro_bias),
         imus,
     })

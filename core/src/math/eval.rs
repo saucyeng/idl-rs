@@ -1074,7 +1074,7 @@ pub(super) fn require_string<'a>(v: &'a Value, ctx: &str) -> Result<&'a str, Mat
 pub(super) fn estimator_channel_id(name: &str, arg: &str) -> Result<&'static str, MathEvalError> {
     let expected = match name {
         "wheel_travel" | "wheel_velocity" => "\"front\" or \"rear\"",
-        "attitude" => "\"roll\", \"pitch\", \"heading\", \"heading_sigma\", \"course\", \"slip\", \"slip_sigma\", \"steer\" or \"steer_sigma\"",
+        "attitude" => "\"roll\", \"pitch\", \"heading\", \"heading_sigma\", \"course\", \"slip\", \"slip_sigma\", \"steer\", \"steer_sigma\", \"steer_needed\" or \"understeer\"",
         _ => "\"long\" or \"lat\"",
     };
     match (name, arg) {
@@ -1091,6 +1091,8 @@ pub(super) fn estimator_channel_id(name: &str, arg: &str) -> Result<&'static str
         ("attitude", "slip_sigma") => Ok("Slip uncertainty (deg)"),
         ("attitude", "steer") => Ok("Steer (deg)"),
         ("attitude", "steer_sigma") => Ok("Steer uncertainty (deg)"),
+        ("attitude", "steer_needed") => Ok("Steer needed (deg)"),
+        ("attitude", "understeer") => Ok("Understeer (deg)"),
         ("body_accel", "long") => Ok("Longitudinal accel (g)"),
         ("body_accel", "lat") => Ok("Lateral accel (g)"),
         _ => Err(err(

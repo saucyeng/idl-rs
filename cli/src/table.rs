@@ -868,6 +868,7 @@ pub const COMMANDS: &[CommandRow] = &[
             Flag::value("steer-from-ms", ValueKind::Integer, "Start of the window with the frame still and the bars swung"),
             Flag::value("steer-to-ms", ValueKind::Integer, "End of that window"),
             Flag::value("forward-from", ValueKind::Text, "Session id of a ride: set the newest calibration's forward and steering zero so that ride's straight-line riding reads zero slip and zero steer, instead of fitting a new calibration"),
+            Flag::value("wheelbase-mm", ValueKind::Integer, "Set the newest calibration's wheelbase (suspension topped out), mm, instead of fitting a new calibration; the understeer outputs need it"),
             Flag::value("note", ValueKind::Text, "Free text kept with the calibration"),
             Flag::value("delete", ValueKind::Text, "Remove this calibration id instead of fitting one"),
         ],

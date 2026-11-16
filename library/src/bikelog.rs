@@ -907,6 +907,7 @@ mod tests {
                 forward_trim_deg: None,
                 steer_axis: None,
                 steer_zero_deg: None,
+                wheelbase_m: None,
                 imu0_gyro_bias_rad_s: [0.0; 3],
                 imus: Vec::new(),
             },

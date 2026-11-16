@@ -124,6 +124,10 @@ pub struct CalibrationFit {
     /// zero. Absent = not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steer_zero_deg: Option<f64>,
+    /// Wheelbase with the suspension topped out, metres. Entered, not fitted:
+    /// no recording measures it. Needed for the understeer outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wheelbase_m: Option<f64>,
     /// IMU0's gyro offset in the still window, rad/s.
     pub imu0_gyro_bias_rad_s: [f64; 3],
     /// The unsprung IMUs that were fitted, ascending by index.
@@ -392,6 +396,7 @@ impl CalibrationFit {
             None => ImuPose { mount: shift * fallback.mount, lever: fallback.lever },
         };
         let mut out = base.clone();
+        out.wheelbase = self.wheelbase_m.filter(|w| w.is_finite() && *w > 0.0).or(base.wheelbase);
         out.imu0 = ImuPose { mount: m0, lever: base.imu0.lever };
         out.imu1 = pose(1, &base.imu1);
         out.imu2 = base.imu2.as_ref().map(|p| pose(2, p));
@@ -515,6 +520,7 @@ mod tests {
             forward_trim_deg: None,
             steer_axis: None,
             steer_zero_deg: None,
+            wheelbase_m: None,
             imu0_gyro_bias_rad_s: [0.0; 3],
             imus: Vec::new(),
         }
@@ -716,6 +722,10 @@ mod tests {
         assert_relative_eq!(g.front_axis, g.steer_axis, epsilon = 1e-12);
         // Travel and sag are not a calibration's to change.
         assert_eq!(g.front_travel_max, base.front_travel_max);
+        // An entered wheelbase reaches the geometry; without one it stays unknown.
+        assert_eq!(g.wheelbase, None);
+        f.wheelbase_m = Some(1.28);
+        assert_eq!(f.apply_to(&base).unwrap().wheelbase, Some(1.28));
     }
 
     #[test]

@@ -197,6 +197,23 @@ pub fn calibrate(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
         ));
     }
 
+    if let Some(wheelbase_mm) = opt_integer(m, "wheelbase-mm") {
+        if !(300..=3000).contains(&wheelbase_mm) {
+            return Err(CliError::usage(format!("--wheelbase-mm {wheelbase_mm} is not a bike's wheelbase in millimetres")));
+        }
+        let Some(current) = file.calibrations.iter().filter(|c| !c.deleted).max_by_key(|c| (c.captured_at_ms, c.updated_at_ms)) else {
+            return Err(CliError::new(ErrorKind::NotFound, format!("{bike_id} has no calibration to hold a wheelbase; fit one with --still first")));
+        };
+        let mut changed = BikeCalibration { updated_at_ms: now.max(current.updated_at_ms + 1), ..current.clone() };
+        changed.fit.wheelbase_m = Some(wheelbase_mm as f64 / 1000.0);
+        let line = format!("wheelbase of calibration {} set to {wheelbase_mm} mm", changed.calibration_id);
+        if ctx.dry_run {
+            return Ok(VerbOutput::new(format!("would save: {line}"), json!({ "calibration": changed, "written": false })));
+        }
+        let saved = bikelog::save_calibration(root, &bike_id, &changed)?;
+        return Ok(VerbOutput::new(line, json!({ "calibration": saved, "written": true })));
+    }
+
     if let Some(ride_id) = opt_text(m, "forward-from") {
         let Some(current) = file.calibrations.iter().filter(|c| !c.deleted).max_by_key(|c| (c.captured_at_ms, c.updated_at_ms)) else {
             return Err(CliError::new(ErrorKind::NotFound, format!("{bike_id} has no calibration to turn; fit one with --still first")));

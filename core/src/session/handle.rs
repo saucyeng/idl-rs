@@ -238,7 +238,7 @@ pub enum SliceRole {
 /// string store allowed is impossible by construction.
 /// Every channel one estimator run stores, by id. One list, so the run and
 /// the calibration setter that invalidates it cannot disagree.
-const ESTIMATOR_CHANNELS: [&str; 15] = [
+const ESTIMATOR_CHANNELS: [&str; 17] = [
     "Front travel (mm)",
     "Front velocity (mm/s)",
     "Rear travel (mm)",
@@ -254,6 +254,8 @@ const ESTIMATOR_CHANNELS: [&str; 15] = [
     "Slip uncertainty (deg)",
     "Steer (deg)",
     "Steer uncertainty (deg)",
+    "Steer needed (deg)",
+    "Understeer (deg)",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -637,6 +639,8 @@ impl SessionHandle {
         store("Slip uncertainty (deg)", est.slip_sigma);
         store("Steer (deg)", est.steer);
         store("Steer uncertainty (deg)", est.steer_sigma);
+        store("Steer needed (deg)", est.steer_needed);
+        store("Understeer (deg)", est.understeer);
         true
     }
 

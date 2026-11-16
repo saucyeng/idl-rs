@@ -93,6 +93,9 @@ pub struct BikeGeometry {
     pub imu1: ImuPose,
     /// Rear-unsprung IMU pose (None on a hardtail).
     pub imu2: Option<ImuPose>,
+    /// Wheelbase with the suspension topped out, metres. None when it is not
+    /// known for this bike; the understeer outputs are then blank.
+    pub wheelbase: Option<f64>,
 }
 
 impl BikeGeometry {
@@ -147,6 +150,8 @@ impl BikeGeometry {
         ));
 
         BikeGeometry {
+            // Not a property of "a reference bike": it is entered per bike.
+            wheelbase: None,
             topology: Topology::FullSuspension,
             steer_axis: tilt_back,
             front_axis: tilt_back,
