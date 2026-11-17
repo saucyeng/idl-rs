@@ -3,10 +3,17 @@
 //! the `ChannelLookup`/FFI adapter that pulls named session channels into
 //! [`EstimatorInput`] is a thin bridge-layer concern, kept out of here.
 //!
-//! Pipeline: stationary detection → orientation/bias pre-step → forward IEKF over
-//! the shared factors (diff-accel wheel drive, ZUPT/ZARU, gravity-leveling, sag,
-//! barrier, GPS velocity) → observability ledger. The wheel-drive controls are the
-//! projected differential specific forces (design §5), built per sample here.
+//! Pipeline: every channel resampled onto IMU0's gyro grid by recorded time →
+//! GPS latency measured from the ride → IMU0's mount (the bike's calibration, or
+//! fitted from straight-line riding) → stationary detection → orientation/bias
+//! pre-step → forward IEKF over the shared factors (diff-accel wheel drive,
+//! ZUPT/ZARU, gravity-leveling, sag, barrier, topout, GPS velocity, and steering
+//! when the bike's calibration allows it) → RTS smoothing of the wheel chains →
+//! the per-ride forward trim and steering zero → observability ledger. The
+//! heading is set from the GPS course once and never pulled onto it again. The
+//! wheel-drive controls are the projected differential specific forces
+//! (design §5), built per sample here. `README.md` in this folder says what
+//! each output is and how far it can be trusted.
 
 use crate::estimate::detect::stationary_context;
 use crate::math::eval::ChannelLookup;
@@ -346,11 +353,15 @@ pub enum Imu0Mount {
     GeometryTilt,
 }
 
-/// Tuning for one run (refined in M3). [`EstimatorConfig::default`] gives sensible
-/// starting values for the reference bike.
+/// Tuning for one run. [`EstimatorConfig::default`] gives the values for a bike
+/// with no calibration; [`session_setup`] gives what a session runs with for
+/// its bike's calibration.
 #[derive(Debug, Clone, Copy)]
 pub struct EstimatorConfig {
-    /// Estimate steering states (M2a: false — wheels first).
+    /// Estimate the steer angle ([`SteerRate`], [`SteerLevel`]). Default
+    /// **false**: it needs the bike's own steering axis and fork-pod mount, which
+    /// only a calibration has ([`session_setup`] turns it on for one that does).
+    /// With it off, or with no fork IMU, the steering outputs are `NaN`.
     pub estimate_steering: bool,
     /// Process-noise PSDs.
     pub process_noise: ProcessNoiseConfig,
@@ -568,12 +579,15 @@ pub fn session_setup(calibration: Option<&crate::calibration::bike::CalibrationF
     (geometry, EstimatorConfig { imu0_mount, trim_forward, estimate_steering, ..EstimatorConfig::default() })
 }
 
-/// The result of one run: the wheel-output channels + the observability ledger.
+/// The result of one run: the per-sample output channels (wheels, attitude,
+/// heading and travel direction, steering, body acceleration), what the run
+/// measured about the ride (GPS latency, forward trim, steering zero, mount
+/// check), and the observability ledger.
 /// With [`EstimatorConfig::smooth`] (the default) the four wheel outputs are the
 /// **RTS-smoothed** trajectories — each topout/ZUPT anchor distributed backward over
 /// the interval before it; with it off they are the raw causal forward pass.
 /// The full per-sample [`MtbState`] trajectory is deliberately **not** retained
-/// — only the four wheel outputs (the derived channels the bridge maps to `store_math`),
+/// — only the output channels (what `SessionHandle` stores as derived channels),
 /// the per-sample stationary flag, and the final state — so a run's memory is O(outputs),
 /// not O(samples × full state). A multi-hour log (millions of samples) stays bounded
 /// instead of allocating hundreds of MB of state. The full covariance stays lazy too.
@@ -1059,8 +1073,7 @@ fn lowpass_vectors(v: &[Vector3<f64>], cutoff_hz: f64, dt: f64) -> Vec<Vector3<f
 /// [`crate::estimate::orient::RIDING_MIN_STRAIGHT_S`] of such riding.
 fn straight_riding_median(heading: &[f64], values: &[f64], speed: &[f64], dt: f64) -> Option<f64> {
     use crate::estimate::orient::{RIDING_MIN_SPEED_MPS, RIDING_MIN_STRAIGHT_S};
-    let slip = values;
-    let n = heading.len().min(slip.len()).min(speed.len());
+    let n = heading.len().min(values.len()).min(speed.len());
     let half = ((0.5 / dt).round() as usize).max(1);
     // A sample every 20 ms is plenty for a median and keeps the sort small.
     let stride = ((0.02 / dt).round() as usize).max(1);
@@ -1069,8 +1082,8 @@ fn straight_riding_median(heading: &[f64], values: &[f64], speed: &[f64], dt: f6
     while i + half < n {
         let turned = ((heading[i + half] - heading[i - half] + 180.0).rem_euclid(360.0) - 180.0).to_radians();
         let rate = turned / (2.0 * half as f64 * dt);
-        if slip[i].is_finite() && rate.abs() <= FORWARD_TRIM_MAX_TURN_RATE && speed[i] >= RIDING_MIN_SPEED_MPS {
-            straight.push(slip[i]);
+        if values[i].is_finite() && rate.abs() <= FORWARD_TRIM_MAX_TURN_RATE && speed[i] >= RIDING_MIN_SPEED_MPS {
+            straight.push(values[i]);
         }
         i += stride;
     }
@@ -1990,8 +2003,8 @@ mod tests {
             steer: vec![f64::NAN; 2],
             steer_sigma: vec![f64::NAN; 2],
             steer_zero_deg: None,
-            steer_needed: vec![f64::NAN; 5],
-            understeer: vec![f64::NAN; 5],
+            steer_needed: vec![f64::NAN; 2],
+            understeer: vec![f64::NAN; 2],
             imu0_mount: None,
             imu0_riding_check_deg: None,
             gps_latency_s: 0.0,
@@ -2364,7 +2377,7 @@ mod tests {
         let est = run(&input, &BikeGeometry::reference_bike(), &EstimatorConfig::default());
 
         // Assert — velocity confidently pinned (ZUPT); attitude relative-only at rest
-        // (yaw gauge); steering frozen (M2a).
+        // (yaw gauge); steering frozen (off by default).
         assert_eq!(est.ledger.get("v_chassis").unwrap().dc_source, DcSource::Pinned);
         assert_eq!(est.ledger.get("R_chassis").unwrap().dc_source, DcSource::RelativeOnly);
         assert_eq!(est.ledger.get("psi").unwrap().dc_source, DcSource::Frozen);

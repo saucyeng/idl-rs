@@ -14,9 +14,9 @@
 //! ```
 //!
 //! and on convergence updates `P⁺ = (I − K H) P` (Joseph form for stability). One
-//! iteration is the plain EKF; iterating matters for the steering re-linearization
-//! through `ψ̂` (M2b). Frozen states carry a tiny prior variance, so the gain barely
-//! moves them.
+//! iteration is the plain EKF, and the default (`EstimatorConfig::iekf_iters`).
+//! States a run does not estimate (steering without a calibration, the rear on a
+//! hardtail) carry a tiny prior variance, so the gain barely moves them.
 
 use crate::estimate::model::{ErrorState, ImuInput, MeasurementModel, ProcessModel, SampleContext};
 use crate::estimate::process::MtbProcess;

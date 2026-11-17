@@ -7,7 +7,9 @@
 //! changes per bike/stage is which components are active:
 //!
 //! - **Hardtail** drops the rear-unsprung gyro bias and both rear wheel states.
-//! - **Wheels-first (M2a)** holds the steering states frozen (steering is M2b).
+//! - **No steering** holds the steering states frozen: a bike whose calibration
+//!   has no steering axis and fork-pod mount, or none at all
+//!   ([`crate::estimate::run::session_setup`]).
 
 use crate::estimate::geometry::{BikeGeometry, Topology};
 
@@ -52,7 +54,7 @@ pub struct StateSchema {
 
 impl StateSchema {
     /// Derives the schema from bike geometry and whether steering is estimated this
-    /// run (M2a passes `false` — wheels first; M2b passes `true`). A hardtail
+    /// run ([`crate::estimate::run::EstimatorConfig::estimate_steering`]). A hardtail
     /// freezes the rear-unsprung bias and rear wheel states.
     pub fn from_geometry(geometry: &BikeGeometry, estimate_steering: bool) -> StateSchema {
         let full_sus = geometry.topology == Topology::FullSuspension;
@@ -117,7 +119,7 @@ mod tests {
 
     #[test]
     fn full_suspension_wheels_first_active_set() {
-        // Arrange — reference full-sus bike, steering off (M2a).
+        // Arrange — reference full-sus bike, steering off.
         let g = BikeGeometry::reference_bike();
 
         // Act
@@ -128,8 +130,8 @@ mod tests {
         for sym in ["R_chassis", "v_chassis", "b_g0", "b_a0", "b_g1", "b_g2", "w_f", "dw_f", "w_r", "dw_r"] {
             assert!(s.is_active(sym), "{sym} should be active");
         }
-        assert!(!s.is_active("psi"), "steering frozen in M2a");
-        assert!(!s.is_active("dpsi"), "steering rate frozen in M2a");
+        assert!(!s.is_active("psi"), "steering frozen when not estimated");
+        assert!(!s.is_active("dpsi"), "steering rate frozen when not estimated");
         // 3+3+3+3+3+3 + 1+1+1+1 = 22 active DOF.
         assert_eq!(s.active_error_dim(), 22);
     }

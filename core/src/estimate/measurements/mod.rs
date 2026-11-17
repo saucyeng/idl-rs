@@ -11,8 +11,9 @@
 //!
 //! Every factor is **soft** (finite `R`); there are no hard equality constraints.
 //!
-//! M2a ships: [`zupt`] (ZUPT + ZARU), [`gravity`] (accel-compensated leveling),
-//! [`gps`] (velocity anchor), [`prior`] (sag + travel barrier). The off-axis
+//! The factors: [`zupt`] (ZUPT + ZARU), [`gravity`] (accel-compensated leveling),
+//! [`gps`] (horizontal and vertical velocity), [`prior`] (sag, travel barrier,
+//! topout), [`steer`] (steer rate and steer angle from the fork and frame IMUs). The off-axis
 //! diff-accel pin and the unsprung-link gyro-rate factor are noted in the design
 //! §5 and land alongside the IEKF tuning (off-axis carries ~no information in the
 //! static first-light case and is sequenced with the dynamic synthetic harness).

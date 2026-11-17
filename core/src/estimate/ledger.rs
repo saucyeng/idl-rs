@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn frozen_components_are_reported_frozen() {
-        // Arrange — M2a freezes steering; initial == final (no run needed for this).
+        // Arrange — steering not estimated; initial == final (no run needed for this).
         let init = FilterState::initial(rest_state(), &schema(), &InitStd::default());
 
         // Act

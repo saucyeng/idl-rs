@@ -8,7 +8,9 @@
 //! - **Biases**: random walk (mean unchanged; driven by `Q`).
 //! - **Wheels**: double integrators `{w, ẇ}` driven by the precomputed diff-accel
 //!   controls in [`ImuInput`] (`ẇ⁺ = ẇ + ẅ_ctrl·dt`, `w⁺ = w + ẇ·dt`).
-//! - **Steering**: kinematic `{ψ, ψ̇}` (frozen in M2a via zero `Q` + tight prior).
+//! - **Steering**: kinematic `{ψ, ψ̇}`, corrected by the steering factors
+//!   (`measurements::steer`); frozen by zero `Q` + a tight prior when the run
+//!   does not estimate steering.
 //!
 //! The error-state index layout matches [`MtbState`]'s 24-DOF ordering exactly.
 
@@ -37,7 +39,7 @@ pub struct ProcessNoiseConfig {
     pub wheel_vel_rw: f64,
     /// Wheel-travel regularizing noise, (m)/√s.
     pub wheel_pos_rw: f64,
-    /// Steer-rate driving noise, (rad/s²)/√s (frozen → contributes 0 in M2a).
+    /// Steer-rate driving noise, (rad/s²)/√s (0 when steering is not estimated).
     pub steer_rate_rw: f64,
     /// Steer-angle random walk, rad/√s: how fast the angle integrated from the
     /// two gyros is allowed to wander before the accelerometers pull it back.
@@ -129,7 +131,7 @@ impl ProcessModel<MtbState> for MtbProcess {
             dd_f: x.dd_f + u.wheel_accel_front * dt,
             s_r: x.s_r + x.ds_r * dt,
             ds_r: x.ds_r + u.wheel_accel_rear * dt,
-            // Steering kinematics (frozen in M2a via Q).
+            // Steering kinematics (held by zero Q when steering is not estimated).
             psi: x.psi + x.dpsi * dt,
             dpsi: x.dpsi,
         }
@@ -389,7 +391,7 @@ mod tests {
 
     #[test]
     fn process_noise_is_positive_on_active_and_zero_on_frozen_steering() {
-        // Arrange — M2a freezes steering (ψ, ψ̇ at indices 22, 23).
+        // Arrange — a run that does not estimate steering (ψ, ψ̇ at indices 22, 23).
         let p = full_sus_process();
 
         // Act
