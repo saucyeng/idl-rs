@@ -236,28 +236,6 @@ pub enum SliceRole {
 /// triple. Because the two are different variants, a lap slice can never occupy
 /// a math output's key (or vice-versa): the cross-kind collision the old flat
 /// string store allowed is impossible by construction.
-/// Every channel one estimator run stores, by id. One list, so the run and
-/// the calibration setter that invalidates it cannot disagree.
-const ESTIMATOR_CHANNELS: [&str; 17] = [
-    "Front travel (mm)",
-    "Front velocity (mm/s)",
-    "Rear travel (mm)",
-    "Rear velocity (mm/s)",
-    "Roll (deg)",
-    "Pitch (deg)",
-    "Longitudinal accel (g)",
-    "Lateral accel (g)",
-    "Heading (deg)",
-    "Heading uncertainty (deg)",
-    "Course (deg)",
-    "Slip (deg)",
-    "Slip uncertainty (deg)",
-    "Steer (deg)",
-    "Steer uncertainty (deg)",
-    "Steer needed (deg)",
-    "Understeer (deg)",
-];
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum DerivedKey {
     /// A math-channel output, addressed by its workbook name.
@@ -568,10 +546,14 @@ impl SessionHandle {
         .flatten()
     }
 
-    /// Canonical stored names of the estimator's outputs. The four wheel names
-    /// match what `idl-rs-bridge` already writes, so the app does not end up
-    /// with duplicate entries for the same quantity.
-    pub const ESTIMATOR_CHANNELS: [&'static str; 8] = [
+    /// Canonical stored names of every estimator output, by id: what one run
+    /// stores, what [`ChannelLookup::estimator_channel`] serves, and what a
+    /// new calibration invalidates. One list, so the three cannot disagree.
+    /// The four wheel names match what `idl-rs-bridge` already writes, so the
+    /// app does not end up with duplicate entries for the same quantity.
+    ///
+    /// [`ChannelLookup::estimator_channel`]: crate::math::eval::ChannelLookup::estimator_channel
+    pub const ESTIMATOR_CHANNELS: [&'static str; 17] = [
         "Front travel (mm)",
         "Front velocity (mm/s)",
         "Rear travel (mm)",
@@ -580,6 +562,15 @@ impl SessionHandle {
         "Pitch (deg)",
         "Longitudinal accel (g)",
         "Lateral accel (g)",
+        "Heading (deg)",
+        "Heading uncertainty (deg)",
+        "Course (deg)",
+        "Slip (deg)",
+        "Slip uncertainty (deg)",
+        "Steer (deg)",
+        "Steer uncertainty (deg)",
+        "Steer needed (deg)",
+        "Understeer (deg)",
     ];
 
     /// Run the suspension/attitude estimator once and cache all of
@@ -644,7 +635,7 @@ impl SessionHandle {
         }
         *current = calibration;
         let mut derived = self.derived.write().unwrap();
-        derived.retain(|key, _| !matches!(key, DerivedKey::Math(id) if ESTIMATOR_CHANNELS.contains(&id.as_str())));
+        derived.retain(|key, _| !matches!(key, DerivedKey::Math(id) if Self::ESTIMATOR_CHANNELS.contains(&id.as_str())));
     }
 
     /// Metadata for one channel by id, **including** derived (math /
@@ -2356,7 +2347,7 @@ mod tests {
         // Act — ask for one channel.
         let roll = h.estimator_channel("Roll (deg)");
 
-        // Assert — all eight are now resident, so the run happened once and
+        // Assert — all of them are now resident, so the run happened once and
         // populated the whole set rather than one channel at a time.
         assert!(roll.is_some(), "roll channel missing");
         for id in SessionHandle::ESTIMATOR_CHANNELS {
@@ -2365,6 +2356,44 @@ mod tests {
                 "{id} not cached after the estimator ran"
             );
         }
+    }
+
+    #[test]
+    fn estimator_channel_every_builtin_selector_is_served() {
+        // Arrange — each selector the estimator builtins accept, by the id it
+        // reads. A stored output the handle does not serve reads as "the
+        // estimator could not run" in a workbook.
+        use crate::math::eval::ChannelLookup;
+        let h = level_parked_handle();
+        let selectors = [
+            ("wheel_travel", "front"),
+            ("wheel_travel", "rear"),
+            ("wheel_velocity", "front"),
+            ("wheel_velocity", "rear"),
+            ("body_accel", "long"),
+            ("body_accel", "lat"),
+            ("attitude", "roll"),
+            ("attitude", "pitch"),
+            ("attitude", "heading"),
+            ("attitude", "heading_sigma"),
+            ("attitude", "course"),
+            ("attitude", "slip"),
+            ("attitude", "slip_sigma"),
+            ("attitude", "steer"),
+            ("attitude", "steer_sigma"),
+            ("attitude", "steer_needed"),
+            ("attitude", "understeer"),
+        ];
+
+        // Act
+        let missing: Vec<&str> = selectors
+            .iter()
+            .map(|(name, arg)| crate::math::eval::estimator_channel_id(name, arg).unwrap())
+            .filter(|id| h.estimator_channel(id).is_none())
+            .collect();
+
+        // Assert
+        assert!(missing.is_empty(), "not served: {missing:?}");
     }
 
     #[test]

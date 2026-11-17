@@ -1208,6 +1208,129 @@ mod tests {
         assert_eq!(text.trim_end(), expected.trim_end(), "actual `workbook eval --values` output:\n{text}");
     }
 
+    /// The estimator's `attitude(...)` selectors added with the bike
+    /// calibration (heading and travel direction, slide angle, steering,
+    /// understeer).
+    const CALIBRATED_SELECTORS: [&str; 9] =
+        ["heading", "heading_sigma", "course", "slip", "slip_sigma", "steer", "steer_sigma", "steer_needed", "understeer"];
+
+    /// A calibration whose IMU mounts, lever arms and steering axis are the
+    /// reference bike's, stated in IMU0's axes as a fitted one is, with a
+    /// wheelbase: everything the steering outputs need.
+    fn steering_calibration() -> idl_rs::calibration::bike::BikeCalibration {
+        use idl_rs::calibration::bike::{BikeCalibration, CalibrationFit, ImuFit, SourceWindow, BIKE_CALIBRATION_VERSION};
+        let g = idl_rs::estimate::geometry::BikeGeometry::reference_bike();
+        let to_imu0 = g.imu0.mount.inverse();
+        // Row k of IMU0's mount is chassis axis k in IMU0's axes.
+        let m0 = g.imu0.mount.to_rotation_matrix().into_inner();
+        let row = |k: usize| [m0[(k, 0)], m0[(k, 1)], m0[(k, 2)]];
+        let pod = |index: u8, pose: &idl_rs::estimate::geometry::ImuPose| {
+            let (q, lever) = (to_imu0 * pose.mount, to_imu0 * pose.lever);
+            ImuFit { imu_index: index, mount: [q.w, q.i, q.j, q.k], lever_m: [lever.x, lever.y, lever.z], rate_residual_rad_s: None, up_disagreement_deg: 0.0 }
+        };
+        let axis = to_imu0 * g.steer_axis;
+        BikeCalibration {
+            calibration_id: "cal".into(),
+            captured_at_ms: 0,
+            updated_at_ms: 1,
+            deleted: false,
+            note: String::new(),
+            still: SourceWindow { session_id: "still".into(), from_s: 1.0, to_s: None },
+            rigid: None,
+            fork_rigid: None,
+            steer: None,
+            forward_ride: None,
+            fit: CalibrationFit {
+                version: BIKE_CALIBRATION_VERSION,
+                up: row(2),
+                forward: Some(row(0)),
+                forward_from: None,
+                forward_trim_deg: None,
+                steer_axis: Some([axis.x, axis.y, axis.z]),
+                steer_zero_deg: None,
+                wheelbase_m: Some(1.48),
+                imu0_gyro_bias_rad_s: [0.0; 3],
+                imus: vec![pod(1, &g.imu1), pod(2, g.imu2.as_ref().unwrap())],
+            },
+        }
+    }
+
+    /// A data root holding the committed synthetic ride (three IMUs, GPS at
+    /// 6–12 m/s round a lapped track) as session `ride` on bike `test-moto`, the bike given
+    /// `calibration` when there is one, and a workbook counting the known
+    /// (non-blank) samples of each of [`CALIBRATED_SELECTORS`] as `n_<selector>`.
+    fn calibrated_library(calibration: Option<&idl_rs::calibration::bike::BikeCalibration>) -> (PathBuf, PathBuf) {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("idl-rs-wb-calibrated-{}-{nanos}", std::process::id()));
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/fixtures/synth-3lap.idl0");
+        let mut session = idl_rs::parse::parse(&std::fs::read(fixture).unwrap()).unwrap().session;
+        session.session_id = "ride".to_string();
+        idl_rs::store::parquet::write_session_parquet(&root, &session, "0.1.0").unwrap();
+        let bike = idl_library::bikelog::bike_for_name(&root, "Test Moto", 1).unwrap();
+        if let Some(c) = calibration {
+            idl_library::bikelog::save_calibration(&root, &bike.bike_id, c).unwrap();
+        }
+        let mut json = idl_rs::store::session_json::empty_session_json("ride");
+        json.bike_id = bike.bike_id.clone();
+        std::fs::write(root.join("sessions").join("ride").join("session.json"), serde_json::to_vec(&json).unwrap()).unwrap();
+        let defs: String = CALIBRATED_SELECTORS
+            .iter()
+            .map(|s| format!("n_{s} = sum(where(attitude(\"{s}\") > -1000, 1, 0))\n"))
+            .collect();
+        let wb = root.join("attitude.idl1wb");
+        std::fs::write(&wb, format!("---\nid: 3b1d9c4e-7a2f-4e8b-9c1d-5f6a7b8c9d0e\nname: Attitude\n---\n\n```math id=cccccccc\n{defs}```\n")).unwrap();
+        (root, wb)
+    }
+
+    /// `workbook eval --values` over session `ride` in `root`: each
+    /// `n_<selector>` and its value.
+    fn eval_counts(root: &std::path::Path, wb: &std::path::Path) -> (std::collections::HashMap<String, f64>, String) {
+        let m = eval_matches(&[&wb.display().to_string(), "--data-dir", &root.display().to_string(), "--session", "ride", "--values"]);
+        let text = eval(&Ctx::from_matches(&m), &m).unwrap().text;
+        let counts = text
+            .lines()
+            .filter_map(|l| {
+                let mut parts = l.split_whitespace();
+                let name = parts.next()?.strip_prefix("n_")?;
+                Some((name.to_string(), parts.next()?.parse().ok()?))
+            })
+            .collect();
+        (counts, text)
+    }
+
+    #[test]
+    fn workbook_eval_session_on_a_calibrated_bike_every_calibrated_attitude_selector_has_values() {
+        // Arrange
+        let (root, wb) = calibrated_library(Some(&steering_calibration()));
+
+        // Act
+        let (counts, text) = eval_counts(&root, &wb);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Assert — the calibration reached the estimator through the opener
+        // (`apply_session_calibration`): every selector evaluates, and the
+        // steering ones, which need it, are not blank.
+        for s in CALIBRATED_SELECTORS {
+            assert!(counts.get(s).is_some_and(|n| *n > 0.0), "attitude(\"{s}\"): {:?}\n{text}", counts.get(s));
+        }
+    }
+
+    #[test]
+    fn workbook_eval_session_on_a_bike_with_no_calibration_steering_selectors_are_blank() {
+        // Arrange
+        let (root, wb) = calibrated_library(None);
+
+        // Act
+        let (counts, text) = eval_counts(&root, &wb);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Assert — the estimator ran (heading is known) but steering is blank.
+        assert!(counts.get("heading").is_some_and(|n| *n > 0.0), "{text}");
+        for s in ["steer", "steer_sigma", "steer_needed", "understeer"] {
+            assert_eq!(counts.get(s), Some(&0.0), "attitude(\"{s}\")\n{text}");
+        }
+    }
+
     #[test]
     fn workbook_eval_unknown_session_id_is_not_found_naming_the_id_and_data_dir() {
         // Arrange

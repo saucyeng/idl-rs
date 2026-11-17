@@ -1071,7 +1071,7 @@ pub(super) fn require_string<'a>(v: &'a Value, ctx: &str) -> Result<&'a str, Mat
 
 /// Map an estimator-backed function call onto its canonical stored channel
 /// name. Errors list the accepted arguments so a typo says what to type.
-pub(super) fn estimator_channel_id(name: &str, arg: &str) -> Result<&'static str, MathEvalError> {
+pub(crate) fn estimator_channel_id(name: &str, arg: &str) -> Result<&'static str, MathEvalError> {
     let expected = match name {
         "wheel_travel" | "wheel_velocity" => "\"front\" or \"rear\"",
         "attitude" => "\"roll\", \"pitch\", \"heading\", \"heading_sigma\", \"course\", \"slip\", \"slip_sigma\", \"steer\", \"steer_sigma\", \"steer_needed\" or \"understeer\"",
