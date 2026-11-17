@@ -590,10 +590,10 @@ impl SessionHandle {
     /// call sees `Roll (deg)` already resident and returns immediately. Two
     /// threads racing the first call would both run it and upsert identical
     /// values — wasteful but correct, and evaluation is sequential per session.
-    /// Tuning is `EstimatorConfig::default()` (design doc D3). Geometry is the
-    /// bike's calibration applied to `reference_bike()` when one was set
-    /// ([`Self::set_bike_calibration`]); with none, or one that does not apply,
-    /// it is `reference_bike()` with IMU0's mount fitted from the riding.
+    /// Geometry and tuning are [`crate::estimate::run::session_setup`]'s for the
+    /// bike's calibration when one was set ([`Self::set_bike_calibration`]):
+    /// with none, or one that does not apply, `reference_bike()` with IMU0's
+    /// mount fitted from the riding.
     fn run_estimator_once(&self) -> bool {
         if self.with_channel("Roll (deg)", |_| ()).is_some() {
             return true;
@@ -601,19 +601,8 @@ impl SessionHandle {
         let Some(input) = crate::estimate::run::EstimatorInput::from_lookup(self) else {
             return false;
         };
-        use crate::estimate::run::{EstimatorConfig, Imu0Mount};
-        let reference = crate::estimate::geometry::BikeGeometry::reference_bike();
-        let calibrated = self.calibration.read().unwrap().as_ref().and_then(|fit| {
-            let source = if fit.has_forward() { Imu0Mount::Geometry } else { Imu0Mount::GeometryTilt };
-            fit.apply_to(&reference).ok().map(|geometry| (geometry, source, fit.has_steering()))
-        });
-        // Steering needs the bike's own steering axis and fork-pod mount: the
-        // reference bike's are not this bike's, so without them it stays blank.
-        let (geometry, imu0_mount, estimate_steering) = calibrated.unwrap_or((reference, Imu0Mount::Riding, false));
-        // A calibration that says which way is forward is used as given, the
-        // same for every ride; only a bike without one is trimmed per ride.
-        let trim_forward = imu0_mount != Imu0Mount::Geometry;
-        let est = crate::estimate::run::run(&input, &geometry, &EstimatorConfig { imu0_mount, trim_forward, estimate_steering, ..EstimatorConfig::default() });
+        let (geometry, config) = crate::estimate::run::session_setup(self.calibration.read().unwrap().as_ref());
+        let est = crate::estimate::run::run(&input, &geometry, &config);
         let rate_hz = if est.dt > 0.0 { 1.0 / est.dt } else { 0.0 };
         // The outputs live on the estimator's own grid, which starts at IMU0's
         // first recorded sample and not at 0.

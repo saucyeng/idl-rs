@@ -205,6 +205,32 @@ These are known and not being worked on yet.
 - The filter's `_sigma` outputs are its own bookkeeping, not checked
   uncertainties, except where the table above says so.
 
+## Checking a change for regressions
+
+`core/examples/estimator_regression.rs` runs the estimator over one library
+session, the way a workbook would, and prints the numbers in the trust table
+above. Run it before and after a change to the estimator:
+
+```
+cargo run -q --release -p idl-rs --example estimator_regression -- \
+    <library>/sessions/173461a2b9cddbf2d35a0c020099547f --bike <library>/bikes/gt-force.json
+cargo run -q --release -p idl-rs --example estimator_regression -- \
+    <library>/sessions/4f3f3032c3fb672444108c5212063f00
+```
+
+Beacon takes about two minutes, Walden about nine. What each number means,
+and exactly how it is measured, is at the top of the example. The reference
+values:
+
+| | Beacon `173461a2` (GT Force, calibrated) | Walden `4f3f3032` (moto, uncalibrated) |
+|---|---|---|
+| GPS lateness | 0.39 s | 0.61 s |
+| Forward trim | 0.0° (measured, not applied) | 12.2° (applied) |
+| Roll vs GPS lean | slope 0.89, corr 0.93 | slope 0.97, corr 0.97 |
+| Heading − course | median −0.4°, RMS 5.8° | median −1.8°, RMS 13.2° |
+| Steer vs needed | slope 0.74, corr 0.86, scatter 3.1° | — |
+| Understeer median | −1.6° | — |
+
 ## Where things are
 
 | File | What |

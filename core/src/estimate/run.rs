@@ -541,6 +541,33 @@ impl Default for EstimatorConfig {
     }
 }
 
+/// The geometry and tuning a session's estimator outputs are computed with,
+/// given its bike's calibration or `None`: what
+/// [`crate::session::handle::SessionHandle`] runs, so a tool that calls [`run`]
+/// itself reads the same numbers a workbook does.
+///
+/// The geometry is the calibration applied to
+/// [`BikeGeometry::reference_bike`]. A calibration with a forward is used as
+/// given ([`Imu0Mount::Geometry`], no per-ride trim); one without takes its tilt
+/// and the ride's forward ([`Imu0Mount::GeometryTilt`]). Steering is estimated
+/// when the calibration has a steering axis and the fork pod's mount. With no
+/// calibration, or one that does not apply, it is the reference bike with
+/// IMU0's mount fitted from the riding and no steering.
+pub fn session_setup(calibration: Option<&crate::calibration::bike::CalibrationFit>) -> (BikeGeometry, EstimatorConfig) {
+    let reference = BikeGeometry::reference_bike();
+    let calibrated = calibration.and_then(|fit| {
+        let source = if fit.has_forward() { Imu0Mount::Geometry } else { Imu0Mount::GeometryTilt };
+        fit.apply_to(&reference).ok().map(|geometry| (geometry, source, fit.has_steering()))
+    });
+    // Steering needs the bike's own steering axis and fork-pod mount: the
+    // reference bike's are not this bike's, so without them it stays blank.
+    let (geometry, imu0_mount, estimate_steering) = calibrated.unwrap_or((reference, Imu0Mount::Riding, false));
+    // A calibration that says which way is forward is used as given, the
+    // same for every ride; only a bike without one is trimmed per ride.
+    let trim_forward = imu0_mount != Imu0Mount::Geometry;
+    (geometry, EstimatorConfig { imu0_mount, trim_forward, estimate_steering, ..EstimatorConfig::default() })
+}
+
 /// The result of one run: the wheel-output channels + the observability ledger.
 /// With [`EstimatorConfig::smooth`] (the default) the four wheel outputs are the
 /// **RTS-smoothed** trajectories — each topout/ZUPT anchor distributed backward over
