@@ -71,7 +71,8 @@ class Bike(nn.Module):
     calibration (steering-axis point, bend length, rear path) are guesses to
     be fitted."""
 
-    def __init__(self, cal, steer_offset=0.06, bend_len=0.45, rear_rot_per_m=0.25,
+    def __init__(self, cal, steer_offset=0.06, bend_len=0.45, rear_rot_per_m=0.25, bush_overlap=0.10, bend_vs_travel=True,
+                 bend_prior_vs_travel=False,
                  rear_pivot=None, rear_dir=None, linkage=None, link_scale=1.0):
         """`linkage`: a fourbar.FourBar for the rear; without one the rear
         uses the generic path (rear_rot, rear_dir, rear_pivot)."""
@@ -94,6 +95,16 @@ class Bike(nn.Module):
         self.fork_lever = nn.Parameter(r1)
         self.bend_len = nn.Parameter(torch.tensor(bend_len))
         self.register_buffer("bend_k", torch.tensor(2.0 / 3.0))  # cantilever tip: deflection = 2/3 L angle
+        # Fork bending depends on travel (Isaac, 2026-11-18): bend_len is the crown-to-pod length at
+        # top-out and shortens by d as the lower slides up; the bushing overlap (a guess: 0.10 m at
+        # top-out, not measured) grows by d. bend_vs_travel=False restores the fixed lever.
+        self.register_buffer("bush_overlap", torch.tensor(float(bush_overlap)))
+        self.bend_vs_travel = bend_vs_travel
+        # Off by default: a bending prior whose sigma shrinks with travel makes less travel cheaper (the
+        # Gaussian's log-sigma normalisation, which would cancel that, cannot be a least-squares residual).
+        # Tried 2026-11-18: front median travel 67 -> 25 mm, bend cost 4060 -> 7021. How bending varies with
+        # travel is to be measured from the solved bending, not imposed.
+        self.bend_prior_vs_travel = bend_prior_vs_travel
         r2 = f(cal["rear_lever"])
         self.register_buffer("rear_mount", so3.quat_to_mat(f(cal["rear_mount"])))
         self.rear_lever = nn.Parameter(r2)
@@ -106,12 +117,26 @@ class Bike(nn.Module):
 
     # --- poses: latents [T, NL] -> (R pod->frame [T,3,3], p in frame [T,3]) ---
 
+    def bend_arm(self, d):
+        """Crown-to-pod length, m, at front travel d [T]."""
+        return self.bend_len - d if self.bend_vs_travel else self.bend_len.expand_as(d)
+
+    def bend_compliance(self, d):
+        """Relative fork bending compliance at travel d [T] (1 at top-out): a
+        cantilever's tip angle under a tip load goes as its length squared,
+        and the bushings' share as arm / overlap, so the fork is softest
+        fully extended. Scales the bending prior's sigma."""
+        if not (self.bend_vs_travel and self.bend_prior_vs_travel):
+            return torch.ones_like(d)
+        arm = self.bend_arm(d) / self.bend_len
+        return arm**2 * self.bush_overlap / (self.bush_overlap + d.clamp(min=0))
+
     def front_pose(self, q):
         a = so3.unit(self.steer_axis)
         fa = so3.unit(self.fwd - a * (a @ self.fwd))  # fore-aft, normal to the axis
         lat = torch.linalg.cross(a, fa)  # left
         bfa, blat = q[:, B_FA], q[:, B_LAT]
-        kl = self.bend_k * self.bend_len
+        kl = self.bend_k * self.bend_arm(q[:, D])[:, None]
         x = (self.fork_lever + q[:, D, None] * a
              - kl * bfa[:, None] * torch.linalg.cross(lat, a)
              - kl * blat[:, None] * torch.linalg.cross(fa, a))

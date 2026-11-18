@@ -9,6 +9,9 @@ Output (cache/<session>_<rate>.npz), float32 SI units in each sensor's own axes:
   t        grid times, s from the start of the grid
   t0_us    the grid's first time, recorded-clock microseconds (int64)
   acc{k}   (n,3) specific force, m/s^2      gyr{k}  (n,3) angular rate, rad/s
+  clip{k}  (n,) bool: a native sample within CLIP_SMEAR_S of this grid time
+           was at full scale on any int16 axis (taken before filtering: the
+           anti-alias filter smears a clipped plateau into its neighbours)
   gps_t, gps_speed (m/s), gps_course (deg), gps_lat, gps_lon, gps_alt
 """
 import argparse
@@ -25,6 +28,9 @@ LIBRARY = os.environ.get("IDL_LIBRARY", r"C:\Users\isaac\Documents\idl1-library\
 HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CACHE = os.path.join(HERE, "cache")
 AXES = ("X", "Y", "Z")
+CLIP_FRAC = 0.98  # of the int16 full scale (32767 counts)
+CLIP_SMEAR_S = 0.010  # s each side: the 4th-order filtfilt at 160 Hz rings ~this long
+CACHE_VERSION = 2  # 2: clip masks
 
 
 def session_dir(session):
@@ -41,7 +47,7 @@ def read_streams(path):
     meta = {fld.name: {k.decode(): v.decode() for k, v in (fld.metadata or {}).items()} for fld in f.schema_arrow}
     imus = [k for k in range(3) if f"IMU{k}_AccelX" in names]
     gps_cols = ["GPS_SpeedKmh", "GPS_Heading", "GPS_Latitude", "GPS_Longitude", "GPS_Altitude", "GPS_FixQuality"]
-    acc = {k: {"t": [], "v": []} for k in imus}
+    acc = {k: {"t": [], "v": [], "clip": []} for k in imus}
     gps = {"t": [], "v": []}
     for rg in range(f.num_row_groups):
         for k in imus:
@@ -50,9 +56,14 @@ def read_streams(path):
             tt = tb.column(0)
             mask = tt.is_valid()
             tt = tt.filter(mask).to_numpy()
-            v = np.stack([tb.column(c).filter(mask).to_numpy().astype(np.float32) for c in cols[1:]], 1)
+            raw = [tb.column(c).filter(mask) for c in cols[1:]]
+            v = np.stack([r.to_numpy().astype(np.float32) for r in raw], 1)
+            # clipping, on the raw integer counts (float columns such as IMU0's high-g accel have no clip level)
+            ints = [r.to_numpy() for r in raw if r.type == "int16"]
+            clip = (np.abs(np.stack(ints, 1).astype(np.int32)) >= CLIP_FRAC * 32767).any(1) if ints else np.zeros(len(tt), bool)
             acc[k]["t"].append(tt)
             acc[k]["v"].append(v)
+            acc[k]["clip"].append(clip)
         tb = f.read_row_group(rg, columns=["gps_t_recorded_us"] + gps_cols)
         tt = tb.column(0)
         mask = tt.is_valid()
@@ -62,13 +73,14 @@ def read_streams(path):
     for k in imus:
         t = np.concatenate(acc[k]["t"])
         v = np.concatenate(acc[k]["v"])
+        clip = np.concatenate(acc[k]["clip"])
         o = np.argsort(t, kind="stable")
-        t, v = t[o], v[o]
+        t, v, clip = t[o], v[o], clip[o]
         sa = float(meta[f"IMU{k}_AccelX"]["scale"]) * G
         sg = float(meta[f"IMU{k}_GyroX"]["scale"]) * np.pi / 180
         v[:, :3] *= sa
         v[:, 3:] *= sg
-        out[k] = (t, v, float(meta[f"IMU{k}_AccelX"]["nominal_rate_hz"]))
+        out[k] = (t, v, float(meta[f"IMU{k}_AccelX"]["nominal_rate_hz"]), clip)
     gt = np.concatenate(gps["t"])
     gv = np.concatenate(gps["v"])
     gv[:, 0] *= 0.01 / 3.6  # raw int scale 0.01 km/h -> m/s
@@ -82,9 +94,16 @@ def build(session, rate=400.0, cutoff=None):
     cutoff = cutoff or 0.4 * rate  # leaves margin below the new Nyquist
     t0 = imus[0][0][0]
     t1 = min(v[0][-1] for v in imus.values())
+    smear_us = CLIP_SMEAR_S * 1e6
     grid = np.arange(t0, t1, 1e6 / rate)
-    res = {"t": ((grid - t0) / 1e6).astype(np.float64), "t0_us": np.int64(t0), "rate": rate}
-    for k, (t, v, fs) in imus.items():
+    res = {"t": ((grid - t0) / 1e6).astype(np.float64), "t0_us": np.int64(t0), "rate": rate,
+           "version": np.int64(CACHE_VERSION)}
+    for k, (t, v, fs, clip) in imus.items():
+        # a grid time is clipped if any clipped native sample lies within smear_us of it
+        ct = t[clip].astype(np.float64)
+        lo = np.searchsorted(ct, grid - smear_us)
+        hi = np.searchsorted(ct, grid + smear_us, side="right")
+        res[f"clip{k}"] = hi > lo
         sos = butter(4, cutoff, fs=fs, output="sos")
         vf = sosfiltfilt(sos, v, axis=0)
         r = np.empty((len(grid), 6), np.float32)
@@ -103,7 +122,7 @@ def build(session, rate=400.0, cutoff=None):
     res["laps"] = np.array([(n, s, e) for n, k, s, e in laps], dtype=np.float64).reshape(-1, 3)
     res["lap_start_offset_s"] = 0.0  # lap times are session seconds; see notes in README
     os.makedirs(CACHE, exist_ok=True)
-    out = os.path.join(CACHE, f"{sid[:8]}_{int(rate)}.npz")
+    out = os.path.join(CACHE, f"{sid[:8]}_{int(rate)}_v{CACHE_VERSION}.npz")
     np.savez(out, **res)
     return out
 
@@ -112,7 +131,7 @@ def load(session, rate=400.0):
     """The cached session as a dict of arrays, memory-mapped: each array is
     its own .npy file in cache/<id>_<rate>/, so slicing a window reads only
     that window from disk. Built from the .npz (or the parquet) the first time."""
-    base = os.path.join(CACHE, f"{session[:8]}_{int(rate)}")
+    base = os.path.join(CACHE, f"{session[:8]}_{int(rate)}_v{CACHE_VERSION}")
     if not os.path.isdir(base):
         p = base + ".npz"
         if not os.path.exists(p):

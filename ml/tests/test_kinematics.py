@@ -155,3 +155,18 @@ def test_fork_mount_correction_about_the_steer_axis_is_inert():
     with torch.no_grad():
         bike.mount_err["fork"].zero_()
     assert (bike.front_pose(q)[0] - r1).abs().max() > 1e-3
+
+
+def test_fork_bending_is_softest_and_longest_at_full_extension():
+    # Arrange
+    bike = Bike(cal(), bend_prior_vs_travel=True).double()
+    d = torch.tensor([0.0, 0.05, 0.15])
+
+    # Act
+    arm, comp = bike.bend_arm(d), bike.bend_compliance(d)
+
+    # Assert: the arm shortens by the travel; compliance is 1 at top-out and falls with travel
+    assert torch.allclose(arm, bike.bend_len - d)
+    assert comp[0] == 1.0 and comp[1] < comp[0] and comp[2] < comp[1]
+    # and by default the prior does not depend on travel (it would bias travel)
+    assert (Bike(cal()).double().bend_compliance(d) == 1.0).all()

@@ -117,11 +117,13 @@ def window_objective(d, sl, bike, weights, fit=(), dev="cuda", bias_prior="auto"
         bias_prior = still_biases(STILL["gt-force"])
     tt = lambda k: torch.tensor(d[k][sl], dtype=torch.float32, device=dev)
     frame = {"gyro": tt("gyr0"), "accel": tt("acc0")}
-    frame_ok = (frame["accel"].abs() < 0.98 * ACC_FS).all(-1)
+    # clipping from the cache's native-rate masks (cache v2); the value test below stays as a backstop
+    nat = lambda k: torch.tensor(~np.asarray(d[f"clip{k}"][sl]), device=dev) if f"clip{k}" in d else True
+    frame_ok = (frame["accel"].abs() < 0.98 * ACC_FS).all(-1) & nat(0)
     pods = {}
     for name, k in (("fork", 1), ("rear", 2)):
         g, acc = tt(f"gyr{k}"), tt(f"acc{k}")
-        mask = (acc.abs() < 0.98 * ACC_FS).all(-1) & (g.abs() < 0.98 * GYRO_FS).all(-1) & frame_ok
+        mask = (acc.abs() < 0.98 * ACC_FS).all(-1) & (g.abs() < 0.98 * GYRO_FS).all(-1) & frame_ok & nat(k)
         pods[name] = {"gyro": g, "accel": acc, "mask": mask}
     sensors = {k: PodSensor().to(dev) for k in pods}
     for name, s in sensors.items():

@@ -178,7 +178,9 @@ class Objective:
         for i, top in ((D, w.travel_max[0]), (S, w.travel_max[1])):
             walls += [torch.relu(-q[:, i]), torch.relu(q[:, i] - top)]
         segs.append(Segment("bounds", torch.stack(walls, 1) / w.wall_sigma))
-        segs.append(Segment("bend", q[:, [B_FA, B_LAT]] / w.bend_sigma))
+        # softer near full extension (see Bike.bend_compliance)
+        bsig = w.bend_sigma * self.bike.bend_compliance(q[:, D])[:, None]
+        segs.append(Segment("bend", q[:, [B_FA, B_LAT]] / bsig))
         segs.append(Segment("rflex", q[:, [R_ROLL, R_YAW]] / w.rear_flex_sigma))
         segs.append(Segment("fflex", torch.cat([q[:, FRAME_ROT] / w.frame_flex_rot_sigma,
                                                 q[:, FRAME_TRANS] / w.frame_flex_trans_sigma], 1)))
