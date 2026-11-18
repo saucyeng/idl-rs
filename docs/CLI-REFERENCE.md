@@ -13,7 +13,7 @@ idl-rs <noun> <verb> [args] [--flags]
 
 **Verbs.** `list`, `show`, `new`, `check`, `eval`, `set`, `import`, `export`, `scan`, `fold-in`, `index`, `rebuild`, `verify`, `delete`
 
-Verbs added by a later ruling: `set-start` (R229), `set-meta` (R229), `cells` (R229), `data` (R229), `detect` (R229), `laps` (R229), `stale` (R197), `workbook` (R222), `cli` (R230 item 2), `synth` (R187), `calibrate` (R238), `note` (R251).
+Verbs added by a later ruling: `set-start` (R229), `set-meta` (R229), `cells` (R229), `data` (R229), `detect` (R229), `laps` (R229), `stale` (R197), `workbook` (R222), `cli` (R230 item 2), `synth` (R187), `calibrate` (R238), `note` (R251), `estimate-physics` (R252).
 
 ## Uniform behaviour
 
@@ -167,6 +167,28 @@ Fit the rigid-body IMU calibration to a held-in-the-air session (ruling R238).
 | `--json` | switch | Emit the result as JSON on stdout (schema_version 1); errors become typed JSON on stderr |
 
 Calls `calibration::rigid::calibrate`; `--json` emits `CalibrationReport`.
+
+### `idl-rs session estimate-physics <id>`
+
+Estimate travel, steer, fork bending and flex with the physics model (no drift: travel is seen through the pods' lever arms); fits the bike's geometry the first time and writes the channels to the session's derived files.
+
+| Argument | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `id` | text | yes | Session id, as `session list` prints it |
+
+| Flag | Value | Meaning |
+| --- | --- | --- |
+| `--refit` | switch | Fit the bike's geometry from this session again, even if its calibration has a current fit |
+| `--front-travel-mm` | integer | Fork travel, mm; default the bike's (`bike set --front-travel-mm`) |
+| `--rear-travel-mm` | integer | Rear travel, mm; default the bike's linkage |
+| `--threads` | integer | Worker threads; default up to 4 |
+| `--from-ms` | integer | Only from here, ms from the session's first sample (with `--to-ms`): less memory, and a first fit uses windows inside it |
+| `--to-ms` | integer | Only to here, ms from the session's first sample |
+| `--data-dir` | path | Data directory root (contract C4 §1's <data>); defaults to $IDL1_DATA_DIR |
+| `--dry-run` | switch | Report what would change and write nothing |
+| `--json` | switch | Emit the result as JSON on stdout (schema_version 1); errors become typed JSON on stderr |
+
+Calls `idl_library::physics::estimate_physics`; `--json` emits `PhysicsReport`.
 
 ## `workbook`
 
@@ -388,6 +410,25 @@ Fit a bike's IMU calibration from its recordings and save it in the bike's file;
 | `--json` | switch | Emit the result as JSON on stdout (schema_version 1); errors become typed JSON on stderr |
 
 Calls `idl_rs::commands::calibration_ops::fit_bike_calibration`; `--json` emits `BikeCalibration`.
+
+### `idl-rs bike set <bike_id>`
+
+Set a bike's suspension geometry for the physics estimator: its rear linkage (from the photo tool) and travel.
+
+| Argument | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `bike_id` | text | yes | Bike id, as `bike list` prints it |
+
+| Flag | Value | Meaning |
+| --- | --- | --- |
+| `--linkage` | path | The linkage photo tool's JSON export (`ml/tools/linkage.html`): the rear 4-bar and rear travel |
+| `--shock-mm` | integer | The shock's specified eye-to-eye length, mm: checks the photo's scale |
+| `--front-travel-mm` | integer | The fork's travel, mm |
+| `--data-dir` | path | Data directory root (contract C4 §1's <data>); defaults to $IDL1_DATA_DIR |
+| `--dry-run` | switch | Report what would change and write nothing |
+| `--json` | switch | Emit the result as JSON on stdout (schema_version 1); errors become typed JSON on stderr |
+
+Calls `idl_library::bikelog::save_linkage`; `--json` emits `Linkage`.
 
 ## `catalog`
 
