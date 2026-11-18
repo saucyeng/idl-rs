@@ -151,14 +151,14 @@ In order of how much each matters, as measured on the Beacon ride:
    per-axis scale and offset to ~0.1%; then fix them in the sensor model
    (`window_objective(..., sensor_cal=...)` already takes them). The
    rejected fit is kept as `runs/real/gt-force-fit-cal_REJECTED.json`.
-3. **Clipping.** The ±16 g pods clip on hits: 1.0% (fork) and 1.5% (rear)
-   of Lower Broken Bomber's samples are masked. But the clip mask is taken
-   after the cache's anti-alias filter and resampling, which smear each
-   clipped plateau into its neighbours: another ~2.5-4% of samples within
-   10 ms of a clipped one are fitted as if good, and they are the big hits
-   where travel moves fastest. Fix: take the clip mask at the native rate
-   in `data/cache.py`, widen it by the filter's length, and store it in the
-   cache. Riding at ±32 g (moto pods) avoids most of it.
+3. **Clipping.** The ±16 g pods clip on hits. The clip mask is taken at
+   the native rate on the raw int16 counts and widened 10 ms each side
+   (cache v2), because the anti-alias filter smears a clipped plateau into
+   its neighbours. On Lower Broken Bomber it masks 3.8% (fork) and 6.0%
+   (rear) of samples; the old value test on the filtered data caught only
+   1.0% / 1.5%. Masked samples carry no information, and they are the big
+   hits, so travel through a hard hit is interpolated by the model. Riding
+   at ±32 g (moto pods) avoids most of it.
 4. **Airtime detection** (`data/real.py: airborne`): frame |f| (10 Hz
    low-pass) under 0.6 g AND both unsprung pods quiet (30-150 Hz accel RMS
    under 1.5 m/s^2) for >= 0.12 s, first 80 ms and last 30 ms of each event
@@ -173,14 +173,17 @@ In order of how much each matters, as measured on the Beacon ride:
    On synthetic rides with exact geometry, travel is recovered to ~1-1.7 mm
    RMS and steer to 0.04 deg; a 0.5 ms pod clock error costs ~3.4 mm, 3x the
    noise ~3 mm.
-6. **Known model gaps**: fork bending is travel-independent (lever fixed at
-   bend_len x 2/3, one prior sigma). Really the fork is more compliant near
-   full extension: the bushing overlap is shortest there, so the bushing
-   loads and the tubes' moment at the bushings are largest, and the
-   crown-to-axle arm is longest (Isaac, 2026-11-18). To model: lever
-   L(d) = L0 - d and a bending prior sigma that grows toward extension
-   (e.g. with 1 / overlap(d)); then bending amplitude vs travel is itself a
-   measurement, comparable across forks. 60-200 Hz gyro vibration is
+6. **Known model gaps**: the fork is more compliant near full extension: the
+   bushing overlap is shortest there, so the bushing loads and the tubes'
+   moment at the bushings are largest, and the crown-to-axle arm is longest
+   (Isaac, 2026-11-18). The bending lever now shortens with travel
+   (`bend_len` is the crown-to-pod length at top-out). A bending *prior*
+   that loosens toward extension was tried and is off: a prior whose sigma
+   depends on travel makes less travel cheaper (the Gaussian's log-sigma
+   term that would cancel it cannot be a least-squares residual), and it
+   moved front median travel 67 -> 25 mm. How bending varies with travel
+   should be measured from the solved bending instead, which is the number
+   to compare across forks. 60-200 Hz gyro vibration is
    not modelled (largest remaining gyro residual). Pod clocks are fixed (the
    parser's alignment is good to <0.5-1 ms). Frame flex is "frame pod vs a
    rigid chassis", and its ~20 Hz peak coincides with the fork's fore-aft
@@ -197,15 +200,21 @@ In order of how much each matters, as measured on the Beacon ride:
 ## Results so far (GT Force, Beacon `173461a2`)
 
 Lower Broken Bomber (lap 6, 5784.3-5834.4 s), geometry from the bike fit,
-airtime anchor on:
+airtime anchor on, native-rate clip mask, bending lever shortening with
+travel (2026-11-18):
 
-- Travel: front 1% 0 / median 67 / 99% 130 / max 171 mm (stop 170); rear
-  2 / 50 / 116 / 153 mm (stop 160); airborne median 1 mm both.
+- Travel: front 1% 0 / median 42 / 99% 105 / max 182 mm (stop 170); rear
+  1 / 51 / 135 / 160 mm (stop 160); airborne median 0 / 1 mm.
 - Without the airtime anchor (the held-out check of slow travel), airborne
-  travel reads front 21 / rear 20 mm median (should be ~0), events 10-26 mm.
-- Fitted geometry: steer point [-0.835, 0.017, -0.241] m (IMU0 axes),
-  fork bending length 0.614 m, 4-bar scale 1.078 (photo + shock prior
-  1.066: the ride data confirms the photo's linkage).
+  travel reads front 15 / rear 14 mm median (should be ~0; before the clip
+  and bending changes 21 / 20). Front events: 6, 42, 1, 12, 1 mm; the 42 is
+  the event at 5793.1 s, where the frame only reached 0.3-0.6 g.
+- Front median travel has moved with each model change (67 mm with a fixed
+  bending lever, 42 mm now): its absolute level is the least trustworthy
+  output until the pods' accelerometers are calibrated (limit 2).
+- Fitted geometry: steer point [-0.830, 0.023, -0.245] m (IMU0 axes),
+  fork bending length at top-out 0.633 m, 4-bar scale 1.096 (photo + shock
+  prior 1.066: the ride data agrees with the photo's linkage to 3%).
 - Fork fore-aft bending ~0.26-0.33 deg RMS, mode ~20 Hz; lateral ~40 Hz.
   Rear-member flex 10-45 Hz.
 - Frame-pod flex vs chassis: rotation 0.03-0.07 deg RMS, translation
@@ -324,13 +333,22 @@ the travel limits (`Weights.travel_max`), and the IMU full scales
 ## Next steps and the road to idl1-app
 
 Near term, in order:
-1. Clip mask at the native rate (limit 3).
-2. Six-position static test of each pod, and use the measured scales and
+1. Six-position static test of each pod, and use the measured scales and
    offsets (limit 2). Then re-check airborne travel *without* the anchor:
    that is the honest test of slow travel.
-3. Whole-ride runs: overlapping windows end to end, written as one output.
-4. A second bike (dual-crown MTB or the moto, which needs a calibration
+2. Whole-ride runs: overlapping windows end to end, written as one output.
+3. A second bike (dual-crown MTB or the moto, which needs a calibration
    first) to compare fork bending and frame flex across bikes.
+
+**Rust port** (`core/src/estimate/physics/`, 2026-11-18): the forward model,
+its per-sample Jacobian, the objective and the window solver run in Rust,
+held equal to this code by golden tests (`ml/experiments/export_golden.py`,
+`export_window.py` write the fixtures; regenerate them after a model change
+here). The solve of a real 2 s window lands on PyTorch's loss and travel
+exactly. Not ported yet: the bike fit, the session pipeline (cache, clip and
+airtime masks) and multi-threading. Speed is not yet measured reliably (the
+dev machine was thermally throttled); single-threaded, the Jacobian took
+~0.1 ms per sample against ~0.4 ms per sample for PyTorch on the GPU.
 
 Toward the app: the app should be able to show all of this as charts
 (travel with its uncertainty band, airborne events, bending and flex
