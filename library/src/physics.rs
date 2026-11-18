@@ -170,6 +170,13 @@ pub fn estimate_physics(data_root: &Path, session_id: &str, opts: &PhysicsOption
             },
         )
     })?;
+    // the inputs' column hashes (C1 §5) now, then drop the session: its decoded
+    // channels would otherwise sit in memory through every solve
+    let inputs: Vec<(String, [u8; 32])> = IMU_CHANNELS
+        .iter()
+        .filter_map(|&name| handle.lookup(name).map(|c| (name.to_string(), derived_input_hash(name, &c.t_us, &c.samples))))
+        .collect();
+    drop(handle);
     // at-rest biases from the calibration's still recording, else IMU0's from the calibration
     let mut centre = [0.0; NG];
     centre[..3].copy_from_slice(&cal.fit.imu0_gyro_bias_rad_s);
@@ -228,10 +235,6 @@ pub fn estimate_physics(data_root: &Path, session_id: &str, opts: &PhysicsOption
     let output = if opts.dry_run {
         None
     } else {
-        let inputs: Vec<(String, [u8; 32])> = IMU_CHANNELS
-            .iter()
-            .filter_map(|&name| handle.lookup(name).map(|c| (name.to_string(), derived_input_hash(name, &c.t_us, &c.samples))))
-            .collect();
         let config = serde_json::json!({
             "estimator_version": PHYSICS_ESTIMATOR_VERSION,
             "calibration_id": cal.calibration_id,

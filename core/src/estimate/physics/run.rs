@@ -44,7 +44,7 @@ impl Default for Config {
         Config {
             window_s: 12.0,
             overlap_s: 2.0,
-            fit_window_s: 30.0,
+            fit_window_s: 15.0, // 30 s windows held ~170 MB of normal matrix each
             fit_air_windows: 2,
             fit_busy_windows: 2,
             iters: 20,
