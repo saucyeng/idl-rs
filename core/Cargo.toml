@@ -30,6 +30,7 @@ pulldown-cmark = "0.13.4"
 serde_yaml_ng = "0.10.0"
 quick-xml = "0.41.0"
 fitparser = "0.9"
+num-dual = { version = "0.16.0", default-features = false }  # exact derivatives for estimate::physics; no nalgebra feature (it pulls nalgebra 0.35 beside ours)
 
 [dev-dependencies]
 approx = "0.5"

@@ -15,6 +15,7 @@ pub mod measurements;
 pub mod model;
 pub mod noise;
 pub mod orient;
+pub mod physics;
 pub mod process;
 pub mod run;
 pub mod schema;

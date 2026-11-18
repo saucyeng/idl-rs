@@ -837,6 +837,7 @@ dependencies = [
  "arrow",
  "fitparser",
  "nalgebra",
+ "num-dual",
  "parquet",
  "pulldown-cmark",
  "quick-xml",
@@ -1135,6 +1136,15 @@ name = "num-complex"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "num-dual"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3277bc2cc02ea62cff7a33b0a0498e4d1a0745b2e448456c9cdb382848655f9"
 dependencies = [
  "num-traits",
 ]
