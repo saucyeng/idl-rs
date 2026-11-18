@@ -1,0 +1,8 @@
+# versions the project was developed with (Python 3.14.7)
+# torch: install the CUDA build from pytorch.org first (developed on 2.14.1+cu130)
+torch>=2.14
+numpy>=2.5
+scipy>=1.18
+pyarrow>=25
+matplotlib>=3.11
+pytest

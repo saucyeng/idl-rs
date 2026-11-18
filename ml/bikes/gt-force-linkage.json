@@ -1,0 +1,821 @@
+{
+  "source_image": "GT Force Side View.jpg",
+  "wheelbase_m": 1.28,
+  "rear_travel_m": 0.16,
+  "frame": "bike side plane: origin rear axle, x toward the front axle, y up, metres",
+  "px_per_m": 4916.164489600978,
+  "points_m": {
+    "front_axle": [
+      1.28,
+      0
+    ],
+    "rear_axle": [
+      0,
+      0
+    ],
+    "main_pivot": [
+      0.43717,
+      0.08031
+    ],
+    "horst": [
+      0.07805,
+      -0.01296
+    ],
+    "ss_rocker": [
+      0.37094,
+      0.18068
+    ],
+    "rocker_frame": [
+      0.48793,
+      0.19457
+    ],
+    "shock_frame": [
+      0.52277,
+      0.04682
+    ],
+    "shock_rocker": [
+      0.55827,
+      0.25971
+    ],
+    "imu0": [
+      0.47677,
+      0.36738
+    ],
+    "fork_pod": [
+      1.19139,
+      -0.00206
+    ],
+    "rear_pod": [
+      0.07006,
+      0.07105
+    ]
+  },
+  "points_px": {
+    "front_axle": [
+      760.7302024459849,
+      4448.63735437725
+    ],
+    "rear_axle": [
+      7052.326992397002,
+      4565.958064698689
+    ],
+    "main_pivot": [
+      4910.885489444951,
+      4131.131805302434
+    ],
+    "horst": [
+      6667.500811818139,
+      4622.503806427399
+    ],
+    "ss_rocker": [
+      5245.59890602087,
+      3643.857935879881
+    ],
+    "rocker_frame": [
+      4671.829660216952,
+      3564.8860632346255
+    ],
+    "shock_frame": [
+      4487.034116963414,
+      4287.915817766042
+    ],
+    "shock_rocker": [
+      4332.075362425385,
+      3238.2347702196867
+    ],
+    "imu0": [
+      4742.522403731511,
+      2716.452388417505
+    ],
+    "fork_pod": [
+      1196.1100001961775,
+      4466.909518653947
+    ],
+    "rear_pod": [
+      6714.457649024517,
+      4210.323040583108
+    ]
+  },
+  "sweep": [
+    {
+      "travel_m": 0,
+      "seatstay_rot_rad": 0,
+      "axle_m": [
+        0,
+        0
+      ],
+      "shock_len_m": 0.21583
+    },
+    {
+      "travel_m": 0.00192,
+      "seatstay_rot_rad": -0.001615,
+      "axle_m": [
+        -0.00044,
+        0.00192
+      ],
+      "shock_len_m": 0.21516
+    },
+    {
+      "travel_m": 0.00385,
+      "seatstay_rot_rad": -0.003271,
+      "axle_m": [
+        -0.00087,
+        0.00385
+      ],
+      "shock_len_m": 0.2145
+    },
+    {
+      "travel_m": 0.00578,
+      "seatstay_rot_rad": -0.004966,
+      "axle_m": [
+        -0.00129,
+        0.00578
+      ],
+      "shock_len_m": 0.21383
+    },
+    {
+      "travel_m": 0.00772,
+      "seatstay_rot_rad": -0.006698,
+      "axle_m": [
+        -0.0017,
+        0.00772
+      ],
+      "shock_len_m": 0.21316
+    },
+    {
+      "travel_m": 0.00967,
+      "seatstay_rot_rad": -0.008465,
+      "axle_m": [
+        -0.00211,
+        0.00967
+      ],
+      "shock_len_m": 0.21249
+    },
+    {
+      "travel_m": 0.01161,
+      "seatstay_rot_rad": -0.010266,
+      "axle_m": [
+        -0.0025,
+        0.01161
+      ],
+      "shock_len_m": 0.21183
+    },
+    {
+      "travel_m": 0.01357,
+      "seatstay_rot_rad": -0.012099,
+      "axle_m": [
+        -0.00288,
+        0.01357
+      ],
+      "shock_len_m": 0.21116
+    },
+    {
+      "travel_m": 0.01552,
+      "seatstay_rot_rad": -0.013964,
+      "axle_m": [
+        -0.00325,
+        0.01552
+      ],
+      "shock_len_m": 0.21048
+    },
+    {
+      "travel_m": 0.01749,
+      "seatstay_rot_rad": -0.015858,
+      "axle_m": [
+        -0.00362,
+        0.01749
+      ],
+      "shock_len_m": 0.20981
+    },
+    {
+      "travel_m": 0.01945,
+      "seatstay_rot_rad": -0.01778,
+      "axle_m": [
+        -0.00397,
+        0.01945
+      ],
+      "shock_len_m": 0.20914
+    },
+    {
+      "travel_m": 0.02142,
+      "seatstay_rot_rad": -0.01973,
+      "axle_m": [
+        -0.00431,
+        0.02142
+      ],
+      "shock_len_m": 0.20846
+    },
+    {
+      "travel_m": 0.02339,
+      "seatstay_rot_rad": -0.021707,
+      "axle_m": [
+        -0.00465,
+        0.02339
+      ],
+      "shock_len_m": 0.20779
+    },
+    {
+      "travel_m": 0.02537,
+      "seatstay_rot_rad": -0.02371,
+      "axle_m": [
+        -0.00497,
+        0.02537
+      ],
+      "shock_len_m": 0.20711
+    },
+    {
+      "travel_m": 0.02735,
+      "seatstay_rot_rad": -0.025738,
+      "axle_m": [
+        -0.00528,
+        0.02735
+      ],
+      "shock_len_m": 0.20643
+    },
+    {
+      "travel_m": 0.02933,
+      "seatstay_rot_rad": -0.02779,
+      "axle_m": [
+        -0.00559,
+        0.02933
+      ],
+      "shock_len_m": 0.20575
+    },
+    {
+      "travel_m": 0.03132,
+      "seatstay_rot_rad": -0.029865,
+      "axle_m": [
+        -0.00588,
+        0.03132
+      ],
+      "shock_len_m": 0.20506
+    },
+    {
+      "travel_m": 0.03331,
+      "seatstay_rot_rad": -0.031963,
+      "axle_m": [
+        -0.00617,
+        0.03331
+      ],
+      "shock_len_m": 0.20438
+    },
+    {
+      "travel_m": 0.03531,
+      "seatstay_rot_rad": -0.034083,
+      "axle_m": [
+        -0.00644,
+        0.03531
+      ],
+      "shock_len_m": 0.20369
+    },
+    {
+      "travel_m": 0.0373,
+      "seatstay_rot_rad": -0.036225,
+      "axle_m": [
+        -0.00671,
+        0.0373
+      ],
+      "shock_len_m": 0.20301
+    },
+    {
+      "travel_m": 0.0393,
+      "seatstay_rot_rad": -0.038387,
+      "axle_m": [
+        -0.00696,
+        0.0393
+      ],
+      "shock_len_m": 0.20232
+    },
+    {
+      "travel_m": 0.04131,
+      "seatstay_rot_rad": -0.04057,
+      "axle_m": [
+        -0.00721,
+        0.04131
+      ],
+      "shock_len_m": 0.20162
+    },
+    {
+      "travel_m": 0.04331,
+      "seatstay_rot_rad": -0.042773,
+      "axle_m": [
+        -0.00744,
+        0.04331
+      ],
+      "shock_len_m": 0.20093
+    },
+    {
+      "travel_m": 0.04532,
+      "seatstay_rot_rad": -0.044996,
+      "axle_m": [
+        -0.00767,
+        0.04532
+      ],
+      "shock_len_m": 0.20023
+    },
+    {
+      "travel_m": 0.04733,
+      "seatstay_rot_rad": -0.047237,
+      "axle_m": [
+        -0.00788,
+        0.04733
+      ],
+      "shock_len_m": 0.19953
+    },
+    {
+      "travel_m": 0.04935,
+      "seatstay_rot_rad": -0.049498,
+      "axle_m": [
+        -0.00809,
+        0.04935
+      ],
+      "shock_len_m": 0.19883
+    },
+    {
+      "travel_m": 0.05136,
+      "seatstay_rot_rad": -0.051776,
+      "axle_m": [
+        -0.00829,
+        0.05136
+      ],
+      "shock_len_m": 0.19813
+    },
+    {
+      "travel_m": 0.05338,
+      "seatstay_rot_rad": -0.054072,
+      "axle_m": [
+        -0.00847,
+        0.05338
+      ],
+      "shock_len_m": 0.19743
+    },
+    {
+      "travel_m": 0.0554,
+      "seatstay_rot_rad": -0.056386,
+      "axle_m": [
+        -0.00865,
+        0.0554
+      ],
+      "shock_len_m": 0.19672
+    },
+    {
+      "travel_m": 0.05743,
+      "seatstay_rot_rad": -0.058717,
+      "axle_m": [
+        -0.00881,
+        0.05743
+      ],
+      "shock_len_m": 0.19601
+    },
+    {
+      "travel_m": 0.05945,
+      "seatstay_rot_rad": -0.061065,
+      "axle_m": [
+        -0.00897,
+        0.05945
+      ],
+      "shock_len_m": 0.1953
+    },
+    {
+      "travel_m": 0.06148,
+      "seatstay_rot_rad": -0.063429,
+      "axle_m": [
+        -0.00912,
+        0.06148
+      ],
+      "shock_len_m": 0.19459
+    },
+    {
+      "travel_m": 0.06351,
+      "seatstay_rot_rad": -0.06581,
+      "axle_m": [
+        -0.00925,
+        0.06351
+      ],
+      "shock_len_m": 0.19387
+    },
+    {
+      "travel_m": 0.06554,
+      "seatstay_rot_rad": -0.068207,
+      "axle_m": [
+        -0.00938,
+        0.06554
+      ],
+      "shock_len_m": 0.19315
+    },
+    {
+      "travel_m": 0.06758,
+      "seatstay_rot_rad": -0.070619,
+      "axle_m": [
+        -0.00949,
+        0.06758
+      ],
+      "shock_len_m": 0.19243
+    },
+    {
+      "travel_m": 0.06961,
+      "seatstay_rot_rad": -0.073047,
+      "axle_m": [
+        -0.0096,
+        0.06961
+      ],
+      "shock_len_m": 0.19171
+    },
+    {
+      "travel_m": 0.07165,
+      "seatstay_rot_rad": -0.075491,
+      "axle_m": [
+        -0.0097,
+        0.07165
+      ],
+      "shock_len_m": 0.19099
+    },
+    {
+      "travel_m": 0.07369,
+      "seatstay_rot_rad": -0.077949,
+      "axle_m": [
+        -0.00978,
+        0.07369
+      ],
+      "shock_len_m": 0.19026
+    },
+    {
+      "travel_m": 0.07573,
+      "seatstay_rot_rad": -0.080423,
+      "axle_m": [
+        -0.00986,
+        0.07573
+      ],
+      "shock_len_m": 0.18953
+    },
+    {
+      "travel_m": 0.07777,
+      "seatstay_rot_rad": -0.082911,
+      "axle_m": [
+        -0.00993,
+        0.07777
+      ],
+      "shock_len_m": 0.1888
+    },
+    {
+      "travel_m": 0.07982,
+      "seatstay_rot_rad": -0.085414,
+      "axle_m": [
+        -0.00998,
+        0.07982
+      ],
+      "shock_len_m": 0.18807
+    },
+    {
+      "travel_m": 0.08186,
+      "seatstay_rot_rad": -0.087931,
+      "axle_m": [
+        -0.01003,
+        0.08186
+      ],
+      "shock_len_m": 0.18733
+    },
+    {
+      "travel_m": 0.08391,
+      "seatstay_rot_rad": -0.090462,
+      "axle_m": [
+        -0.01006,
+        0.08391
+      ],
+      "shock_len_m": 0.18659
+    },
+    {
+      "travel_m": 0.08596,
+      "seatstay_rot_rad": -0.093008,
+      "axle_m": [
+        -0.01009,
+        0.08596
+      ],
+      "shock_len_m": 0.18585
+    },
+    {
+      "travel_m": 0.08801,
+      "seatstay_rot_rad": -0.095567,
+      "axle_m": [
+        -0.01011,
+        0.08801
+      ],
+      "shock_len_m": 0.18511
+    },
+    {
+      "travel_m": 0.09006,
+      "seatstay_rot_rad": -0.09814,
+      "axle_m": [
+        -0.01011,
+        0.09006
+      ],
+      "shock_len_m": 0.18436
+    },
+    {
+      "travel_m": 0.09211,
+      "seatstay_rot_rad": -0.100726,
+      "axle_m": [
+        -0.01011,
+        0.09211
+      ],
+      "shock_len_m": 0.18362
+    },
+    {
+      "travel_m": 0.09416,
+      "seatstay_rot_rad": -0.103326,
+      "axle_m": [
+        -0.01009,
+        0.09416
+      ],
+      "shock_len_m": 0.18287
+    },
+    {
+      "travel_m": 0.09622,
+      "seatstay_rot_rad": -0.10594,
+      "axle_m": [
+        -0.01007,
+        0.09622
+      ],
+      "shock_len_m": 0.18211
+    },
+    {
+      "travel_m": 0.09827,
+      "seatstay_rot_rad": -0.108566,
+      "axle_m": [
+        -0.01004,
+        0.09827
+      ],
+      "shock_len_m": 0.18136
+    },
+    {
+      "travel_m": 0.10033,
+      "seatstay_rot_rad": -0.111206,
+      "axle_m": [
+        -0.00999,
+        0.10033
+      ],
+      "shock_len_m": 0.1806
+    },
+    {
+      "travel_m": 0.10238,
+      "seatstay_rot_rad": -0.113859,
+      "axle_m": [
+        -0.00994,
+        0.10238
+      ],
+      "shock_len_m": 0.17984
+    },
+    {
+      "travel_m": 0.10444,
+      "seatstay_rot_rad": -0.116525,
+      "axle_m": [
+        -0.00987,
+        0.10444
+      ],
+      "shock_len_m": 0.17908
+    },
+    {
+      "travel_m": 0.1065,
+      "seatstay_rot_rad": -0.119204,
+      "axle_m": [
+        -0.0098,
+        0.1065
+      ],
+      "shock_len_m": 0.17832
+    },
+    {
+      "travel_m": 0.10856,
+      "seatstay_rot_rad": -0.121895,
+      "axle_m": [
+        -0.00971,
+        0.10856
+      ],
+      "shock_len_m": 0.17755
+    },
+    {
+      "travel_m": 0.11062,
+      "seatstay_rot_rad": -0.124599,
+      "axle_m": [
+        -0.00962,
+        0.11062
+      ],
+      "shock_len_m": 0.17678
+    },
+    {
+      "travel_m": 0.11268,
+      "seatstay_rot_rad": -0.127316,
+      "axle_m": [
+        -0.00951,
+        0.11268
+      ],
+      "shock_len_m": 0.17601
+    },
+    {
+      "travel_m": 0.11474,
+      "seatstay_rot_rad": -0.130045,
+      "axle_m": [
+        -0.0094,
+        0.11474
+      ],
+      "shock_len_m": 0.17524
+    },
+    {
+      "travel_m": 0.1168,
+      "seatstay_rot_rad": -0.132786,
+      "axle_m": [
+        -0.00927,
+        0.1168
+      ],
+      "shock_len_m": 0.17446
+    },
+    {
+      "travel_m": 0.11887,
+      "seatstay_rot_rad": -0.13554,
+      "axle_m": [
+        -0.00914,
+        0.11887
+      ],
+      "shock_len_m": 0.17368
+    },
+    {
+      "travel_m": 0.12093,
+      "seatstay_rot_rad": -0.138307,
+      "axle_m": [
+        -0.00899,
+        0.12093
+      ],
+      "shock_len_m": 0.1729
+    },
+    {
+      "travel_m": 0.12299,
+      "seatstay_rot_rad": -0.141085,
+      "axle_m": [
+        -0.00884,
+        0.12299
+      ],
+      "shock_len_m": 0.17212
+    },
+    {
+      "travel_m": 0.12505,
+      "seatstay_rot_rad": -0.143876,
+      "axle_m": [
+        -0.00867,
+        0.12505
+      ],
+      "shock_len_m": 0.17133
+    },
+    {
+      "travel_m": 0.12712,
+      "seatstay_rot_rad": -0.146679,
+      "axle_m": [
+        -0.00849,
+        0.12712
+      ],
+      "shock_len_m": 0.17054
+    },
+    {
+      "travel_m": 0.12918,
+      "seatstay_rot_rad": -0.149494,
+      "axle_m": [
+        -0.00831,
+        0.12918
+      ],
+      "shock_len_m": 0.16975
+    },
+    {
+      "travel_m": 0.13124,
+      "seatstay_rot_rad": -0.152321,
+      "axle_m": [
+        -0.00811,
+        0.13124
+      ],
+      "shock_len_m": 0.16896
+    },
+    {
+      "travel_m": 0.13331,
+      "seatstay_rot_rad": -0.15516,
+      "axle_m": [
+        -0.00791,
+        0.13331
+      ],
+      "shock_len_m": 0.16817
+    },
+    {
+      "travel_m": 0.13537,
+      "seatstay_rot_rad": -0.158012,
+      "axle_m": [
+        -0.00769,
+        0.13537
+      ],
+      "shock_len_m": 0.16737
+    },
+    {
+      "travel_m": 0.13743,
+      "seatstay_rot_rad": -0.160875,
+      "axle_m": [
+        -0.00746,
+        0.13743
+      ],
+      "shock_len_m": 0.16657
+    },
+    {
+      "travel_m": 0.1395,
+      "seatstay_rot_rad": -0.163749,
+      "axle_m": [
+        -0.00723,
+        0.1395
+      ],
+      "shock_len_m": 0.16577
+    },
+    {
+      "travel_m": 0.14156,
+      "seatstay_rot_rad": -0.166636,
+      "axle_m": [
+        -0.00698,
+        0.14156
+      ],
+      "shock_len_m": 0.16497
+    },
+    {
+      "travel_m": 0.14362,
+      "seatstay_rot_rad": -0.169535,
+      "axle_m": [
+        -0.00672,
+        0.14362
+      ],
+      "shock_len_m": 0.16416
+    },
+    {
+      "travel_m": 0.14569,
+      "seatstay_rot_rad": -0.172445,
+      "axle_m": [
+        -0.00646,
+        0.14569
+      ],
+      "shock_len_m": 0.16335
+    },
+    {
+      "travel_m": 0.14775,
+      "seatstay_rot_rad": -0.175368,
+      "axle_m": [
+        -0.00618,
+        0.14775
+      ],
+      "shock_len_m": 0.16254
+    },
+    {
+      "travel_m": 0.14981,
+      "seatstay_rot_rad": -0.178302,
+      "axle_m": [
+        -0.00589,
+        0.14981
+      ],
+      "shock_len_m": 0.16173
+    },
+    {
+      "travel_m": 0.15187,
+      "seatstay_rot_rad": -0.181248,
+      "axle_m": [
+        -0.00559,
+        0.15187
+      ],
+      "shock_len_m": 0.16091
+    },
+    {
+      "travel_m": 0.15393,
+      "seatstay_rot_rad": -0.184205,
+      "axle_m": [
+        -0.00528,
+        0.15393
+      ],
+      "shock_len_m": 0.1601
+    },
+    {
+      "travel_m": 0.15599,
+      "seatstay_rot_rad": -0.187174,
+      "axle_m": [
+        -0.00497,
+        0.15599
+      ],
+      "shock_len_m": 0.15928
+    },
+    {
+      "travel_m": 0.15805,
+      "seatstay_rot_rad": -0.190155,
+      "axle_m": [
+        -0.00464,
+        0.15805
+      ],
+      "shock_len_m": 0.15846
+    },
+    {
+      "travel_m": 0.16011,
+      "seatstay_rot_rad": -0.193148,
+      "axle_m": [
+        -0.0043,
+        0.16011
+      ],
+      "shock_len_m": 0.15763
+    }
+  ]
+}

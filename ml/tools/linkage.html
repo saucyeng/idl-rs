@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linkage Pivot Check</title>
+<style>
+  :root { --bg:#f6f6f4; --panel:#ffffff; --ink:#1d1d1f; --muted:#6b6b70; --line:#d9d9de; --accent:#0a66c2; --warn:#b3261e; --ok:#1e7d32; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#151517; --panel:#1f1f22; --ink:#ececf0; --muted:#9a9aa2; --line:#34343a; --accent:#5aa2ff; --warn:#ff7b72; --ok:#56c26a; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--ink); display:grid; grid-template-columns: 340px 1fr; height:100vh; }
+  aside { background:var(--panel); border-right:1px solid var(--line); overflow:auto; padding:14px 16px; }
+  main { position:relative; overflow:hidden; }
+  canvas { display:block; width:100%; height:100%; cursor:crosshair; }
+  h1 { font-size:16px; margin:0 0 4px; } h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:16px 0 6px; }
+  p.hint { color:var(--muted); margin:4px 0 8px; font-size:12.5px; }
+  label { display:flex; justify-content:space-between; align-items:center; gap:8px; margin:4px 0; }
+  input[type=number] { width:90px; padding:3px 6px; background:var(--bg); color:var(--ink); border:1px solid var(--line); border-radius:4px; }
+  .pts button { display:flex; width:100%; justify-content:space-between; align-items:center; padding:5px 8px; margin:2px 0; border:1px solid var(--line); background:var(--bg); color:var(--ink); border-radius:5px; cursor:pointer; text-align:left; }
+  .pts button.active { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .sw { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:8px; vertical-align:middle; }
+  .done { color:var(--ok); } .todo { color:var(--muted); }
+  .btn { padding:6px 10px; border:1px solid var(--line); border-radius:5px; background:var(--bg); color:var(--ink); cursor:pointer; margin:3px 4px 3px 0; }
+  table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; font-size:12.5px; }
+  td, th { padding:2px 4px; border-bottom:1px solid var(--line); text-align:right; } th:first-child, td:first-child { text-align:left; }
+  .warn { color:var(--warn); } .ok { color:var(--ok); }
+  #plots canvas { width:100%; height:130px; border:1px solid var(--line); border-radius:4px; margin-top:4px; cursor:default; }
+  .drop { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:15px; pointer-events:none; }
+</style>
+</head>
+<body>
+<aside>
+  <h1>Linkage pivot check</h1>
+  <p class="hint">Load a side-on photo, click each point, then sweep the 4-bar through its travel. Wheel zooms, right-drag (or Shift-drag) pans, Backspace clears the selected point.</p>
+  <input type="file" id="file" accept="image/*">
+
+  <h2>Scale</h2>
+  <label>Wheelbase (mm) <input type="number" id="wb" value="1280" step="1"></label>
+  <p class="hint">From the GT Force calibration. The two axle centres set the scale and the ground line.</p>
+  <label>Rear wheel travel (mm) <input type="number" id="travel" value="160" step="1"></label>
+  <label>Shock stroke spec (mm) <input type="number" id="stroke" value="" placeholder="optional" step="0.5"></label>
+
+  <h2>Points</h2>
+  <div class="pts" id="pts"></div>
+
+  <h2>Sweep</h2>
+  <label>Travel shown (mm) <input type="range" id="sweep" min="0" max="160" value="0" step="1" style="width:150px"><span id="sweepv">0</span></label>
+  <div id="sweepinfo" class="hint"></div>
+  <div id="plots"><canvas id="p1"></canvas><canvas id="p2"></canvas></div>
+
+  <h2>Pods vs calibration</h2>
+  <div id="imucheck" class="hint">Click IMU0, the fork pod and the rear pod to compare with the calibration's lever arms.</div>
+
+  <h2>Export</h2>
+  <button class="btn" id="dl">Download JSON</button><button class="btn" id="cp">Copy JSON</button>
+  <p class="hint">Bike side-plane coordinates in metres: origin at the rear axle, x toward the front axle, y up. Save it as <code>ml/bikes/gt-force-linkage.json</code>.</p>
+</aside>
+<main><canvas id="cv"></canvas><div class="drop" id="drop">Choose or drop a photo</div></main>
+<script>
+// Calibration lever arms of the pods from IMU0, projected on the bike's side plane
+// (forward along the ground, up), from bikes/gt-force.json calibration 0mwjed5fqqohlot.
+const CAL = { fork_pod: { fwd: 0.7684, up: -0.4073, left: 0.0305 }, rear_pod: { fwd: -0.4135, up: -0.3347, left: 0.0985 } };
+const POINTS = [
+  ["front_axle", "Front axle centre", "#e8a33d"],
+  ["rear_axle", "Rear axle centre", "#e8a33d"],
+  ["main_pivot", "Main pivot (chainstay–frame)", "#d64545"],
+  ["horst", "Chainstay–seatstay pivot", "#d64545"],
+  ["ss_rocker", "Seatstay–rocker pivot", "#d64545"],
+  ["rocker_frame", "Rocker–frame pivot", "#d64545"],
+  ["shock_frame", "Shock eye on frame (optional)", "#8a63d2"],
+  ["shock_rocker", "Shock eye on rocker (optional)", "#8a63d2"],
+  ["imu0", "IMU0 (frame logger)", "#2b8a3e"],
+  ["fork_pod", "Fork pod (front caliper)", "#2b8a3e"],
+  ["rear_pod", "Rear pod (rear caliper)", "#2b8a3e"],
+];
+const COLOR = Object.fromEntries(POINTS.map(p => [p[0], p[2]]));
+let img = null, imgName = "", pts = {}, sel = "front_axle";
+let view = { s: 1, x: 0, y: 0 };
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const $ = id => document.getElementById(id);
+
+function storeKey() { return "linkage:" + imgName; }
+function save() { try { localStorage.setItem(storeKey(), JSON.stringify({ pts, wb: $("wb").value, travel: $("travel").value, stroke: $("stroke").value })); } catch (e) {} }
+function restore() {
+  try { const s = JSON.parse(localStorage.getItem(storeKey()) || "null"); if (!s) return;
+    pts = s.pts || {}; if (s.wb) $("wb").value = s.wb; if (s.travel) $("travel").value = s.travel; if (s.stroke) $("stroke").value = s.stroke; } catch (e) {}
+}
+
+function renderList() {
+  const el = $("pts"); el.innerHTML = "";
+  for (const [k, label, c] of POINTS) {
+    const b = document.createElement("button");
+    b.className = k === sel ? "active" : "";
+    b.innerHTML = `<span><span class="sw" style="background:${c}"></span>${label}</span><span class="${pts[k] ? "done" : "todo"}">${pts[k] ? "✓" : "–"}</span>`;
+    b.onclick = () => { sel = k; renderList(); };
+    el.appendChild(b);
+  }
+}
+
+// ---------- image <-> screen ----------
+function resize() { const r = cv.getBoundingClientRect(); cv.width = r.width * devicePixelRatio; cv.height = r.height * devicePixelRatio; draw(); }
+function fit() { if (!img) return; const r = cv.getBoundingClientRect(); view.s = Math.min(r.width / img.width, r.height / img.height) * 0.98; view.x = (r.width - img.width * view.s) / 2; view.y = (r.height - img.height * view.s) / 2; }
+const toScreen = p => [p[0] * view.s + view.x, p[1] * view.s + view.y];
+const toImage = (x, y) => [(x - view.x) / view.s, (y - view.y) / view.s];
+
+// ---------- bike frame: origin rear axle, x toward front axle, y up (metres) ----------
+function frame() {
+  if (!pts.front_axle || !pts.rear_axle) return null;
+  const [fx, fy] = pts.front_axle, [rx, ry] = pts.rear_axle;
+  const d = Math.hypot(fx - rx, fy - ry); if (d < 1) return null;
+  const ex = [(fx - rx) / d, (fy - ry) / d];
+  let ey = [ex[1], -ex[0]]; if (ey[1] > 0) ey = [-ey[0], -ey[1]]; // the perpendicular that points up in the image
+  const ppm = d / (parseFloat($("wb").value) / 1000);
+  return { o: [rx, ry], ex, ey, ppm };
+}
+const toBike = (F, p) => { const dx = p[0] - F.o[0], dy = p[1] - F.o[1]; return [(dx * F.ex[0] + dy * F.ex[1]) / F.ppm, (dx * F.ey[0] + dy * F.ey[1]) / F.ppm]; };
+const fromBike = (F, b) => [F.o[0] + (b[0] * F.ex[0] + b[1] * F.ey[0]) * F.ppm, F.o[1] + (b[0] * F.ex[1] + b[1] * F.ey[1]) * F.ppm];
+
+// ---------- 4-bar ----------
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1]], add = (a, b) => [a[0] + b[0], a[1] + b[1]];
+const rot = (v, t) => [v[0] * Math.cos(t) - v[1] * Math.sin(t), v[0] * Math.sin(t) + v[1] * Math.cos(t)];
+const len = v => Math.hypot(v[0], v[1]), ang = v => Math.atan2(v[1], v[0]);
+function circles(c0, r0, c1, r1, near) {
+  const d = len(sub(c1, c0)); if (d > r0 + r1 || d < Math.abs(r0 - r1) || d === 0) return null;
+  const a = (r0 * r0 - r1 * r1 + d * d) / (2 * d), h = Math.sqrt(Math.max(r0 * r0 - a * a, 0));
+  const u = [(c1[0] - c0[0]) / d, (c1[1] - c0[1]) / d], m = [c0[0] + a * u[0], c0[1] + a * u[1]];
+  const s1 = [m[0] - h * u[1], m[1] + h * u[0]], s2 = [m[0] + h * u[1], m[1] - h * u[0]];
+  return len(sub(s1, near)) < len(sub(s2, near)) ? s1 : s2;
+}
+function linkage() {
+  const F = frame(); if (!F) return null;
+  const need = ["main_pivot", "horst", "ss_rocker", "rocker_frame"]; if (!need.every(k => pts[k])) return null;
+  const B = Object.fromEntries(Object.entries(pts).map(([k, p]) => [k, toBike(F, p)]));
+  const M = B.main_pivot, H = B.horst, S = B.ss_rocker, R = B.rocker_frame, A = [0, 0];
+  const lHS = len(sub(S, H)), lRS = len(sub(S, R));
+  const pose = th => { // chainstay rotated by th about M
+    const H2 = add(M, rot(sub(H, M), th));
+    const S2 = circles(H2, lHS, R, lRS, S); if (!S2) return null;
+    const phi = ang(sub(S2, H2)) - ang(sub(S, H)), psi = ang(sub(S2, R)) - ang(sub(S, R));
+    const onSS = P => add(H2, rot(sub(P, H), phi));
+    const out = { th, H: H2, S: S2, phi, psi, A: onSS(A) };
+    if (B.rear_pod) out.pod = onSS(B.rear_pod);
+    if (B.shock_rocker && B.shock_frame) { out.E = add(R, rot(sub(B.shock_rocker, R), psi)); out.shock = len(sub(out.E, B.shock_frame)); }
+    return out;
+  };
+  // which way of turning the chainstay lifts the axle?
+  const p1 = pose(0.01), p0 = pose(0); if (!p0 || !p1) return { error: "The four pivots do not close as a 4-bar; check them." };
+  const dir = p1.A[1] > p0.A[1] ? 1 : -1;
+  const target = parseFloat($("travel").value) / 1000;
+  const rows = []; let th = 0;
+  for (let i = 0; i < 4000; i++) {
+    const p = pose(dir * th); if (!p) break;
+    p.travel = p.A[1] - p0.A[1];
+    rows.push(p);
+    if (p.travel >= target) break;
+    th += 0.0005;
+  }
+  return { B, rows, p0, reached: rows.length ? rows[rows.length - 1].travel : 0, target };
+}
+
+// ---------- drawing ----------
+function dot(p, c, r = 5, hollow = false) { const [x, y] = toScreen(p); ctx.beginPath(); ctx.arc(x, y, r, 0, 7); if (hollow) { ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.stroke(); } else { ctx.fillStyle = c; ctx.fill(); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke(); } }
+function line(a, b, c, w = 2, dash = []) { const A = toScreen(a), B = toScreen(b); ctx.beginPath(); ctx.setLineDash(dash); ctx.moveTo(...A); ctx.lineTo(...B); ctx.strokeStyle = c; ctx.lineWidth = w; ctx.stroke(); ctx.setLineDash([]); }
+function draw() {
+  const W = cv.width, H = cv.height; ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, W, H);
+  ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  if (!img) return;
+  ctx.drawImage(img, view.x, view.y, img.width * view.s, img.height * view.s);
+  const F = frame();
+  if (F) line(pts.rear_axle, pts.front_axle, "#e8a33d", 1, [6, 4]);
+  const L = linkage();
+  if (L && L.rows && L.rows.length) {
+    // axle path
+    ctx.beginPath(); L.rows.forEach((p, i) => { const s = toScreen(fromBike(F, p.A)); i ? ctx.lineTo(...s) : ctx.moveTo(...s); }); ctx.strokeStyle = "#e8a33d"; ctx.lineWidth = 2; ctx.stroke();
+    const want = parseFloat($("sweep").value) / 1000;
+    let p = L.rows[0]; for (const r of L.rows) { if (r.travel <= want) p = r; }
+    const b = k => fromBike(F, L.B[k]), fb = v => fromBike(F, v);
+    line(b("main_pivot"), fb(p.H), "#ff5a5a", 4);                    // chainstay
+    line(fb(p.H), fb(p.S), "#4dabf7", 4); line(fb(p.H), fb(p.A), "#4dabf7", 4); // seatstay (to the axle)
+    line(b("rocker_frame"), fb(p.S), "#ffd43b", 4);                  // rocker
+    if (p.E) { line(b("rocker_frame"), fb(p.E), "#ffd43b", 3); line(b("shock_frame"), fb(p.E), "#b197fc", 5); }
+    dot(fb(p.A), "#e8a33d", 6); if (p.pod) dot(fb(p.pod), "#2b8a3e", 5, true);
+  }
+  // pods vs calibration
+  if (F && pts.imu0) for (const k of ["fork_pod", "rear_pod"]) {
+    const c = CAL[k], i0 = toBike(F, pts.imu0), e = fromBike(F, [i0[0] + c.fwd, i0[1] + c.up]);
+    dot(e, COLOR[k], 9, true); if (pts[k]) line(e, pts[k], COLOR[k], 1.5, [3, 3]);
+  }
+  for (const [k] of POINTS) if (pts[k]) { dot(pts[k], COLOR[k], k === sel ? 7 : 5); }
+}
+
+function plot(id, xs, ys, xl, yl, color) {
+  const c = $(id), r = c.getBoundingClientRect(); c.width = r.width * devicePixelRatio; c.height = r.height * devicePixelRatio;
+  const g = c.getContext("2d"); g.scale(devicePixelRatio, devicePixelRatio);
+  const W = r.width, H = r.height, m = { l: 40, r: 8, t: 8, b: 22 };
+  const ink = getComputedStyle(document.body).getPropertyValue("--muted");
+  if (xs.length < 2) return;
+  const x0 = Math.min(...xs), x1 = Math.max(...xs); let y0 = Math.min(...ys), y1 = Math.max(...ys); if (y1 - y0 < 1e-9) { y0 -= 1; y1 += 1; }
+  const X = v => m.l + (v - x0) / (x1 - x0) * (W - m.l - m.r), Y = v => H - m.b - (v - y0) / (y1 - y0) * (H - m.t - m.b);
+  g.strokeStyle = ink; g.lineWidth = 1; g.strokeRect(m.l, m.t, W - m.l - m.r, H - m.t - m.b);
+  g.fillStyle = ink; g.font = "11px system-ui"; g.fillText(yl, 4, 12); g.fillText(xl, W - 70, H - 6);
+  g.fillText(y1.toFixed(2), 2, m.t + 10); g.fillText(y0.toFixed(2), 2, H - m.b);
+  g.beginPath(); xs.forEach((x, i) => i ? g.lineTo(X(x), Y(ys[i])) : g.moveTo(X(x), Y(ys[i]))); g.strokeStyle = color; g.lineWidth = 2; g.stroke();
+}
+
+function report() {
+  const F = frame(), L = linkage();
+  $("sweep").max = $("travel").value; $("sweepv").textContent = $("sweep").value;
+  let html = "";
+  if (!F) html = "Place both axles first.";
+  else if (!L) html = `Scale ${(F.ppm / 1000).toFixed(3)} px/mm. Place the four pivots to sweep the 4-bar.`;
+  else if (L.error) html = `<span class="warn">${L.error}</span>`;
+  else {
+    const last = L.rows[L.rows.length - 1], tr = L.rows.map(r => r.travel * 1000);
+    html = `Scale ${(F.ppm / 1000).toFixed(3)} px/mm. Swept to <b>${(L.reached * 1000).toFixed(0)} mm</b>`
+      + (L.reached < L.target - 1e-3 ? ` <span class="warn">(the linkage locks before ${L.target * 1000} mm)</span>` : "") + ".<br>"
+      + `Seatstay rotation over the stroke: <b>${(last.phi * 180 / Math.PI).toFixed(2)}°</b>; axle moves ${((last.A[0] - L.p0.A[0]) * 1000).toFixed(1)} mm ${last.A[0] < L.p0.A[0] ? "rearward" : "forward"}.`;
+    if (last.shock !== undefined) {
+      const used = (L.p0.shock - last.shock) * 1000, spec = parseFloat($("stroke").value);
+      html += `<br>Shock stroke used: <b>${used.toFixed(1)} mm</b>, average leverage ${(L.reached * 1000 / used).toFixed(2)}`
+        + (spec ? ` — spec ${spec} mm: <span class="${Math.abs(used - spec) / spec < 0.05 ? "ok" : "warn"}">${((used - spec) / spec * 100).toFixed(1)}%</span>` : "");
+      const lev = []; for (let i = 1; i < L.rows.length; i++) { const ds = L.rows[i - 1].shock - L.rows[i].shock; lev.push(ds > 1e-9 ? (L.rows[i].travel - L.rows[i - 1].travel) / ds : NaN); }
+      const k = 20, sm = lev.map((_, i) => { const w = lev.slice(Math.max(0, i - k), i + k).filter(Number.isFinite); return w.reduce((a, b) => a + b, 0) / w.length; });
+      plot("p2", tr.slice(1), sm, "wheel travel mm", "leverage", "#b197fc");
+    } else plot("p2", [], [], "", "", "#000");
+    plot("p1", tr, L.rows.map(r => r.phi * 180 / Math.PI), "wheel travel mm", "seatstay rotation °", "#4dabf7");
+  }
+  $("sweepinfo").innerHTML = html;
+  // IMU check
+  let ih = "Click IMU0, the fork pod and the rear pod to compare with the calibration's lever arms.";
+  if (F && pts.imu0) {
+    const i0 = toBike(F, pts.imu0);
+    ih = `<table><tr><th>pod</th><th>cal fwd</th><th>cal up</th><th>photo fwd</th><th>photo up</th><th>miss mm</th></tr>`;
+    for (const k of ["fork_pod", "rear_pod"]) {
+      const c = CAL[k];
+      if (pts[k]) { const b = toBike(F, pts[k]), f = b[0] - i0[0], u = b[1] - i0[1], miss = Math.hypot(f - c.fwd, u - c.up) * 1000;
+        ih += `<tr><td>${k}</td><td>${(c.fwd * 1000).toFixed(0)}</td><td>${(c.up * 1000).toFixed(0)}</td><td>${(f * 1000).toFixed(0)}</td><td>${(u * 1000).toFixed(0)}</td><td class="${miss < 30 ? "ok" : "warn"}">${miss.toFixed(0)}</td></tr>`; }
+      else ih += `<tr><td>${k}</td><td>${(c.fwd * 1000).toFixed(0)}</td><td>${(c.up * 1000).toFixed(0)}</td><td colspan=3>not clicked</td></tr>`;
+    }
+    ih += `</table><p class="hint">Hollow circles: where the calibration puts each pod, from IMU0. Misses of a few cm are expected from photo perspective and from the pods' sideways offsets (fork pod ${(CAL.fork_pod.left * 1000).toFixed(0)} mm, rear pod ${(CAL.rear_pod.left * 1000).toFixed(0)} mm off the frame's plane).</p>`;
+  }
+  $("imucheck").innerHTML = ih;
+  draw();
+}
+
+function exportJSON() {
+  const F = frame(), L = linkage();
+  const out = { source_image: imgName, wheelbase_m: parseFloat($("wb").value) / 1000, rear_travel_m: parseFloat($("travel").value) / 1000,
+    frame: "bike side plane: origin rear axle, x toward the front axle, y up, metres", px_per_m: F ? F.ppm : null, points_m: {}, points_px: pts };
+  if (F) for (const [k, p] of Object.entries(pts)) out.points_m[k] = toBike(F, p).map(v => +v.toFixed(5));
+  if (L && L.rows) out.sweep = L.rows.filter((_, i) => i % 10 === 0).map(r => ({ travel_m: +r.travel.toFixed(5), seatstay_rot_rad: +r.phi.toFixed(6),
+    axle_m: r.A.map(v => +v.toFixed(5)), shock_len_m: r.shock !== undefined ? +r.shock.toFixed(5) : null }));
+  return JSON.stringify(out, null, 2);
+}
+
+// ---------- events ----------
+function loadFile(f) { if (!f) return; imgName = f.name; const u = URL.createObjectURL(f); const im = new Image(); im.onload = () => { img = im; $("drop").style.display = "none"; restore(); fit(); renderList(); report(); }; im.src = u; }
+$("file").onchange = e => loadFile(e.target.files[0]);
+document.body.addEventListener("dragover", e => e.preventDefault());
+document.body.addEventListener("drop", e => { e.preventDefault(); loadFile(e.dataTransfer.files[0]); });
+let drag = null;
+cv.addEventListener("contextmenu", e => e.preventDefault());
+cv.addEventListener("mousedown", e => {
+  if (!img) return;
+  if (e.button === 2 || e.shiftKey) { drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y }; return; }
+  const r = cv.getBoundingClientRect(); pts[sel] = toImage(e.clientX - r.left, e.clientY - r.top);
+  const i = POINTS.findIndex(p => p[0] === sel); const next = POINTS.slice(i + 1).concat(POINTS.slice(0, i)).find(p => !pts[p[0]]); if (next) sel = next[0];
+  save(); renderList(); report();
+});
+window.addEventListener("mousemove", e => { if (drag) { view.x = drag.vx + e.clientX - drag.x; view.y = drag.vy + e.clientY - drag.y; draw(); } });
+window.addEventListener("mouseup", () => drag = null);
+cv.addEventListener("wheel", e => { e.preventDefault(); const r = cv.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top, k = Math.exp(-e.deltaY * 0.0015);
+  view.x = mx - (mx - view.x) * k; view.y = my - (my - view.y) * k; view.s *= k; draw(); }, { passive: false });
+window.addEventListener("keydown", e => { if ((e.key === "Backspace" || e.key === "Delete") && document.activeElement.tagName !== "INPUT") { delete pts[sel]; save(); renderList(); report(); } });
+for (const id of ["wb", "travel", "stroke"]) $(id).addEventListener("input", () => { save(); report(); });
+$("sweep").addEventListener("input", report);
+$("dl").onclick = () => { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([exportJSON()], { type: "application/json" })); a.download = "gt-force-linkage.json"; a.click(); };
+$("cp").onclick = () => navigator.clipboard && navigator.clipboard.writeText(exportJSON());
+window.addEventListener("resize", () => { resize(); report(); });
+renderList(); resize();
+</script>
+</body>
+</html>
