@@ -52,6 +52,11 @@ pub fn estimate_physics(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliErro
         rear_travel_m: mm("rear-travel-mm"),
         threads: opt_integer(m, "threads").map(|t| t.max(1) as usize),
         dry_run: ctx.dry_run,
+        span_ms: match (opt_integer(m, "from-ms"), opt_integer(m, "to-ms")) {
+            (Some(a), Some(b)) if b > a => Some((a, b)),
+            (None, None) => None,
+            _ => return Err(CliError::usage("--from-ms and --to-ms go together, with --to-ms after --from-ms".to_string())),
+        },
     };
     let r = idl_library::physics::estimate_physics(root, &id, &opts)?;
     let t = |s: &idl_library::physics::TravelSummary| {

@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use idl_rs::calibration::linkage::{PhysicsFit, PHYSICS_FIT_VERSION};
 use idl_rs::estimate::physics::objective::NG;
-use idl_rs::estimate::physics::pipeline::{ride, still_bias_centre, PipelineError, Ride};
+use idl_rs::estimate::physics::pipeline::{ride_between, still_bias_centre, PipelineError, Ride};
 use idl_rs::estimate::physics::run::{bike_geometry, fit_bike, fitted_bike, outputs, solve_ride, Config, PHYSICS_ESTIMATOR_VERSION};
 use idl_rs::estimate::physics::setup::{bike, SetupError};
 use idl_rs::estimate::physics::solve::SolveError;
@@ -41,6 +41,9 @@ pub struct PhysicsOptions {
     pub threads: Option<usize>,
     /// Report what would be done; write nothing.
     pub dry_run: bool,
+    /// Only this stretch of the session, ms from its first sample (both or
+    /// neither): less memory, and the bike fit picks its windows inside it.
+    pub span_ms: Option<(i64, i64)>,
 }
 
 /// Distribution of one travel channel over the solved samples, mm.
@@ -161,7 +164,9 @@ pub fn estimate_physics(data_root: &Path, session_id: &str, opts: &PhysicsOption
         return Err(err(PhysicsErrorKind::NotCalibrated, format!("{}: fork and rear travel unknown; give --front-travel-mm and --rear-travel-mm or a linkage", doc.bike_id)));
     };
 
-    let r = ride(&handle).map_err(|e| {
+    // a margin each side, so the stretch's own ends are not window edges
+    let span = opts.span_ms.map(|(a, b)| ((a - 2000).max(0) * 1000, (b + 2000) * 1000));
+    let r = ride_between(&handle, span).map_err(|e| {
         err(
             PhysicsErrorKind::Unusable,
             match e {
@@ -245,6 +250,7 @@ pub fn estimate_physics(data_root: &Path, session_id: &str, opts: &PhysicsOption
             "window_s": cfg.window_s,
             "overlap_s": cfg.overlap_s,
             "bias_centre": centre.to_vec(),
+            "span_ms": opts.span_ms,
         });
         let derived: Vec<DerivedOutput> = outs
             .into_iter()

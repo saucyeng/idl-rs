@@ -61,7 +61,18 @@ pub enum PipelineError {
 /// The session's IMUs on IMU0's grid, with clip masks taken at each IMU's
 /// native rate on its raw int16 counts.
 pub fn ride(h: &SessionHandle) -> Result<Ride, PipelineError> {
-    let input = EstimatorInput::from_lookup(h).ok_or(PipelineError::NoFrameImu)?;
+    ride_between(h, None)
+}
+
+/// As [`ride`], over session times `span` (us since the first sample) only:
+/// every channel is cut to the span before it is resampled, so the grid, the
+/// windows and everything after hold only that stretch.
+pub fn ride_between(h: &SessionHandle, span: Option<(i64, i64)>) -> Result<Ride, PipelineError> {
+    let input = match span {
+        Some((a, b)) => EstimatorInput::from_lookup(&Cropped { inner: h, from_us: a, to_us: b }),
+        None => EstimatorInput::from_lookup(h),
+    }
+    .ok_or(PipelineError::NoFrameImu)?;
     for (k, s) in [(1u8, &input.imu1), (2, &input.imu2)] {
         if s.is_none() {
             return Err(PipelineError::MissingPod { imu_index: k });
@@ -71,6 +82,25 @@ pub fn ride(h: &SessionHandle) -> Result<Ride, PipelineError> {
     let grid_us: Vec<i64> = (0..n).map(|i| ((input.t0_s + i as f64 * input.dt) * 1e6).round() as i64).collect();
     let clip = std::array::from_fn(|k| clip_mask(h, k, &grid_us));
     Ok(Ride { input, grid_us, clip })
+}
+
+/// A lookup that serves its inner lookup's channels cut to `from_us..to_us`.
+struct Cropped<'a> {
+    inner: &'a SessionHandle,
+    from_us: i64,
+    to_us: i64,
+}
+
+impl ChannelLookup for Cropped<'_> {
+    fn lookup(&self, name: &str) -> Option<crate::math::eval::LookupChannel> {
+        let c = self.inner.lookup(name)?;
+        if c.t_us.is_empty() {
+            return Some(c);
+        }
+        let a = c.t_us.partition_point(|&t| t < self.from_us);
+        let b = c.t_us.partition_point(|&t| t <= self.to_us);
+        Some(crate::math::eval::LookupChannel { samples: c.samples[a..b].into(), sample_rate_hz: c.sample_rate_hz, t_us: c.t_us[a..b].into() })
+    }
 }
 
 /// IMU `k`'s clip mask on `grid_us`: any int16 axis at full scale within
