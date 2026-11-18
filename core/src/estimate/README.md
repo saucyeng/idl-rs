@@ -272,6 +272,18 @@ channels are written to `sessions/<id>/derived/<hash>.parquet` (C1 §5,
 | `physics/run.rs` | The bike fit, the whole-ride solve, the output channels. |
 | `physics/setup.rs`, `physics/fourbar.rs` | The bike from a calibration, its linkage and its physics fit. |
 
+First end-to-end check (2026-11-18, Beacon `173461a2`, Lower Broken Bomber,
+`--from-ms 5780000 --to-ms 5845000`): with the PyTorch fit's geometry the Rust
+run gives front travel 1% / median / 99% 0 / 39 / 103 mm and rear 0 / 51 / 133
+mm, against PyTorch's 0 / 42 / 105 and 1 / 51 / 135; airborne medians 0 mm.
+Its own fit inside that stretch moves the bending length to 0.72 m and front
+median travel to 67 mm: with the bending arm shortening with travel, the
+fitted bending length and slow front travel trade almost freely. Measuring
+the crown-to-fork-pod length at top-out (and fixing `bend_len_m` to it)
+removes that trade. The IMUs are low-passed at 0.4 x the grid rate before
+the fit, as the reference's cache does; without it the pods' 60-230 Hz
+vibration pulled the fit to a 1.23 linkage scale and front travel to -35 mm.
+
 Golden tests hold the forward model, its Jacobian and a real window's solve
 equal to the PyTorch reference (`ml/experiments/export_golden.py`,
 `export_window.py` write the fixtures); regenerate them after a model change

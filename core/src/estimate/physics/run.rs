@@ -12,7 +12,7 @@ use super::solve::{gauss_newton, gauss_newton_multi, latents, SolveError, SolveI
 /// Version of the estimator's output. Bump when the same inputs give
 /// different channels (a model or solver change); stored in the output file
 /// so an older file can be shown as stale.
-pub const PHYSICS_ESTIMATOR_VERSION: u32 = 1;
+pub const PHYSICS_ESTIMATOR_VERSION: u32 = 2; // 2: IMUs low-passed at 0.4 x the grid rate
 
 /// How a run is set up.
 #[derive(Clone, Debug)]

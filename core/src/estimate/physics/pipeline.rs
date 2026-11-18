@@ -73,6 +73,8 @@ pub fn ride_between(h: &SessionHandle, span: Option<(i64, i64)>) -> Result<Ride,
         None => EstimatorInput::from_lookup(h),
     }
     .ok_or(PipelineError::NoFrameImu)?;
+    let mut input = input;
+    antialias(&mut input);
     for (k, s) in [(1u8, &input.imu1), (2, &input.imu2)] {
         if s.is_none() {
             return Err(PipelineError::MissingPod { imu_index: k });
@@ -82,6 +84,30 @@ pub fn ride_between(h: &SessionHandle, span: Option<(i64, i64)>) -> Result<Ride,
     let grid_us: Vec<i64> = (0..n).map(|i| ((input.t0_s + i as f64 * input.dt) * 1e6).round() as i64).collect();
     let clip = std::array::from_fn(|k| clip_mask(h, k, &grid_us));
     Ok(Ride { input, grid_us, clip })
+}
+
+/// Zero-phase 4th-order Butterworth low-pass of every IMU axis at 0.4 x the
+/// grid rate, as the PyTorch reference's cache does: the IEKF's resampler
+/// filters only streams faster than the grid, so the pods (about the grid's
+/// rate) would otherwise bring their 60-230 Hz vibration, which the model does
+/// not describe, into the fit.
+fn antialias(input: &mut EstimatorInput) {
+    let rate = 1.0 / input.dt;
+    let mut series = vec![&mut input.imu0];
+    series.extend(input.imu1.as_mut());
+    series.extend(input.imu2.as_mut());
+    for s in series {
+        for v in [&mut s.gyro, &mut s.accel] {
+            for a in 0..3 {
+                let x: Vec<f64> = v.iter().map(|p| p[a]).collect();
+                if let Ok(y) = crate::filters::lowpass(&x, 4, 0.4 * rate, rate) {
+                    for (p, y) in v.iter_mut().zip(y) {
+                        p[a] = y;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A lookup that serves its inner lookup's channels cut to `from_us..to_us`.
