@@ -887,7 +887,7 @@ impl SessionHandle {
     /// seam accessors and the `ChannelLookup` impl. Passing `&Channel` (not a
     /// materialized slice) lets each accessor use the narrowest column op — a
     /// tile range, a min/max fold over raw — without widening the whole channel.
-    fn with_channel<R>(&self, channel_id: &str, f: impl FnOnce(&Channel) -> R) -> Option<R> {
+    pub(crate) fn with_channel<R>(&self, channel_id: &str, f: impl FnOnce(&Channel) -> R) -> Option<R> {
         if let Some(c) = self.session.channels.iter().find(|c| c.channel_id == channel_id) {
             return Some(f(c));
         }

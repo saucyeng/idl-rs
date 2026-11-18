@@ -18,6 +18,7 @@ pub mod eval_cache;
 pub mod import;
 pub mod index_job;
 pub mod lap_index;
+pub mod physics;
 /// The read-only library summary served to paired peers (library tiers Phase 1).
 pub mod library_summary;
 pub mod profile;

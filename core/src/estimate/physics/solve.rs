@@ -9,7 +9,7 @@
 //! starts near zero (Marquardt damping brakes hardest on exactly the slow,
 //! nearly flat travel modes; the problem is close to linear).
 
-use super::objective::{basis, Objective, Vars, NG, NROW};
+use super::objective::{basis, Objective, Vars, NROW};
 use super::bike::NL;
 
 /// One spline row's place in the unknown vector.
@@ -100,8 +100,8 @@ impl Layout {
                 c[k] += dl[p];
             }
         }
-        for i in 0..NG {
-            out.glob[i] += dg[i];
+        for (g, d) in out.glob.iter_mut().zip(dg) {
+            *g += d;
         }
         out
     }
@@ -109,32 +109,36 @@ impl Layout {
 
 /// The normal equations J^T J x = -J^T r in band + border form.
 pub struct Normal {
+    /// Number of globals.
+    pub ng: usize,
     /// Lower band, row-major: row i holds columns i-bw..=i (`band[i*(bw+1) + (j + bw - i)]`).
     pub band: Vec<f64>,
-    /// Border: d^2 / d local d global, [n_loc][NG].
-    pub border: Vec<[f64; NG]>,
-    /// Globals block, [NG][NG].
-    pub c: [[f64; NG]; NG],
+    /// Border: d^2 / d local d global, row-major [n_loc][ng].
+    pub border: Vec<f64>,
+    /// Globals block, row-major [ng][ng].
+    pub c: Vec<f64>,
     /// Gradient, local.
     pub g_loc: Vec<f64>,
     /// Gradient, globals.
-    pub g_glob: [f64; NG],
+    pub g_glob: Vec<f64>,
     /// Loss at the linearisation point.
     pub loss: f64,
 }
 
-/// Assemble the normal equations at `v`.
-pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars) -> Normal {
-    let (n, bw) = (lay.n_loc, lay.bw);
+/// Assemble the normal equations at `v`; `global_prior`: include the priors
+/// on the globals (a multi-window fit counts them once).
+pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: bool) -> Normal {
+    let (n, bw, ng) = (lay.n_loc, lay.bw, obj.n_glob());
     let wd = bw + 1;
-    let mut ne = Normal { band: vec![0.0; n * wd], border: vec![[0.0; NG]; n], c: [[0.0; NG]; NG], g_loc: vec![0.0; n], g_glob: [0.0; NG], loss: 0.0 };
+    let mut ne = Normal { ng, band: vec![0.0; n * wd], border: vec![0.0; n * ng], c: vec![0.0; ng * ng], g_loc: vec![0.0; n], g_glob: vec![0.0; ng], loss: 0.0 };
     let sp = &obj.spec;
+    let ctx = obj.ctx(&v.glob, true);
     let ncol = lay.groups.len() * 4;
     let mut a = vec![0.0; NROW * ncol];
     let mut cols = vec![0usize; ncol];
     for t in 0..sp.n {
         let s = obj.sample(v, t);
-        let sj = obj.sample_residuals(&s, &v.glob, t, true);
+        let sj = obj.sample_residuals(&ctx, &s, &v.glob, t, true);
         // chain d r / d z through the spline basis to the coefficients
         a.iter_mut().for_each(|x| *x = 0.0);
         for (gi, g) in lay.groups.iter().enumerate() {
@@ -175,24 +179,24 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars) -> Normal {
                 }
                 ne.band[cp * wd + (cq + bw - cp)] += h;
             }
-            for gq in 0..NG {
+            for gq in 0..ng {
                 let mut h = 0.0;
                 for r in 0..NROW {
                     h += a[r * ncol + p] * sj.jg[r][gq];
                 }
-                ne.border[cp][gq] += h;
+                ne.border[cp * ng + gq] += h;
             }
         }
-        for gp in 0..NG {
+        for gp in 0..ng {
             for r in 0..NROW {
                 ne.g_glob[gp] += sj.jg[r][gp] * sj.r[r];
             }
-            for gq in 0..NG {
+            for gq in 0..ng {
                 let mut h = 0.0;
                 for r in 0..NROW {
                     h += sj.jg[r][gp] * sj.jg[r][gq];
                 }
-                ne.c[gp][gq] += h;
+                ne.c[gp * ng + gq] += h;
             }
         }
     }
@@ -216,14 +220,15 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars) -> Normal {
             }
         }
     }
-    // global priors
-    let sig = obj.glob_sigma();
-    for i in 0..NG {
-        let gw = 1.0 / sig[i];
-        let gp = (v.glob[i] - obj.glob_centre[i]) * gw;
-        ne.c[i][i] += gw * gw;
-        ne.g_glob[i] += gw * gp;
-        ne.loss += 0.5 * gp * gp;
+    if global_prior {
+        let sig = obj.glob_sigma();
+        for i in 0..ng {
+            let gw = 1.0 / sig[i];
+            let gp = (v.glob[i] - obj.glob_centre[i]) * gw;
+            ne.c[i * ng + i] += gw * gw;
+            ne.g_glob[i] += gw * gp;
+            ne.loss += 0.5 * gp * gp;
+        }
     }
     ne
 }
@@ -257,18 +262,17 @@ fn band_solve(l: &[f64], n: usize, bw: usize, x: &mut [f64]) {
     let wd = bw + 1;
     for i in 0..n {
         let lo = i.saturating_sub(bw);
-        let mut s = x[i];
-        for k in lo..i {
-            s -= l[i * wd + (k + bw - i)] * x[k];
-        }
-        x[i] = s / l[i * wd + bw];
+        let row = &l[i * wd + (lo + bw - i)..i * wd + bw];
+        let s: f64 = row.iter().zip(&x[lo..i]).map(|(a, b)| a * b).sum();
+        x[i] = (x[i] - s) / l[i * wd + bw];
     }
     for i in (0..n).rev() {
         x[i] /= l[i * wd + bw];
         let xi = x[i];
         let lo = i.saturating_sub(bw);
-        for k in lo..i {
-            x[k] -= l[i * wd + (k + bw - i)] * xi;
+        let row = &l[i * wd + (lo + bw - i)..i * wd + bw];
+        for (xk, a) in x[lo..i].iter_mut().zip(row) {
+            *xk -= a * xi;
         }
     }
 }
@@ -279,13 +283,19 @@ pub enum SolveError {
     /// The damped normal matrix was not positive definite at this row (the
     /// problem is degenerate there, e.g. unobserved latents with no prior).
     NotPositiveDefinite {
-        /// Row of the band where the factorisation failed.
+        /// Row of the band (or n_loc for the globals' block) where it failed.
         row: usize,
     },
 }
 
-/// (H + lam diag(H)) x = -g for the band + border system.
-pub fn solve_damped(ne: &Normal, lay: &Layout, lam: f64) -> Result<(Vec<f64>, [f64; NG]), SolveError> {
+/// One window's damped band solved against -g_loc and the border: A^-1 (-g_loc), A^-1 B.
+struct Factored {
+    ar: Vec<f64>,
+    /// A^-1 B, column-major [ng][n_loc].
+    ab: Vec<Vec<f64>>,
+}
+
+fn factor(ne: &Normal, lay: &Layout, lam: f64) -> Result<Factored, SolveError> {
     let (n, bw) = (lay.n_loc, lay.bw);
     let wd = bw + 1;
     let mut l = ne.band.clone();
@@ -295,25 +305,48 @@ pub fn solve_damped(ne: &Normal, lay: &Layout, lam: f64) -> Result<(Vec<f64>, [f
     band_cholesky(&mut l, n, bw)?;
     let mut ar: Vec<f64> = ne.g_loc.iter().map(|g| -g).collect();
     band_solve(&l, n, bw, &mut ar);
-    let mut ab: Vec<Vec<f64>> = (0..NG).map(|j| ne.border.iter().map(|r| r[j]).collect()).collect();
-    for col in ab.iter_mut() {
-        band_solve(&l, n, bw, col);
-    }
-    // Schur complement for the globals
-    let mut sch = nalgebra::DMatrix::<f64>::zeros(NG, NG);
-    let mut rhs = nalgebra::DVector::<f64>::zeros(NG);
-    for i in 0..NG {
-        for j in 0..NG {
-            let bab: f64 = (0..n).map(|k| ne.border[k][i] * ab[j][k]).sum();
-            sch[(i, j)] = ne.c[i][j] - bab + if i == j { lam * ne.c[i][i] + 1e-9 } else { 0.0 };
+    let ab = (0..ne.ng)
+        .map(|j| {
+            let mut col: Vec<f64> = (0..n).map(|k| ne.border[k * ne.ng + j]).collect();
+            band_solve(&l, n, bw, &mut col);
+            col
+        })
+        .collect();
+    Ok(Factored { ar, ab })
+}
+
+/// This window's share of the globals' Schur system: (C - B^T A^-1 B, -g - B^T A^-1 (-g_loc)).
+fn schur_part(ne: &Normal, f: &Factored, lam: f64) -> (Vec<f64>, Vec<f64>) {
+    let (ng, n) = (ne.ng, ne.g_loc.len());
+    let mut s = vec![0.0; ng * ng];
+    let mut rhs = vec![0.0; ng];
+    for i in 0..ng {
+        for j in 0..ng {
+            let bab: f64 = (0..n).map(|k| ne.border[k * ng + i] * f.ab[j][k]).sum();
+            s[i * ng + j] = ne.c[i * ng + j] - bab + if i == j { lam * ne.c[i * ng + i] + 1e-9 } else { 0.0 };
         }
-        let bar: f64 = (0..n).map(|k| ne.border[k][i] * ar[k]).sum();
+        let bar: f64 = (0..n).map(|k| ne.border[k * ng + i] * f.ar[k]).sum();
         rhs[i] = -ne.g_glob[i] - bar;
     }
-    let xg = sch.cholesky().ok_or(SolveError::NotPositiveDefinite { row: n })?.solve(&rhs);
-    let xg: [f64; NG] = std::array::from_fn(|i| xg[i]);
-    let xl: Vec<f64> = (0..n).map(|k| ar[k] - (0..NG).map(|j| ab[j][k] * xg[j]).sum::<f64>()).collect();
-    Ok((xl, xg))
+    (s, rhs)
+}
+
+fn solve_globals(s: &[f64], rhs: &[f64], ng: usize, n_loc: usize) -> Result<Vec<f64>, SolveError> {
+    let m = nalgebra::DMatrix::from_row_slice(ng, ng, s);
+    let x = m.cholesky().ok_or(SolveError::NotPositiveDefinite { row: n_loc })?.solve(&nalgebra::DVector::from_column_slice(rhs));
+    Ok(x.iter().cloned().collect())
+}
+
+fn back_substitute(f: &Factored, xg: &[f64]) -> Vec<f64> {
+    (0..f.ar.len()).map(|k| f.ar[k] - xg.iter().zip(&f.ab).map(|(x, col)| col[k] * x).sum::<f64>()).collect()
+}
+
+/// (H + lam diag(H)) x = -g for one window's band + border system.
+pub fn solve_damped(ne: &Normal, lay: &Layout, lam: f64) -> Result<(Vec<f64>, Vec<f64>), SolveError> {
+    let f = factor(ne, lay, lam)?;
+    let (s, rhs) = schur_part(ne, &f, lam);
+    let xg = solve_globals(&s, &rhs, ne.ng, lay.n_loc)?;
+    Ok((back_substitute(&f, &xg), xg))
 }
 
 /// What a solve did.
@@ -323,31 +356,62 @@ pub struct SolveInfo {
     pub loss: Vec<f64>,
     /// Iterations run.
     pub iterations: usize,
+    /// Whether the last iteration gained less than the tolerance.
+    pub converged: bool,
     /// Seconds assembling normal equations, solving, and evaluating the loss.
     pub seconds: [f64; 3],
 }
 
 /// Levenberg-Marquardt from `v` until an iteration gains less than `tol` in loss.
-pub fn gauss_newton(obj: &Objective, mut v: Vars, iters: usize, tol: f64) -> Result<(Vars, SolveInfo), SolveError> {
-    let lay = Layout::new(obj);
+pub fn gauss_newton(obj: &Objective, v: Vars, iters: usize, tol: f64) -> Result<(Vars, SolveInfo), SolveError> {
+    let (mut vs, info) = gauss_newton_multi(std::slice::from_ref(obj), vec![v], iters, tol)?;
+    Ok((vs.remove(0), info))
+}
+
+/// Levenberg-Marquardt over several windows that share their globals (sensor
+/// biases and, when fitting, the bike's geometry); the latents are per window.
+/// Each window's band is factored on its own; the shared unknowns come from
+/// the summed Schur complements; the global priors count once. How the bike
+/// is learned from several windows before per-window solves with it frozen.
+pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, tol: f64) -> Result<(Vec<Vars>, SolveInfo), SolveError> {
+    let lays: Vec<Layout> = objs.iter().map(Layout::new).collect();
+    let ng = objs[0].n_glob();
+    // every window sees window 0's globals
+    let share = |vs: &mut Vec<Vars>| {
+        let g = vs[0].glob.clone();
+        for v in vs.iter_mut() {
+            v.glob = g.clone();
+        }
+    };
+    share(&mut vs);
+    let total = |vs: &[Vars]| objs.iter().zip(vs).map(|(o, v)| o.data_loss(v)).sum::<f64>() + objs[0].prior_loss(&vs[0]);
     let mut lam = 1e-10;
-    let mut loss = obj.loss(&v);
-    let mut info = SolveInfo { loss: vec![loss], iterations: 0, seconds: [0.0; 3] };
+    let mut loss = total(&vs);
+    let mut info = SolveInfo { loss: vec![loss], iterations: 0, seconds: [0.0; 3], converged: false };
     for it in 0..iters {
         let t0 = std::time::Instant::now();
-        let ne = normal_equations(obj, &lay, &v);
+        let nes: Vec<Normal> = objs.iter().zip(&vs).zip(&lays).enumerate().map(|(w, ((o, v), l))| normal_equations(o, l, v, w == 0)).collect();
         info.seconds[0] += t0.elapsed().as_secs_f64();
         let mut new;
         loop {
             let t1 = std::time::Instant::now();
-            let (xl, xg) = solve_damped(&ne, &lay, lam)?;
+            let mut fs = Vec::with_capacity(objs.len());
+            let (mut s, mut rhs) = (vec![0.0; ng * ng], vec![0.0; ng]);
+            for (ne, lay) in nes.iter().zip(&lays) {
+                let f = factor(ne, lay, lam)?;
+                let (sw, rw) = schur_part(ne, &f, lam);
+                s.iter_mut().zip(&sw).for_each(|(a, b)| *a += b);
+                rhs.iter_mut().zip(&rw).for_each(|(a, b)| *a += b);
+                fs.push(f);
+            }
+            let xg = solve_globals(&s, &rhs, ng, lays[0].n_loc)?;
+            let cand: Vec<Vars> = vs.iter().zip(&lays).zip(&fs).map(|((v, lay), f)| lay.apply(v, &back_substitute(f, &xg), &xg)).collect();
             info.seconds[1] += t1.elapsed().as_secs_f64();
             let t2 = std::time::Instant::now();
-            let cand = lay.apply(&v, &xl, &xg);
-            new = obj.loss(&cand);
+            new = total(&cand);
             info.seconds[2] += t2.elapsed().as_secs_f64();
             if new < loss {
-                v = cand;
+                vs = cand;
                 lam = (lam / 10.0).max(1e-12);
                 break;
             }
@@ -361,10 +425,11 @@ pub fn gauss_newton(obj: &Objective, mut v: Vars, iters: usize, tol: f64) -> Res
         info.loss.push(loss);
         info.iterations = it + 1;
         if gain < tol || lam > 1e2 {
+            info.converged = true;
             break;
         }
     }
-    Ok((v, info))
+    Ok((vs, info))
 }
 
 /// Latent values per sample, [n][NL], SI units.
@@ -401,7 +466,7 @@ mod tests {
             air: Some(serde_json::from_value(doc["air"].clone()).unwrap()),
         };
         let n = win.frame_gyro.len();
-        let mut centre = [0.0; NG];
+        let mut centre = [0.0; crate::estimate::physics::objective::NG];
         for (i, key) in ["frame_bias", "fork.gyro_bias", "fork.accel_bias", "rear.gyro_bias", "rear.accel_bias"].iter().enumerate() {
             let c = &doc["bias_prior"][key];
             for a in 0..3 {

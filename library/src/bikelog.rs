@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use idl_rs::calibration::bike::{calibration_for, merge_calibrations, BikeCalibration};
+use idl_rs::calibration::linkage::Linkage;
 use idl_rs::store::atomic::{sha256_hex, write_atomic_with_retry, AtomicWriteError};
 
 // The session.json schema owns these two; re-exported so the bike log's own
@@ -166,6 +167,9 @@ pub struct BikeFile {
     /// oldest capture first. Not part of the log: a calibration is a
     /// measurement of where the sensors sit, not a setup change.
     pub calibrations: Vec<BikeCalibration>,
+    /// The rear linkage from the photo tool, and the suspension's travel
+    /// (the physics estimator's 4-bar and end stops). None: not entered.
+    pub linkage: Option<Linkage>,
 }
 
 /// An entry as written in the file: the current version's fields at the
@@ -189,12 +193,14 @@ struct StoredBikeFile {
     entries: Vec<StoredEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     calibrations: Vec<BikeCalibration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    linkage: Option<Linkage>,
 }
 
 impl BikeFile {
     /// A new bike with an empty log.
     pub fn new(bike: Bike) -> BikeFile {
-        BikeFile { bike, entries: Vec::new(), calibrations: Vec::new() }
+        BikeFile { bike, entries: Vec::new(), calibrations: Vec::new(), linkage: None }
     }
 
     /// Parses a bike file.
@@ -202,7 +208,8 @@ impl BikeFile {
         let stored: StoredBikeFile =
             serde_json::from_slice(bytes).map_err(|e| BikeLogError { kind: BikeLogErrorKind::Parse, message: e.to_string() })?;
         let bike_id = stored.bike.bike_id.clone();
-        let mut file = BikeFile { bike: stored.bike, entries: Vec::new(), calibrations: merge_calibrations(&stored.calibrations, &[]) };
+        let mut file =
+            BikeFile { bike: stored.bike, entries: Vec::new(), calibrations: merge_calibrations(&stored.calibrations, &[]), linkage: stored.linkage };
         for s in stored.entries {
             let mut versions = s.history;
             versions.push(s.current);
@@ -224,7 +231,12 @@ impl BikeFile {
                 Some(StoredEntry { entry_id: e.entry_id.clone(), kind: e.kind, current, history })
             })
             .collect();
-        serde_json::to_vec_pretty(&StoredBikeFile { bike: self.bike.clone(), entries, calibrations: self.calibrations.clone() })
+        serde_json::to_vec_pretty(&StoredBikeFile {
+            bike: self.bike.clone(),
+            entries,
+            calibrations: self.calibrations.clone(),
+            linkage: self.linkage.clone(),
+        })
             .map_err(|e| BikeLogError { kind: BikeLogErrorKind::Encode, message: e.to_string() })
     }
 
@@ -248,6 +260,11 @@ impl BikeFile {
             bike: self.bike.merge(&other.bike),
             entries: self.entries.clone(),
             calibrations: merge_calibrations(&self.calibrations, &other.calibrations),
+            // the copy changed last wins; a copy without one never removes the other's
+            linkage: match (&self.linkage, &other.linkage) {
+                (Some(a), Some(b)) => Some(if b.updated_at_ms > a.updated_at_ms { b.clone() } else { a.clone() }),
+                (a, b) => a.clone().or_else(|| b.clone()),
+            },
         };
         for e in &other.entries {
             out.upsert(e);
@@ -543,6 +560,36 @@ pub fn save_calibration(data_root: &Path, bike_id: &str, calibration: &BikeCalib
     file.calibrations = vec![calibration.clone()];
     let merged = save_bike_file(data_root, &file)?;
     Ok(merged.calibrations.into_iter().find(|c| c.calibration_id == calibration.calibration_id).expect("just saved"))
+}
+
+/// The photo tool's linkage export (`ml/tools/linkage.html`: `points_m`,
+/// `wheelbase_m`, `rear_travel_m`, `source_image`) as a [`Linkage`], with the
+/// shock's specified eye-to-eye length (the photo's scale check) and the
+/// fork's travel, which the tool does not know.
+pub fn linkage_from_tool(bytes: &[u8], shock_eye_to_eye_m: Option<f64>, front_travel_m: Option<f64>, now_ms: i64) -> Result<Linkage, BikeLogError> {
+    let bad = |m: String| BikeLogError { kind: BikeLogErrorKind::Parse, message: m };
+    let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| bad(e.to_string()))?;
+    let points_m = serde_json::from_value(v["points_m"].clone()).map_err(|e| bad(format!("points_m: {e}")))?;
+    let num = |k: &str| v[k].as_f64().ok_or_else(|| bad(format!("{k} missing")));
+    Ok(Linkage {
+        updated_at_ms: now_ms,
+        points_m,
+        wheelbase_m: num("wheelbase_m")?,
+        rear_travel_m: num("rear_travel_m")?,
+        front_travel_m,
+        shock_eye_to_eye_m,
+        source_image: v["source_image"].as_str().map(str::to_string),
+    })
+}
+
+/// Saves `linkage` as the bike's (the newer of it and the file's wins on a merge).
+pub fn save_linkage(data_root: &Path, bike_id: &str, linkage: &Linkage) -> Result<Linkage, BikeLogError> {
+    let mut file = read_bike_file(data_root, bike_id)?;
+    file.entries.clear();
+    file.calibrations.clear();
+    file.linkage = Some(linkage.clone());
+    let merged = save_bike_file(data_root, &file)?;
+    Ok(merged.linkage.expect("just saved"))
 }
 
 /// The calibration the session described by `session` (starting at
@@ -886,6 +933,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    const TOOL_JSON: &str = r#"{"source_image":"side.jpg","wheelbase_m":1.28,"rear_travel_m":0.16,"points_m":{
+        "front_axle":[1.28,0],"rear_axle":[0,0],"main_pivot":[0.43717,0.08031],"horst":[0.07805,-0.01296],
+        "ss_rocker":[0.37094,0.18068],"rocker_frame":[0.48793,0.19457],"shock_frame":[0.52277,0.04682],
+        "shock_rocker":[0.55827,0.25971],"imu0":[0.47677,0.36738]}}"#;
+
+    #[test]
+    fn linkage_from_the_photo_tool_round_trips_through_the_bike_file_and_its_merge() {
+        // Arrange
+        let older = linkage_from_tool(TOOL_JSON.as_bytes(), Some(0.230), Some(0.17), 10).unwrap();
+        let newer = Linkage { front_travel_m: Some(0.18), updated_at_ms: 20, ..older.clone() };
+        let mut a = BikeFile::new(Bike { bike_id: "b".into(), name: "B".into(), name_updated_at_ms: 0, fields: vec![], fields_updated_at_ms: 0 });
+        a.linkage = Some(older.clone());
+        let mut b = a.clone();
+        b.linkage = Some(newer.clone());
+
+        // Act
+        let back = BikeFile::from_slice(&a.to_vec().unwrap()).unwrap();
+        let merged = (a.merge(&b), b.merge(&a), a.merge(&BikeFile { linkage: None, ..a.clone() }));
+
+        // Assert: the file keeps it; the newer copy wins either way round; a copy without one never removes it
+        assert_eq!(back.linkage, Some(older.clone()));
+        assert_eq!(merged.0.linkage, Some(newer.clone()));
+        assert_eq!(merged.1.linkage, Some(newer));
+        assert_eq!(merged.2.linkage, Some(older.clone()));
+        assert!((older.scale_prior() - 0.230 / older.drawn_shock_m().unwrap()).abs() < 1e-12);
+    }
+
     fn calibration(id: &str, captured_at_ms: i64, updated_at_ms: i64) -> BikeCalibration {
         use idl_rs::calibration::bike::{CalibrationFit, SourceWindow, BIKE_CALIBRATION_VERSION};
         BikeCalibration {
@@ -899,6 +973,7 @@ mod tests {
             fork_rigid: None,
             steer: None,
             forward_ride: None,
+            physics: None,
             fit: CalibrationFit {
                 version: BIKE_CALIBRATION_VERSION,
                 up: [0.2, 0.0, 0.98],

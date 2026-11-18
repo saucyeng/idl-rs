@@ -169,6 +169,11 @@ pub struct BikeCalibration {
     /// The fitted numbers.
     #[serde(flatten)]
     pub fit: CalibrationFit,
+    /// The physics estimator's fit of the geometry this calibration cannot
+    /// give (`estimate::physics`), when it has been run. Cleared by any
+    /// change to the mounts or directions it was fitted with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physics: Option<super::linkage::PhysicsFit>,
 }
 
 /// Why a calibration could not be fitted or used.
@@ -539,6 +544,7 @@ mod tests {
             steer: None,
             forward_ride: None,
             fit: fit(Vector3::z(), Some(Vector3::x())),
+            physics: None,
         }
     }
 

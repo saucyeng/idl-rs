@@ -231,6 +231,52 @@ values:
 | Steer vs needed | slope 0.74, corr 0.86, scatter 3.1° | — |
 | Understeer median | −1.6° | — |
 
+## The physics estimator (`physics/`)
+
+A second estimator, ported from the PyTorch research code in `ml/` (whose
+README has the method, the results and how far to trust them). Instead of
+integrating accelerations forward in time, it fits a model of the bike to a
+whole window at once: given the frame pod's measurement and guessed latents
+(front and rear travel, steer, fork bending, rear and frame-pod flex), the
+model predicts what the fork and rear pods should read, and a Gauss-Newton
+solve picks the latents that make the prediction match. Travel is seen
+through the pods' lever arms (a pod's position moves with travel, and the
+frame's rotation turns that into acceleration), so it does not drift and
+stays inside its end stops. Fast motion (hits, bending, flex) is good; slow
+front travel (sag) is the weak part until the pods' accelerometers are
+calibrated against each other.
+
+It needs a calibrated bike with both pods, the bike's travel, and for a
+4-bar rear its linkage from the photo tool (`ml/tools/linkage.html`):
+
+```
+idl-rs bike set gt-force --linkage gt-force-linkage.json --shock-mm 230 --front-travel-mm 170
+idl-rs session estimate-physics <session id>
+```
+
+The first run fits the geometry a calibration cannot give (steering-axis
+point, fork bending length, the linkage photo's scale) from four windows of
+that session and saves it in the calibration (`physics`); later runs reuse
+it (`--refit` to fit again). Every stretch of riding (GPS faster than 3 m/s)
+is then solved in 12 s windows overlapping by 2 s, and the `Physics ...`
+channels are written to `sessions/<id>/derived/<hash>.parquet` (C1 §5,
+`derived_kind` `physics`). The app does not read them yet.
+
+| File | What |
+|---|---|
+| `physics/bike.rs` | The pose functions: steer, travel, bending, 4-bar or generic rear, frame-pod flex. |
+| `physics/readings.rs` | What each pod reads, and its exact per-sample Jacobian (hyper-dual numbers). |
+| `physics/objective.rs` | The residuals: pods, end stops, flex and bending priors, airtime anchor. |
+| `physics/solve.rs` | Banded Gauss-Newton over one window or several sharing globals. |
+| `physics/pipeline.rs` | A session into windows: native-rate clip masks, airborne detection, still biases. |
+| `physics/run.rs` | The bike fit, the whole-ride solve, the output channels. |
+| `physics/setup.rs`, `physics/fourbar.rs` | The bike from a calibration, its linkage and its physics fit. |
+
+Golden tests hold the forward model, its Jacobian and a real window's solve
+equal to the PyTorch reference (`ml/experiments/export_golden.py`,
+`export_window.py` write the fixtures); regenerate them after a model change
+there.
+
 ## Where things are
 
 | File | What |

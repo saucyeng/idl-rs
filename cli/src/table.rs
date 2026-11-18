@@ -274,6 +274,9 @@ pub const VERBS_RULED: &[(&str, &str)] = &[
     // adds setup changes through the engine's merge, not by hand-editing
     // `bikes/<id>.json`. The same ruling added the noun `bike`.
     ("note", "R251"),
+    // The physics estimator's run over a session (Isaac, 2026-11-18, in the
+    // `ml/` port; numbered here as the next after R251).
+    ("estimate-physics", "R252"),
 ];
 
 /// Whether `verb` is in either vocabulary (the table's own vocabulary tests).
@@ -652,6 +655,24 @@ pub const COMMANDS: &[CommandRow] = &[
         data_dir: false,
         writer: false,
     },
+    CommandRow {
+        noun: "session",
+        verb: "estimate-physics",
+        args: &[SESSION_ID_ARG],
+        flags: &[
+            Flag::switch("refit", "Fit the bike's geometry from this session again, even if its calibration has a current fit"),
+            Flag::value("front-travel-mm", ValueKind::Integer, "Fork travel, mm; default the bike's (`bike set --front-travel-mm`)"),
+            Flag::value("rear-travel-mm", ValueKind::Integer, "Rear travel, mm; default the bike's linkage"),
+            Flag::value("threads", ValueKind::Integer, "Worker threads; default up to 4"),
+        ],
+        core_fn: "idl_library::physics::estimate_physics",
+        json_shape: Some("PhysicsReport"),
+        help: "Estimate travel, steer, fork bending and flex with the physics model (no drift: travel is seen through the pods' lever arms); fits the bike's geometry the first time and writes the channels to the session's derived files",
+        tier: Tier::Occasional,
+        status: Status::Current,
+        data_dir: true,
+        writer: true,
+    },
     // --- workbook ---------------------------------------------------------
     CommandRow {
         noun: "workbook",
@@ -880,6 +901,23 @@ pub const COMMANDS: &[CommandRow] = &[
         data_dir: true,
         writer: true,
     },
+    CommandRow {
+        noun: "bike",
+        verb: "set",
+        args: &[BIKE_ID_ARG],
+        flags: &[
+            Flag::value("linkage", ValueKind::Path, "The linkage photo tool's JSON export (`ml/tools/linkage.html`): the rear 4-bar and rear travel"),
+            Flag::value("shock-mm", ValueKind::Integer, "The shock's specified eye-to-eye length, mm: checks the photo's scale"),
+            Flag::value("front-travel-mm", ValueKind::Integer, "The fork's travel, mm"),
+        ],
+        core_fn: "idl_library::bikelog::save_linkage",
+        json_shape: Some("Linkage"),
+        help: "Set a bike's suspension geometry for the physics estimator: its rear linkage (from the photo tool) and travel",
+        tier: Tier::Occasional,
+        status: Status::Current,
+        data_dir: true,
+        writer: true,
+    },
     // --- catalog ----------------------------------------------------------
     CommandRow {
         noun: "catalog",
@@ -1080,7 +1118,7 @@ mod tests {
         // Arrange
         let expected = [
             "set-start", "set-meta", "cells", "data", "detect", "laps", "stale", "workbook", "cli",
-            "synth", "calibrate", "note",
+            "synth", "calibrate", "note", "estimate-physics",
         ];
 
         // Act

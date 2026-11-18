@@ -1240,6 +1240,7 @@ mod tests {
             fork_rigid: None,
             steer: None,
             forward_ride: None,
+            physics: None,
             fit: CalibrationFit {
                 version: BIKE_CALIBRATION_VERSION,
                 up: row(2),

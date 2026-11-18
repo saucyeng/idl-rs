@@ -23,14 +23,21 @@
 
 use super::bike::{Bike, B_FA, B_LAT, D, F_ROT, F_TRANS, NL, R_ROLL, R_YAW, S};
 use super::la::V3;
-use super::readings::{readings_and_jacobian, Sample, NZ};
+use super::readings::{pod_readings, readings_and_jacobian, Sample, NR, NZ};
+use super::setup::{geometry, with_geometry, Geometry, GEOMETRY_SIGMA};
 use num_dual::{Dual64, HyperDual};
 
 /// Residual rows per sample (see the module table).
 pub const NROW: usize = 31;
-/// Global unknowns: frame gyro bias, fork gyro bias, fork accel bias, rear
-/// gyro bias, rear accel bias (3 each; rad/s and m/s^2).
+/// Bias globals: frame gyro bias, fork gyro bias, fork accel bias, rear gyro
+/// bias, rear accel bias (3 each; rad/s and m/s^2), in reading order.
 pub const NG: usize = 15;
+/// Geometry globals when fitting the bike ([`super::setup::Geometry`]).
+pub const NP: usize = 5;
+/// Most globals an objective has (biases + geometry).
+pub const NGMAX: usize = NG + NP;
+/// Central-difference steps for the geometry derivatives: m, m, m, m, scale.
+const GEOMETRY_STEP: [f64; NP] = [1e-5, 1e-5, 1e-5, 1e-5, 1e-6];
 
 /// Noise levels and prior widths (`Weights` in the PyTorch reference, with
 /// the values `ride_fit.py` uses on real rides).
@@ -163,24 +170,32 @@ pub struct Vars {
     pub lvl: Vec<Vec<Vec<f64>>>,
     /// The frame-rate spline's coefficients per axis, rad/s (full rate).
     pub frame: [Vec<f64>; 3],
-    /// Globals, [`NG`] (order in [`NG`]'s docs).
-    pub glob: [f64; NG],
+    /// Globals: the [`NG`] biases, then (when fitting the bike) the [`NP`] geometry.
+    pub glob: Vec<f64>,
 }
 
 /// A window's objective: bike, measurements, layout, weights and priors.
 pub struct Objective {
-    /// Bike geometry (frozen).
+    /// Bike geometry (with `fit`, the starting point and prior centre of the fitted part).
     pub bike: Bike<f64>,
-    bike_h: Bike<HyperDual<f64>>,
-    bike_dh: Bike<HyperDual<Dual64>>,
     /// Measurements.
     pub win: Window,
     /// Latent layout.
     pub spec: Spec,
     /// Weights and priors.
     pub w: Weights,
-    /// Prior centres of the globals (e.g. still-recording gyro biases).
-    pub glob_centre: [f64; NG],
+    /// Prior centres of the globals (biases: e.g. still-recording gyro biases).
+    pub glob_centre: Vec<f64>,
+    /// Whether the bike's geometry is estimated too (globals [`NG`]..[`NGMAX`]).
+    pub fit: bool,
+}
+
+/// The bike lifted for one linearisation point: values, values + Jacobian,
+/// and, when fitting, the geometry nudged each way for central differences.
+pub struct Ctx {
+    bike_h: Bike<HyperDual<f64>>,
+    bike_dh: Bike<HyperDual<Dual64>>,
+    fd: Vec<(Bike<HyperDual<f64>>, Bike<HyperDual<f64>>, f64)>,
 }
 
 /// Per-sample residuals and their Jacobians.
@@ -189,21 +204,70 @@ pub struct SampleJac {
     pub r: [f64; NROW],
     /// d r / d local inputs (q, q', q'', w0, a0).
     pub jz: [[f64; NZ]; NROW],
-    /// d r / d globals.
-    pub jg: [[f64; NG]; NROW],
+    /// d r / d globals (first [`Objective::n_glob`] columns used).
+    pub jg: [[f64; NGMAX]; NROW],
 }
 
 impl Objective {
-    /// An objective over `win` with `bike` frozen.
-    pub fn new(bike: Bike<f64>, win: Window, spec: Spec, w: Weights, glob_centre: [f64; NG]) -> Self {
-        let bike_h = bike.map(HyperDual::from_re);
-        let bike_dh = bike.map(|x| HyperDual::from_re(Dual64::from(x)));
-        Objective { bike, bike_h, bike_dh, win, spec, w, glob_centre }
+    /// An objective over `win` with `bike` frozen; `bias_centre`: the biases' prior centres.
+    pub fn new(bike: Bike<f64>, win: Window, spec: Spec, w: Weights, bias_centre: [f64; NG]) -> Self {
+        Objective { bike, win, spec, w, glob_centre: bias_centre.to_vec(), fit: false }
+    }
+
+    /// As [`Self::new`], also estimating the bike's geometry, with a prior
+    /// ([`GEOMETRY_SIGMA`]) centred on `bike`'s.
+    pub fn fitting(bike: Bike<f64>, win: Window, spec: Spec, w: Weights, bias_centre: [f64; NG]) -> Self {
+        let mut c = bias_centre.to_vec();
+        c.extend(geometry(&bike));
+        Objective { bike, win, spec, w, glob_centre: c, fit: true }
+    }
+
+    /// Number of globals: [`NG`], or [`NGMAX`] when fitting.
+    pub fn n_glob(&self) -> usize {
+        if self.fit {
+            NGMAX
+        } else {
+            NG
+        }
     }
 
     /// Prior sigma of each global.
-    pub fn glob_sigma(&self) -> [f64; NG] {
-        std::array::from_fn(|i| if (6..9).contains(&i) || (12..15).contains(&i) { self.w.accel_bias_sigma } else { self.w.gyro_bias_sigma })
+    pub fn glob_sigma(&self) -> Vec<f64> {
+        (0..self.n_glob())
+            .map(|i| match i {
+                i if i >= NG => GEOMETRY_SIGMA[i - NG],
+                6..=8 | 12..=14 => self.w.accel_bias_sigma,
+                _ => self.w.gyro_bias_sigma,
+            })
+            .collect()
+    }
+
+    /// The bike at the globals' geometry (the frozen bike when not fitting).
+    pub fn bike_at(&self, glob: &[f64]) -> Bike<f64> {
+        if self.fit {
+            with_geometry(&self.bike, &std::array::from_fn(|i| glob[NG + i]))
+        } else {
+            self.bike.clone()
+        }
+    }
+
+    /// The lifted bikes for linearising at `glob` (`jac`: with the geometry nudges).
+    pub fn ctx(&self, glob: &[f64], jac: bool) -> Ctx {
+        let b = self.bike_at(glob);
+        let fd = if self.fit && jac {
+            let g: Geometry = geometry(&b);
+            (0..NP)
+                .map(|p| {
+                    let (mut lo, mut hi) = (g, g);
+                    lo[p] -= GEOMETRY_STEP[p];
+                    hi[p] += GEOMETRY_STEP[p];
+                    (with_geometry(&b, &hi).map(HyperDual::from_re), with_geometry(&b, &lo).map(HyperDual::from_re), 2.0 * GEOMETRY_STEP[p])
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ctx { bike_h: b.map(HyperDual::from_re), bike_dh: b.map(|x| HyperDual::from_re(Dual64::from(x))), fd }
     }
 
     /// Starting values: latents at `spec.init`, the frame rate through the
@@ -220,7 +284,7 @@ impl Objective {
             c.push(g[n - 1][x]);
             c
         });
-        Vars { lvl, frame, glob: self.glob_centre }
+        Vars { lvl, frame, glob: self.glob_centre.clone() }
     }
 
     /// The local inputs at sample `t`: latents and their derivatives, chassis rate and acceleration.
@@ -253,14 +317,18 @@ impl Objective {
     }
 
     /// Residuals at sample `t` and, if `jac`, their Jacobians.
-    pub fn sample_residuals(&self, s: &Sample<f64>, glob: &[f64; NG], t: usize, jac: bool) -> SampleJac {
+    pub fn sample_residuals(&self, ctx: &Ctx, s: &Sample<f64>, glob: &[f64], t: usize, jac: bool) -> SampleJac {
         let w = &self.w;
-        let (val, jr) = if jac {
-            readings_and_jacobian(&self.bike_h, &self.bike_dh, s)
-        } else {
-            (super::readings::pod_readings(&self.bike_h, s), [[0.0; NZ]; 15])
-        };
-        let mut out = SampleJac { r: [0.0; NROW], jz: [[0.0; NZ]; NROW], jg: [[0.0; NG]; NROW] };
+        let (val, jr) = if jac { readings_and_jacobian(&ctx.bike_h, &ctx.bike_dh, s) } else { (pod_readings(&ctx.bike_h, s), [[0.0; NZ]; NR]) };
+        // geometry: central differences of the readings
+        let mut jp = [[0.0; NP]; NR];
+        for (p, (hi, lo, h)) in ctx.fd.iter().enumerate() {
+            let (a, b) = (pod_readings(hi, s), pod_readings(lo, s));
+            for r in 0..NR {
+                jp[r][p] = (a[r] - b[r]) / h;
+            }
+        }
+        let mut out = SampleJac { r: [0.0; NROW], jz: [[0.0; NZ]; NROW], jg: [[0.0; NGMAX]; NROW] };
         let acc_sigma = (w.accel_sigma * w.accel_sigma + w.frame_accel_sigma * w.frame_accel_sigma).sqrt();
         let win = &self.win;
         // readings rows: frame gyro (no mask), then each pod's gyro and accel (masked)
@@ -277,6 +345,9 @@ impl Objective {
                 let r = row0 + a; // reading index == residual row and global index here
                 out.r[r] = (val[r] + glob[r] - m[a]) * k;
                 out.jg[r][r] = k;
+                for p in 0..ctx.fd.len() {
+                    out.jg[r][NG + p] = jp[r][p] * k;
+                }
                 if jac {
                     for z in 0..NZ {
                         out.jz[r][z] = jr[r][z] * k;
@@ -323,10 +394,17 @@ impl Objective {
 
     /// The objective's value: half the sum of squared whitened residuals.
     pub fn loss(&self, v: &Vars) -> f64 {
+        self.data_loss(v) + self.prior_loss(v)
+    }
+
+    /// Half the sum of squares of the per-sample residuals and the smoothness
+    /// priors (everything but the global priors).
+    pub fn data_loss(&self, v: &Vars) -> f64 {
+        let ctx = self.ctx(&v.glob, false);
         let mut l = 0.0;
         for t in 0..self.spec.n {
             let s = self.sample(v, t);
-            l += self.sample_residuals(&s, &v.glob, t, false).r.iter().map(|x| x * x).sum::<f64>();
+            l += self.sample_residuals(&ctx, &s, &v.glob, t, false).r.iter().map(|x| x * x).sum::<f64>();
         }
         let k = self.smooth_weight();
         for lvl in &v.lvl {
@@ -337,11 +415,12 @@ impl Objective {
                 }
             }
         }
-        let sig = self.glob_sigma();
-        for i in 0..NG {
-            let g = (v.glob[i] - self.glob_centre[i]) / sig[i];
-            l += g * g;
-        }
         0.5 * l
+    }
+
+    /// Half the sum of squares of the global priors.
+    pub fn prior_loss(&self, v: &Vars) -> f64 {
+        let sig = self.glob_sigma();
+        0.5 * (0..self.n_glob()).map(|i| ((v.glob[i] - self.glob_centre[i]) / sig[i]).powi(2)).sum::<f64>()
     }
 }

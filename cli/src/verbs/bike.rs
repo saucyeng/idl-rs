@@ -16,7 +16,7 @@ use idl_library::catalog_read::{get_session, list_sessions, SessionDetail};
 use idl_rs::calibration::bike::{BikeCalibration, ForwardFrom, SourceWindow};
 use idl_rs::commands::calibration_ops::{fit_bike_calibration, ride_trims, ProtocolWindows};
 
-use super::{many, opt_integer, opt_text, text, Ctx, VerbOutput};
+use super::{many, opt_integer, opt_path, opt_text, text, Ctx, VerbOutput};
 use crate::envelope::{CliError, ErrorKind};
 
 impl From<BikeLogError> for CliError {
@@ -231,7 +231,8 @@ pub fn calibrate(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
         if let Some(zero) = trims.steer_zero_deg {
             fit = fit.with_steer_zero(zero);
         }
-        let turned = BikeCalibration { fit, forward_ride: Some(ride.session_id.clone()), updated_at_ms: now.max(current.updated_at_ms + 1), ..current.clone() };
+        // a new forward direction changes what the physics fit was fitted with
+        let turned = BikeCalibration { fit, forward_ride: Some(ride.session_id.clone()), updated_at_ms: now.max(current.updated_at_ms + 1), physics: None, ..current.clone() };
         let line = format!(
             "calibration {} matched to ride {}: forward turned {:+.1} deg ({}){}",
             turned.calibration_id,
@@ -295,6 +296,7 @@ pub fn calibrate(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
         steer: protocol_window(fit.steer_axis.is_some(), steer),
         forward_ride: None,
         fit,
+        physics: None,
     };
 
     let mut lines = vec![calibration_line(&calibration)];
@@ -319,4 +321,43 @@ pub fn calibrate(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
     let saved = bikelog::save_calibration(root, &bike_id, &calibration)?;
     lines.insert(0, format!("saved calibration {} for {bike_id}:", saved.calibration_id));
     Ok(VerbOutput::new(lines.join("\n"), json!({ "calibration": saved, "written": true })))
+}
+
+/// `bike set` — the bike's suspension geometry for the physics estimator:
+/// its rear linkage from the photo tool's export and its travel.
+pub fn set(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
+    let root = ctx.data_dir()?;
+    let bike_id = text(m, "bike_id")?;
+    let file = bikelog::read_bike_file(root, &bike_id)?;
+    let now = now_ms();
+    let mm = |name: &str| opt_integer(m, name).map(|v| v as f64 / 1000.0);
+    let linkage = match opt_path(m, "linkage") {
+        Some(p) => {
+            let bytes = std::fs::read(&p).map_err(|e| CliError::new(ErrorKind::Io, format!("{}: {e}", p.display())))?;
+            bikelog::linkage_from_tool(&bytes, mm("shock-mm"), mm("front-travel-mm"), now)?
+        }
+        None => {
+            let Some(mut l) = file.linkage.clone() else {
+                return Err(CliError::usage(format!("{bike_id} has no linkage yet; give --linkage <file> first")));
+            };
+            if mm("shock-mm").is_none() && mm("front-travel-mm").is_none() {
+                return Err(CliError::usage("bike set needs --linkage, --shock-mm or --front-travel-mm".to_string()));
+            }
+            l.shock_eye_to_eye_m = mm("shock-mm").or(l.shock_eye_to_eye_m);
+            l.front_travel_m = mm("front-travel-mm").or(l.front_travel_m);
+            l.updated_at_ms = now.max(l.updated_at_ms + 1);
+            l
+        }
+    };
+    let line = format!(
+        "{bike_id}: linkage with {:.0} mm rear travel{}{}",
+        linkage.rear_travel_m * 1000.0,
+        linkage.front_travel_m.map_or(String::new(), |f| format!(", {:.0} mm front travel", f * 1000.0)),
+        linkage.shock_eye_to_eye_m.map_or(String::new(), |_| format!(", photo scale {:.3} from the shock", linkage.scale_prior())),
+    );
+    if ctx.dry_run {
+        return Ok(VerbOutput::new(format!("would save {line}"), json!({ "linkage": linkage, "written": false })));
+    }
+    let saved = bikelog::save_linkage(root, &bike_id, &linkage)?;
+    Ok(VerbOutput::new(format!("saved {line}"), json!({ "linkage": saved, "written": true })))
 }

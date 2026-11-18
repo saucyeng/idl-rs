@@ -27,6 +27,71 @@ use idl_rs::synth::{generate, Protocol, SynthConfig, Truth};
 use crate::envelope::{CliError, ErrorKind};
 use crate::verbs::{integer, opt_integer, opt_path, opt_text, path, text, Ctx, VerbOutput};
 
+impl From<idl_library::physics::PhysicsError> for CliError {
+    fn from(e: idl_library::physics::PhysicsError) -> Self {
+        use idl_library::physics::PhysicsErrorKind as K;
+        let kind = match e.kind {
+            K::NotFound => ErrorKind::NotFound,
+            K::NotCalibrated | K::Unusable => ErrorKind::InvalidInput,
+            K::Solve => ErrorKind::Eval,
+            K::Io => ErrorKind::Io,
+        };
+        CliError::new(kind, e.message)
+    }
+}
+
+/// `session estimate-physics` — the physics estimator over one session
+/// (`idl_library::physics::estimate_physics`).
+pub fn estimate_physics(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
+    let root = ctx.data_dir()?;
+    let id = text(m, "id")?;
+    let mm = |name: &str| opt_integer(m, name).map(|v| v as f64 / 1000.0);
+    let opts = idl_library::physics::PhysicsOptions {
+        refit: crate::verbs::switch(m, "refit"),
+        front_travel_m: mm("front-travel-mm"),
+        rear_travel_m: mm("rear-travel-mm"),
+        threads: opt_integer(m, "threads").map(|t| t.max(1) as usize),
+        dry_run: ctx.dry_run,
+    };
+    let r = idl_library::physics::estimate_physics(root, &id, &opts)?;
+    let t = |s: &idl_library::physics::TravelSummary| {
+        json!({ "p01_mm": s.p01, "median_mm": s.median, "p99_mm": s.p99, "airborne_median_mm": s.airborne_median })
+    };
+    let fit = r.new_fit.as_ref().map_or("the calibration's geometry".to_string(), |f| {
+        format!("a new geometry fit ({} iterations{})", f.iterations, if f.converged { "" } else { ", not converged" })
+    });
+    let line = |name: &str, s: &idl_library::physics::TravelSummary| {
+        format!("  {name} travel mm: 1% {:.0}  median {:.0}  99% {:.0};  airborne median {:.0}", s.p01, s.median, s.p99, s.airborne_median)
+    };
+    let text = [
+        format!("{id}: {:.0} s of riding solved in {} windows ({} failed) with {fit}, {:.0} s", r.solved_s, r.windows.0, r.windows.1, r.seconds),
+        line("front", &r.travel[0]),
+        line("rear", &r.travel[1]),
+        match &r.output {
+            Some(p) => format!("  wrote {}", p.display()),
+            None => "  dry run: nothing written".to_string(),
+        },
+    ]
+    .join("\n");
+    Ok(VerbOutput::new(
+        text,
+        json!({
+            "session_id": r.session_id,
+            "bike_id": r.bike_id,
+            "calibration_id": r.calibration_id,
+            "new_fit": r.new_fit,
+            "geometry": r.geometry,
+            "windows": r.windows.0,
+            "windows_failed": r.windows.1,
+            "solved_s": r.solved_s,
+            "front_travel": t(&r.travel[0]),
+            "rear_travel": t(&r.travel[1]),
+            "output": r.output,
+            "seconds": r.seconds,
+        }),
+    ))
+}
+
 /// `session list` — every catalogued session the filters keep.
 pub fn list(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
     let root = ctx.data_dir()?;

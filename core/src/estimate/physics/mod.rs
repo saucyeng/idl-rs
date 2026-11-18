@@ -22,7 +22,11 @@
 pub mod bike;
 #[cfg(test)]
 mod fixture;
+pub mod fourbar;
 pub mod la;
 pub mod objective;
+pub mod pipeline;
 pub mod readings;
+pub mod run;
+pub mod setup;
 pub mod solve;

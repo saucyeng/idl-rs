@@ -39,7 +39,7 @@ fn main() {
     let lay = Layout::new(&obj);
     let v0 = obj.initial_vars();
     let t = std::time::Instant::now();
-    let ne = normal_equations(&obj, &lay, &v0);
+    let ne = normal_equations(&obj, &lay, &v0, true);
     let t_ne = t.elapsed().as_secs_f64();
     let t = std::time::Instant::now();
     let _ = solve_damped(&ne, &lay, 1e-10).unwrap();
