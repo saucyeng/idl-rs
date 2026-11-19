@@ -111,29 +111,54 @@ impl Default for BumpTrain {
 }
 
 impl BumpTrain {
+    /// Length of the run, seconds: the lead, every hit, the tail.
+    pub fn duration_s(&self) -> f64 {
+        2.0 * self.lead_s + self.spacing_s * self.count.saturating_sub(1) as f64 + self.compress_s + self.rebound_s
+    }
+
+    /// Rear travel at `t_s` seconds into the run, metres: sag between hits,
+    /// a half-cosine down to `depth_m` over `compress_s` and back up over
+    /// `rebound_s` at each hit (a later hit wins where two overlap).
+    pub fn travel_at(&self, t_s: f64) -> f64 {
+        let pi = std::f64::consts::PI;
+        let mut s = self.sag_m;
+        for h in 0..self.count {
+            let u = t_s - (self.lead_s + h as f64 * self.spacing_s);
+            if u >= 0.0 && u < self.compress_s {
+                s = self.sag_m + (self.depth_m - self.sag_m) * 0.5 * (1.0 - (pi * u / self.compress_s).cos());
+            } else if u >= self.compress_s && u < self.compress_s + self.rebound_s {
+                let v = (u - self.compress_s) / self.rebound_s;
+                s = self.sag_m + (self.depth_m - self.sag_m) * 0.5 * (1.0 + (pi * v).cos());
+            }
+        }
+        s
+    }
+
+    /// Height of the ground the rear wheel follows, metres above the flat,
+    /// `distance_m` along it from where the run starts (negative: behind):
+    /// the travel above sag laid out at the train's speed. It treats the tyre
+    /// as rigid and the frame as level, so it is the ground that alone would
+    /// give the train's travel; for drawing the run, not a terrain model.
+    pub fn ground_height(&self, distance_m: f64) -> f64 {
+        self.travel_at(distance_m / self.speed_mps.max(1e-6)) - self.sag_m
+    }
+
     /// The train as an excitation sampled at `rate_hz`.
     pub fn excitation(&self, rate_hz: f64) -> Excitation {
-        let total = 2.0 * self.lead_s + self.spacing_s * self.count.saturating_sub(1) as f64 + self.compress_s + self.rebound_s;
-        let n = (total * rate_hz).ceil() as usize + 1;
+        let n = (self.duration_s() * rate_hz).ceil() as usize + 1;
         let mut e = Excitation { t_s: Vec::with_capacity(n), travel_m: Vec::with_capacity(n), fx: vec![0.0; n], fy: Vec::with_capacity(n), omega: vec![0.0; n], speed_mps: vec![self.speed_mps; n] };
         let pi = std::f64::consts::PI;
         for k in 0..n {
             let t = k as f64 / rate_hz;
-            let mut s = self.sag_m;
             let mut a = 0.0;
             for h in 0..self.count {
-                let t0 = self.lead_s + h as f64 * self.spacing_s;
-                let u = t - t0;
+                let u = t - (self.lead_s + h as f64 * self.spacing_s);
                 if u >= 0.0 && u < self.compress_s {
-                    s = self.sag_m + (self.depth_m - self.sag_m) * 0.5 * (1.0 - (pi * u / self.compress_s).cos());
                     a += self.chassis_g * G * (pi * u / self.compress_s).sin();
-                } else if u >= self.compress_s && u < self.compress_s + self.rebound_s {
-                    let v = (u - self.compress_s) / self.rebound_s;
-                    s = self.sag_m + (self.depth_m - self.sag_m) * 0.5 * (1.0 + (pi * v).cos());
                 }
             }
             e.t_s.push(t);
-            e.travel_m.push(s);
+            e.travel_m.push(self.travel_at(t));
             e.fy.push(G + a);
         }
         e
@@ -158,6 +183,21 @@ mod tests {
         let peak = e.travel_m.iter().cloned().fold(0.0, f64::max);
         assert!((peak - b.depth_m).abs() < 1e-4, "{peak}");
         assert!((e.at(0.0).f[1] - G).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bump_train_ground_is_flat_between_hits_and_rises_by_the_travel_at_each() {
+        // Arrange
+        let b = BumpTrain::default();
+        let hit_bottom_m = (b.lead_s + b.compress_s) * b.speed_mps;
+
+        // Act
+        let (before, behind, peak) = (b.ground_height(0.5 * b.lead_s * b.speed_mps), b.ground_height(-1.0), b.ground_height(hit_bottom_m));
+
+        // Assert
+        assert_eq!(before, 0.0);
+        assert_eq!(behind, 0.0);
+        assert!((peak - (b.depth_m - b.sag_m)).abs() < 1e-9, "{peak}");
     }
 
     #[test]
