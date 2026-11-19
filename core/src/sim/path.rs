@@ -155,14 +155,28 @@ fn right_of(l: &Line, c: P2) -> (f64, bool) {
 }
 
 /// The chain's path at `pose` in gear `gear` with the cage at absolute
-/// rotation `cage_abs`, going round each fitted roller (`enabled`) the chain
-/// would otherwise cross.
+/// rotation `cage_abs`: round every fitted threaded idler, and round each
+/// fitted guide (`enabled`) the chain would otherwise cross.
 pub fn chain_path(bike: &SimBike, pose: &LinkagePose, gear: usize, cage_abs: f64, enabled: &dyn Fn(usize) -> bool) -> Result<ChainPath, SimError> {
     let [cog, ring, lower, upper] = bike.fixed_wheels(pose, gear, cage_abs)?;
-    let mut top: Vec<Wheel> = Vec::new();
-    let mut low: Vec<Wheel> = Vec::new();
-    let mut pending: Vec<(Span, Wheel)> =
-        bike.rollers_on(Span::Top, enabled).into_iter().map(|i| (Span::Top, bike.roller(pose, i))).chain(bike.rollers_on(Span::Lower, enabled).into_iter().map(|i| (Span::Lower, bike.roller(pose, i)))).collect();
+    // threaded idlers are always in the path, in order along their span; guides
+    // join only where the chain would otherwise cross them
+    let along = |from: P2, to: P2, c: P2| (c[0] - from[0]) * (to[0] - from[0]) + (c[1] - from[1]) * (to[1] - from[1]);
+    let threaded = |span: Span, from: P2, to: P2| {
+        let mut v: Vec<Wheel> = bike.rollers_on(span, enabled).into_iter().filter(|&i| bike.drivetrain.rollers[i].threaded).map(|i| bike.roller(pose, i)).collect();
+        v.sort_by(|a, b| along(from, to, a.centre).partial_cmp(&along(from, to, b.centre)).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    };
+    let mut top: Vec<Wheel> = threaded(Span::Top, cog.centre, ring.centre);
+    let mut low: Vec<Wheel> = threaded(Span::Lower, ring.centre, lower.centre);
+    let guide = |i: &usize| !bike.drivetrain.rollers[*i].threaded;
+    let mut pending: Vec<(Span, Wheel)> = bike
+        .rollers_on(Span::Top, enabled)
+        .into_iter()
+        .filter(guide)
+        .map(|i| (Span::Top, bike.roller(pose, i)))
+        .chain(bike.rollers_on(Span::Lower, enabled).into_iter().filter(guide).map(|i| (Span::Lower, bike.roller(pose, i))))
+        .collect();
     loop {
         let wheels: Vec<Wheel> = std::iter::once(cog).chain(top.iter().copied()).chain(std::iter::once(ring)).chain(low.iter().copied()).chain([lower, upper]).collect();
         let path = path_through(&wheels)?;
@@ -332,7 +346,7 @@ mod tests {
     fn a_roller_clear_of_the_chain_is_not_in_the_path_and_one_in_its_way_is() {
         // Arrange: one roller far above the top span, one pushing up into it
         let mut d = gt_force_drivetrain();
-        let roller = |y: f64| Roller { name: "r".into(), body: Body::FrontTriangle, centre_m: [0.25, y], teeth: Some(16), radius_m: 0.0, span: Span::Top, side: ChainSide::Under, inertia_kgm2: 2e-6, enabled: true };
+        let roller = |y: f64| Roller { name: "r".into(), body: Body::FrontTriangle, centre_m: [0.25, y], teeth: Some(16), radius_m: 0.0, span: Span::Top, side: ChainSide::Under, inertia_kgm2: 2e-6, enabled: true, threaded: false };
         d.rollers = vec![roller(0.3), roller(0.02)];
         d.rollers[1].side = ChainSide::Over;
         let bike = SimBike::new(&gt_force_linkage(), &d).unwrap();
