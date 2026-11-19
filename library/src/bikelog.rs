@@ -640,14 +640,15 @@ pub fn save_bike_photo(data_root: &Path, bike_id: &str, source: &Path) -> Result
     let dir = data_root.join("bikes");
     std::fs::create_dir_all(&dir).map_err(|e| io(e.to_string()))?;
     let name = format!("{bike_id}.photo.{ext}");
+    let target = dir.join(&name);
+    let based_on = std::fs::read(&target).ok().map(|b| sha256_hex(&b));
+    write_atomic_with_retry(data_root, &target, &bytes, based_on.as_deref(), |_current| bytes.clone()).map_err(|e| io(e.message))?;
+    // the photo it replaces, if that had another extension: only once the new one is written
     for other in PHOTO_EXTENSIONS {
         if other != ext {
             let _ = std::fs::remove_file(dir.join(format!("{bike_id}.photo.{other}")));
         }
     }
-    let target = dir.join(&name);
-    let based_on = std::fs::read(&target).ok().map(|b| sha256_hex(&b));
-    write_atomic_with_retry(data_root, &target, &bytes, based_on.as_deref(), |_current| bytes.clone()).map_err(|e| io(e.message))?;
     Ok(name)
 }
 
