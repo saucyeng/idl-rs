@@ -6,39 +6,20 @@
 use super::bike::FourBar;
 use crate::calibration::linkage::LinkagePoints;
 
-type P2 = [f64; 2];
+use crate::calibration::linkage::{branch_sign, pose_at_angle, P2};
 
 fn sub(a: P2, b: P2) -> P2 {
     [a[0] - b[0], a[1] - b[1]]
 }
-fn norm(a: P2) -> f64 {
-    (a[0] * a[0] + a[1] * a[1]).sqrt()
-}
-fn rot2(v: P2, t: f64) -> P2 {
-    let (s, c) = t.sin_cos();
-    [c * v[0] - s * v[1], s * v[0] + c * v[1]]
-}
-
-/// The intersection of circle (c0, r0) and (c1, r1) on the `sign` side.
-fn intersect(c0: P2, r0: f64, c1: P2, r1: f64, sign: f64) -> P2 {
-    let d = sub(c1, c0);
-    let dn = norm(d);
-    let a = (r0 * r0 - r1 * r1 + dn * dn) / (2.0 * dn);
-    let hh = (r0 * r0 - a * a).max(0.0).sqrt();
-    let u = [d[0] / dn, d[1] / dn];
-    [c0[0] + a * u[0] - sign * hh * u[1], c0[1] + a * u[1] + sign * hh * u[0]]
-}
 
 /// Chainstay angle `theta` -> rear axle position (side plane, m).
 fn axle(p: &LinkagePoints, theta: f64, sign: f64) -> P2 {
-    let (m, h, s, r) = (p.main_pivot, p.horst, p.ss_rocker, p.rocker_frame);
-    let h2 = [m[0] + rot2(sub(h, m), theta)[0], m[1] + rot2(sub(h, m), theta)[1]];
-    let s2 = intersect(h2, norm(sub(s, h)), r, norm(sub(s, r)), sign);
-    let v = sub(s2, h2);
-    let v0 = sub(s, h);
-    let phi = v[1].atan2(v[0]) - v0[1].atan2(v0[0]);
-    let back = rot2([-h[0], -h[1]], phi);
-    [h2[0] + back[0], h2[1] + back[1]]
+    pose_at_angle(p, theta, sign).seatstay_point(p.rear_axle)
+}
+
+/// The chainstay angle (rad) the 4-bar's polynomial gives at rear travel `travel_m` (m).
+pub fn chainstay_angle(coef: &[f64], travel_m: f64) -> f64 {
+    horner(coef, travel_m)
 }
 
 /// Why a linkage cannot be used.
@@ -60,9 +41,7 @@ pub enum FourBarError {
 
 /// The 4-bar the estimator uses, from photo points and the rear travel (m).
 pub fn fourbar(p: &LinkagePoints, travel_max_m: f64) -> Result<FourBar<f64>, FourBarError> {
-    let (h, s, r) = (p.horst, p.ss_rocker, p.rocker_frame);
-    let cand = [1.0, -1.0].map(|sg| intersect(h, norm(sub(s, h)), r, norm(sub(s, r)), sg));
-    let sign = if norm(sub(cand[0], s)) < norm(sub(cand[1], s)) { 1.0 } else { -1.0 };
+    let sign = branch_sign(p);
     let dir = if axle(p, 1e-3, sign)[1] > 0.0 { 1.0 } else { -1.0 };
     let (mut th, mut tr) = (Vec::new(), Vec::new());
     for i in 0..=6000 {

@@ -29,6 +29,7 @@ pub mod parse;
 pub mod pulse;
 pub mod rotation;
 pub mod session;
+pub mod sim;
 pub mod spectrogram;
 pub mod statistics;
 pub mod store;

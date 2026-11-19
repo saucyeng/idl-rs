@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use idl_rs::calibration::bike::{calibration_for, merge_calibrations, BikeCalibration};
+use idl_rs::calibration::drivetrain::Drivetrain;
 use idl_rs::calibration::linkage::Linkage;
 use idl_rs::store::atomic::{sha256_hex, write_atomic_with_retry, AtomicWriteError};
 
@@ -170,6 +171,8 @@ pub struct BikeFile {
     /// The rear linkage from the photo tool, and the suspension's travel
     /// (the physics estimator's 4-bar and end stops). None: not entered.
     pub linkage: Option<Linkage>,
+    /// The drivetrain for the drivetrain simulator. None: not entered.
+    pub drivetrain: Option<Drivetrain>,
 }
 
 /// An entry as written in the file: the current version's fields at the
@@ -195,12 +198,14 @@ struct StoredBikeFile {
     calibrations: Vec<BikeCalibration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     linkage: Option<Linkage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drivetrain: Option<Drivetrain>,
 }
 
 impl BikeFile {
     /// A new bike with an empty log.
     pub fn new(bike: Bike) -> BikeFile {
-        BikeFile { bike, entries: Vec::new(), calibrations: Vec::new(), linkage: None }
+        BikeFile { bike, entries: Vec::new(), calibrations: Vec::new(), linkage: None, drivetrain: None }
     }
 
     /// Parses a bike file.
@@ -209,7 +214,13 @@ impl BikeFile {
             serde_json::from_slice(bytes).map_err(|e| BikeLogError { kind: BikeLogErrorKind::Parse, message: e.to_string() })?;
         let bike_id = stored.bike.bike_id.clone();
         let mut file =
-            BikeFile { bike: stored.bike, entries: Vec::new(), calibrations: merge_calibrations(&stored.calibrations, &[]), linkage: stored.linkage };
+            BikeFile {
+            bike: stored.bike,
+            entries: Vec::new(),
+            calibrations: merge_calibrations(&stored.calibrations, &[]),
+            linkage: stored.linkage,
+            drivetrain: stored.drivetrain,
+        };
         for s in stored.entries {
             let mut versions = s.history;
             versions.push(s.current);
@@ -236,6 +247,7 @@ impl BikeFile {
             entries,
             calibrations: self.calibrations.clone(),
             linkage: self.linkage.clone(),
+            drivetrain: self.drivetrain.clone(),
         })
             .map_err(|e| BikeLogError { kind: BikeLogErrorKind::Encode, message: e.to_string() })
     }
@@ -262,6 +274,11 @@ impl BikeFile {
             calibrations: merge_calibrations(&self.calibrations, &other.calibrations),
             // the copy changed last wins; a copy without one never removes the other's
             linkage: match (&self.linkage, &other.linkage) {
+                (Some(a), Some(b)) => Some(if b.updated_at_ms > a.updated_at_ms { b.clone() } else { a.clone() }),
+                (a, b) => a.clone().or_else(|| b.clone()),
+            },
+            // the same rule as the linkage
+            drivetrain: match (&self.drivetrain, &other.drivetrain) {
                 (Some(a), Some(b)) => Some(if b.updated_at_ms > a.updated_at_ms { b.clone() } else { a.clone() }),
                 (a, b) => a.clone().or_else(|| b.clone()),
             },
@@ -590,6 +607,57 @@ pub fn save_linkage(data_root: &Path, bike_id: &str, linkage: &Linkage) -> Resul
     file.linkage = Some(linkage.clone());
     let merged = save_bike_file(data_root, &file)?;
     Ok(merged.linkage.expect("just saved"))
+}
+
+/// Saves `drivetrain` as the bike's (the newer of it and the file's wins on a merge).
+pub fn save_drivetrain(data_root: &Path, bike_id: &str, drivetrain: &Drivetrain) -> Result<Drivetrain, BikeLogError> {
+    let mut file = read_bike_file(data_root, bike_id)?;
+    file.entries.clear();
+    file.calibrations.clear();
+    file.linkage = None;
+    file.drivetrain = Some(drivetrain.clone());
+    let merged = save_bike_file(data_root, &file)?;
+    Ok(merged.drivetrain.expect("just saved"))
+}
+
+/// Image extensions a bike photo may have.
+pub const PHOTO_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
+
+/// Copies the photo at `source` beside the bike's file as
+/// `bikes/<bike_id>.photo.<ext>` (atomically, replacing any earlier photo)
+/// and returns that file name. The bike file names it in its drivetrain's
+/// `photo`.
+pub fn save_bike_photo(data_root: &Path, bike_id: &str, source: &Path) -> Result<String, BikeLogError> {
+    let io = |m: String| BikeLogError { kind: BikeLogErrorKind::Io, message: m };
+    if !is_valid_id(bike_id) {
+        return Err(BikeLogError { kind: BikeLogErrorKind::InvalidId, message: format!("{bike_id:?} is not a bike id") });
+    }
+    let ext = source.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).filter(|e| PHOTO_EXTENSIONS.contains(&e.as_str()));
+    let Some(ext) = ext else {
+        return Err(BikeLogError { kind: BikeLogErrorKind::Parse, message: format!("{} is not a JPEG, PNG or WebP photo", source.display()) });
+    };
+    let bytes = std::fs::read(source).map_err(|e| io(format!("{}: {e}", source.display())))?;
+    let dir = data_root.join("bikes");
+    std::fs::create_dir_all(&dir).map_err(|e| io(e.to_string()))?;
+    let name = format!("{bike_id}.photo.{ext}");
+    for other in PHOTO_EXTENSIONS {
+        if other != ext {
+            let _ = std::fs::remove_file(dir.join(format!("{bike_id}.photo.{other}")));
+        }
+    }
+    let target = dir.join(&name);
+    let based_on = std::fs::read(&target).ok().map(|b| sha256_hex(&b));
+    write_atomic_with_retry(data_root, &target, &bytes, based_on.as_deref(), |_current| bytes.clone()).map_err(|e| io(e.message))?;
+    Ok(name)
+}
+
+/// The bytes of the bike photo named `file` (a name [`save_bike_photo`] gave).
+pub fn read_bike_photo(data_root: &Path, bike_id: &str, file: &str) -> Result<Vec<u8>, BikeLogError> {
+    let ok = is_valid_id(bike_id) && file.starts_with(&format!("{bike_id}.photo.")) && !file.contains(['/', '\\']);
+    if !ok {
+        return Err(BikeLogError { kind: BikeLogErrorKind::InvalidId, message: format!("{file:?} is not {bike_id}'s photo") });
+    }
+    std::fs::read(data_root.join("bikes").join(file)).map_err(|e| BikeLogError { kind: BikeLogErrorKind::Io, message: e.to_string() })
 }
 
 /// The calibration the session described by `session` (starting at
@@ -950,7 +1018,7 @@ mod tests {
 
         // Act
         let back = BikeFile::from_slice(&a.to_vec().unwrap()).unwrap();
-        let merged = (a.merge(&b), b.merge(&a), a.merge(&BikeFile { linkage: None, ..a.clone() }));
+        let merged = (a.merge(&b), b.merge(&a), a.merge(&BikeFile { linkage: None, drivetrain: None, ..a.clone() }));
 
         // Assert: the file keeps it; the newer copy wins either way round; a copy without one never removes it
         assert_eq!(back.linkage, Some(older.clone()));
@@ -1155,6 +1223,50 @@ mod tests {
         let ride1 = read_session_json(&root.join("sessions/ride1/session.json")).unwrap().bike_log.unwrap();
         assert_eq!(ride1.entry_ids, vec!["s1", "n1"]);
         assert_eq!(ride1.after_ms, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_drivetrain_keeps_the_newer_copy_and_the_rest_of_the_file() {
+        // Arrange
+        let root = temp_root();
+        save_bike(&root, &gt()).unwrap();
+        save_entry(&root, &note("n1", 10, &[])).unwrap();
+        let older = Drivetrain::typical([0.43, 0.0], 100);
+        let newer = Drivetrain { chain_links: 118, ..Drivetrain::typical([0.43, 0.0], 200) };
+
+        // Act
+        save_drivetrain(&root, "gt", &newer).unwrap();
+        let kept = save_drivetrain(&root, "gt", &older).unwrap();
+
+        // Assert
+        assert_eq!(kept.chain_links, 118);
+        let file = read_bike_file(&root, "gt").unwrap();
+        assert_eq!(file.entries.len(), 1);
+        assert_eq!(file.drivetrain.unwrap().chain_links, 118);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_bike_photo_copies_beside_the_bike_file_and_replaces_another_format() {
+        // Arrange
+        let root = temp_root();
+        let src_png = root.join("side.PNG");
+        let src_jpg = root.join("side.jpg");
+        std::fs::write(&src_png, b"png").unwrap();
+        std::fs::write(&src_jpg, b"jpg").unwrap();
+
+        // Act
+        let first = save_bike_photo(&root, "gt", &src_png).unwrap();
+        let second = save_bike_photo(&root, "gt", &src_jpg).unwrap();
+
+        // Assert
+        assert_eq!(first, "gt.photo.png");
+        assert_eq!(second, "gt.photo.jpg");
+        assert!(!root.join("bikes/gt.photo.png").exists());
+        assert_eq!(read_bike_photo(&root, "gt", &second).unwrap(), b"jpg");
+        assert!(read_bike_photo(&root, "gt", "../gt.json").is_err());
+        assert!(load_bikes(&root).skipped.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

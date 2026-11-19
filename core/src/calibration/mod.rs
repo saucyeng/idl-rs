@@ -20,6 +20,7 @@
 use nalgebra::Vector3;
 
 pub mod bike;
+pub mod drivetrain;
 pub mod json;
 pub mod linkage;
 pub mod rigid;

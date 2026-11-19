@@ -82,6 +82,127 @@ impl Linkage {
     }
 }
 
+/// Bike side-plane point, metres: x toward the front axle, y up.
+pub type P2 = [f64; 2];
+
+fn sub(a: P2, b: P2) -> P2 {
+    [a[0] - b[0], a[1] - b[1]]
+}
+fn norm(a: P2) -> f64 {
+    (a[0] * a[0] + a[1] * a[1]).sqrt()
+}
+fn rot2(v: P2, t: f64) -> P2 {
+    let (s, c) = t.sin_cos();
+    [c * v[0] - s * v[1], s * v[0] + c * v[1]]
+}
+
+/// The intersection of circle (`c0`, `r0`) and (`c1`, `r1`) on the `sign`
+/// side (+1 or -1) of the line from `c0` to `c1`. Metres.
+pub fn intersect(c0: P2, r0: f64, c1: P2, r1: f64, sign: f64) -> P2 {
+    let d = sub(c1, c0);
+    let dn = norm(d);
+    let a = (r0 * r0 - r1 * r1 + dn * dn) / (2.0 * dn);
+    let hh = (r0 * r0 - a * a).max(0.0).sqrt();
+    let u = [d[0] / dn, d[1] / dn];
+    [c0[0] + a * u[0] - sign * hh * u[1], c0[1] + a * u[1] + sign * hh * u[0]]
+}
+
+/// The Horst 4-bar at one chainstay angle: each moving link as a rigid
+/// motion of its drawn (topped-out) points. The front triangle does not move.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LinkagePose {
+    /// Chainstay rotation about the main pivot from the drawn pose, rad (CCW, x forward y up).
+    pub chainstay_rad: f64,
+    /// Seatstay rotation from the drawn pose, rad (CCW).
+    pub seatstay_rad: f64,
+    /// Main pivot, metres (fixed).
+    pub main_pivot: P2,
+    /// Horst pivot as drawn, metres.
+    pub horst_drawn: P2,
+    /// Horst pivot at this pose, metres.
+    pub horst: P2,
+}
+
+impl LinkagePose {
+    /// Where a point drawn on the chainstay is at this pose, metres.
+    pub fn chainstay_point(&self, p: P2) -> P2 {
+        let r = rot2(sub(p, self.main_pivot), self.chainstay_rad);
+        [self.main_pivot[0] + r[0], self.main_pivot[1] + r[1]]
+    }
+
+    /// Where a point drawn on the seatstay (axle, hanger, derailleur) is at this pose, metres.
+    pub fn seatstay_point(&self, p: P2) -> P2 {
+        let r = rot2(sub(p, self.horst_drawn), self.seatstay_rad);
+        [self.horst[0] + r[0], self.horst[1] + r[1]]
+    }
+}
+
+/// The 4-bar's pose with the chainstay turned `theta` rad about the main
+/// pivot, on the circle-intersection branch `sign` (+1 or -1).
+pub fn pose_at_angle(p: &LinkagePoints, theta: f64, sign: f64) -> LinkagePose {
+    let (m, h, s, r) = (p.main_pivot, p.horst, p.ss_rocker, p.rocker_frame);
+    let hr = rot2(sub(h, m), theta);
+    let h2 = [m[0] + hr[0], m[1] + hr[1]];
+    let s2 = intersect(h2, norm(sub(s, h)), r, norm(sub(s, r)), sign);
+    let v = sub(s2, h2);
+    let v0 = sub(s, h);
+    let phi = v[1].atan2(v[0]) - v0[1].atan2(v0[0]);
+    LinkagePose { chainstay_rad: theta, seatstay_rad: phi, main_pivot: m, horst_drawn: h, horst: h2 }
+}
+
+/// The branch of the seatstay-rocker intersection the drawn linkage is on (+1 or -1).
+pub fn branch_sign(p: &LinkagePoints) -> f64 {
+    let (h, s, r) = (p.horst, p.ss_rocker, p.rocker_frame);
+    let cand = [1.0, -1.0].map(|sg| intersect(h, norm(sub(s, h)), r, norm(sub(s, r)), sg));
+    if norm(sub(cand[0], s)) < norm(sub(cand[1], s)) { 1.0 } else { -1.0 }
+}
+
+/// A photo's scale and axes: the two axle centres clicked on it (pixels,
+/// image y down) and the wheelbase between them. Maps pixels to the bike
+/// side plane (origin rear axle, x toward the front axle, y up, metres) the
+/// way `ml/tools/linkage.html` does.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PhotoFrame {
+    /// Rear axle centre, pixels.
+    pub rear_axle_px: P2,
+    /// Front axle centre, pixels.
+    pub front_axle_px: P2,
+    /// Wheelbase, metres.
+    pub wheelbase_m: f64,
+}
+
+impl PhotoFrame {
+    fn axes(&self) -> (P2, P2, f64) {
+        let d = sub(self.front_axle_px, self.rear_axle_px);
+        let len = norm(d).max(1e-9);
+        let ex = [d[0] / len, d[1] / len];
+        // the perpendicular that points up in the image (image y grows down)
+        let mut ey = [ex[1], -ex[0]];
+        if ey[1] > 0.0 {
+            ey = [-ey[0], -ey[1]];
+        }
+        (ex, ey, len / self.wheelbase_m.max(1e-9))
+    }
+
+    /// Pixels per metre.
+    pub fn px_per_m(&self) -> f64 {
+        self.axes().2
+    }
+
+    /// A pixel position as a bike side-plane point, metres.
+    pub fn to_bike(&self, px: P2) -> P2 {
+        let (ex, ey, ppm) = self.axes();
+        let v = sub(px, self.rear_axle_px);
+        [(v[0] * ex[0] + v[1] * ex[1]) / ppm, (v[0] * ey[0] + v[1] * ey[1]) / ppm]
+    }
+
+    /// A bike side-plane point (metres) as a pixel position.
+    pub fn to_px(&self, m: P2) -> P2 {
+        let (ex, ey, ppm) = self.axes();
+        [self.rear_axle_px[0] + (m[0] * ex[0] + m[1] * ey[0]) * ppm, self.rear_axle_px[1] + (m[0] * ex[1] + m[1] * ey[1]) * ppm]
+    }
+}
+
 /// Version of the physics fit. Bump when the same recordings would give a
 /// different fit (a model change in `estimate::physics`).
 pub const PHYSICS_FIT_VERSION: u32 = 1;
