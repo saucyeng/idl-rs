@@ -1,7 +1,15 @@
 //! The chain loop's dynamics (spec §2.4): one point mass per link joint,
-//! rigid links, and every rotating part as a body with its inertia, solved
-//! with small-step XPBD (positions projected onto the constraints each step,
-//! velocities from the positions).
+//! rigid links, and every rotating part as a body with its inertia. Links,
+//! the stays and the ratchet are constraints, projected each small step
+//! (XPBD); the chain's contact with its wheels is a force.
+//!
+//! **Wheels are circles at the pitch radius, and their teeth are grip.** A
+//! link's roller pressing into a wheel feels a stiff, damped normal force,
+//! and an elastic stick-slip friction anchored to the wheel, capped at
+//! `tooth_grip` × the normal force. Nothing decides where the chain joins or
+//! leaves a wheel: a link leaves where the chain stops pressing it on, which
+//! for a taut chain is the tangent, and a little sooner or later in motion.
+//! The reactions turn the wheel and, through a jockey's axle, the cage.
 //!
 //! The run is in the front triangle's frame, which accelerates and turns
 //! with the bike: each node feels minus the specific force at its position
@@ -45,11 +53,44 @@ pub struct DynConfig {
     pub chain_damping_per_s: f64,
     /// One link's axial stiffness, N/m (a steel roller chain is about 1e7).
     pub link_stiffness_npm: f64,
+    /// Crank speed forward, rad/s; 0 holds the cranks (coasting, the default).
+    #[serde(default)]
+    pub crank_rate_rad_s: f64,
+    /// How hard a sprocket's teeth hold the chain from sliding round it, as a
+    /// friction coefficient on its pitch circle (teeth are not modelled; their
+    /// grip is). By the capstan relation a wrap of θ holds a tension ratio of
+    /// e^(μθ), so 1.5 never slips under a real load, while a link the chain
+    /// stops pressing on is free to leave.
+    #[serde(default = "default_grip")]
+    pub tooth_grip: f64,
+    /// Contact stiffness between a link's roller and a wheel, N/m.
+    #[serde(default = "default_contact_k")]
+    pub contact_stiffness_npm: f64,
+    /// Contact damping, N·s/m.
+    #[serde(default = "default_contact_c")]
+    pub contact_damping_nspm: f64,
+    /// Friction between the chain and a contact surface (a rubber protector).
+    #[serde(default = "default_surface_mu")]
+    pub surface_friction: f64,
+}
+
+fn default_surface_mu() -> f64 {
+    0.5
+}
+
+fn default_grip() -> f64 {
+    1.5
+}
+fn default_contact_k() -> f64 {
+    2.0e5
+}
+fn default_contact_c() -> f64 {
+    20.0
 }
 
 impl Default for DynConfig {
     fn default() -> Self {
-        DynConfig { dt_s: 2.5e-5, iterations: 2, frame_rate_hz: 500.0, settle_s: 0.4, settle_damping_per_s: 40.0, chain_damping_per_s: 1.5, link_stiffness_npm: 1.0e7 }
+        DynConfig { dt_s: 2.5e-5, iterations: 2, frame_rate_hz: 500.0, settle_s: 0.4, settle_damping_per_s: 40.0, chain_damping_per_s: 1.5, link_stiffness_npm: 1.0e7, crank_rate_rad_s: 0.0, tooth_grip: 1.5, contact_stiffness_npm: 2.0e5, contact_damping_nspm: 20.0, surface_friction: 0.5 }
     }
 }
 
@@ -132,12 +173,15 @@ struct DWheel {
     psi: f64,
     psi_prev: f64,
     omega: f64,
+    /// Centre last step, m (the wheel's own velocity at a contact).
+    centre_prev: P2,
 }
 
 #[derive(Clone, Copy)]
 struct Contact {
     wheel: usize,
-    a0: f64,
+    /// Where the grip's spring is anchored, as an angle in the wheel's own frame, rad.
+    anchor: f64,
 }
 
 fn wrap_pi(a: f64) -> f64 {
@@ -147,6 +191,7 @@ fn perp(v: P2) -> P2 {
     [-v[1], v[0]]
 }
 
+#[derive(Clone)]
 struct Surf {
     a: P2,
     u: P2,
@@ -194,6 +239,7 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
         psi: 0.0,
         psi_prev: 0.0,
         omega: 0.0,
+        centre_prev: w.centre,
     };
     let mut cage = bike.cage_abs(&pose0, fwd0);
     let [cog_w, ring_w, low_w, up_w] = bike.fixed_wheels(&pose0, gear, cage)?;
@@ -247,31 +293,10 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
         out
     };
 
-    // contacts at the start
+    // which wheel each link's roller is pressing on, with its grip's anchor
     let mut contact: Vec<Option<Contact>> = vec![None; n];
-    let enter_tol = 3.0e-4;
-    let leave_tol = 1.0e-3;
-    let assign = |x: &[P2], contact: &mut [Option<Contact>], wheels: &[DWheel]| {
-        for i in 0..x.len() {
-            if contact[i].is_some() {
-                continue;
-            }
-            let mut best: Option<(usize, f64)> = None;
-            for (k, w) in wheels.iter().enumerate() {
-                let dx = [x[i][0] - w.centre[0], x[i][1] - w.centre[1]];
-                let gap = (dx[0] * dx[0] + dx[1] * dx[1]).sqrt() - w.radius;
-                if gap < enter_tol && gap > -0.5 * w.radius && best.map_or(true, |b| gap < b.1) {
-                    best = Some((k, gap));
-                }
-            }
-            if let Some((k, _)) = best {
-                let w = &wheels[k];
-                let a = (x[i][1] - w.centre[1]).atan2(x[i][0] - w.centre[0]);
-                contact[i] = Some(Contact { wheel: k, a0: a - w.psi });
-            }
-        }
-    };
-    assign(&x, &mut contact, &wheels);
+    let (k_n, c_n) = (cfg.contact_stiffness_npm, cfg.contact_damping_nspm);
+    let mut f_contact = vec![[0.0f64; 2]; n];
 
     // the cage
     let mut cage_prev;
@@ -363,12 +388,106 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
         };
         let damp = (-(if settling { cfg.settle_damping_per_s } else { cfg.chain_damping_per_s }) * dt).exp();
 
+        // the stays where they are now; their speed from where they were
+        let surfs = surfaces_at(&pose);
+        if surfs_prev.len() != surfs.len() {
+            surfs_prev = surfs.clone();
+        }
+        // contact forces: each link's roller against the wheel it presses into
+        let mut wheel_torque = vec![0.0f64; wheels.len()];
+        let mut cage_torque = 0.0f64;
+        let piv = piv_hist[2];
+        for i in 0..n {
+            f_contact[i] = [0.0, 0.0];
+            let mut deepest: Option<(usize, f64)> = None;
+            for (k, w) in wheels.iter().enumerate() {
+                let gap = ((x[i][0] - w.centre[0]).powi(2) + (x[i][1] - w.centre[1]).powi(2)).sqrt() - w.radius;
+                if gap < 0.0 && gap > -0.5 * w.radius && deepest.map_or(true, |b| gap < b.1) {
+                    deepest = Some((k, gap));
+                }
+            }
+            let Some((k, gap)) = deepest else {
+                contact[i] = None;
+                continue;
+            };
+            let w = &wheels[k];
+            let rv = [x[i][0] - w.centre[0], x[i][1] - w.centre[1]];
+            let dist = (rv[0] * rv[0] + rv[1] * rv[1]).sqrt().max(1e-9);
+            let nn = [rv[0] / dist, rv[1] / dist];
+            let tt = perp(nn);
+            // the wheel's surface velocity there: its centre's, plus its spin
+            let vc = [(w.centre[0] - w.centre_prev[0]) / dt, (w.centre[1] - w.centre_prev[1]) / dt];
+            let vs = [vc[0] - w.omega * rv[1], vc[1] + w.omega * rv[0]];
+            let vr = [v[i][0] - vs[0], v[i][1] - vs[1]];
+            let (vn, vt) = (vr[0] * nn[0] + vr[1] * nn[1], vr[0] * tt[0] + vr[1] * tt[1]);
+            let f_n = (-k_n * gap - c_n * vn).max(0.0);
+            let ang = rv[1].atan2(rv[0]);
+            let mu = if w.toothed { cfg.tooth_grip } else { 0.0 };
+            let mut f_t = 0.0;
+            if mu > 0.0 {
+                let ct = match contact[i] {
+                    Some(c) if c.wheel == k => c,
+                    _ => Contact { wheel: k, anchor: ang - w.psi },
+                };
+                // the grip: a stiff spring to where the link touched down, sliding past mu × N
+                let slip = w.radius * wrap_pi(ang - w.psi - ct.anchor);
+                let trial = -k_n * slip - c_n * vt;
+                let cap = mu * f_n;
+                let anchor = if trial.abs() > cap {
+                    f_t = cap * trial.signum();
+                    ang - w.psi + f_t / (k_n * w.radius)
+                } else {
+                    f_t = trial;
+                    ct.anchor
+                };
+                contact[i] = Some(Contact { wheel: k, anchor });
+            } else {
+                contact[i] = Some(Contact { wheel: k, anchor: 0.0 });
+            }
+            let f = [f_n * nn[0] + f_t * tt[0], f_n * nn[1] + f_t * tt[1]];
+            f_contact[i] = f;
+            // the reaction turns the wheel, and a jockey's axle carries it to the cage
+            wheel_torque[k] -= rv[0] * f[1] - rv[1] * f[0];
+            if matches!(w.mount, Mount::Upper | Mount::Lower) {
+                let arm = [w.centre[0] - piv[0], w.centre[1] - piv[1]];
+                cage_torque -= arm[0] * f[1] - arm[1] * f[0];
+            }
+        }
+
+        // and against the stays: the same stiff, damped contact, with rubber's friction.
+        // Only a link on the surface's side, within 6 mm of it, feels it, so a span on
+        // the far side of a stay is not pulled through.
+        for i in 0..n {
+            for (si, (_, sf)) in surfs.iter().enumerate() {
+                let w = [x[i][0] - sf.a[0], x[i][1] - sf.a[1]];
+                let along = w[0] * sf.u[0] + w[1] * sf.u[1];
+                if along < 0.0 || along > sf.len {
+                    continue;
+                }
+                let gap = w[0] * sf.n[0] + w[1] * sf.n[1] - CHAIN_HALF_ROLLER_M;
+                if gap >= 0.0 || gap < -6.0e-3 {
+                    continue;
+                }
+                let sp = &surfs_prev[si].1;
+                let fr = (along / sf.len).clamp(0.0, 1.0);
+                let now = [sf.a[0] + fr * sf.len * sf.u[0], sf.a[1] + fr * sf.len * sf.u[1]];
+                let was = [sp.a[0] + fr * sp.len * sp.u[0], sp.a[1] + fr * sp.len * sp.u[1]];
+                let vr = [v[i][0] - (now[0] - was[0]) / dt, v[i][1] - (now[1] - was[1]) / dt];
+                let (vn, vt) = (vr[0] * sf.n[0] + vr[1] * sf.n[1], vr[0] * sf.u[0] + vr[1] * sf.u[1]);
+                let f_n = (-k_n * gap - c_n * vn).max(0.0);
+                let f_t = -cfg.surface_friction * f_n * (vt / 0.02).tanh();
+                f_contact[i][0] += f_n * sf.n[0] + f_t * sf.u[0];
+                f_contact[i][1] += f_n * sf.n[1] + f_t * sf.u[1];
+            }
+        }
+
         // predict the nodes
         for i in 0..n {
             let f = spec(x[i]);
             let cor = [2.0 * s.omega * v[i][1], -2.0 * s.omega * v[i][0]];
-            v[i][0] = (v[i][0] + (-f[0] + cor[0]) * dt) * damp;
-            v[i][1] = (v[i][1] + (-f[1] + cor[1]) * dt) * damp;
+            let fc = f_contact[i];
+            v[i][0] = (v[i][0] + (-f[0] + cor[0] + fc[0] * w_node) * dt) * damp;
+            v[i][1] = (v[i][1] + (-f[1] + cor[1] + fc[1] * w_node) * dt) * damp;
             v_pre[i] = v[i];
             xp[i] = x[i];
             x[i][0] += v[i][0] * dt;
@@ -377,7 +496,7 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
         // predict the wheels
         let wheel_rate = if settling { 0.0 } else { s.speed_mps / d.wheel_radius_m.max(0.05) };
         for (k, w) in wheels.iter_mut().enumerate() {
-            let mut torque_acc = -s.alpha;
+            let mut torque_acc = -s.alpha + wheel_torque[k] * w.inv_inertia;
             if k == COG && w.inv_inertia > 0.0 {
                 // forward is CW (negative); drag pulls the cassette toward the wheel's speed
                 let cog_fwd = -(w.omega - ss_rate);
@@ -385,8 +504,11 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
             }
             if w.inv_inertia > 0.0 {
                 w.omega = (w.omega + torque_acc * dt) * if settling { damp } else { 1.0 };
+            } else if matches!(w.mount, Mount::Ring) {
+                // the cranks: held, or turned forward (CW) at the set rate
+                w.omega = if settling { 0.0 } else { -cfg.crank_rate_rad_s };
             } else {
-                w.omega = ss_rate * if matches!(w.mount, Mount::Ring) { 0.0 } else { 1.0 };
+                w.omega = ss_rate;
             }
             w.psi_prev = w.psi;
             w.psi += w.omega * dt;
@@ -402,17 +524,15 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
             let fc = spec(com);
             let force = [-dr.cage_mass_kg * (fc[0] + a_piv[0]), -dr.cage_mass_kg * (fc[1] + a_piv[1])];
             let weight = r[0] * force[1] - r[1] * force[0];
-            let acc = (spring + weight) * jockey_inv_cage - s.alpha;
+            let acc = (spring + weight + cage_torque) * jockey_inv_cage - s.alpha;
             cage_omega = (cage_omega + acc * dt) * if settling { damp } else { 1.0 };
             cage_prev = cage;
             cage += cage_omega * dt;
         }
-        place_wheels(&mut wheels, &pose, cage);
-        let surfs = surfaces_at(&pose);
-        if surfs_prev.len() != surfs.len() {
-            surfs_prev = surfaces_at(&pose);
+        for w in wheels.iter_mut() {
+            w.centre_prev = w.centre;
         }
-        assign(&x, &mut contact, &wheels);
+        place_wheels(&mut wheels, &pose, cage);
         for l in lam.iter_mut() {
             *l = 0.0;
         }
@@ -434,79 +554,6 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
                 x[j][0] -= w_node * corr * nn[0];
                 x[j][1] -= w_node * corr * nn[1];
                 lam[i] += corr;
-            }
-            // wheels
-            for i in 0..n {
-                let Some(ct) = contact[i] else { continue };
-                let k = ct.wheel;
-                let is_jockey = matches!(wheels[k].mount, Mount::Upper | Mount::Lower);
-                let c = wheels[k].centre;
-                let dx = [x[i][0] - c[0], x[i][1] - c[1]];
-                let dist = (dx[0] * dx[0] + dx[1] * dx[1]).sqrt().max(1e-9);
-                let nn = [dx[0] / dist, dx[1] / dist];
-                let r = wheels[k].radius;
-                let piv = piv_hist[2];
-                let dc = perp([c[0] - piv[0], c[1] - piv[1]]);
-                // radial: the chain sits on the pitch circle, never inside it
-                let cr = dist - r;
-                if cr < 0.0 {
-                    let g = if is_jockey { -(nn[0] * dc[0] + nn[1] * dc[1]) } else { 0.0 };
-                    let wc = if is_jockey { jockey_inv_cage } else { 0.0 };
-                    let dl = -cr / (w_node + wc * g * g);
-                    x[i][0] += w_node * nn[0] * dl;
-                    x[i][1] += w_node * nn[1] * dl;
-                    if is_jockey {
-                        cage += wc * g * dl;
-                    }
-                }
-                // tangential: a tooth holds the link
-                if wheels[k].toothed {
-                    let a = dx[1].atan2(dx[0]);
-                    let ct_err = r * wrap_pi(a - wheels[k].psi - ct.a0);
-                    let t_hat = perp(nn);
-                    let gx = r / dist;
-                    let gpsi = -r;
-                    let gth = if is_jockey { -(r / dist) * (t_hat[0] * dc[0] + t_hat[1] * dc[1]) } else { 0.0 };
-                    let wc = if is_jockey { jockey_inv_cage } else { 0.0 };
-                    let wsum = w_node * gx * gx + wheels[k].inv_inertia * gpsi * gpsi + wc * gth * gth;
-                    if wsum > 0.0 {
-                        let dl = -ct_err / wsum;
-                        x[i][0] += w_node * gx * t_hat[0] * dl;
-                        x[i][1] += w_node * gx * t_hat[1] * dl;
-                        wheels[k].psi += wheels[k].inv_inertia * gpsi * dl;
-                        if is_jockey {
-                            cage += wc * gth * dl;
-                        }
-                    }
-                }
-                if is_jockey {
-                    let (uj, lj) = bike.jockeys(&pose, gear, cage);
-                    for w in wheels.iter_mut() {
-                        match w.mount {
-                            Mount::Upper => w.centre = uj,
-                            Mount::Lower => w.centre = lj,
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            // surfaces: a link that was on the allowed side can't cross
-            for i in 0..n {
-                for (si, (_, sf)) in surfs.iter().enumerate() {
-                    let w = [x[i][0] - sf.a[0], x[i][1] - sf.a[1]];
-                    let along = w[0] * sf.u[0] + w[1] * sf.u[1];
-                    if along < 0.0 || along > sf.len {
-                        continue;
-                    }
-                    let sp = &surfs_prev[si].1;
-                    let before = (xp[i][0] - sp.a[0]) * sp.n[0] + (xp[i][1] - sp.a[1]) * sp.n[1];
-                    let dist = w[0] * sf.n[0] + w[1] * sf.n[1];
-                    if dist < CHAIN_HALF_ROLLER_M && before > CHAIN_HALF_ROLLER_M - 2e-3 {
-                        let c = dist - CHAIN_HALF_ROLLER_M;
-                        x[i][0] -= c * sf.n[0];
-                        x[i][1] -= c * sf.n[1];
-                    }
-                }
             }
             // the ratchet: the cassette can't run forward past the wheel
             let q = -(wheels[COG].psi - pose.seatstay_rad) - wheel_fwd - wheel_rate * dt;
@@ -540,16 +587,6 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
         if !settling && slip > 1e-3 {
             slipping_frame = true;
             out.summary.clutch_slip_deg += (slip * dt).to_degrees();
-        }
-        // leave wheels the chain has pulled off
-        for i in 0..n {
-            if let Some(ct) = contact[i] {
-                let c = wheels[ct.wheel].centre;
-                let gap = ((x[i][0] - c[0]).powi(2) + (x[i][1] - c[1]).powi(2)).sqrt() - wheels[ct.wheel].radius;
-                if gap > leave_tol {
-                    contact[i] = None;
-                }
-            }
         }
         // the freehub
         wheel_fwd += wheel_rate * dt;
@@ -796,5 +833,69 @@ mod tests {
         assert!(swing > 0.5, "cage swing {swing} deg");
         assert!(r.summary.max_lower_deflection_mm > 0.5, "{:?}", r.summary);
         assert!(r.summary.max_link_error_mm < 1.0, "{:?}", r.summary);
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::super::bike::tests::{gt_force_drivetrain, gt_force_linkage};
+    use super::super::excite::Excitation;
+    use super::super::kinematics::role_name;
+    use super::super::path::chain_path;
+    use super::*;
+
+    /// The worst difference, over every frame after `from_s` and every wheel,
+    /// between the links on the wheel in the run and on the exact tangent
+    /// path at the same travel and cage angle (both counting the end links).
+    pub(super) fn worst_wrap_error(bike: &SimBike, r: &DynResult, from_s: f64) -> (f64, String) {
+        let ch = |n: &str| r.channels.iter().find(|c| c.name == n).unwrap().values.clone();
+        let (trav, cage) = (ch("Rear travel"), ch("Cage angle"));
+        let np = r.point_names.len();
+        let mut worst = (0.0f64, String::new());
+        for f in 0..r.frame_t_s.len() {
+            if r.frame_t_s[f] < from_s {
+                continue;
+            }
+            let pose = bike.pose(trav[f] as f64 / 1000.0);
+            let kp = chain_path(bike, &pose, r.gear, bike.cage_abs(&pose, (cage[f] as f64).to_radians()), &|_| true).unwrap();
+            for (role, radius, _) in &r.wheels {
+                let pi = r.point_names.iter().position(|n| n == &format!("wheel:{role}")).unwrap();
+                let c = [r.point_xy[(f * np + pi) * 2] as f64, r.point_xy[(f * np + pi) * 2 + 1] as f64];
+                let on = (0..r.nodes)
+                    .filter(|&i| {
+                        let q = [r.node_xy[(f * r.nodes + i) * 2] as f64, r.node_xy[(f * r.nodes + i) * 2 + 1] as f64];
+                        (((q[0] - c[0]).powi(2) + (q[1] - c[1]).powi(2)).sqrt() - radius).abs() < 5e-4
+                    })
+                    .count() as f64;
+                let want = kp.arcs.iter().find(|a| role_name(a.wheel.role) == *role).map(|a| a.len / CHAIN_PITCH_M + 1.0).unwrap_or(0.0);
+                if (on - want).abs() > worst.0 {
+                    worst = ((on - want).abs(), format!("{role} at {:.3} s: {on} links, the tangent path holds {want:.1}", r.frame_t_s[f]));
+                }
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn a_taut_chain_driven_round_its_wheels_leaves_each_at_the_tangent() {
+        // Arrange: no gravity or bumps; the cranks turn the chain round, the hub
+        // overruns a little so the cassette freewheels with it
+        let bike = SimBike::new(&gt_force_linkage(), &gt_force_drivetrain()).unwrap();
+        let crank = 3.0;
+        let ring_r = bike.drivetrain.chainring_teeth as f64 * CHAIN_PITCH_M / std::f64::consts::TAU;
+        let cog_r = bike.cog_teeth(5).unwrap() as f64 * CHAIN_PITCH_M / std::f64::consts::TAU;
+        let speed = 1.1 * crank * ring_r / cog_r * bike.drivetrain.wheel_radius_m;
+        let e = Excitation { t_s: vec![0.0, 0.6], travel_m: vec![0.04; 2], fx: vec![0.0; 2], fy: vec![0.0; 2], omega: vec![0.0; 2], speed_mps: vec![speed; 2] };
+        let cfg = DynConfig { crank_rate_rad_s: crank, ..DynConfig::default() };
+
+        // Act
+        let r = simulate(&bike, 5, &|_| true, &e, &cfg, &mut |_| true).unwrap();
+
+        // Assert: the chain moved round, and every wheel holds the tangent path's links within one
+        let cog = r.wheels.iter().position(|w| w.0 == "cog").unwrap();
+        let turned = (r.wheel_angle[(r.frame_t_s.len() - 1) * r.wheels.len() + cog] - r.wheel_angle[cog]).abs();
+        assert!(turned > 1.0, "the cassette turned only {turned} rad");
+        let (worst, at) = worst_wrap_error(&bike, &r, 0.2);
+        assert!(worst <= 1.0, "{at}");
     }
 }
