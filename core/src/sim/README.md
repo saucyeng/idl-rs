@@ -72,6 +72,9 @@ In order of how much each matters:
    answerable yet. Fixing this is D8 of the whole-bike spec.
 3. **The input is a synthetic bump train**, not a recorded ride. Replay of a
    ride's IMU0 motion, estimated rear travel and GPS speed is planned (spec §5).
+   The train defines rear travel over time, not a ground shape;
+   `BumpTrain::ground_height` gives the ground that alone would produce it
+   (rigid tyre, level frame), which the app draws scrolling under the wheel.
 4. **The clutch has no free play.** A real clutch lets the cage turn a little
    before it bites; here it is Coulomb friction from zero. This overstates
    clutch work for small motions.
