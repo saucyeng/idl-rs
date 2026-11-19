@@ -3,12 +3,15 @@
 //! the stays and the ratchet are constraints, projected each small step
 //! (XPBD); the chain's contact with its wheels is a force.
 //!
-//! **Wheels are circles at the pitch radius, and their teeth are grip.** A
-//! link's roller pressing into a wheel feels a stiff, damped normal force,
-//! and an elastic stick-slip friction anchored to the wheel, capped at
-//! `tooth_grip` × the normal force. Nothing decides where the chain joins or
-//! leaves a wheel: a link leaves where the chain stops pressing it on, which
-//! for a taut chain is the tangent, and a little sooner or later in motion.
+//! **Wheels are circles at the pitch radius; a sprocket's teeth hold.** A
+//! link's roller pressing into a wheel feels a stiff, damped normal force.
+//! On a sprocket it is also held where it touched down (a stiff, damped
+//! spring to that point on the wheel, with no slip at all, as a roller in a
+//! tooth gap cannot move round the wheel however lightly it presses). The
+//! moment it stops pressing in, it is free. Nothing decides where the chain
+//! joins or leaves a wheel: a link leaves where the chain stops pressing it
+//! on, which for a taut chain is the tangent, a little sooner or later in
+//! motion. Smooth rollers hold nothing tangentially.
 //! The reactions turn the wheel and, through a jockey's axle, the cage.
 //!
 //! The run is in the front triangle's frame, which accelerates and turns
@@ -56,13 +59,6 @@ pub struct DynConfig {
     /// Crank speed forward, rad/s; 0 holds the cranks (coasting, the default).
     #[serde(default)]
     pub crank_rate_rad_s: f64,
-    /// How hard a sprocket's teeth hold the chain from sliding round it, as a
-    /// friction coefficient on its pitch circle (teeth are not modelled; their
-    /// grip is). By the capstan relation a wrap of θ holds a tension ratio of
-    /// e^(μθ), so 1.5 never slips under a real load, while a link the chain
-    /// stops pressing on is free to leave.
-    #[serde(default = "default_grip")]
-    pub tooth_grip: f64,
     /// Contact stiffness between a link's roller and a wheel, N/m.
     #[serde(default = "default_contact_k")]
     pub contact_stiffness_npm: f64,
@@ -78,9 +74,6 @@ fn default_surface_mu() -> f64 {
     0.5
 }
 
-fn default_grip() -> f64 {
-    1.5
-}
 fn default_contact_k() -> f64 {
     2.0e5
 }
@@ -90,7 +83,7 @@ fn default_contact_c() -> f64 {
 
 impl Default for DynConfig {
     fn default() -> Self {
-        DynConfig { dt_s: 5.0e-5, iterations: 2, frame_rate_hz: 500.0, settle_s: 0.4, settle_damping_per_s: 40.0, chain_damping_per_s: 1.5, link_stiffness_npm: 1.0e7, crank_rate_rad_s: 0.0, tooth_grip: 1.5, contact_stiffness_npm: 2.0e5, contact_damping_nspm: 20.0, surface_friction: 0.5 }
+        DynConfig { dt_s: 5.0e-5, iterations: 2, frame_rate_hz: 500.0, settle_s: 0.4, settle_damping_per_s: 40.0, chain_damping_per_s: 1.5, link_stiffness_npm: 1.0e7, crank_rate_rad_s: 0.0, contact_stiffness_npm: 2.0e5, contact_damping_nspm: 20.0, surface_friction: 0.5 }
     }
 }
 
@@ -424,33 +417,21 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
             let vr = [v[i][0] - vs[0], v[i][1] - vs[1]];
             let (vn, vt) = (vr[0] * nn[0] + vr[1] * nn[1], vr[0] * tt[0] + vr[1] * tt[1]);
             let f_n = (-k_n * gap - c_n * vn).max(0.0);
-            let mu = if w.toothed { cfg.tooth_grip } else { 0.0 };
             let mut f_t = 0.0;
-            if mu > 0.0 {
+            if w.toothed {
                 // the wheel's frame: world = centre + R(psi) local
                 let (sp, cp) = rot[k];
                 let to_local = |q: P2| [cp * q[0] + sp * q[1], -sp * q[0] + cp * q[1]];
-                let on_circle = [w.radius * nn[0], w.radius * nn[1]];
                 let ct = match contact[i] {
                     Some(c) if c.wheel == k => c,
-                    _ => Contact { wheel: k, anchor: to_local(on_circle) },
+                    _ => Contact { wheel: k, anchor: to_local([w.radius * nn[0], w.radius * nn[1]]) },
                 };
-                // the grip: a stiff spring to where the link touched down, sliding past mu × N
+                // the tooth: held where it touched down, no slip
                 let a = ct.anchor;
                 let aw = [cp * a[0] - sp * a[1], sp * a[0] + cp * a[1]];
                 let slip = (rv[0] - aw[0]) * tt[0] + (rv[1] - aw[1]) * tt[1];
-                let trial = -k_n * slip - c_n * vt;
-                let cap = mu * f_n;
-                let anchor = if trial.abs() > cap {
-                    f_t = cap * trial.signum();
-                    // re-anchor so the spring holds exactly the sliding force
-                    let s_new = -f_t / k_n;
-                    to_local([on_circle[0] - s_new * tt[0], on_circle[1] - s_new * tt[1]])
-                } else {
-                    f_t = trial;
-                    a
-                };
-                contact[i] = Some(Contact { wheel: k, anchor });
+                f_t = -k_n * slip - c_n * vt;
+                contact[i] = Some(ct);
             } else {
                 contact[i] = Some(Contact { wheel: k, anchor: [0.0, 0.0] });
             }
@@ -920,5 +901,56 @@ mod bench {
         assert!(turned > 1.0, "the cassette turned only {turned} rad");
         let (worst, at) = worst_wrap_error(&bike, &r, 0.2);
         assert!(worst <= 1.0, "{at}");
+    }
+}
+
+#[cfg(test)]
+mod held_cranks {
+    use super::super::bike::tests::{gt_force_drivetrain, gt_force_linkage};
+    use super::super::excite::BumpTrain;
+    use super::*;
+
+    /// Tooth height above the pitch circle, m: a roller lifted less than this is still between the teeth.
+    const TOOTH_HEIGHT_M: f64 = 0.004;
+
+    #[test]
+    fn with_the_cranks_held_a_link_only_moves_round_the_chainring_if_it_lifts_over_the_teeth() {
+        // Arrange: bumps, cranks held (the default)
+        let bike = SimBike::new(&gt_force_linkage(), &gt_force_drivetrain()).unwrap();
+        let e = BumpTrain::default().excitation(1000.0);
+
+        // Act
+        let r = simulate(&bike, 5, &|_| true, &e, &DynConfig::default(), &mut |_| true).unwrap();
+
+        // Assert: each time a link is back on the ring without having cleared the
+        // teeth since it was last on, it is within half a tooth of where it was
+        let (_, radius, teeth) = r.wheels.iter().find(|w| w.0 == "ring").unwrap().clone();
+        let ri = r.point_names.iter().position(|n| n == "wheel:ring").unwrap();
+        let c = [r.point_xy[ri * 2] as f64, r.point_xy[ri * 2 + 1] as f64];
+        let at = |f: usize, i: usize| [r.node_xy[(f * r.nodes + i) * 2] as f64, r.node_xy[(f * r.nodes + i) * 2 + 1] as f64];
+        let gap = |q: [f64; 2]| ((q[0] - c[0]).powi(2) + (q[1] - c[1]).powi(2)).sqrt() - radius;
+        let ang = |q: [f64; 2]| (q[1] - c[1]).atan2(q[0] - c[0]);
+        let half_tooth = std::f64::consts::PI / teeth as f64;
+        let mut worst = 0.0f64;
+        for i in 0..r.nodes {
+            let mut seat: Option<f64> = None;
+            let mut lift = 0.0f64;
+            for f in 0..r.frame_t_s.len() {
+                let q = at(f, i);
+                let g = gap(q);
+                if g.abs() < 5e-4 {
+                    if let Some(a0) = seat.filter(|_| lift < TOOTH_HEIGHT_M) {
+                        let d = (ang(q) - a0 + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
+                        worst = worst.max(d.abs());
+                    } else {
+                        seat = Some(ang(q));
+                    }
+                    lift = 0.0;
+                } else {
+                    lift = lift.max(g);
+                }
+            }
+        }
+        assert!(worst < half_tooth, "a link moved {:.1}° round the held chainring without clearing the teeth (half a tooth is {:.1}°)", worst.to_degrees(), half_tooth.to_degrees());
     }
 }
