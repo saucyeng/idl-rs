@@ -86,6 +86,11 @@ pub struct Roller {
     /// Whether it is fitted (off: kept in the file for an A/B, but not simulated).
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// An idler the chain is threaded round, so it stays on that side of it at
+    /// every travel (a high-pivot or main-pivot idler). Otherwise a guide that
+    /// acts only when the chain reaches it (an ISCG roller, a chain guide).
+    #[serde(default)]
+    pub threaded: bool,
 }
 
 fn default_roller_inertia() -> f64 {
@@ -307,6 +312,7 @@ mod tests {
             side: ChainSide::Over,
             inertia_kgm2: 2e-6,
             enabled: true,
+            threaded: true,
         });
 
         // Act

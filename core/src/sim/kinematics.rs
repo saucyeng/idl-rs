@@ -285,7 +285,7 @@ mod tests {
     fn a_top_roller_pressing_on_the_top_span_changes_growth_and_the_loop_still_closes() {
         // Arrange: a 16T roller on the chainstay holding the top span down
         let mut d = gt_force_drivetrain();
-        d.rollers.push(Roller { name: "Top roller".into(), body: Body::Chainstay, centre_m: [0.36, 0.07], teeth: Some(16), radius_m: 0.0, span: Span::Top, side: ChainSide::Under, inertia_kgm2: 2e-6, enabled: true });
+        d.rollers.push(Roller { name: "Top roller".into(), body: Body::Chainstay, centre_m: [0.36, 0.07], teeth: Some(16), radius_m: 0.0, span: Span::Top, side: ChainSide::Under, inertia_kgm2: 2e-6, enabled: true, threaded: false });
         let bike = SimBike::new(&gt_force_linkage(), &d).unwrap();
 
         // Act
@@ -310,5 +310,28 @@ mod tests {
         let (a, b) = (s.chain[0], *s.chain.last().unwrap());
         assert!(((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt() < 1e-9);
         assert_eq!(s.wheels.len(), 4);
+    }
+
+    #[test]
+    fn a_threaded_idler_on_the_main_pivot_is_in_the_path_at_every_travel_and_growth_has_no_jumps() {
+        // Arrange: Isaac's idler, 16T on the main pivot, the top span over it
+        let mut d = gt_force_drivetrain();
+        d.rollers.push(Roller { name: "Top idler".into(), body: Body::Chainstay, centre_m: [0.43717, 0.08031], teeth: Some(16), radius_m: 0.0, span: Span::Top, side: ChainSide::Over, inertia_kgm2: 2e-6, enabled: true, threaded: true });
+        let bike = SimBike::new(&gt_force_linkage(), &d).unwrap();
+        let fits: Vec<u32> = (90..170).step_by(2).filter(|&l| {
+            let mut b = bike.clone();
+            b.drivetrain.chain_links = l;
+            gear_curves(&b, 5, 9, &|_| true).is_ok()
+        }).collect();
+        let mut b = bike.clone();
+        b.drivetrain.chain_links = fits[fits.len() / 2];
+
+        // Act
+        let c = gear_curves(&b, 5, 17, &|_| true).unwrap();
+
+        // Assert: always on the idler; no step in growth bigger than a smooth curve's (1 cm in 1 cm of travel)
+        assert!(c.roller_touching[0].iter().all(|&t| t));
+        let worst = c.growth_mm.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f64::max);
+        assert!(worst < 10.0, "growth jumps {worst:.1} mm between samples: {:?}", c.growth_mm);
     }
 }

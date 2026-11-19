@@ -90,7 +90,7 @@ fn default_contact_c() -> f64 {
 
 impl Default for DynConfig {
     fn default() -> Self {
-        DynConfig { dt_s: 2.5e-5, iterations: 2, frame_rate_hz: 500.0, settle_s: 0.4, settle_damping_per_s: 40.0, chain_damping_per_s: 1.5, link_stiffness_npm: 1.0e7, crank_rate_rad_s: 0.0, tooth_grip: 1.5, contact_stiffness_npm: 2.0e5, contact_damping_nspm: 20.0, surface_friction: 0.5 }
+        DynConfig { dt_s: 5.0e-5, iterations: 2, frame_rate_hz: 500.0, settle_s: 0.4, settle_damping_per_s: 40.0, chain_damping_per_s: 1.5, link_stiffness_npm: 1.0e7, crank_rate_rad_s: 0.0, tooth_grip: 1.5, contact_stiffness_npm: 2.0e5, contact_damping_nspm: 20.0, surface_friction: 0.5 }
     }
 }
 
@@ -180,13 +180,10 @@ struct DWheel {
 #[derive(Clone, Copy)]
 struct Contact {
     wheel: usize,
-    /// Where the grip's spring is anchored, as an angle in the wheel's own frame, rad.
-    anchor: f64,
+    /// Where the grip's spring is anchored: the touch-down point in the wheel's own frame, m.
+    anchor: P2,
 }
 
-fn wrap_pi(a: f64) -> f64 {
-    (a + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
-}
 fn perp(v: P2) -> P2 {
     [-v[1], v[0]]
 }
@@ -395,14 +392,20 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
         }
         // contact forces: each link's roller against the wheel it presses into
         let mut wheel_torque = vec![0.0f64; wheels.len()];
+        let rot: Vec<(f64, f64)> = wheels.iter().map(|w| w.psi.sin_cos()).collect();
         let mut cage_torque = 0.0f64;
         let piv = piv_hist[2];
         for i in 0..n {
             f_contact[i] = [0.0, 0.0];
             let mut deepest: Option<(usize, f64)> = None;
             for (k, w) in wheels.iter().enumerate() {
-                let gap = ((x[i][0] - w.centre[0]).powi(2) + (x[i][1] - w.centre[1]).powi(2)).sqrt() - w.radius;
-                if gap < 0.0 && gap > -0.5 * w.radius && deepest.map_or(true, |b| gap < b.1) {
+                // most links are nowhere near most wheels: skip them without a square root
+                let d2 = (x[i][0] - w.centre[0]).powi(2) + (x[i][1] - w.centre[1]).powi(2);
+                if d2 >= w.radius * w.radius || d2 <= 0.25 * w.radius * w.radius {
+                    continue;
+                }
+                let gap = d2.sqrt() - w.radius;
+                if deepest.map_or(true, |b| gap < b.1) {
                     deepest = Some((k, gap));
                 }
             }
@@ -421,28 +424,35 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
             let vr = [v[i][0] - vs[0], v[i][1] - vs[1]];
             let (vn, vt) = (vr[0] * nn[0] + vr[1] * nn[1], vr[0] * tt[0] + vr[1] * tt[1]);
             let f_n = (-k_n * gap - c_n * vn).max(0.0);
-            let ang = rv[1].atan2(rv[0]);
             let mu = if w.toothed { cfg.tooth_grip } else { 0.0 };
             let mut f_t = 0.0;
             if mu > 0.0 {
+                // the wheel's frame: world = centre + R(psi) local
+                let (sp, cp) = rot[k];
+                let to_local = |q: P2| [cp * q[0] + sp * q[1], -sp * q[0] + cp * q[1]];
+                let on_circle = [w.radius * nn[0], w.radius * nn[1]];
                 let ct = match contact[i] {
                     Some(c) if c.wheel == k => c,
-                    _ => Contact { wheel: k, anchor: ang - w.psi },
+                    _ => Contact { wheel: k, anchor: to_local(on_circle) },
                 };
                 // the grip: a stiff spring to where the link touched down, sliding past mu × N
-                let slip = w.radius * wrap_pi(ang - w.psi - ct.anchor);
+                let a = ct.anchor;
+                let aw = [cp * a[0] - sp * a[1], sp * a[0] + cp * a[1]];
+                let slip = (rv[0] - aw[0]) * tt[0] + (rv[1] - aw[1]) * tt[1];
                 let trial = -k_n * slip - c_n * vt;
                 let cap = mu * f_n;
                 let anchor = if trial.abs() > cap {
                     f_t = cap * trial.signum();
-                    ang - w.psi + f_t / (k_n * w.radius)
+                    // re-anchor so the spring holds exactly the sliding force
+                    let s_new = -f_t / k_n;
+                    to_local([on_circle[0] - s_new * tt[0], on_circle[1] - s_new * tt[1]])
                 } else {
                     f_t = trial;
-                    ct.anchor
+                    a
                 };
                 contact[i] = Some(Contact { wheel: k, anchor });
             } else {
-                contact[i] = Some(Contact { wheel: k, anchor: 0.0 });
+                contact[i] = Some(Contact { wheel: k, anchor: [0.0, 0.0] });
             }
             let f = [f_n * nn[0] + f_t * tt[0], f_n * nn[1] + f_t * tt[1]];
             f_contact[i] = f;
@@ -457,8 +467,21 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
         // and against the stays: the same stiff, damped contact, with rubber's friction.
         // Only a link on the surface's side, within 6 mm of it, feels it, so a span on
         // the far side of a stay is not pulled through.
+        // a box round each surface, 6 mm proud, to skip the links nowhere near it
+        let boxes: Vec<[f64; 4]> = surfs
+            .iter()
+            .map(|(_, sf)| {
+                let b = [sf.a[0] + sf.len * sf.u[0], sf.a[1] + sf.len * sf.u[1]];
+                let m = 6.0e-3 + CHAIN_HALF_ROLLER_M;
+                [sf.a[0].min(b[0]) - m, sf.a[0].max(b[0]) + m, sf.a[1].min(b[1]) - m, sf.a[1].max(b[1]) + m]
+            })
+            .collect();
         for i in 0..n {
             for (si, (_, sf)) in surfs.iter().enumerate() {
+                let bx = &boxes[si];
+                if x[i][0] < bx[0] || x[i][0] > bx[1] || x[i][1] < bx[2] || x[i][1] > bx[3] {
+                    continue;
+                }
                 let w = [x[i][0] - sf.a[0], x[i][1] - sf.a[1]];
                 let along = w[0] * sf.u[0] + w[1] * sf.u[1];
                 if along < 0.0 || along > sf.len {
@@ -542,7 +565,7 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
             // links, alternating direction
             for jj in 0..n {
                 let i = if it % 2 == 0 { jj } else { n - 1 - jj };
-                let j = (i + 1) % n;
+                let j = if i + 1 == n { 0 } else { i + 1 };
                 let dd = [x[j][0] - x[i][0], x[j][1] - x[i][1]];
                 let dist = (dd[0] * dd[0] + dd[1] * dd[1]).sqrt().max(1e-12);
                 let c = dist - p;
