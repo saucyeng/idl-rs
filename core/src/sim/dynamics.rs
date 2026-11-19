@@ -385,6 +385,9 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
         }
         // contact forces: each link's roller against the wheel it presses into
         let mut wheel_torque = vec![0.0f64; wheels.len()];
+        // how hard the held teeth resist the wheel's turning: N·m/rad and N·m·s/rad
+        let mut wheel_k = vec![0.0f64; wheels.len()];
+        let mut wheel_c = vec![0.0f64; wheels.len()];
         let rot: Vec<(f64, f64)> = wheels.iter().map(|w| w.psi.sin_cos()).collect();
         let mut cage_torque = 0.0f64;
         let piv = piv_hist[2];
@@ -431,6 +434,8 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
                 let aw = [cp * a[0] - sp * a[1], sp * a[0] + cp * a[1]];
                 let slip = (rv[0] - aw[0]) * tt[0] + (rv[1] - aw[1]) * tt[1];
                 f_t = -k_n * slip - c_n * vt;
+                wheel_k[k] += k_n * dist * dist;
+                wheel_c[k] += c_n * dist * dist;
                 contact[i] = Some(ct);
             } else {
                 contact[i] = Some(Contact { wheel: k, anchor: [0.0, 0.0] });
@@ -507,7 +512,11 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
                 torque_acc += -d.freehub_drag_nm * ((wheel_rate - cog_fwd) / 1.0).tanh() * w.inv_inertia;
             }
             if w.inv_inertia > 0.0 {
-                w.omega = (w.omega + torque_acc * dt) * if settling { damp } else { 1.0 };
+                // implicit in the held teeth: a light wheel held by several stiff teeth
+                // (a 16T idler) overshoots an explicit step and spins up from nothing
+                let (kk, cc) = (wheel_k[k] * w.inv_inertia, wheel_c[k] * w.inv_inertia);
+                let omega = (w.omega + (torque_acc + cc * w.omega) * dt) / (1.0 + cc * dt + kk * dt * dt);
+                w.omega = omega * if settling { damp } else { 1.0 };
             } else if matches!(w.mount, Mount::Ring) {
                 // the cranks: held, or turned forward (CW) at the set rate
                 w.omega = if settling { 0.0 } else { -cfg.crank_rate_rad_s };
@@ -952,5 +961,127 @@ mod held_cranks {
             }
         }
         assert!(worst < half_tooth, "a link moved {:.1}° round the held chainring without clearing the teeth (half a tooth is {:.1}°)", worst.to_degrees(), half_tooth.to_degrees());
+    }
+}
+
+#[cfg(test)]
+mod inside_wheels {
+    use super::super::bike::tests::{gt_force_drivetrain, gt_force_linkage};
+    use super::super::kinematics::gear_curves;
+    use super::*;
+    use crate::calibration::drivetrain::{Body, ChainSide, Roller, Span};
+
+    /// How far a pin may sit inside a wheel's pitch circle, m. A link pressing
+    /// on a wheel gives way by the contact spring's millimetres; a pin deeper
+    /// than the roller's half-diameter is through the wheel, not on it.
+    const INSIDE_M: f64 = CHAIN_HALF_ROLLER_M;
+
+    /// Isaac's idler (16T on the main pivot, the top span over it) on the
+    /// placeholder GT Force, with the chain length the kinematics test uses.
+    fn idler_bike() -> SimBike {
+        let mut d = gt_force_drivetrain();
+        d.rollers.push(Roller { name: "Top idler".into(), body: Body::Chainstay, centre_m: [0.43717, 0.08031], teeth: Some(16), radius_m: 0.0, span: Span::Top, side: ChainSide::Over, inertia_kgm2: 2e-6, enabled: true, threaded: true });
+        let bike = SimBike::new(&gt_force_linkage(), &d).unwrap();
+        let fits: Vec<u32> = (90..170).step_by(2).filter(|&l| {
+            let mut b = bike.clone();
+            b.drivetrain.chain_links = l;
+            gear_curves(&b, 5, 9, &|_| true).is_ok()
+        }).collect();
+        let mut b = bike;
+        b.drivetrain.chain_links = fits[fits.len() / 2];
+        b
+    }
+
+    /// The gears whose loop closes at the still runs' 40 mm of travel.
+    fn closing_gears(bike: &SimBike) -> Vec<usize> {
+        (0..bike.drivetrain.cassette_teeth.len()).filter(|&g| close_cage(bike, &bike.pose(0.04), g, &|_| true).is_ok()).collect()
+    }
+
+    /// The deepest any pin goes inside any wheel's pitch circle, m, with where.
+    fn deepest(nodes: &[P2], wheels: &[(String, P2, f64)], label: &str) -> (f64, String) {
+        let mut worst = (f64::MIN, String::new());
+        for (i, q) in nodes.iter().enumerate() {
+            for (role, c, radius) in wheels {
+                let depth = radius - ((q[0] - c[0]).powi(2) + (q[1] - c[1]).powi(2)).sqrt();
+                if depth > worst.0 {
+                    worst = (depth, format!("{label}: link {i} is {:.1} mm inside the {role}", depth * 1000.0));
+                }
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn with_the_top_idler_fitted_the_chain_starts_outside_every_wheel() {
+        // Arrange
+        let bike = idler_bike();
+        let gears = closing_gears(&bike);
+        let pose = bike.pose(0.04);
+
+        // Act: the nodes and wheels exactly as the dynamics places them before its first step
+        let starts: Vec<(f64, String)> = gears.iter().map(|&g| {
+            let (fwd, path) = close_cage(&bike, &pose, g, &|_| true).unwrap();
+            let nodes: Vec<P2> = (0..bike.drivetrain.chain_links as usize).map(|k| path.point_at(k as f64 * CHAIN_PITCH_M)).collect();
+            let mut wheels: Vec<(String, P2, f64)> = bike.fixed_wheels(&pose, g, bike.cage_abs(&pose, fwd)).unwrap().iter().map(|w| (role_name(w.role).to_string(), w.centre, w.radius)).collect();
+            for i in 0..bike.drivetrain.rollers.len() {
+                let w = bike.roller(&pose, i);
+                wheels.push((role_name(w.role).to_string(), w.centre, w.radius));
+            }
+            deepest(&nodes, &wheels, &format!("gear {} at the start", g + 1))
+        }).collect();
+
+        // Assert
+        assert!(!gears.is_empty(), "no gear closes with the idler");
+        for (depth, at) in &starts {
+            assert!(*depth < INSIDE_M, "{at}");
+        }
+    }
+
+    #[test]
+    fn with_the_top_idler_fitted_no_link_is_ever_inside_a_wheel_in_any_gear() {
+        // Arrange: still, at 40 mm of travel; every gear whose loop closes
+        let bike = idler_bike();
+        let gears = closing_gears(&bike);
+        let still = Excitation { t_s: vec![0.0, 0.1], travel_m: vec![0.04; 2], fx: vec![0.0; 2], fy: vec![super::super::excite::G; 2], omega: vec![0.0; 2], speed_mps: vec![0.0; 2] };
+
+        // Act
+        let runs: Vec<DynResult> = gears.iter().map(|&g| simulate(&bike, g, &|_| true, &still, &DynConfig::default(), &mut |_| true).unwrap()).collect();
+
+        // Assert: every recorded frame, every link, every wheel
+        assert!(!gears.is_empty(), "no gear closes with the idler");
+        for r in &runs {
+            let np = r.point_names.len();
+            let mut worst = (f64::MIN, String::new());
+            for f in 0..r.frame_t_s.len() {
+                let nodes: Vec<P2> = (0..r.nodes).map(|i| [r.node_xy[(f * r.nodes + i) * 2] as f64, r.node_xy[(f * r.nodes + i) * 2 + 1] as f64]).collect();
+                let wheels: Vec<(String, P2, f64)> = r.wheels.iter().map(|(role, radius, _)| {
+                    let pi = r.point_names.iter().position(|n| n == &format!("wheel:{role}")).unwrap();
+                    (role.clone(), [r.point_xy[(f * np + pi) * 2] as f64, r.point_xy[(f * np + pi) * 2 + 1] as f64], *radius)
+                }).collect();
+                let d = deepest(&nodes, &wheels, &format!("gear {} at {:.3} s", r.gear + 1, r.frame_t_s[f]));
+                if d.0 > worst.0 {
+                    worst = d;
+                }
+            }
+            assert!(worst.0 < INSIDE_M, "{}", worst.1);
+        }
+    }
+
+    #[test]
+    fn with_the_top_idler_fitted_the_still_idler_stays_still() {
+        // Arrange: a 16T idler is light for its radius; held by several teeth, an
+        // explicit step had it spinning at ±20 000 rad/s from rest
+        let bike = idler_bike();
+        let still = Excitation { t_s: vec![0.0, 0.05], travel_m: vec![0.04; 2], fx: vec![0.0; 2], fy: vec![super::super::excite::G; 2], omega: vec![0.0; 2], speed_mps: vec![0.0; 2] };
+
+        // Act
+        let r = simulate(&bike, 2, &|_| true, &still, &DynConfig::default(), &mut |_| true).unwrap();
+
+        // Assert: under a tenth of a tooth (1.4°) of turn in any frame
+        let nw = r.wheels.len();
+        let wi = r.wheels.iter().position(|w| w.0 == "roller:0").unwrap();
+        let a0 = r.wheel_angle[wi];
+        let worst = (0..r.frame_t_s.len()).map(|f| (r.wheel_angle[f * nw + wi] - a0).abs()).fold(0.0f32, f32::max);
+        assert!((worst as f64) < 0.1 * std::f64::consts::TAU / 16.0, "the still idler turned {worst} rad");
     }
 }
