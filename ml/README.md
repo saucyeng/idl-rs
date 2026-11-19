@@ -6,13 +6,20 @@ differentiable model of the bike to what the pods measured. It reads the
 idl1 library's `data.parquet` files directly and touches nothing in the
 Rust crates. Deleting this folder removes it completely.
 
-**Status (2026-11-18): a working research tool, not a product.** It runs on
+**Status (2026-11-19): a working research tool, not a product.** It runs on
 one bike (GT Force, calibrated) and has been checked on one ride (Beacon,
 session `173461a2`). Travel does not drift (it is never double-integrated),
 stays inside its end stops, and reads ~1 mm in the air with the airtime
 anchor. It is good at fast motion (hits, bending, flex) and only fair at
-slow travel (sag, slow pitch): see "How far to trust it". Networks, the
-dynamics layer (loads, tires, rider) and any app integration are not started.
+slow travel (sag, slow pitch): see "How far to trust it".
+
+This folder is now the **reference**; the engine runs a Rust port of it
+(`core/src/estimate/physics/`, documented in `core/src/estimate/README.md`
+§"The physics estimator"), held equal to it by golden tests. The port runs
+whole sessions from the CLI (`idl-rs session estimate-physics`) and stores
+its channels in the library; the app does not show them yet. Networks and
+the dynamics layer (loads, tyres, rider) are not started: the dynamics layer
+is planned in idl1-app's whole-bike sim loop spec (§5.2).
 
 ### The structure, in plain words
 
@@ -92,8 +99,10 @@ What happens on a first run:
    and saved to `bikes/gt-force-fit.json`. ~14 min, 20 iterations.
 3. **Target solve**: geometry frozen, ~80 s for 50 s of ride (7 iterations).
 
-Timing on the GTX 1650: about 1.6 s of compute per second of ride. A whole
-ride is not wired up yet (windows are solved one at a time by hand).
+Timing on the GTX 1650: about 1.6 s of compute per second of ride. Here a
+whole ride is not wired up (windows are solved one at a time by hand); for a
+whole session, or a stretch of one, use the Rust port:
+`idl-rs session estimate-physics <id> [--from-ms N --to-ms N] [--refit]`.
 
 ## What comes out
 
@@ -336,39 +345,37 @@ Near term, in order:
 1. Six-position static test of each pod, and use the measured scales and
    offsets (limit 2). Then re-check airborne travel *without* the anchor:
    that is the honest test of slow travel.
-2. Whole-ride runs: overlapping windows end to end, written as one output.
+2. Measure the crown-to-fork-pod length at top-out and fix the bending
+   length to it: fitted bending length and slow front travel trade almost
+   freely (the Rust port's own fit moved front median travel 39 -> 67 mm;
+   `core/src/estimate/README.md`).
 3. A second bike (dual-crown MTB or the moto, which needs a calibration
    first) to compare fork bending and frame flex across bikes.
 
-**Rust port** (`core/src/estimate/physics/`, 2026-11-18): the forward model,
-its per-sample Jacobian, the objective and the window solver run in Rust,
-held equal to this code by golden tests (`ml/experiments/export_golden.py`,
-`export_window.py` write the fixtures; regenerate them after a model change
-here). The solve of a real 2 s window lands on PyTorch's loss and travel
-exactly. Not ported yet: the bike fit, the session pipeline (cache, clip and
-airtime masks) and multi-threading. Speed is not yet measured reliably (the
-dev machine was thermally throttled); single-threaded, the Jacobian took
-~0.1 ms per sample against ~0.4 ms per sample for PyTorch on the GPU.
+**Rust port** (`core/src/estimate/physics/`, 2026-11-18): done, apart from
+speed work. The forward model, its per-sample Jacobian, the objective and
+the window solver are held equal to this code by golden tests
+(`ml/experiments/export_golden.py`, `export_window.py` write the fixtures;
+regenerate them after a model change here). The port also has the session
+pipeline this folder does by hand: resampled input and native-rate clip
+masks, the 0.4x-grid-rate low-pass this folder's cache applies, airborne
+detection, still-recording biases, window picking, the 4-bar from the photo
+tool's points, the bike fit across 15 s windows (stored on the calibration
+as its `physics` fit), and a threaded whole-ride solve in overlapping
+windows. First end-to-end check on Beacon, with this folder's fitted
+geometry: front travel 1 % / median / 99 % 0 / 39 / 103 mm and rear
+0 / 51 / 133 mm, against 0 / 42 / 105 and 1 / 51 / 135 here.
 
-Toward the app: the app should be able to show all of this as charts
-(travel with its uncertainty band, airborne events, bending and flex
-spectra, residuals). The seam is **one parquet file of named channels per
-session** in the library's `derived/` folder, overwritten when the
-estimator is re-run. Its metadata records the estimator version and bike-fit
-hash, so a file from an older estimator can be shown as stale. It is never
-written into `data.parquet`: by the library's rule that file is a pure
-function of the blob and the importer, and re-import would drop anything
-appended. The channels are travel, steer, bending, flex, their std and the
-air mask, on the session's recorded time base, under their own names (e.g.
-"ML front travel (mm)") so they plot beside the IEKF's.
-
-The app should read it the way it reads `data.parquet`: as a second lazy
-`ChannelSource` for the session (`core/src/session/handle.rs`, R211.1),
-which decodes one column when a plot asks for it and hands out the shared
-buffer. It should **not** be copied into the derived store, which is
-for outputs computed inside the app (the IEKF's
-`ESTIMATOR_CHANNELS`, recomputed in memory whenever a session opens):
-copying would hold every ML channel twice. Unlike the IEKF, this estimator
-takes minutes per ride on a GPU, so its output has to be stored. Running the
-estimator itself on a phone is the later network step (train a network on
-this objective, export .tflite).
+Toward the app: the port's channels are written to the session's derived
+store (`sessions/<id>/derived/<hash>.parquet`, contract C1 §5,
+`derived_kind` `"physics"`), content-addressed by the IMU channels, the
+configuration (including the bike fit) and the engine version, so a new
+estimator version or a new fit gives a new file and an old one is never
+mistaken for current. They are never written into
+`data.parquet` (a pure function of the blob and the importer). **Nothing
+reads them yet**: neither the app nor `workbook eval`. The missing piece is
+a lazy channel source over the newest current physics file, beside
+`data.parquet`'s, in `core/src/session/handle.rs`, so the channels plot
+beside the IEKF's and workbooks can use them. Running the estimator on a
+phone is the later network step (train a network on this objective, export
+.tflite).
