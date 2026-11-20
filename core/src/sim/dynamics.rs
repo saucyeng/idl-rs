@@ -26,7 +26,7 @@
 //! - Jockeys and toothed rollers: free to spin, with inertia.
 //! - Cage: inertia, mass (its weight and the bike's accelerations swing it),
 //!   the spring toward tension, and the clutch's Coulomb friction against
-//!   turning forward (slack).
+//!   turning forward (slack), one-way, taking hold only after its free play.
 //! - Contact surfaces: the chain can't pass through them; the speed it
 //!   arrives at is recorded.
 
@@ -292,6 +292,10 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
     let mut cage_prev;
     let mut cage_omega = 0.0;
     let fwd_of = |pose: &LinkagePose, cage: f64| (cage - pose.seatstay_rad) * sigma;
+    // the clutch's free play: it holds only once the cage is forward of
+    // `hold_at`; turning back drags the play open behind it
+    let play = dr.clutch_free_play_deg.max(0.0).to_radians();
+    let mut hold_at = f64::INFINITY;
     // the freehub
     let engage = d.freehub_engagement_deg.max(0.1).to_radians();
     let mut wheel_fwd = 0.0f64; // the wheel's forward rotation relative to the seatstay, rad
@@ -586,12 +590,20 @@ pub fn simulate(bike: &SimBike, gear: usize, enabled: &dyn Fn(usize) -> bool, ex
         // clutch and bearing friction on the cage, relative to the seatstay
         let rel = cage_omega - ss_rate;
         let fwd_rate = sigma * rel;
+        let fwd_now = fwd_of(&pose, cage);
+        hold_at = hold_at.min(fwd_now + play);
         let slip;
-        if fwd_rate > 0.0 {
+        if fwd_rate > 0.0 && fwd_now >= hold_at - 1e-9 {
+            hold_at = fwd_now;
             let stop = (dr.clutch_torque_nm + dr.bearing_torque_nm) * dt * jockey_inv_cage;
             let red = fwd_rate.min(stop);
             cage_omega -= sigma * red;
             slip = fwd_rate - red;
+        } else if fwd_rate > 0.0 {
+            // forward inside the play: the bearing only
+            let red = fwd_rate.min(dr.bearing_torque_nm * dt * jockey_inv_cage);
+            cage_omega -= sigma * red;
+            slip = 0.0;
         } else {
             let red = (-fwd_rate).min(dr.bearing_torque_nm * dt * jockey_inv_cage);
             cage_omega += sigma * red;
@@ -846,6 +858,35 @@ mod tests {
         assert!(swing > 0.5, "cage swing {swing} deg");
         assert!(r.summary.max_lower_deflection_mm > 0.5, "{:?}", r.summary);
         assert!(r.summary.max_link_error_mm < 1.0, "{:?}", r.summary);
+    }
+
+    #[test]
+    fn clutch_free_play_lets_the_cage_turn_before_the_clutch_holds() {
+        // Arrange: the same bumps with no play and with 2 degrees of it
+        let mut d = gt_force_drivetrain();
+        let tight = SimBike::new(&gt_force_linkage(), &d).unwrap();
+        d.derailleur.clutch_free_play_deg = 2.0;
+        let loose = SimBike::new(&gt_force_linkage(), &d).unwrap();
+        let e = BumpTrain { count: 2, ..BumpTrain::default() }.excitation(1000.0);
+
+        // Act
+        let a = simulate(&tight, 5, &|_| true, &e, &DynConfig::default(), &mut |_| true).unwrap();
+        let b = simulate(&loose, 5, &|_| true, &e, &DynConfig::default(), &mut |_| true).unwrap();
+
+        // Assert: the play takes up part of each swing the clutch would have resisted
+        assert!(a.summary.clutch_slip_deg > 0.1, "{:?}", a.summary);
+        assert!(b.summary.clutch_slip_deg < a.summary.clutch_slip_deg - 0.1, "{} vs {}", b.summary.clutch_slip_deg, a.summary.clutch_slip_deg);
+    }
+
+    #[test]
+    fn lower_jockey_arm_is_the_pivot_to_lower_jockey_distance() {
+        // Arrange
+        let mut dr = gt_force_drivetrain().derailleur;
+        dr.cage_pivot_m = [0.0, 0.0];
+        dr.lower_jockey_m = [0.03, -0.04];
+
+        // Act / Assert
+        assert!((dr.lower_jockey_arm_m() - 0.05).abs() < 1e-12);
     }
 }
 

@@ -75,9 +75,10 @@ In order of how much each matters:
    The train defines rear travel over time, not a ground shape;
    `BumpTrain::ground_height` gives the ground that alone would produce it
    (rigid tyre, level frame), which the app draws scrolling under the wheel.
-4. **The clutch has no free play.** A real clutch lets the cage turn a little
-   before it bites; here it is Coulomb friction from zero. This overstates
-   clutch work for small motions.
+4. **The clutch is a plain one-way brake after its free play.** It holds the
+   cage forward with a constant torque once the play
+   (`clutch_free_play_deg`) is taken up, and lets it return freely; real
+   clutches vary with speed and wear, and the spring curve is two points.
 5. **A single run's peaks are chaotic.** The chain is a chaotic system: a
    1 % change in a bump moves the worst impact a lot. Compare setups by
    statistics over many hits (counts, distributions, totals), never by one
