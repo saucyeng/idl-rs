@@ -250,6 +250,7 @@ pub(crate) mod tests {
                 imu0: [0.47677, 0.36738],
                 fork_pod: None,
                 rear_pod: None,
+                centre_of_mass: None,
             },
             wheelbase_m: 1.28,
             rear_travel_m: 0.16,
