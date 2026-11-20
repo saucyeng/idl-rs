@@ -132,7 +132,13 @@ pub struct Derailleur {
     /// points and beyond the ends.
     pub spring_torque_nm: Vec<[f64; 2]>,
     /// Clutch friction against the cage turning in the slack direction, N·m.
+    /// It is one-way: the cage turns back toward tension against the spring
+    /// and bearing only.
     pub clutch_torque_nm: f64,
+    /// How far the cage turns forward, degrees, after turning back, before
+    /// the clutch takes hold (the play in its one-way bearing). 0 = none.
+    #[serde(default)]
+    pub clutch_free_play_deg: f64,
     /// Bearing friction either way, N·m.
     pub bearing_torque_nm: f64,
     /// Cage inertia about its pivot, jockeys' masses included, kg·m².
@@ -156,6 +162,15 @@ fn default_cage_mass() -> f64 {
 }
 
 impl Derailleur {
+    /// The cage's lever arm for a force at the lower jockey's centre, m: the
+    /// distance from the cage pivot, so a force pulled square to the cage
+    /// (along the chain, which leaves the lower jockey about square to it)
+    /// times this is the torque on the cage.
+    pub fn lower_jockey_arm_m(&self) -> f64 {
+        let d = [self.lower_jockey_m[0] - self.cage_pivot_m[0], self.lower_jockey_m[1] - self.cage_pivot_m[1]];
+        (d[0] * d[0] + d[1] * d[1]).sqrt()
+    }
+
     /// The spring's torque toward tension, N·m, at the cage turned `deg_forward`
     /// degrees from its drawn angle in the slack direction.
     pub fn spring_torque(&self, deg_forward: f64) -> f64 {
@@ -245,6 +260,7 @@ impl Drivetrain {
                 jockey_teeth: [12, 12],
                 spring_torque_nm: vec![[0.0, 0.45], [60.0, 0.9]],
                 clutch_torque_nm: 1.2,
+                clutch_free_play_deg: 0.0,
                 bearing_torque_nm: 0.01,
                 cage_inertia_kgm2: 1.5e-4,
                 jockey_inertia_kgm2: 3.0e-6,
