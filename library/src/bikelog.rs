@@ -27,7 +27,7 @@ pub use idl_rs::store::session_json::{RunningSheet, SessionBikeLog};
 
 /// One bike (spec §4): its name and which setup-sheet fields it has. The
 /// two parts merge separately, each by its own `*_updated_at_ms`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Bike {
     /// Stable id, also the file name.
     pub bike_id: String,
@@ -44,6 +44,47 @@ pub struct Bike {
     /// When `fields` last changed, UTC ms.
     #[serde(default)]
     pub fields_updated_at_ms: i64,
+    /// A random tag set when the bike is created, telling two different
+    /// bikes with the same id apart (whole-bike sim spec §12): files merge
+    /// only when their ids match and their uids match or one is empty
+    /// (bikes made before uids).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub uid: String,
+    /// The bike this one is a variant of: an idea for that bike, with no
+    /// log or calibrations of its own. Set at creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_of: Option<String>,
+    /// The bike this one's numbers were copied from, when it was started
+    /// from another bike's. Set at creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_from: Option<String>,
+    /// Make, model, year and size, for grouping like with like.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<BikeModel>,
+    /// When `model` last changed, UTC ms.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub model_updated_at_ms: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
+
+/// What a bike is, as its maker names it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BikeModel {
+    /// "GT".
+    #[serde(default)]
+    pub make: String,
+    /// "Force".
+    #[serde(default)]
+    pub model: String,
+    /// Model year, e.g. 2023.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub year: Option<u32>,
+    /// Frame size as the maker names it ("LG").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
 }
 
 impl Bike {
@@ -59,7 +100,27 @@ impl Bike {
             out.fields = other.fields.clone();
             out.fields_updated_at_ms = other.fields_updated_at_ms;
         }
+        if other.model_updated_at_ms > self.model_updated_at_ms {
+            out.model = other.model.clone();
+            out.model_updated_at_ms = other.model_updated_at_ms;
+        }
+        // set once at creation: whichever copy has them
+        if out.uid.is_empty() {
+            out.uid = other.uid.clone();
+        }
+        if out.variant_of.is_none() {
+            out.variant_of = other.variant_of.clone();
+        }
+        if out.copied_from.is_none() {
+            out.copied_from = other.copied_from.clone();
+        }
         out
+    }
+
+    /// Whether `other` is the same bike as this one: the same id, and the
+    /// same uid unless either was made before uids.
+    pub fn same_bike(&self, other: &Bike) -> bool {
+        self.bike_id == other.bike_id && (self.uid.is_empty() || other.uid.is_empty() || self.uid == other.uid)
     }
 }
 
@@ -420,7 +481,108 @@ pub fn bike_for_name(data_root: &Path, name: &str, now_ms: i64) -> Result<Bike, 
         bike_id = format!("{base}-{n}");
         n += 1;
     }
-    save_bike(data_root, &Bike { bike_id, name: wanted.to_string(), name_updated_at_ms: now_ms, fields: Vec::new(), fields_updated_at_ms: 0 })
+    save_bike(data_root, &Bike { bike_id, name: wanted.to_string(), name_updated_at_ms: now_ms, fields: Vec::new(), fields_updated_at_ms: 0, ..Default::default() })
+}
+
+/// The id for a new bike (whole-bike sim spec §12): the owner's initials,
+/// the model year's last two digits, the make and the model, then the
+/// variant after `--`, each word's letters and digits joined by `-`
+/// ("IA-23-GT-Force", "IA-23-GT-Force--lower-idler"). Empty parts are
+/// left out; nothing at all gives "bike".
+pub fn bike_id_for(initials: &str, year: Option<u32>, make: &str, model: &str, variant: Option<&str>) -> String {
+    let words = |t: &str| -> Vec<String> {
+        t.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect()
+    };
+    let mut parts = words(initials);
+    if let Some(y) = year {
+        parts.push(format!("{:02}", y % 100));
+    }
+    parts.extend(words(make));
+    parts.extend(words(model));
+    let mut id = parts.join("-");
+    if let Some(v) = variant.map(words).filter(|v| !v.is_empty()) {
+        id = if id.is_empty() { v.join("-") } else { format!("{id}--{}", v.join("-")) };
+    }
+    if id.is_empty() { "bike".to_string() } else { id }
+}
+
+/// `base`, or `base-2`, `base-3`… : the first id no bike file has yet, so
+/// creating or copying a bike never overwrites one.
+pub fn free_bike_id(data_root: &Path, base: &str) -> String {
+    let mut id = base.to_string();
+    let mut n = 2;
+    while bike_path(data_root, &id).exists() {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+    id
+}
+
+/// A new random uid for a bike.
+pub fn new_uid() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// Creates a bike at the first free id from `base_id` ([`free_bike_id`]),
+/// with a new uid. Returns it.
+pub fn create_bike(data_root: &Path, base_id: &str, name: &str, model: Option<BikeModel>, now_ms: i64) -> Result<Bike, BikeLogError> {
+    check_id(base_id)?;
+    let bike = Bike {
+        bike_id: free_bike_id(data_root, base_id),
+        name: name.trim().to_string(),
+        name_updated_at_ms: now_ms,
+        uid: new_uid(),
+        model_updated_at_ms: if model.is_some() { now_ms } else { 0 },
+        model,
+        ..Default::default()
+    };
+    save_bike(data_root, &bike)
+}
+
+/// How a bike is copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyKind {
+    /// An idea for the same bike: `variant_of` the source.
+    Variant,
+    /// Another real bike started from the source's numbers: `copied_from`.
+    Copy,
+}
+
+/// Copies `from_id`'s parameters (linkage, drivetrain, photo, model) into a
+/// new bike at the first free id from `base_id`, named `name`, with a new
+/// uid and no log or calibrations. A variant of a variant is a variant of
+/// the real bike. Returns the new bike's file.
+pub fn copy_bike(data_root: &Path, from_id: &str, base_id: &str, name: &str, kind: CopyKind, now_ms: i64) -> Result<BikeFile, BikeLogError> {
+    check_id(base_id)?;
+    let from = read_bike_file(data_root, from_id)?;
+    let bike_id = free_bike_id(data_root, base_id);
+    let root_of = from.bike.variant_of.clone().unwrap_or_else(|| from.bike.bike_id.clone());
+    let bike = Bike {
+        bike_id: bike_id.clone(),
+        name: name.trim().to_string(),
+        name_updated_at_ms: now_ms,
+        fields: from.bike.fields.clone(),
+        fields_updated_at_ms: now_ms,
+        uid: new_uid(),
+        variant_of: (kind == CopyKind::Variant).then(|| root_of.clone()),
+        copied_from: (kind == CopyKind::Copy).then(|| from.bike.bike_id.clone()),
+        model: from.bike.model.clone(),
+        model_updated_at_ms: if from.bike.model.is_some() { now_ms } else { 0 },
+    };
+    let mut file = BikeFile::new(bike);
+    file.linkage = from.linkage.clone().map(|l| Linkage { updated_at_ms: now_ms, ..l });
+    file.drivetrain = from.drivetrain.clone().map(|d| Drivetrain { updated_at_ms: now_ms, ..d });
+    // the photo comes along under the new id
+    if let Some(photo) = from.drivetrain.as_ref().and_then(|d| d.photo.as_ref()) {
+        let src = data_root.join("bikes").join(&photo.file);
+        if src.is_file() {
+            let name = save_bike_photo(data_root, &bike_id, &src)?;
+            if let Some(p) = file.drivetrain.as_mut().and_then(|d| d.photo.as_mut()) {
+                p.file = name;
+            }
+        }
+    }
+    save_bike_file(data_root, &file)
 }
 
 /// Records that `session_id` was ridden on `bike_id` (spec §6): sets its
@@ -477,6 +639,9 @@ pub enum BikeLogErrorKind {
     Parse,
     /// An id would not make a safe file name, or names no bike.
     InvalidId,
+    /// A different bike already has this id (its uid differs): nothing was
+    /// overwritten.
+    Conflict,
 }
 
 /// Error from the bike-log store. Never `Err(String)` (CLAUDE.md §5).
@@ -543,6 +708,12 @@ pub fn save_bike_file(data_root: &Path, file: &BikeFile) -> Result<BikeFile, Bik
     let target = bike_path(data_root, &file.bike.bike_id);
     let on_disk = std::fs::read(&target).ok();
     let merged = match on_disk.as_deref().map(BikeFile::from_slice) {
+        Some(Ok(existing)) if !existing.bike.same_bike(&file.bike) => {
+            return Err(BikeLogError {
+                kind: BikeLogErrorKind::Conflict,
+                message: format!("a different bike already has the id {:?} (\"{}\"): not overwritten", existing.bike.bike_id, existing.bike.name),
+            });
+        }
         Some(Ok(existing)) => existing.merge(file),
         _ => file.merge(&BikeFile::new(file.bike.clone())),
     };
@@ -749,7 +920,7 @@ mod tests {
     }
 
     fn gt() -> Bike {
-        Bike { bike_id: "gt".into(), name: "GT".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 0 }
+        Bike { bike_id: "gt".into(), name: "GT".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 0, ..Default::default() }
     }
 
     fn version(id: &str, parents: &[&str], at_ms: i64, updated_at_ms: i64, text: &str) -> EntryVersion {
@@ -933,8 +1104,8 @@ mod tests {
     #[test]
     fn bike_merge_takes_the_newer_of_each_part() {
         // Arrange
-        let a = Bike { bike_id: "gt".into(), name: "GT".into(), name_updated_at_ms: 20, fields: vec!["fork.lsc".into()], fields_updated_at_ms: 5 };
-        let b = Bike { bike_id: "gt".into(), name: "Old".into(), name_updated_at_ms: 10, fields: vec!["fork.lsc".into(), "fork.hsc".into()], fields_updated_at_ms: 30 };
+        let a = Bike { bike_id: "gt".into(), name: "GT".into(), name_updated_at_ms: 20, fields: vec!["fork.lsc".into()], fields_updated_at_ms: 5, ..Default::default() };
+        let b = Bike { bike_id: "gt".into(), name: "Old".into(), name_updated_at_ms: 10, fields: vec!["fork.lsc".into(), "fork.hsc".into()], fields_updated_at_ms: 30, ..Default::default() };
 
         // Act
         let m = a.merge(&b);
@@ -1012,7 +1183,7 @@ mod tests {
         // Arrange
         let older = linkage_from_tool(TOOL_JSON.as_bytes(), Some(0.230), Some(0.17), 10).unwrap();
         let newer = Linkage { front_travel_m: Some(0.18), updated_at_ms: 20, ..older.clone() };
-        let mut a = BikeFile::new(Bike { bike_id: "b".into(), name: "B".into(), name_updated_at_ms: 0, fields: vec![], fields_updated_at_ms: 0 });
+        let mut a = BikeFile::new(Bike { bike_id: "b".into(), name: "B".into(), name_updated_at_ms: 0, fields: vec![], fields_updated_at_ms: 0, ..Default::default() });
         a.linkage = Some(older.clone());
         let mut b = a.clone();
         b.linkage = Some(newer.clone());
@@ -1095,7 +1266,7 @@ mod tests {
     #[test]
     fn a_bike_file_without_calibrations_writes_no_calibrations_key() {
         // Arrange
-        let file = BikeFile::new(Bike { bike_id: "b".into(), name: "B".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 0 });
+        let file = BikeFile::new(Bike { bike_id: "b".into(), name: "B".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 0, ..Default::default() });
 
         // Act
         let text = String::from_utf8(file.to_vec().unwrap()).unwrap();
@@ -1176,7 +1347,7 @@ mod tests {
     fn bike_for_name_finds_by_name_ignoring_case_and_creates_a_new_one_with_a_free_slug() {
         // Arrange
         let root = temp_root();
-        save_bike(&root, &Bike { bike_id: "gt-force".into(), name: "GT Force".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 0 }).unwrap();
+        save_bike(&root, &Bike { bike_id: "gt-force".into(), name: "GT Force".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 0, ..Default::default() }).unwrap();
 
         // Act
         let found = bike_for_name(&root, "  gt force ", 5).unwrap();
@@ -1268,6 +1439,76 @@ mod tests {
         assert_eq!(read_bike_photo(&root, "gt", &second).unwrap(), b"jpg");
         assert!(read_bike_photo(&root, "gt", "../gt.json").is_err());
         assert!(load_bikes(&root).skipped.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bike_id_for_initials_year_make_model_and_variant_joined_by_hyphens() {
+        // Arrange / Act / Assert
+        assert_eq!(bike_id_for("IA", Some(2023), "GT", "Force", None), "IA-23-GT-Force");
+        assert_eq!(bike_id_for("IA", Some(2023), "GT", "Force", Some("lower idler")), "IA-23-GT-Force--lower-idler");
+        assert_eq!(bike_id_for("", None, "Santa Cruz", "Megatower 2", None), "Santa-Cruz-Megatower-2");
+        assert_eq!(bike_id_for(" ", None, "", "", None), "bike");
+        assert!(is_valid_id(&bike_id_for("I.A.", Some(1999), "GT/", "Force (29)", Some("12T, low"))));
+    }
+
+    #[test]
+    fn create_bike_a_taken_id_gets_the_next_number_and_never_overwrites() {
+        // Arrange
+        let root = temp_root();
+        let first = create_bike(&root, "IA-23-GT-Force", "IA 23 GT Force", None, 1).unwrap();
+
+        // Act
+        let second = create_bike(&root, "IA-23-GT-Force", "IA 23 GT Force", None, 2).unwrap();
+
+        // Assert
+        assert_eq!(first.bike_id, "IA-23-GT-Force");
+        assert_eq!(second.bike_id, "IA-23-GT-Force-2");
+        assert_ne!(first.uid, second.uid);
+        assert_eq!(read_bike_file(&root, "IA-23-GT-Force").unwrap().bike.uid, first.uid);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_bike_file_a_different_bike_under_the_same_id_is_refused() {
+        // Arrange
+        let root = temp_root();
+        let mine = create_bike(&root, "gt", "Mine", None, 1).unwrap();
+        let theirs = Bike { uid: new_uid(), name: "Theirs".into(), ..mine.clone() };
+
+        // Act
+        let r = save_bike(&root, &theirs);
+
+        // Assert
+        assert_eq!(r.unwrap_err().kind, BikeLogErrorKind::Conflict);
+        assert_eq!(read_bike_file(&root, "gt").unwrap().bike.name, "Mine");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copy_bike_a_variant_takes_the_parameters_and_not_the_log() {
+        // Arrange: a bike with a log entry and a linkage
+        let root = temp_root();
+        let real = create_bike(&root, "IA-23-GT-Force", "IA 23 GT Force", Some(BikeModel { make: "GT".into(), model: "Force".into(), year: Some(2023), size: Some("LG".into()) }), 1).unwrap();
+        save_entry(&root, &new_note(&real.bike_id, "fork 80 psi", BTreeMap::new(), 5, "desk", 5)).unwrap();
+        let mut file = read_bike_file(&root, &real.bike_id).unwrap();
+        file.drivetrain = Some(Drivetrain::typical([0.43, -0.02], 7));
+        save_bike_file(&root, &file).unwrap();
+
+        // Act
+        let v = copy_bike(&root, &real.bike_id, "IA-23-GT-Force--lower-idler", "IA 23 GT Force - lower idler", CopyKind::Variant, 9).unwrap();
+        let vv = copy_bike(&root, &v.bike.bike_id, "IA-23-GT-Force--other", "other", CopyKind::Variant, 10).unwrap();
+        let c = copy_bike(&root, &real.bike_id, "SK-23-GT-Force", "SK 23 GT Force", CopyKind::Copy, 11).unwrap();
+
+        // Assert
+        assert_eq!(v.bike.variant_of.as_deref(), Some("IA-23-GT-Force"));
+        assert_eq!(vv.bike.variant_of.as_deref(), Some("IA-23-GT-Force"), "a variant of a variant belongs to the real bike");
+        assert_eq!(c.bike.copied_from.as_deref(), Some("IA-23-GT-Force"));
+        assert!(c.bike.variant_of.is_none());
+        assert!(v.entries.is_empty() && v.calibrations.is_empty());
+        assert_eq!(v.drivetrain.as_ref().unwrap().chain_links, file.drivetrain.as_ref().unwrap().chain_links);
+        assert_eq!(v.bike.model.as_ref().unwrap().size.as_deref(), Some("LG"));
+        assert_ne!(v.bike.uid, real.uid);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

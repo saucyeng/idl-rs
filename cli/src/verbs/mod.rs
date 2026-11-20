@@ -228,6 +228,7 @@ pub fn dispatch(noun: &str, matches: &ArgMatches) -> Option<ExitCode> {
         ("bike", "list") => bike::list(&ctx, m),
         ("bike", "show") => bike::show(&ctx, m),
         ("bike", "note") => bike::note(&ctx, m),
+        ("bike", "copy") => bike::copy(&ctx, m),
         ("bike", "calibrate") => bike::calibrate(&ctx, m),
         ("bike", "set") => bike::set(&ctx, m),
         ("session", "estimate-physics") => session::estimate_physics(&ctx, m),

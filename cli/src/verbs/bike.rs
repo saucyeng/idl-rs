@@ -26,6 +26,7 @@ impl From<BikeLogError> for CliError {
             BikeLogErrorKind::InvalidId => ErrorKind::NotFound,
             BikeLogErrorKind::Parse => ErrorKind::InvalidInput,
             BikeLogErrorKind::Encode => ErrorKind::Internal,
+            BikeLogErrorKind::Conflict => ErrorKind::InvalidInput,
         };
         CliError::new(kind, e.message)
     }
@@ -125,6 +126,45 @@ pub fn note(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
         format!("added note {} to {bike_id}", saved.entry_id),
         json!({ "entry": saved, "written": true }),
     ))
+}
+
+/// `bike copy` — a variant of a bike (`--variant <name>`), or a new real
+/// bike for another owner from its numbers (`--initials <XY>`): linkage,
+/// drivetrain, photo and model, a fresh uid, no log or calibrations
+/// (whole-bike sim spec §12). Never overwrites: a taken id gets `-2`.
+pub fn copy(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
+    let root = ctx.data_dir()?;
+    let from_id = text(m, "bike_id")?;
+    let from = bikelog::read_bike_file(root, &from_id)?;
+    let model = from.bike.model.clone().unwrap_or_default();
+    let year = opt_integer(m, "year").map(|y| y as u32).or(model.year);
+    let (kind, initials, variant) = match (opt_text(m, "variant"), opt_text(m, "initials")) {
+        (Some(v), None) => {
+            // a variant keeps its bike's name; a bike without a recorded model lends its name
+            let initials = if from.bike.model.is_some() { from.bike.name.split_whitespace().next().unwrap_or("").to_string() } else { String::new() };
+            (bikelog::CopyKind::Variant, initials, Some(v))
+        }
+        (None, Some(i)) => (bikelog::CopyKind::Copy, i, None),
+        _ => return Err(CliError::usage("give either --variant <name> or --initials <owner>")),
+    };
+    let model_name = if from.bike.model.is_some() { model.model.clone() } else { from.bike.name.clone() };
+    let base = bikelog::bike_id_for(&initials, year, &model.make, &model_name, variant.as_deref());
+    let mut parts: Vec<String> = vec![initials.clone()];
+    if let Some(y) = year {
+        parts.push(format!("{:02}", y % 100));
+    }
+    parts.push(model.make.clone());
+    parts.push(model_name);
+    let mut name = parts.into_iter().filter(|p| !p.trim().is_empty()).collect::<Vec<_>>().join(" ");
+    if let Some(v) = &variant {
+        name = format!("{name} - {v}");
+    }
+    if ctx.dry_run {
+        let id = bikelog::free_bike_id(root, &base);
+        return Ok(VerbOutput::new(format!("would copy {from_id} to {id} ({name})"), json!({ "bike_id": id, "name": name, "written": false })));
+    }
+    let file = bikelog::copy_bike(root, &from_id, &base, &name, kind, now_ms())?;
+    Ok(VerbOutput::new(format!("copied {from_id} to {} ({})", file.bike.bike_id, file.bike.name), json!({ "bike": file.bike, "written": true })))
 }
 
 /// One calibration in a line: the tilt of IMU0, what else was fitted.

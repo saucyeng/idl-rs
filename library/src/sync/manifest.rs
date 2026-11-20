@@ -1110,7 +1110,7 @@ mod tests {
         use crate::bikelog::{save_bike, Bike};
         let root = std::env::temp_dir().join(format!("idl-rs-manifest-bike-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        save_bike(&root, &Bike { bike_id: "gt".into(), name: "GT".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 1 }).unwrap();
+        save_bike(&root, &Bike { bike_id: "gt".into(), name: "GT".into(), name_updated_at_ms: 1, fields: Vec::new(), fields_updated_at_ms: 1, ..Default::default() }).unwrap();
         std::fs::copy(root.join("bikes/gt.json"), root.join("bikes/other.json")).unwrap();
 
         // Act

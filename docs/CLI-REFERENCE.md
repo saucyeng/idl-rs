@@ -13,7 +13,7 @@ idl-rs <noun> <verb> [args] [--flags]
 
 **Verbs.** `list`, `show`, `new`, `check`, `eval`, `set`, `import`, `export`, `scan`, `fold-in`, `index`, `rebuild`, `verify`, `delete`
 
-Verbs added by a later ruling: `set-start` (R229), `set-meta` (R229), `cells` (R229), `data` (R229), `detect` (R229), `laps` (R229), `stale` (R197), `workbook` (R222), `cli` (R230 item 2), `synth` (R187), `calibrate` (R238), `note` (R251), `estimate-physics` (R252).
+Verbs added by a later ruling: `set-start` (R229), `set-meta` (R229), `cells` (R229), `data` (R229), `detect` (R229), `laps` (R229), `stale` (R197), `workbook` (R222), `cli` (R230 item 2), `synth` (R187), `calibrate` (R238), `note` (R251), `estimate-physics` (R252), `copy` (R253).
 
 ## Uniform behaviour
 
@@ -380,6 +380,25 @@ Add a note to a bike's log; its changes update the setup sheet.
 | `--json` | switch | Emit the result as JSON on stdout (schema_version 1); errors become typed JSON on stderr |
 
 Calls `idl_library::bikelog::save_entry`; `--json` emits `Entry`.
+
+### `idl-rs bike copy <bike_id>`
+
+Copy a bike's parameters into a variant of it, or into a new bike for another owner.
+
+| Argument | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `bike_id` | text | yes | Bike id, as `bike list` prints it |
+
+| Flag | Value | Meaning |
+| --- | --- | --- |
+| `--variant` | text | Make a variant (an idea for this bike) with this name, e.g. `lower idler` |
+| `--initials` | text | Make a new real bike for this owner instead (their initials) |
+| `--year` | integer | The new bike's model year; default the source's |
+| `--data-dir` | path | Data directory root (contract C4 §1's <data>); defaults to $IDL1_DATA_DIR |
+| `--dry-run` | switch | Report what would change and write nothing |
+| `--json` | switch | Emit the result as JSON on stdout (schema_version 1); errors become typed JSON on stderr |
+
+Calls `idl_library::bikelog::copy_bike`; `--json` emits `BikeFile`.
 
 ### `idl-rs bike calibrate <bike_id>`
 
