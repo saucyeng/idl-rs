@@ -357,6 +357,7 @@ mod tests {
             imu0: [0.5, 0.4],
             fork_pod: None,
             rear_pod: None,
+            centre_of_mass: None,
         };
         let linkage = Linkage { updated_at_ms: 0, points_m: points, wheelbase_m: 1.2, rear_travel_m: 0.1, front_travel_m: None, shock_eye_to_eye_m: None, source_image: None };
         let mut d = gt_force_drivetrain();

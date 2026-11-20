@@ -97,6 +97,7 @@ mod tests {
             imu0: [0.47677, 0.36738],
             fork_pod: None,
             rear_pod: None,
+            centre_of_mass: None,
         }
     }
 

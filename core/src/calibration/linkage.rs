@@ -39,6 +39,10 @@ pub struct LinkagePoints {
     /// The rear pod, as a check on the calibration's lever arm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rear_pod: Option<[f64; 2]>,
+    /// The rider and bike's centre of mass, riding, for anti-squat and
+    /// load transfer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub centre_of_mass: Option<[f64; 2]>,
 }
 
 /// A bike's rear linkage from the photo tool.
