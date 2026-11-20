@@ -1,10 +1,11 @@
 //! Chain growth, kickback, cage angle and clearance through travel: the
 //! quasi-static answers (spec §2.2). Geometry only, milliseconds to run.
 
-use crate::calibration::linkage::P2;
+use crate::calibration::drivetrain::CHAIN_PITCH_M;
+use crate::calibration::linkage::{LinkagePose, P2};
 
 use super::bike::{SimBike, WheelRole, CHAIN_HALF_ROLLER_M};
-use super::path::{chain_path, close_cage, ChainPath};
+use super::path::{chain_path, close_cage, close_cage_near, ChainPath};
 use super::SimError;
 
 /// One gear's curves through travel. Every vector has one value per travel sample.
@@ -35,6 +36,10 @@ pub struct GearCurves {
     pub clearance_mm: Vec<Vec<f64>>,
     /// Whether each roller touches the chain. One vector per roller.
     pub roller_touching: Vec<Vec<bool>>,
+    /// The squat line's angle above the ground, degrees ([`Squat`]); null
+    /// where it is undefined (the links parallel, or the chain along the
+    /// axle's line).
+    pub squat_angle_deg: Vec<Option<f64>>,
 }
 
 fn seg_dist(p: P2, a: P2, b: P2) -> f64 {
@@ -108,17 +113,21 @@ pub fn gear_curves(bike: &SimBike, gear: usize, samples: usize, enabled: &dyn Fn
         top_span_mm: Vec::with_capacity(n),
         clearance_mm: vec![Vec::with_capacity(n); surfaces.len()],
         roller_touching: vec![Vec::with_capacity(n); bike.drivetrain.rollers.len()],
+        squat_angle_deg: Vec::with_capacity(n),
     };
+    let mut near = fwd0;
     for k in 0..n {
         let s = bike.travel_max_m * k as f64 / (n - 1) as f64;
         let pose = bike.pose(s);
-        let (fwd, path) = close_cage(bike, &pose, gear, enabled)?;
+        let (fwd, path) = close_cage_near(bike, &pose, gear, near, enabled)?;
+        near = fwd;
         let held = chain_path(bike, &pose, gear, bike.cage_abs(&pose, fwd0), enabled)?;
         let g = top_run(&path, cog_ref, pose.seatstay_rad, ring_ref) - run0;
         out.travel_mm.push(s * 1000.0);
         out.growth_mm.push(g * 1000.0);
         out.kickback_deg.push((g / ring_len_r).to_degrees());
         out.cage_deg.push(fwd.to_degrees());
+        out.squat_angle_deg.push(squat(bike, &pose, &path).angle_deg);
         out.loop_change_mm.push((held.length - fixed0) * 1000.0);
         let (ci, _) = path.arc(WheelRole::Cog).expect("cog");
         out.top_span_mm.push(path.lines[ci].len * 1000.0);
@@ -142,6 +151,9 @@ pub struct Snapshot {
     pub cage_deg: f64,
     /// The chain's pin line, closed, metres.
     pub chain: Vec<P2>,
+    /// The chain's pins, one per link, a pitch apart along the pin line
+    /// from where it arrives on the first wheel, metres.
+    pub pins: Vec<P2>,
     /// Wheels the chain goes round, as (centre, radius) in metres; rollers
     /// clear of the chain are included.
     pub wheels: Vec<WheelView>,
@@ -149,6 +161,69 @@ pub struct Snapshot {
     pub linkage: Vec<(String, P2)>,
     /// Contact surfaces at this travel, metres.
     pub surfaces: Vec<Vec<P2>>,
+    /// The squat construction at this travel.
+    pub squat: Squat,
+}
+
+/// The squat construction (Cossalter, Motorcycle Dynamics 2nd ed., §6.1.3,
+/// PDF pp. 246-248): the squat line runs from the rear tyre's contact
+/// point through A, where the chain's top span (from the cog) meets the
+/// line from the rear axle through the instant centre of the body carrying
+/// it (the seatstay, about the frame: where the chainstay's and the
+/// rocker's lines cross). The frame is held level and the ground is a
+/// wheel radius below each axle; the rider's weight shift (sag, pitch) is
+/// not modelled.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Squat {
+    /// Rear axle, metres.
+    pub axle: P2,
+    /// The seatstay's instant centre about the frame, metres; null when the
+    /// chainstay and rocker are parallel.
+    pub ic: Option<P2>,
+    /// Point A, metres; null when undefined.
+    pub point: Option<P2>,
+    /// The rear tyre's contact point, metres.
+    pub contact: P2,
+    /// The front tyre's contact point, metres.
+    pub front_contact: P2,
+    /// The squat line's angle above the ground line (rear to front contact), degrees.
+    pub angle_deg: Option<f64>,
+}
+
+/// Where two lines (each through two points) cross; None when parallel.
+fn cross_lines(a0: P2, a1: P2, b0: P2, b1: P2) -> Option<P2> {
+    let (da, db) = ([a1[0] - a0[0], a1[1] - a0[1]], [b1[0] - b0[0], b1[1] - b0[1]]);
+    let den = da[0] * db[1] - da[1] * db[0];
+    let scale = (da[0].hypot(da[1]) * db[0].hypot(db[1])).max(1e-12);
+    if den.abs() < 1e-9 * scale {
+        return None;
+    }
+    let t = ((b0[0] - a0[0]) * db[1] - (b0[1] - a0[1]) * db[0]) / den;
+    Some([a0[0] + t * da[0], a0[1] + t * da[1]])
+}
+
+/// The squat construction at `pose` with the chain on `path`.
+pub fn squat(bike: &SimBike, pose: &LinkagePose, path: &ChainPath) -> Squat {
+    let p = &bike.points;
+    let r = bike.drivetrain.wheel_radius_m;
+    let axle = pose.seatstay_point(p.rear_axle);
+    let ic = cross_lines(p.main_pivot, pose.horst, p.rocker_frame, pose.seatstay_point(p.ss_rocker));
+    let (ci, _) = path.arc(WheelRole::Cog).expect("the cog is always in the path");
+    let chain = &path.lines[ci];
+    let point = ic.and_then(|c| cross_lines(axle, c, chain.from, chain.to));
+    let contact = [axle[0], axle[1] - r];
+    let front_contact = [p.front_axle[0], p.front_axle[1] - r];
+    let ground = (front_contact[1] - contact[1]).atan2(front_contact[0] - contact[0]);
+    let angle_deg = point.map(|a| ((a[1] - contact[1]).atan2(a[0] - contact[0]) - ground).to_degrees());
+    Squat { axle, ic, point, contact, front_contact, angle_deg }
+}
+
+/// Anti-squat, percent: the squat line's slope over the load transfer
+/// line's (Cossalter §6.1.3, the squat ratio ℜ = tan τ / tan σ inverted to
+/// the bicycle convention, 100 % = no squat), for a centre of mass
+/// `cog_height_m` above the ground on a `wheelbase_m` wheelbase.
+pub fn anti_squat_pct(squat_angle_deg: f64, cog_height_m: f64, wheelbase_m: f64) -> f64 {
+    100.0 * squat_angle_deg.to_radians().tan() * wheelbase_m / cog_height_m.max(1e-6)
 }
 
 /// A wheel to draw.
@@ -198,8 +273,29 @@ pub fn linkage_points(bike: &SimBike, pose: &crate::calibration::linkage::Linkag
 
 /// The bike at travel `travel_m` in gear `gear` with the loop closed.
 pub fn snapshot(bike: &SimBike, travel_m: f64, gear: usize, enabled: &dyn Fn(usize) -> bool) -> Result<Snapshot, SimError> {
+    snapshot_near(bike, travel_m, gear, 0.0, enabled)
+}
+
+/// [`snapshot`] with the cage on the loop-closing angle nearest `near_fwd`
+/// (rad forward from drawn): the previous sample's, through travel.
+pub fn snapshot_near(bike: &SimBike, travel_m: f64, gear: usize, near_fwd: f64, enabled: &dyn Fn(usize) -> bool) -> Result<Snapshot, SimError> {
     let pose = bike.pose(travel_m);
-    let (fwd, path) = close_cage(bike, &pose, gear, enabled)?;
+    let (fwd, path) = close_cage_near(bike, &pose, gear, near_fwd, enabled)?;
+    Ok(snapshot_of(bike, &pose, travel_m, gear, fwd, &path, enabled))
+}
+
+/// The bike as drawn: topped out, in the photo's gear, with the cage at its
+/// drawn angle, so the chain runs round the jockeys where they were clicked
+/// whatever the chain's length (the loop needn't close).
+pub fn drawn_snapshot(bike: &SimBike, enabled: &dyn Fn(usize) -> bool) -> Result<Snapshot, SimError> {
+    let pose = bike.pose(0.0);
+    let gear = bike.drivetrain.derailleur.photo_gear;
+    let path = chain_path(bike, &pose, gear, bike.cage_abs(&pose, 0.0), enabled)?;
+    Ok(snapshot_of(bike, &pose, 0.0, gear, 0.0, &path, enabled))
+}
+
+fn snapshot_of(bike: &SimBike, pose: &LinkagePose, travel_m: f64, gear: usize, fwd: f64, path: &ChainPath, enabled: &dyn Fn(usize) -> bool) -> Snapshot {
+    let pose = *pose;
     let mut wheels: Vec<WheelView> = path.arcs.iter().map(|a| WheelView { role: role_name(a.wheel.role), centre: a.wheel.centre, radius: a.wheel.radius, touching: true }).collect();
     for i in 0..bike.drivetrain.rollers.len() {
         if enabled(i) && path.arc(WheelRole::Roller(i)).is_none() {
@@ -209,14 +305,16 @@ pub fn snapshot(bike: &SimBike, travel_m: f64, gear: usize, enabled: &dyn Fn(usi
     }
     let mut linkage = linkage_points(bike, &pose);
     linkage.push(("cage_pivot".into(), bike.cage_pivot(&pose, gear)));
-    Ok(Snapshot {
+    Snapshot {
         travel_mm: travel_m * 1000.0,
         cage_deg: fwd.to_degrees(),
         chain: path.polyline(0.004),
+        pins: (0..(path.length / CHAIN_PITCH_M).floor() as usize).map(|k| path.point_at(k as f64 * CHAIN_PITCH_M)).collect(),
         wheels,
         linkage,
         surfaces: bike.drivetrain.contacts.iter().map(|s| s.polyline_m.iter().map(|&p| bike.place(&pose, s.body, p)).collect()).collect(),
-    })
+        squat: squat(bike, &pose, path),
+    }
 }
 
 #[cfg(test)]
@@ -333,5 +431,67 @@ mod tests {
         assert!(c.roller_touching[0].iter().all(|&t| t));
         let worst = c.growth_mm.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f64::max);
         assert!(worst < 10.0, "growth jumps {worst:.1} mm between samples: {:?}", c.growth_mm);
+    }
+
+    #[test]
+    fn drawn_snapshot_puts_the_jockeys_where_they_were_clicked_in_the_photos_gear() {
+        // Arrange: a photo taken on the fourth cog
+        let mut d = gt_force_drivetrain();
+        d.derailleur.photo_gear = 3;
+        let bike = SimBike::new(&gt_force_linkage(), &d).unwrap();
+
+        // Act
+        let s = drawn_snapshot(&bike, &|_| true).unwrap();
+
+        // Assert
+        let at = |role: &str| s.wheels.iter().find(|w| w.role == role).unwrap().centre;
+        let near = |a: P2, b: P2| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt() < 1e-6;
+        assert!(near(at("upper_jockey"), d.derailleur.upper_jockey_m) && near(at("lower_jockey"), d.derailleur.lower_jockey_m), "{:?} {:?} vs {:?} {:?}, pose {:?}", at("upper_jockey"), at("lower_jockey"), d.derailleur.upper_jockey_m, d.derailleur.lower_jockey_m, bike.pose(0.0));
+        assert_eq!(s.cage_deg, 0.0);
+        let cog = s.wheels.iter().find(|w| w.role == "cog").unwrap();
+        assert!((cog.radius - crate::calibration::drivetrain::pitch_radius(d.cassette_teeth[3])).abs() < 1e-9, "{}", cog.radius);
+    }
+
+    #[test]
+    fn gear_curves_cage_angle_moves_smoothly_through_travel_in_every_gear() {
+        // Arrange
+        let bike = SimBike::new(&gt_force_linkage(), &gt_force_drivetrain()).unwrap();
+
+        // Act / Assert: no sample jumps to another branch
+        for g in 0..bike.drivetrain.cassette_teeth.len() {
+            let c = gear_curves(&bike, g, 41, &|_| true).unwrap();
+            let worst = c.cage_deg.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f64::max);
+            assert!(worst < 3.0, "gear {g}: cage jumps {worst:.1} deg between samples: {:?}", c.cage_deg);
+        }
+    }
+
+    #[test]
+    fn squat_point_is_on_the_chain_line_and_on_the_axle_to_instant_centre_line() {
+        // Arrange
+        let bike = SimBike::new(&gt_force_linkage(), &gt_force_drivetrain()).unwrap();
+        let pose = bike.pose(0.05);
+        let (_, path) = close_cage(&bike, &pose, 5, &|_| true).unwrap();
+
+        // Act
+        let q = squat(&bike, &pose, &path);
+
+        // Assert: A is collinear with both lines; the contact is a wheel radius under the axle
+        let (a, ic) = (q.point.unwrap(), q.ic.unwrap());
+        let (ci, _) = path.arc(WheelRole::Cog).unwrap();
+        let ch = &path.lines[ci];
+        let off = |p0: P2, p1: P2, x: P2| ((p1[0] - p0[0]) * (x[1] - p0[1]) - (p1[1] - p0[1]) * (x[0] - p0[0])) / (p1[0] - p0[0]).hypot(p1[1] - p0[1]);
+        assert!(off(ch.from, ch.to, a).abs() < 1e-9 && off(q.axle, ic, a).abs() < 1e-9);
+        assert!((q.axle[1] - q.contact[1] - bike.drivetrain.wheel_radius_m).abs() < 1e-12);
+        assert!(q.angle_deg.unwrap().is_finite());
+    }
+
+    #[test]
+    fn anti_squat_is_100_percent_when_the_squat_line_points_at_the_centre_of_mass_over_the_front_contact() {
+        // Arrange: CoM 1.1 m up on a 1.25 m wheelbase
+        let tau = (1.1f64 / 1.25).atan().to_degrees();
+
+        // Act / Assert
+        assert!((anti_squat_pct(tau, 1.1, 1.25) - 100.0).abs() < 1e-9);
+        assert!(anti_squat_pct(0.0, 1.1, 1.25).abs() < 1e-12);
     }
 }
