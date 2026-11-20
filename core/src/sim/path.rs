@@ -215,17 +215,25 @@ pub fn chain_path(bike: &SimBike, pose: &LinkagePose, gear: usize, cage_abs: f64
 /// makes the path as long as the chain at `pose` in gear `gear`, and that
 /// path. Searches -40° to +100° and takes the root nearest the drawn angle.
 pub fn close_cage(bike: &SimBike, pose: &LinkagePose, gear: usize, enabled: &dyn Fn(usize) -> bool) -> Result<(f64, ChainPath), SimError> {
+    close_cage_near(bike, pose, gear, 0.0, enabled)
+}
+
+/// [`close_cage`], taking the root nearest `near_fwd` (rad): through travel,
+/// the previous sample's angle, so the cage follows one branch instead of
+/// jumping to another. A sign change where the path's length jumps (a guide
+/// joining or leaving the chain) is not a root and is skipped.
+pub fn close_cage_near(bike: &SimBike, pose: &LinkagePose, gear: usize, near_fwd: f64, enabled: &dyn Fn(usize) -> bool) -> Result<(f64, ChainPath), SimError> {
     let target = bike.drivetrain.chain_length_m();
     let f = |fwd: f64| chain_path(bike, pose, gear, bike.cage_abs(pose, fwd), enabled).map(|p| p.length - target);
     let (lo, hi, step) = (-0.7_f64, 1.75_f64, 0.01_f64);
-    let mut best: Option<(f64, f64)> = None;
+    let mut brackets: Vec<(f64, f64, f64)> = Vec::new();
     let mut prev: Option<(f64, f64)> = None;
     let mut x = lo;
     while x <= hi {
         if let Ok(v) = f(x) {
             if let Some((px, pv)) = prev {
-                if pv.signum() != v.signum() && (best.is_none() || px.abs() < best.unwrap().0.abs()) {
-                    best = Some((px, x));
+                if pv.signum() != v.signum() {
+                    brackets.push((px, x, pv));
                 }
             }
             prev = Some((x, v));
@@ -234,22 +242,28 @@ pub fn close_cage(bike: &SimBike, pose: &LinkagePose, gear: usize, enabled: &dyn
         }
         x += step;
     }
-    let (mut a, mut b) = best.ok_or_else(|| {
-        SimError::new(SimErrorKind::NoPath, format!("no cage angle fits a {}-link chain in gear {} at this travel: the chain is too short or too long", bike.drivetrain.chain_links, gear + 1))
-    })?;
-    let fa = f(a)?;
-    for _ in 0..60 {
-        let m = 0.5 * (a + b);
-        let fm = f(m)?;
-        if fm.signum() == fa.signum() {
-            a = m;
-        } else {
-            b = m;
+    brackets.sort_by(|p, q| (0.5 * (p.0 + p.1) - near_fwd).abs().total_cmp(&(0.5 * (q.0 + q.1) - near_fwd).abs()));
+    for (mut a, mut b, fa) in brackets {
+        for _ in 0..60 {
+            let m = 0.5 * (a + b);
+            let fm = f(m)?;
+            if fm.signum() == fa.signum() {
+                a = m;
+            } else {
+                b = m;
+            }
+        }
+        let fwd = 0.5 * (a + b);
+        let path = chain_path(bike, pose, gear, bike.cage_abs(pose, fwd), enabled)?;
+        if (path.length - target).abs() < CLOSE_TOL_M {
+            return Ok((fwd, path));
         }
     }
-    let fwd = 0.5 * (a + b);
-    Ok((fwd, chain_path(bike, pose, gear, bike.cage_abs(pose, fwd), enabled)?))
+    Err(SimError::new(SimErrorKind::NoPath, format!("no cage angle fits a {}-link chain in gear {} at this travel: the chain is too short or too long", bike.drivetrain.chain_links, gear + 1)))
 }
+
+/// How near the chain's length a closed loop's path must be, m.
+const CLOSE_TOL_M: f64 = 1e-4;
 
 /// The chain lengths (links, as a fractional range) that close the loop in
 /// every gear from top-out to full travel, with the cage anywhere it can

@@ -258,9 +258,12 @@ impl Drivetrain {
                 upper_jockey_m: [0.008, -0.058],
                 lower_jockey_m: [0.0, -0.22],
                 jockey_teeth: [12, 12],
-                spring_torque_nm: vec![[0.0, 0.45], [60.0, 0.9]],
-                clutch_torque_nm: 1.2,
-                clutch_free_play_deg: 0.0,
+                // a long coil: constant moment, 12 N back at the lower jockey
+                // (172 mm from the pivot); 27 N to pull it forward, so a 15 N
+                // clutch; 1 mm of play there (a GT Force's SRAM, measured 2026-11-20)
+                spring_torque_nm: vec![[0.0, 12.0 * 0.172], [60.0, 12.0 * 0.172]],
+                clutch_torque_nm: 15.0 * 0.172,
+                clutch_free_play_deg: (0.001_f64 / 0.172).to_degrees(),
                 bearing_torque_nm: 0.01,
                 cage_inertia_kgm2: 1.5e-4,
                 jockey_inertia_kgm2: 3.0e-6,
@@ -303,7 +306,8 @@ mod tests {
     #[test]
     fn spring_torque_interpolates_between_points_and_extends_past_the_ends() {
         // Arrange
-        let d = Drivetrain::typical([0.43, 0.02], 0).derailleur;
+        let mut d = Drivetrain::typical([0.43, 0.02], 0).derailleur;
+        d.spring_torque_nm = vec![[0.0, 0.45], [60.0, 0.9]];
 
         // Act
         let (at0, mid, past) = (d.spring_torque(0.0), d.spring_torque(30.0), d.spring_torque(120.0));

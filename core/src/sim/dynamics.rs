@@ -838,7 +838,7 @@ mod tests {
         // Act
         let r = simulate(&bike, 5, &|_| true, &still(0.3), &DynConfig::default(), &mut |_| true).unwrap();
 
-        // Assert: a 0.45-0.9 N·m spring on a ~90 mm cage gives a few N to a few tens of N
+        // Assert: a 2 N·m spring on a 172 mm cage gives a few N to a few tens of N
         let t = *r.channels[5].values.last().unwrap();
         assert!(t > 1.0 && t < 60.0, "lower span {t} N");
     }
@@ -864,6 +864,7 @@ mod tests {
     fn clutch_free_play_lets_the_cage_turn_before_the_clutch_holds() {
         // Arrange: the same bumps with no play and with 2 degrees of it
         let mut d = gt_force_drivetrain();
+        d.derailleur.clutch_free_play_deg = 0.0;
         let tight = SimBike::new(&gt_force_linkage(), &d).unwrap();
         d.derailleur.clutch_free_play_deg = 2.0;
         let loose = SimBike::new(&gt_force_linkage(), &d).unwrap();
