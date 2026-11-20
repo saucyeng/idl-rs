@@ -277,6 +277,10 @@ pub const VERBS_RULED: &[(&str, &str)] = &[
     // The physics estimator's run over a session (Isaac, 2026-11-18, in the
     // `ml/` port; numbered here as the next after R251).
     ("estimate-physics", "R252"),
+    // `bike copy` (Isaac, 2026-11-20, whole-bike sim spec §12): a variant
+    // or a new bike from another's numbers, with a fresh uid, so an agent
+    // making test setups never hand-copies a bike file.
+    ("copy", "R253"),
 ];
 
 /// Whether `verb` is in either vocabulary (the table's own vocabulary tests).
@@ -877,6 +881,23 @@ pub const COMMANDS: &[CommandRow] = &[
     },
     CommandRow {
         noun: "bike",
+        verb: "copy",
+        args: &[BIKE_ID_ARG],
+        flags: &[
+            Flag::value("variant", ValueKind::Text, "Make a variant (an idea for this bike) with this name, e.g. `lower idler`"),
+            Flag::value("initials", ValueKind::Text, "Make a new real bike for this owner instead (their initials)"),
+            Flag::value("year", ValueKind::Integer, "The new bike's model year; default the source's"),
+        ],
+        core_fn: "idl_library::bikelog::copy_bike",
+        json_shape: Some("BikeFile"),
+        help: "Copy a bike's parameters into a variant of it, or into a new bike for another owner",
+        tier: Tier::Occasional,
+        status: Status::Current,
+        data_dir: true,
+        writer: true,
+    },
+    CommandRow {
+        noun: "bike",
         verb: "calibrate",
         args: &[BIKE_ID_ARG],
         flags: &[
@@ -1120,7 +1141,7 @@ mod tests {
         // Arrange
         let expected = [
             "set-start", "set-meta", "cells", "data", "detect", "laps", "stale", "workbook", "cli",
-            "synth", "calibrate", "note", "estimate-physics",
+            "synth", "calibrate", "note", "estimate-physics", "copy",
         ];
 
         // Act

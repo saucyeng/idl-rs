@@ -562,7 +562,24 @@ fn install_bike(data_root: &Path, item: &SyncItem, bytes: &[u8]) -> Result<Insta
     if peer.bike.bike_id != item.key || !crate::bikelog::is_valid_id(&peer.bike.bike_id) {
         return Err(malformed(format!("bike: asked for {:?}, received {:?}", item.key, peer.bike.bike_id)));
     }
-    crate::bikelog::save_bike_file(data_root, &peer).map_err(bikelog_error)?;
+    match crate::bikelog::save_bike_file(data_root, &peer) {
+        Err(e) if e.kind == crate::bikelog::BikeLogErrorKind::Conflict => {
+            // a different bike under the same id (whole-bike sim spec §12): kept
+            // alongside, in the copy it went to before if there is one
+            let id = crate::bikelog::load_bikes(data_root)
+                .bikes
+                .iter()
+                .find(|b| !peer.bike.uid.is_empty() && b.uid == peer.bike.uid)
+                .map(|b| b.bike_id.clone())
+                .unwrap_or_else(|| crate::bikelog::free_bike_id(data_root, &peer.bike.bike_id));
+            let mut moved = peer.clone();
+            moved.bike.bike_id = id;
+            crate::bikelog::save_bike_file(data_root, &moved).map_err(bikelog_error)?;
+        }
+        r => {
+            r.map_err(bikelog_error)?;
+        }
+    }
     Ok(InstallOutcome::Installed)
 }
 
@@ -1159,5 +1176,24 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_bike_a_different_bike_with_the_same_id_is_kept_alongside_and_found_again() {
+        // Arrange: my "gt" and a teammate's "gt" with another uid
+        let root = temp_root();
+        let mine = crate::bikelog::create_bike(&root, "gt", "Mine", None, 1).unwrap();
+        let theirs = crate::bikelog::BikeFile::new(crate::bikelog::Bike { uid: crate::bikelog::new_uid(), name: "Theirs".into(), ..mine.clone() });
+        let bytes = theirs.to_vec().unwrap();
+        let item = SyncItem { class: SyncClass::Bike, key: "gt".into(), session_id: None, size_bytes: bytes.len() as u64 };
+
+        // Act: it arrives twice
+        install(&root, &item, &bytes, "peer", 1, &InstallContext::default()).unwrap();
+        install(&root, &item, &bytes, "peer", 2, &InstallContext::default()).unwrap();
+
+        // Assert
+        assert_eq!(crate::bikelog::read_bike_file(&root, "gt").unwrap().bike.name, "Mine");
+        assert_eq!(crate::bikelog::read_bike_file(&root, "gt-2").unwrap().bike.name, "Theirs");
+        assert!(!crate::bikelog::bike_path(&root, "gt-3").exists());
     }
 }
