@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use idl_rs::calibration::bike::{calibration_for, merge_calibrations, BikeCalibration};
 use idl_rs::calibration::drivetrain::Drivetrain;
 use idl_rs::calibration::linkage::Linkage;
+use idl_rs::calibration::params::{self, Params};
 use idl_rs::store::atomic::{sha256_hex, write_atomic_with_retry, AtomicWriteError};
 
 // The session.json schema owns these two; re-exported so the bike log's own
@@ -234,6 +235,13 @@ pub struct BikeFile {
     pub linkage: Option<Linkage>,
     /// The drivetrain for the drivetrain simulator. None: not entered.
     pub drivetrain: Option<Drivetrain>,
+    /// The bike's own parameter values by key (`idl_rs::calibration::params`):
+    /// what it is (masses, sizes) and, for a variant, its whole setup. A
+    /// real bike's logged setup changes live in its log, applied on top
+    /// ([`effective_parameters`]).
+    pub parameters: Params,
+    /// When `parameters` last changed, UTC ms.
+    pub parameters_updated_at_ms: i64,
 }
 
 /// An entry as written in the file: the current version's fields at the
@@ -261,12 +269,16 @@ struct StoredBikeFile {
     linkage: Option<Linkage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     drivetrain: Option<Drivetrain>,
+    #[serde(default, skip_serializing_if = "Params::is_empty")]
+    parameters: Params,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    parameters_updated_at_ms: i64,
 }
 
 impl BikeFile {
     /// A new bike with an empty log.
     pub fn new(bike: Bike) -> BikeFile {
-        BikeFile { bike, entries: Vec::new(), calibrations: Vec::new(), linkage: None, drivetrain: None }
+        BikeFile { bike, entries: Vec::new(), calibrations: Vec::new(), linkage: None, drivetrain: None, parameters: Params::new(), parameters_updated_at_ms: 0 }
     }
 
     /// Parses a bike file.
@@ -281,6 +293,8 @@ impl BikeFile {
             calibrations: merge_calibrations(&stored.calibrations, &[]),
             linkage: stored.linkage,
             drivetrain: stored.drivetrain,
+            parameters: stored.parameters,
+            parameters_updated_at_ms: stored.parameters_updated_at_ms,
         };
         for s in stored.entries {
             let mut versions = s.history;
@@ -309,6 +323,8 @@ impl BikeFile {
             calibrations: self.calibrations.clone(),
             linkage: self.linkage.clone(),
             drivetrain: self.drivetrain.clone(),
+            parameters: self.parameters.clone(),
+            parameters_updated_at_ms: self.parameters_updated_at_ms,
         })
             .map_err(|e| BikeLogError { kind: BikeLogErrorKind::Encode, message: e.to_string() })
     }
@@ -343,6 +359,9 @@ impl BikeFile {
                 (Some(a), Some(b)) => Some(if b.updated_at_ms > a.updated_at_ms { b.clone() } else { a.clone() }),
                 (a, b) => a.clone().or_else(|| b.clone()),
             },
+            // the copy changed last wins, as the linkage
+            parameters: if other.parameters_updated_at_ms > self.parameters_updated_at_ms { other.parameters.clone() } else { self.parameters.clone() },
+            parameters_updated_at_ms: self.parameters_updated_at_ms.max(other.parameters_updated_at_ms),
         };
         for e in &other.entries {
             out.upsert(e);
@@ -572,6 +591,9 @@ pub fn copy_bike(data_root: &Path, from_id: &str, base_id: &str, name: &str, kin
     let mut file = BikeFile::new(bike);
     file.linkage = from.linkage.clone().map(|l| Linkage { updated_at_ms: now_ms, ..l });
     file.drivetrain = from.drivetrain.clone().map(|d| Drivetrain { updated_at_ms: now_ms, ..d });
+    // a variant or copy starts from the source as it is now: its own values with its log applied
+    file.parameters = effective_parameters(&from, now_ms);
+    file.parameters_updated_at_ms = now_ms;
     // the photo comes along under the new id
     if let Some(photo) = from.drivetrain.as_ref().and_then(|d| d.photo.as_ref()) {
         let src = data_root.join("bikes").join(&photo.file);
@@ -581,6 +603,38 @@ pub fn copy_bike(data_root: &Path, from_id: &str, base_id: &str, name: &str, kin
                 p.file = name;
             }
         }
+    }
+    save_bike_file(data_root, &file)
+}
+
+/// The bike's parameters at `at_ms`: its own values with its log's running
+/// sheet up to then on top (whole-bike sim spec §12).
+pub fn effective_parameters(file: &BikeFile, at_ms: i64) -> Params {
+    params::overlay(&file.parameters, &running_sheet(&file.entries, at_ms).values)
+}
+
+/// Sets parameter values on a bike (whole-bike sim spec §12): on a real
+/// bike, the logged ones (pressures, clicks) become one log note at
+/// `now_ms` and the rest change the bike's own values; on a variant, all
+/// change its own values. A `null` value clears one of the bike's own
+/// values. Returns the bike's file as written.
+pub fn set_parameters(data_root: &Path, bike_id: &str, values: &Params, note: &str, device: &str, now_ms: i64) -> Result<BikeFile, BikeLogError> {
+    let mut file = read_bike_file(data_root, bike_id)?;
+    let real = file.bike.variant_of.is_none();
+    let mut logged = BTreeMap::new();
+    for (k, v) in values {
+        let to_log = real && !v.is_null() && params::spec(k).is_some_and(|s| s.logged);
+        if to_log {
+            logged.insert(k.clone(), v.clone());
+        } else if v.is_null() {
+            file.parameters.remove(k);
+        } else {
+            file.parameters.insert(k.clone(), v.clone());
+        }
+    }
+    file.parameters_updated_at_ms = now_ms;
+    if !logged.is_empty() {
+        file.upsert(&new_note(bike_id, note, logged, now_ms, device, now_ms));
     }
     save_bike_file(data_root, &file)
 }
@@ -1509,6 +1563,31 @@ mod tests {
         assert_eq!(v.drivetrain.as_ref().unwrap().chain_links, file.drivetrain.as_ref().unwrap().chain_links);
         assert_eq!(v.bike.model.as_ref().unwrap().size.as_deref(), Some("LG"));
         assert_ne!(v.bike.uid, real.uid);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_parameters_a_real_bike_logs_setup_changes_and_keeps_masses_a_variant_keeps_both() {
+        // Arrange
+        let root = temp_root();
+        let real = create_bike(&root, "gt", "GT", None, 1).unwrap();
+        let values: Params = [("fork.psi".to_string(), serde_json::json!(80)), ("mass.fork_kg".to_string(), serde_json::json!(2.2))].into();
+
+        // Act
+        let f = set_parameters(&root, &real.bike_id, &values, "more support", "desk", 10).unwrap();
+        let v = copy_bike(&root, &real.bike_id, "gt--idler", "GT - idler", CopyKind::Variant, 20).unwrap();
+        let fv = set_parameters(&root, &v.bike.bike_id, &[("fork.psi".to_string(), serde_json::json!(85))].into(), "", "desk", 30).unwrap();
+
+        // Assert: the pressure is a log note on the real bike, the mass its own value
+        assert_eq!(f.entries.len(), 1);
+        assert!(!f.parameters.contains_key("fork.psi"));
+        assert_eq!(params::number(&effective_parameters(&f, 10), "fork.psi"), Some(80.0));
+        assert_eq!(params::number(&effective_parameters(&f, 5), "fork.psi"), None, "before the note");
+        assert_eq!(params::number(&f.parameters, "mass.fork_kg"), Some(2.2));
+        // the variant took the real bike's values as they were, and keeps its own changes
+        assert_eq!(params::number(&v.parameters, "fork.psi"), Some(80.0));
+        assert!(fv.entries.is_empty());
+        assert_eq!(params::number(&effective_parameters(&fv, 30), "fork.psi"), Some(85.0));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

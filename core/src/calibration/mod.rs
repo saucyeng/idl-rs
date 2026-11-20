@@ -23,6 +23,7 @@ pub mod bike;
 pub mod drivetrain;
 pub mod json;
 pub mod linkage;
+pub mod params;
 pub mod rigid;
 
 /// Computes per-axis bias by averaging N static samples.
