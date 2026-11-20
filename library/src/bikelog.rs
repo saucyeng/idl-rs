@@ -613,6 +613,39 @@ pub fn effective_parameters(file: &BikeFile, at_ms: i64) -> Params {
     params::overlay(&file.parameters, &running_sheet(&file.entries, at_ms).values)
 }
 
+/// A sag measurement from the log: a live note that set `fork.sag_mm` or
+/// `shock.sag_mm`, with the bike's parameters at that moment (pressures,
+/// spacers, carried mass), so a later pressure change doesn't rewrite it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SagMeasurement {
+    /// The note's entry id.
+    pub entry_id: String,
+    /// When it was measured, UTC ms.
+    pub at_ms: i64,
+    /// The bike's effective parameters then ([`effective_parameters`]).
+    pub params: Params,
+    /// Which ends it measured: `fork.sag_mm` and/or `shock.sag_mm` were in the note.
+    pub fork: bool,
+    /// See `fork`.
+    pub shock: bool,
+}
+
+/// Every sag measurement in the bike's log, oldest first.
+pub fn sag_measurements(file: &BikeFile) -> Vec<SagMeasurement> {
+    let mut out: Vec<SagMeasurement> = file
+        .entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::Note)
+        .filter_map(|e| {
+            let v = e.current().filter(|v| !v.deleted)?;
+            let (fork, shock) = (v.changes.contains_key("fork.sag_mm"), v.changes.contains_key("shock.sag_mm"));
+            (fork || shock).then(|| SagMeasurement { entry_id: e.entry_id.clone(), at_ms: v.at_ms, params: effective_parameters(file, v.at_ms), fork, shock })
+        })
+        .collect();
+    out.sort_by(|a, b| (a.at_ms, &a.entry_id).cmp(&(b.at_ms, &b.entry_id)));
+    out
+}
+
 /// Sets parameter values on a bike (whole-bike sim spec §12): on a real
 /// bike, the logged ones (pressures, clicks) become one log note at
 /// `now_ms` and the rest change the bike's own values; on a variant, all
@@ -1589,5 +1622,27 @@ mod tests {
         assert!(fv.entries.is_empty());
         assert_eq!(params::number(&effective_parameters(&fv, 30), "fork.psi"), Some(85.0));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sag_measurements_carry_the_pressure_logged_before_them_not_after() {
+        // Arrange
+        let root = temp_root();
+        let b = create_bike(&root, "b", "B", None, 1).unwrap();
+        let set = |k: &str, v: serde_json::Value, t: i64| {
+            set_parameters(&root, &b.bike_id, &[(k.to_string(), v)].into(), "", "pc", t).unwrap();
+        };
+        set("shock.psi", serde_json::json!(200), 10);
+        set("shock.sag_mm", serde_json::json!(18), 20);
+        set("shock.psi", serde_json::json!(220), 30);
+
+        // Act
+        let m = sag_measurements(&read_bike_file(&root, &b.bike_id).unwrap());
+
+        // Assert
+        assert_eq!(m.len(), 1);
+        assert!(m[0].shock && !m[0].fork);
+        assert_eq!(params::number(&m[0].params, "shock.psi"), Some(200.0));
+        assert_eq!(params::number(&m[0].params, "shock.sag_mm"), Some(18.0));
     }
 }

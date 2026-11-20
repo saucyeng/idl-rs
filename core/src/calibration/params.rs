@@ -29,6 +29,8 @@ pub enum Family {
     Shock,
     /// Frame settings.
     Frame,
+    /// The frame's geometry table (one size), as the maker lists it.
+    Geometry,
     /// Bars and stem.
     Cockpit,
     /// Component and whole-bike masses.
@@ -108,6 +110,11 @@ pub const PARAMS: &[ParamSpec] = &[
     n("fork.hsc", "HSC", "clicks", Fork, true),
     n("fork.lsr", "LSR", "clicks", Fork, true),
     n("fork.hsr", "HSR", "clicks", Fork, true),
+    n("fork.sag_mm", "Measured sag (stanchion)", "mm", Fork, true),
+    n("fork.piston_area_cm2", "Air piston area", "cm²", Fork, false),
+    n("fork.positive_volume_cc", "Positive chamber at top-out", "cc", Fork, false),
+    n("fork.negative_volume_cc", "Negative chamber at top-out", "cc", Fork, false),
+    n("fork.reducer_cc", "Volume per reducer", "cc", Fork, false),
     t("shock.model", "Shock", Shock),
     n("shock.travel_mm", "Shock travel", "mm", Shock, true),
     n("shock.wheel_travel_mm", "Wheel travel", "mm", Shock, true),
@@ -118,7 +125,28 @@ pub const PARAMS: &[ParamSpec] = &[
     n("shock.hsc", "HSC", "clicks", Shock, true),
     n("shock.lsr", "LSR", "clicks", Shock, true),
     n("shock.hsr", "HSR", "clicks", Shock, true),
+    n("shock.sag_mm", "Measured sag (shaft)", "mm", Shock, true),
+    n("shock.piston_area_cm2", "Air piston area", "cm²", Shock, false),
+    n("shock.positive_volume_cc", "Positive chamber at top-out", "cc", Shock, false),
+    n("shock.negative_volume_cc", "Negative chamber at top-out", "cc", Shock, false),
+    n("shock.spacer_cc", "Volume per spacer", "cc", Shock, false),
     t("frame.flip_chip", "Flip chip", Frame),
+    t("geometry.size", "Size", Geometry),
+    n("geometry.head_angle_deg", "Head angle", "°", Geometry, false),
+    n("geometry.seat_angle_deg", "Seat angle (effective)", "°", Geometry, false),
+    n("geometry.stack_mm", "Stack", "mm", Geometry, false),
+    n("geometry.reach_mm", "Reach", "mm", Geometry, false),
+    n("geometry.top_tube_mm", "Top tube (effective)", "mm", Geometry, false),
+    n("geometry.head_tube_mm", "Head tube", "mm", Geometry, false),
+    n("geometry.seat_tube_mm", "Seat tube", "mm", Geometry, false),
+    n("geometry.chainstay_mm", "Chainstay", "mm", Geometry, false),
+    n("geometry.wheelbase_mm", "Wheelbase", "mm", Geometry, false),
+    n("geometry.bb_drop_mm", "BB drop", "mm", Geometry, false),
+    n("geometry.bb_height_mm", "BB height", "mm", Geometry, false),
+    n("geometry.fork_offset_mm", "Fork offset", "mm", Geometry, false),
+    n("geometry.trail_mm", "Trail", "mm", Geometry, false),
+    n("geometry.standover_mm", "Standover", "mm", Geometry, false),
+    n("geometry.fork_length_mm", "Fork length (axle to crown)", "mm", Geometry, false),
     n("cockpit.bar_height_mm", "Bar height", "mm", Cockpit, true),
     n("mass.bike_kg", "Whole bike, weighed", "kg", Masses, false),
     n("mass.frame_kg", "Frame without shock", "kg", Masses, false),
@@ -126,6 +154,7 @@ pub const PARAMS: &[ParamSpec] = &[
     n("mass.shock_kg", "Shock", "kg", Masses, false),
     n("rider.mass_kg", "Rider in kit", "kg", Rider, false),
     n("rider.height_m", "Rider height", "m", Rider, false),
+    n("rider.carried_kg", "Carried (pack, bottles)", "kg", Rider, true),
 ];
 
 /// The spec for `key`, if it is in the vocabulary.

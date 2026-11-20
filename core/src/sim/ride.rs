@@ -1,0 +1,312 @@
+//! The rear end riding over terrain (whole-bike sim spec §9, stride 3): the
+//! rear wheel's travel comes out of the springs, the damper and the tyre
+//! instead of being prescribed. A two-mass model in the vertical: the
+//! rear's share of the sprung mass on the shock (through the leverage), the
+//! unsprung mass on the tyre, the tyre on the ground. The frame stays level
+//! (no pitch) and the front is not modelled yet.
+//!
+//! The result is an [`Excitation`], so the chain's dynamics
+//! ([`super::dynamics`]) run on it unchanged: suspension drives the chain.
+//! The chain's force back on the suspension (anti-squat while pedalling,
+//! chain tension) is not yet fed back.
+
+use super::bike::SimBike;
+use super::excite::{Excitation, G};
+use super::suspension::{leverage_ratio, shock_stroke, AirSpring, N_DYNAMIC};
+use super::{SimError, SimErrorKind};
+
+/// A damper at the shock shaft: linear up to a knee, then a shallower line
+/// (the high-speed circuit), in compression and in rebound. N·s/m at the shaft.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Damper {
+    /// Low-speed compression, N·s/m.
+    pub lsc_ns_m: f64,
+    /// High-speed compression past the knee, N·s/m.
+    pub hsc_ns_m: f64,
+    /// Low-speed rebound, N·s/m.
+    pub lsr_ns_m: f64,
+    /// High-speed rebound past the knee, N·s/m.
+    pub hsr_ns_m: f64,
+    /// Shaft speed where high speed starts, m/s.
+    pub knee_mps: f64,
+}
+
+impl Default for Damper {
+    /// A mid-range air shock's damping at the shaft, middle clicks: an
+    /// estimate until the shock is dyno'd or identified from a ride.
+    fn default() -> Self {
+        Damper { lsc_ns_m: 4000.0, hsc_ns_m: 1200.0, lsr_ns_m: 9000.0, hsr_ns_m: 3500.0, knee_mps: 0.15 }
+    }
+}
+
+impl Damper {
+    /// The damping force at the shaft, N, resisting shaft speed `v_mps`
+    /// (positive compressing).
+    pub fn force_n(&self, v_mps: f64) -> f64 {
+        let (lo, hi) = if v_mps >= 0.0 { (self.lsc_ns_m, self.hsc_ns_m) } else { (self.lsr_ns_m, self.hsr_ns_m) };
+        let s = v_mps.abs();
+        let f = if s <= self.knee_mps { lo * s } else { lo * self.knee_mps + hi * (s - self.knee_mps) };
+        f.copysign(v_mps)
+    }
+}
+
+/// The rear end, ready to ride.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RearEnd {
+    /// The rear wheel's share of the sprung mass, kg.
+    pub sprung_kg: f64,
+    /// Rear unsprung mass (wheel, part of the swingarm), kg.
+    pub unsprung_kg: f64,
+    /// The shock's air spring.
+    pub spring: AirSpring,
+    /// Its gauge pressure, Pa.
+    pub gauge_pa: f64,
+    /// The shock's damper.
+    pub damper: Damper,
+    /// Tyre radial stiffness, N/m.
+    pub tyre_k_n_m: f64,
+    /// Tyre damping, N·s/m.
+    pub tyre_c_ns_m: f64,
+}
+
+/// Tyre radial stiffness for a pressure, N/m: a 29 x 2.5" MTB tyre's
+/// load-deflection slope, roughly linear in pressure (casing stiffness plus
+/// the air): about 110 kN/m at 25 psi.
+pub fn tyre_stiffness_n_m(psi: f64) -> f64 {
+    20_000.0 + 3_600.0 * psi.max(0.0)
+}
+
+/// One bump or drop on the trail.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Feature {
+    /// Where it starts, metres along the trail.
+    pub at_m: f64,
+    /// Its length along the trail, metres.
+    pub length_m: f64,
+    /// Its height, metres: positive a bump (half-cosine up and down),
+    /// negative a step down (a half-cosine ramp to the lower level).
+    pub height_m: f64,
+}
+
+/// The trail's surface: flat with [`Feature`]s on it.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct Terrain {
+    /// The features, in any order.
+    pub features: Vec<Feature>,
+}
+
+impl Terrain {
+    /// Ground height at `x_m` along the trail, metres.
+    pub fn height(&self, x_m: f64) -> f64 {
+        let pi = std::f64::consts::PI;
+        self.features
+            .iter()
+            .map(|f| {
+                let u = (x_m - f.at_m) / f.length_m.max(1e-6);
+                if f.height_m >= 0.0 {
+                    if (0.0..1.0).contains(&u) { f.height_m * 0.5 * (1.0 - (2.0 * pi * u).cos()) } else { 0.0 }
+                } else if u <= 0.0 {
+                    0.0
+                } else if u >= 1.0 {
+                    f.height_m
+                } else {
+                    f.height_m * 0.5 * (1.0 - (pi * u).cos())
+                }
+            })
+            .sum()
+    }
+
+    /// `count` bumps `height_m` high and `length_m` long, `spacing_m` apart, the first at `lead_m`.
+    pub fn bumps(count: u32, height_m: f64, length_m: f64, spacing_m: f64, lead_m: f64) -> Terrain {
+        Terrain { features: (0..count).map(|i| Feature { at_m: lead_m + i as f64 * spacing_m, length_m, height_m }).collect() }
+    }
+}
+
+/// What a ride produced beside its excitation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RideOut {
+    /// The travel and chassis motion, for the chain's dynamics.
+    pub excitation: Excitation,
+    /// Tyre force on the ground at each sample, N (0 in the air).
+    pub tyre_n: Vec<f64>,
+    /// Shock force at the shaft at each sample, N.
+    pub shock_n: Vec<f64>,
+    /// Ground height under the tyre at each sample, m.
+    pub ground_m: Vec<f64>,
+    /// Static sag the ride starts from, m of wheel travel.
+    pub sag_m: f64,
+}
+
+/// The suspension's force at the wheel, N, at travel `s` and travel speed
+/// `v` (positive compressing): spring and damper through the leverage, with
+/// stiff stops at top-out and bottom-out. The air compresses adiabatically
+/// about the shock's stroke at sag, `x_sag`.
+fn wheel_force(bike: &SimBike, rear: &RearEnd, x_sag: f64, s: f64, v: f64) -> f64 {
+    let max = bike.travel_max_m;
+    let sc = s.clamp(0.0, max);
+    let lr = leverage_ratio(bike, sc).unwrap_or(3.0).max(0.5);
+    let x = shock_stroke(bike, sc).unwrap_or(sc / lr);
+    let spring = rear.spring.force_about_n(rear.gauge_pa, x_sag, x, N_DYNAMIC);
+    let damper = rear.damper.force_n(v / lr);
+    let stop = if s < 0.0 { 2.0e6 * s } else if s > max { 2.0e6 * (s - max) } else { 0.0 };
+    (spring + damper) / lr + stop
+}
+
+/// Rides the rear end over `terrain` at `speed_mps` for `duration_s`,
+/// sampling the result at `rate_hz`, from rest at sag on the flat. Errors:
+/// `Excitation` for a non-positive speed, duration or rate, or a rear end
+/// that can't hold its load (it sits on the stop).
+pub fn ride(bike: &SimBike, rear: &RearEnd, terrain: &Terrain, speed_mps: f64, duration_s: f64, rate_hz: f64) -> Result<RideOut, SimError> {
+    if !(speed_mps > 0.0 && duration_s > 0.0 && rate_hz > 0.0) {
+        return Err(SimError::new(SimErrorKind::Excitation, "a ride needs a positive speed, duration and sample rate"));
+    }
+    let (ms, mu) = (rear.sprung_kg, rear.unsprung_kg.max(0.5));
+    // static sag: the wheel force holding the sprung weight (slow spring)
+    let hold = |s: f64| {
+        let lr = leverage_ratio(bike, s).unwrap_or(3.0).max(0.5);
+        rear.spring.force_n(rear.gauge_pa, shock_stroke(bike, s).unwrap_or(s / lr), 1.0) / lr - ms * G
+    };
+    let (mut a, mut b) = (0.0, bike.travel_max_m);
+    if hold(b) < 0.0 {
+        return Err(SimError::new(SimErrorKind::Excitation, "the shock can't hold the rear's weight: it sits bottomed out (more pressure)"));
+    }
+    for _ in 0..60 {
+        let m = 0.5 * (a + b);
+        if hold(m) < 0.0 {
+            a = m;
+        } else {
+            b = m;
+        }
+    }
+    let sag = 0.5 * (a + b);
+    let x_sag = shock_stroke(bike, sag).unwrap_or(0.0);
+    // axle height above the flat (the tyre's centre over its undeformed radius) and the frame's datum
+    let squash0 = (ms + mu) * G / rear.tyre_k_n_m;
+    let mut yu = -squash0;
+    let mut vu = 0.0;
+    let mut ys = yu - sag;
+    let mut vs = 0.0;
+
+    let dt = 2.0e-5;
+    let steps_per_sample = ((1.0 / rate_hz) / dt).round().max(1.0) as usize;
+    let dt = 1.0 / rate_hz / steps_per_sample as f64;
+    let n = (duration_s * rate_hz).ceil() as usize + 1;
+    let mut out = RideOut {
+        excitation: Excitation { t_s: Vec::with_capacity(n), travel_m: Vec::with_capacity(n), fx: vec![0.0; n], fy: Vec::with_capacity(n), omega: vec![0.0; n], speed_mps: vec![speed_mps; n] },
+        tyre_n: Vec::with_capacity(n),
+        shock_n: Vec::with_capacity(n),
+        ground_m: Vec::with_capacity(n),
+        sag_m: sag,
+    };
+    let forces = |t: f64, yu: f64, vu: f64, ys: f64, vs: f64| {
+        let x = speed_mps * t;
+        let (g, g_next) = (terrain.height(x), terrain.height(x + speed_mps * 1e-4));
+        let g_rate = (g_next - g) / 1e-4;
+        let pen = g - yu;
+        let tyre = if pen > 0.0 { (rear.tyre_k_n_m * pen + rear.tyre_c_ns_m * (g_rate - vu)).max(0.0) } else { 0.0 };
+        let s = yu - ys;
+        let fw = wheel_force(bike, rear, x_sag, s, vu - vs);
+        (tyre, fw, g)
+    };
+    let mut t = 0.0;
+    for k in 0..n {
+        let (tyre, fw, g) = forces(t, yu, vu, ys, vs);
+        let acc_s = fw / ms - G;
+        out.excitation.t_s.push(k as f64 / rate_hz);
+        out.excitation.travel_m.push((yu - ys).clamp(0.0, bike.travel_max_m));
+        out.excitation.fy.push(acc_s + G);
+        out.tyre_n.push(tyre);
+        let lr = leverage_ratio(bike, (yu - ys).clamp(0.0, bike.travel_max_m)).unwrap_or(3.0);
+        out.shock_n.push(fw * lr);
+        out.ground_m.push(g);
+        if k + 1 == n {
+            break;
+        }
+        for _ in 0..steps_per_sample {
+            let (tyre, fw, _) = forces(t, yu, vu, ys, vs);
+            // semi-implicit Euler: velocities from the forces, then positions from the new velocities
+            vs += dt * (fw / ms - G);
+            vu += dt * ((tyre - fw) / mu - G);
+            ys += dt * vs;
+            yu += dt * vu;
+            t += dt;
+        }
+        if !(ys.is_finite() && yu.is_finite()) {
+            return Err(SimError::new(SimErrorKind::Excitation, "the ride diverged"));
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::bike::tests::{gt_force_drivetrain, gt_force_linkage};
+    use crate::sim::suspension::PSI_PA;
+
+    fn rear(bike: &SimBike) -> RearEnd {
+        let st = shock_stroke(bike, bike.travel_max_m).unwrap();
+        RearEnd {
+            sprung_kg: 55.0,
+            unsprung_kg: 4.5,
+            spring: AirSpring { area_m2: 16e-4, positive_m3: 2.6 * 16e-4 * st, negative_m3: 0.6 * 16e-4 * st, stroke_m: st },
+            gauge_pa: 220.0 * PSI_PA,
+            damper: Damper::default(),
+            tyre_k_n_m: tyre_stiffness_n_m(25.0),
+            tyre_c_ns_m: 100.0,
+        }
+    }
+
+    #[test]
+    fn ride_on_the_flat_stays_at_sag() {
+        // Arrange
+        let bike = SimBike::new(&gt_force_linkage(), &gt_force_drivetrain()).unwrap();
+        let r = rear(&bike);
+
+        // Act
+        let out = ride(&bike, &r, &Terrain::default(), 5.0, 0.5, 500.0).unwrap();
+
+        // Assert
+        let drift = out.excitation.travel_m.iter().map(|s| (s - out.sag_m).abs()).fold(0.0, f64::max);
+        assert!(drift < 1e-3, "{drift}");
+        assert!(out.sag_m > 0.01 && out.sag_m < 0.08, "{}", out.sag_m);
+    }
+
+    #[test]
+    fn ride_a_bump_compresses_then_settles_back_to_sag() {
+        // Arrange
+        let bike = SimBike::new(&gt_force_linkage(), &gt_force_drivetrain()).unwrap();
+        let r = rear(&bike);
+        let terrain = Terrain::bumps(1, 0.08, 0.5, 1.0, 1.0);
+
+        // Act
+        let out = ride(&bike, &r, &terrain, 5.0, 1.5, 1000.0).unwrap();
+
+        // Assert
+        let peak = out.excitation.travel_m.iter().cloned().fold(0.0, f64::max);
+        assert!(peak > out.sag_m + 0.02, "peak {peak} sag {}", out.sag_m);
+        let last = *out.excitation.travel_m.last().unwrap();
+        assert!((last - out.sag_m).abs() < 0.01, "{last}");
+    }
+
+    #[test]
+    fn damper_rebound_resists_harder_than_compression_at_low_speed() {
+        // Arrange
+        let d = Damper::default();
+
+        // Act / Assert
+        assert!(d.force_n(-0.1).abs() > d.force_n(0.1));
+        assert!(d.force_n(0.5) - d.force_n(0.4) < d.force_n(0.1) - d.force_n(0.0) + 1e-9);
+    }
+
+    #[test]
+    fn terrain_bump_rises_and_falls_a_drop_stays_down() {
+        // Arrange
+        let t = Terrain { features: vec![Feature { at_m: 1.0, length_m: 0.4, height_m: 0.1 }, Feature { at_m: 3.0, length_m: 0.2, height_m: -0.3 }] };
+
+        // Act / Assert
+        assert!((t.height(1.2) - 0.1).abs() < 1e-12);
+        assert_eq!(t.height(2.0), 0.0);
+        assert!((t.height(4.0) + 0.3).abs() < 1e-12);
+    }
+}

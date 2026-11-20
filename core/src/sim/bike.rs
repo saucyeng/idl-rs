@@ -137,11 +137,12 @@ impl SimBike {
 
     /// How far the parallelogram moves the cage in gear `gear` from the
     /// photo's gear, metres, in drawn seatstay coordinates: along the line
-    /// from the axle to the upper jockey, by the change in cog radius.
+    /// from the axle to the upper jockey, by the change in cog radius times
+    /// the derailleur's slant (0, none, for a horizontal parallelogram).
     fn gear_shift(&self, gear: usize) -> P2 {
         let d = &self.drivetrain;
         let teeth = |g: usize| d.cassette_teeth.get(g).or(d.cassette_teeth.last()).copied().unwrap_or(10);
-        let dr = pitch_radius(teeth(gear)) - pitch_radius(teeth(d.derailleur.photo_gear));
+        let dr = d.derailleur.slant * (pitch_radius(teeth(gear)) - pitch_radius(teeth(d.derailleur.photo_gear)));
         let u = [d.derailleur.upper_jockey_m[0] - self.points.rear_axle[0], d.derailleur.upper_jockey_m[1] - self.points.rear_axle[1]];
         let n = (u[0] * u[0] + u[1] * u[1]).sqrt().max(1e-9);
         [dr * u[0] / n, dr * u[1] / n]
@@ -312,5 +313,39 @@ pub(crate) mod tests {
 
         // Assert
         assert!(after[0] > before[0]);
+    }
+
+    #[test]
+    fn cage_pivot_horizontal_parallelogram_stays_where_drawn_in_every_gear() {
+        // Arrange
+        let mut d = gt_force_drivetrain();
+        d.derailleur.slant = 0.0;
+        let bike = SimBike::new(&gt_force_linkage(), &d).unwrap();
+        let pose = bike.pose(0.0);
+
+        // Act
+        let small = bike.cage_pivot(&pose, 0);
+        let big = bike.cage_pivot(&pose, d.cassette_teeth.len() - 1);
+
+        // Assert
+        assert!((small[0] - big[0]).abs() < 1e-12 && (small[1] - big[1]).abs() < 1e-12, "{small:?} {big:?}");
+    }
+
+    #[test]
+    fn cage_pivot_full_slant_moves_by_the_change_in_cog_radius() {
+        // Arrange
+        let mut d = gt_force_drivetrain();
+        d.derailleur.slant = 1.0;
+        d.derailleur.photo_gear = 0;
+        let last = d.cassette_teeth.len() - 1;
+        let want = pitch_radius(d.cassette_teeth[last]) - pitch_radius(d.cassette_teeth[0]);
+        let bike = SimBike::new(&gt_force_linkage(), &d).unwrap();
+        let pose = bike.pose(0.0);
+
+        // Act
+        let (a, b) = (bike.cage_pivot(&pose, 0), bike.cage_pivot(&pose, last));
+
+        // Assert
+        assert!(((b[0] - a[0]).hypot(b[1] - a[1]) - want).abs() < 1e-9);
     }
 }

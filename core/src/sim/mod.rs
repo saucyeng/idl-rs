@@ -14,6 +14,8 @@
 //!   which rollers it touches, and the cage angle that closes the loop.
 //! - [`kinematics`]: growth, kickback, cage angle and clearance through travel.
 //! - [`excite`]: what drives a dynamic run (synthetic bumps).
+//! - [`suspension`]: shock stroke and leverage, air springs, static loads, sag, and the springs fitted to measured sag.
+//! - [`ride`]: the rear end riding over terrain (springs, damper, tyre), giving the travel the chain's dynamics run on.
 //! - [`dynamics`]: the chain as one point mass per link (XPBD), with the
 //!   cassette, jockeys, rollers and cage as rotating bodies, the freehub
 //!   ratchet, the clutch, and contact with the stays.
@@ -23,6 +25,8 @@ pub mod dynamics;
 pub mod excite;
 pub mod kinematics;
 pub mod path;
+pub mod ride;
+pub mod suspension;
 
 /// What went wrong in the simulator.
 #[derive(Debug, Clone, PartialEq)]

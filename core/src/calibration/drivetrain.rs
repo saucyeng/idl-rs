@@ -150,11 +150,19 @@ pub struct Derailleur {
     #[serde(default = "default_cage_mass")]
     pub cage_mass_kg: f64,
     /// The gear the photo was taken in (0 = the smallest cog). In other
-    /// gears the parallelogram moves the cage along the line from the axle to
-    /// the upper jockey by the change in cog radius, which keeps the upper
-    /// jockey's gap to the cog (the B-gap) as drawn.
+    /// gears the parallelogram moves the cage pivot along the line from the
+    /// axle to the upper jockey by [`Derailleur::slant`] times the change in
+    /// cog radius.
     #[serde(default)]
     pub photo_gear: usize,
+    /// How much the parallelogram drops the cage toward the axle as it
+    /// shifts, as a fraction of the change in cog radius (dimensionless).
+    /// 0: a horizontal parallelogram (SRAM Eagle's X-Horizon), where the
+    /// pivot only moves sideways and the offset upper jockey tracks the
+    /// cassette as the cage turns. 1: a slant parallelogram that keeps the
+    /// upper jockey's gap to the cog as drawn with the cage still.
+    #[serde(default)]
+    pub slant: f64,
 }
 
 fn default_cage_mass() -> f64 {
@@ -269,6 +277,8 @@ impl Drivetrain {
                 jockey_inertia_kgm2: 3.0e-6,
                 cage_mass_kg: 0.05,
                 photo_gear: 0,
+                // these guessed points were laid out for a slant parallelogram
+                slant: 1.0,
             },
             rollers: Vec::new(),
             contacts: Vec::new(),
