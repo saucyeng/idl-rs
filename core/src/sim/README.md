@@ -11,6 +11,18 @@ moving with the rear suspension. Two halves:
   hits, with the cranks held or turning, the cassette's inertia and freehub
   ratchet, the cage's spring, clutch and mass, and the chain hitting the
   stays. What chain slap, clutch slip and kickback look like in time.
+- **Suspension** (`suspension`): the shock's stroke and leverage ratio
+  through travel, air springs with self-equalising negative chambers
+  (isothermal for sag, adiabatic over a bump), the static load on each wheel
+  from the centre of mass, the sag, and `fit`, which sizes an air spring
+  (piston area, then positive volume) from measured sag.
+- **Ride** (`ride`): the rear end riding over terrain, a two-mass model (the
+  rear's sprung share on the shock through the leverage, the unsprung mass on
+  the tyre), giving the travel and chassis motion the dynamics run on.
+
+`calibration::geometry_table` reads a maker's geometry table from OCR words
+with their boxes (sizes across, rows down; inches and settings like
+"435 / 445" handled) into the `geometry.*` parameters.
 
 The physics layer is `core` (bike physics, no app). The app's Simulate tab
 (idl1-app, C3 §3.15) draws both over the bike's photo; a dynamic run reaches
