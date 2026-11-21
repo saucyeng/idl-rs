@@ -152,11 +152,76 @@ fn wheel_force(bike: &SimBike, rear: &RearEnd, x_sag: f64, s: f64, v: f64) -> f6
     (spring + damper) / lr + stop
 }
 
+/// The rider pedalling through a ride: crank torque with two power strokes
+/// a revolution, the drive force it puts on the ground, and the load it
+/// moves onto the rear wheel (drive force × centre of mass height ÷
+/// wheelbase). The linkage carries the anti-squat share of that load
+/// straight to the wheel; the rest compresses the suspension (Cossalter
+/// §6.1.3: 100 % neither squats nor extends).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pedalling {
+    /// Mean crank torque, N·m.
+    pub torque_nm: f64,
+    /// Cadence, rpm.
+    pub cadence_rpm: f64,
+    /// Chainring and cog teeth.
+    pub chainring_teeth: u32,
+    /// See `chainring_teeth`.
+    pub cog_teeth: u32,
+    /// Rear wheel's rolling radius, m.
+    pub wheel_radius_m: f64,
+    /// Centre of mass height, m.
+    pub cog_height_m: f64,
+    /// Wheelbase, m.
+    pub wheelbase_m: f64,
+    /// Anti-squat through travel in the gear: (travel m, %), increasing travel.
+    pub anti_squat: Vec<(f64, f64)>,
+}
+
+impl Pedalling {
+    /// Crank torque at `t_s`, N·m: `torque_nm` (1 − cos 2θ), zero at the dead centres.
+    pub fn torque_at(&self, t_s: f64) -> f64 {
+        let w = self.cadence_rpm * std::f64::consts::TAU / 60.0;
+        self.torque_nm * (1.0 - (2.0 * w * t_s).cos())
+    }
+
+    /// The drive force on the ground at `t_s`, N.
+    pub fn drive_n(&self, t_s: f64) -> f64 {
+        self.torque_at(t_s) * self.cog_teeth as f64 / self.chainring_teeth.max(1) as f64 / self.wheel_radius_m.max(0.1)
+    }
+
+    /// Anti-squat at `travel_m`, % (linear between samples, held at the ends; 100 without a curve).
+    pub fn anti_squat_at(&self, travel_m: f64) -> f64 {
+        let a = &self.anti_squat;
+        match a.iter().position(|p| p.0 >= travel_m) {
+            None => a.last().map_or(100.0, |p| p.1),
+            Some(0) => a[0].1,
+            Some(i) => {
+                let (p, q) = (a[i - 1], a[i]);
+                p.1 + (q.1 - p.1) * (travel_m - p.0) / (q.0 - p.0).max(1e-12)
+            }
+        }
+    }
+
+    /// The pedalling's squat force on the suspension at `t_s` and `travel_m`, N
+    /// (positive compressing), and the part the linkage takes straight to the wheel.
+    pub fn squat_n(&self, t_s: f64, travel_m: f64) -> (f64, f64) {
+        let transfer = self.drive_n(t_s) * self.cog_height_m / self.wheelbase_m.max(0.5);
+        let as_share = self.anti_squat_at(travel_m) / 100.0;
+        (transfer * (1.0 - as_share), transfer * as_share)
+    }
+}
+
 /// Rides the rear end over `terrain` at `speed_mps` for `duration_s`,
-/// sampling the result at `rate_hz`, from rest at sag on the flat. Errors:
-/// `Excitation` for a non-positive speed, duration or rate, or a rear end
-/// that can't hold its load (it sits on the stop).
+/// sampling the result at `rate_hz`, from rest at sag on the flat, coasting.
+/// Errors: `Excitation` for a non-positive speed, duration or rate, or a
+/// rear end that can't hold its load (it sits on the stop).
 pub fn ride(bike: &SimBike, rear: &RearEnd, terrain: &Terrain, speed_mps: f64, duration_s: f64, rate_hz: f64) -> Result<RideOut, SimError> {
+    ride_pedalling(bike, rear, terrain, speed_mps, duration_s, rate_hz, None)
+}
+
+/// [`ride`], pedalling as `pedal` says.
+pub fn ride_pedalling(bike: &SimBike, rear: &RearEnd, terrain: &Terrain, speed_mps: f64, duration_s: f64, rate_hz: f64, pedal: Option<&Pedalling>) -> Result<RideOut, SimError> {
     if !(speed_mps > 0.0 && duration_s > 0.0 && rate_hz > 0.0) {
         return Err(SimError::new(SimErrorKind::Excitation, "a ride needs a positive speed, duration and sample rate"));
     }
@@ -206,27 +271,31 @@ pub fn ride(bike: &SimBike, rear: &RearEnd, terrain: &Terrain, speed_mps: f64, d
         let tyre = if pen > 0.0 { (rear.tyre_k_n_m * pen + rear.tyre_c_ns_m * (g_rate - vu)).max(0.0) } else { 0.0 };
         let s = yu - ys;
         let fw = wheel_force(bike, rear, x_sag, s, vu - vs);
-        (tyre, fw, g)
+        let (squat, direct) = pedal.map_or((0.0, 0.0), |p| p.squat_n(t, s.clamp(0.0, bike.travel_max_m)));
+        // the squat share pushes the frame down on the suspension, the rest goes down through the linkage
+        // and the wheel carries the whole transfer: the suspension's share through the spring, the rest directly
+        (tyre, fw - squat, g, direct + squat)
     };
     let mut t = 0.0;
     for k in 0..n {
-        let (tyre, fw, g) = forces(t, yu, vu, ys, vs);
+        let (tyre, fw, g, _) = forces(t, yu, vu, ys, vs);
         let acc_s = fw / ms - G;
         out.excitation.t_s.push(k as f64 / rate_hz);
         out.excitation.travel_m.push((yu - ys).clamp(0.0, bike.travel_max_m));
         out.excitation.fy.push(acc_s + G);
         out.tyre_n.push(tyre);
         let lr = leverage_ratio(bike, (yu - ys).clamp(0.0, bike.travel_max_m)).unwrap_or(3.0);
-        out.shock_n.push(fw * lr);
+        let squat = pedal.map_or(0.0, |p| p.squat_n(t, (yu - ys).clamp(0.0, bike.travel_max_m)).0);
+        out.shock_n.push((fw + squat) * lr);
         out.ground_m.push(g);
         if k + 1 == n {
             break;
         }
         for _ in 0..steps_per_sample {
-            let (tyre, fw, _) = forces(t, yu, vu, ys, vs);
+            let (tyre, fw, _, direct) = forces(t, yu, vu, ys, vs);
             // semi-implicit Euler: velocities from the forces, then positions from the new velocities
             vs += dt * (fw / ms - G);
-            vu += dt * ((tyre - fw) / mu - G);
+            vu += dt * ((tyre - fw - direct) / mu - G);
             ys += dt * vs;
             yu += dt * vu;
             t += dt;
@@ -308,5 +377,37 @@ mod tests {
         assert!((t.height(1.2) - 0.1).abs() < 1e-12);
         assert_eq!(t.height(2.0), 0.0);
         assert!((t.height(4.0) + 0.3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ride_pedalling_with_no_anti_squat_sits_deeper_than_with_full() {
+        // Arrange
+        let bike = SimBike::new(&gt_force_linkage(), &gt_force_drivetrain()).unwrap();
+        let r = rear(&bike);
+        let pedal = |pct: f64| Pedalling { torque_nm: 60.0, cadence_rpm: 80.0, chainring_teeth: 30, cog_teeth: 28, wheel_radius_m: 0.37, cog_height_m: 1.1, wheelbase_m: 1.28, anti_squat: vec![(0.0, pct), (0.16, pct)] };
+        let mean = |o: &RideOut| o.excitation.travel_m.iter().skip(500).sum::<f64>() / (o.excitation.travel_m.len() - 500) as f64;
+
+        // Act
+        let none = ride_pedalling(&bike, &r, &Terrain::default(), 5.0, 2.0, 500.0, Some(&pedal(0.0))).unwrap();
+        let full = ride_pedalling(&bike, &r, &Terrain::default(), 5.0, 2.0, 500.0, Some(&pedal(100.0))).unwrap();
+
+        // Assert: 100 % holds the sag; none squats under the transfer
+        assert!((mean(&full) - full.sag_m).abs() < 1e-3, "{} {}", mean(&full), full.sag_m);
+        assert!(mean(&none) > none.sag_m + 2e-3, "{} {}", mean(&none), none.sag_m);
+    }
+
+    #[test]
+    fn pedalling_torque_is_zero_at_dead_centre_and_averages_the_mean() {
+        // Arrange
+        let p = Pedalling { torque_nm: 50.0, cadence_rpm: 60.0, chainring_teeth: 30, cog_teeth: 30, wheel_radius_m: 0.37, cog_height_m: 1.1, wheelbase_m: 1.28, anti_squat: Vec::new() };
+
+        // Act
+        let n = 1000;
+        let avg = (0..n).map(|k| p.torque_at(k as f64 / n as f64)).sum::<f64>() / n as f64;
+
+        // Assert
+        assert!(p.torque_at(0.0).abs() < 1e-12);
+        assert!((avg - 50.0).abs() < 1e-6, "{avg}");
+        assert_eq!(p.anti_squat_at(0.05), 100.0);
     }
 }
