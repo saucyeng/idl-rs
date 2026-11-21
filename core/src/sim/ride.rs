@@ -2,7 +2,8 @@
 //! rear wheel's travel comes out of the springs, the damper and the tyre
 //! instead of being prescribed. A two-mass model in the vertical: the
 //! rear's share of the sprung mass on the shock (through the leverage), the
-//! unsprung mass on the tyre, the tyre on the ground. The frame stays level
+//! unsprung mass on the tyre ([`super::tyre`]: air, casing, insert, rim
+//! strike), the tyre on the ground it envelops. The frame stays level
 //! (no pitch) and the front is not modelled yet.
 //!
 //! The result is an [`Excitation`], so the chain's dynamics
@@ -13,6 +14,7 @@
 use super::bike::SimBike;
 use super::excite::{Excitation, G};
 use super::suspension::{leverage_ratio, shock_stroke, AirSpring, N_DYNAMIC};
+use super::tyre::{Envelope, Tyre};
 use super::{SimError, SimErrorKind};
 
 /// A damper at the shock shaft: linear up to a knee, then a shallower line
@@ -63,17 +65,8 @@ pub struct RearEnd {
     pub gauge_pa: f64,
     /// The shock's damper.
     pub damper: Damper,
-    /// Tyre radial stiffness, N/m.
-    pub tyre_k_n_m: f64,
-    /// Tyre damping, N·s/m.
-    pub tyre_c_ns_m: f64,
-}
-
-/// Tyre radial stiffness for a pressure, N/m: a 29 x 2.5" MTB tyre's
-/// load-deflection slope, roughly linear in pressure (casing stiffness plus
-/// the air): about 110 kN/m at 25 psi.
-pub fn tyre_stiffness_n_m(psi: f64) -> f64 {
-    20_000.0 + 3_600.0 * psi.max(0.0)
+    /// The rear tyre.
+    pub tyre: Tyre,
 }
 
 /// One bump or drop on the trail.
@@ -133,6 +126,10 @@ pub struct RideOut {
     pub shock_n: Vec<f64>,
     /// Ground height under the tyre at each sample, m.
     pub ground_m: Vec<f64>,
+    /// Tyre deflection at each sample, m (0 in the air).
+    pub tyre_deflection_m: Vec<f64>,
+    /// Times the rim pinched the tyre on the ground.
+    pub rim_strikes: u32,
     /// Static sag the ride starts from, m of wheel travel.
     pub sag_m: f64,
 }
@@ -246,7 +243,9 @@ pub fn ride_pedalling(bike: &SimBike, rear: &RearEnd, terrain: &Terrain, speed_m
     let sag = 0.5 * (a + b);
     let x_sag = shock_stroke(bike, sag).unwrap_or(0.0);
     // axle height above the flat (the tyre's centre over its undeformed radius) and the frame's datum
-    let squash0 = (ms + mu) * G / rear.tyre_k_n_m;
+    let squash0 = rear.tyre.deflection_under((ms + mu) * G);
+    // the ground as the tyre feels it (enveloping), a metre either side of the ride
+    let env = Envelope::new(&rear.tyre, &|x| terrain.height(x), -1.0, speed_mps * duration_s + 1.0, squash0);
     let mut yu = -squash0;
     let mut vu = 0.0;
     let mut ys = yu - sag;
@@ -261,14 +260,17 @@ pub fn ride_pedalling(bike: &SimBike, rear: &RearEnd, terrain: &Terrain, speed_m
         tyre_n: Vec::with_capacity(n),
         shock_n: Vec::with_capacity(n),
         ground_m: Vec::with_capacity(n),
+        tyre_deflection_m: Vec::with_capacity(n),
+        rim_strikes: 0,
         sag_m: sag,
     };
+    let mut striking = false;
     let forces = |t: f64, yu: f64, vu: f64, ys: f64, vs: f64| {
         let x = speed_mps * t;
-        let (g, g_next) = (terrain.height(x), terrain.height(x + speed_mps * 1e-4));
-        let g_rate = (g_next - g) / 1e-4;
+        let (g, slope) = env.at(x);
+        let g_rate = slope * speed_mps;
         let pen = g - yu;
-        let tyre = if pen > 0.0 { (rear.tyre_k_n_m * pen + rear.tyre_c_ns_m * (g_rate - vu)).max(0.0) } else { 0.0 };
+        let tyre = if pen > 0.0 { (rear.tyre.force(pen).force_n + rear.tyre.damping_ns_m * (g_rate - vu)).max(0.0) } else { 0.0 };
         let s = yu - ys;
         let fw = wheel_force(bike, rear, x_sag, s, vu - vs);
         let (squat, direct) = pedal.map_or((0.0, 0.0), |p| p.squat_n(t, s.clamp(0.0, bike.travel_max_m)));
@@ -288,6 +290,13 @@ pub fn ride_pedalling(bike: &SimBike, rear: &RearEnd, terrain: &Terrain, speed_m
         let squat = pedal.map_or(0.0, |p| p.squat_n(t, (yu - ys).clamp(0.0, bike.travel_max_m)).0);
         out.shock_n.push((fw + squat) * lr);
         out.ground_m.push(g);
+        let pen = (g - yu).max(0.0);
+        out.tyre_deflection_m.push(pen);
+        let strike = rear.tyre.force(pen).rim_strike;
+        if strike && !striking {
+            out.rim_strikes += 1;
+        }
+        striking = strike;
         if k + 1 == n {
             break;
         }
@@ -321,8 +330,7 @@ mod tests {
             spring: AirSpring { area_m2: 16e-4, positive_m3: 2.6 * 16e-4 * st, negative_m3: 0.6 * 16e-4 * st, stroke_m: st },
             gauge_pa: 220.0 * PSI_PA,
             damper: Damper::default(),
-            tyre_k_n_m: tyre_stiffness_n_m(25.0),
-            tyre_c_ns_m: 100.0,
+            tyre: Tyre::mtb_29(2.5, 25.0, true, false),
         }
     }
 
@@ -409,5 +417,38 @@ mod tests {
         assert!(p.torque_at(0.0).abs() < 1e-12);
         assert!((avg - 50.0).abs() < 1e-6, "{avg}");
         assert_eq!(p.anti_squat_at(0.05), 100.0);
+    }
+
+    #[test]
+    fn ride_a_sharp_bump_with_an_insert_strikes_the_rim_less_than_without() {
+        // Arrange: a sharp 80 mm bump 100 mm long at 8 m/s, low pressure
+        let bike = SimBike::new(&gt_force_linkage(), &gt_force_drivetrain()).unwrap();
+        let bare = RearEnd { tyre: Tyre::mtb_29(2.5, 18.0, false, false), ..rear(&bike) };
+        let with = RearEnd { tyre: Tyre::mtb_29(2.5, 18.0, false, true), ..rear(&bike) };
+        let kerb = Terrain { features: vec![Feature { at_m: 2.0, length_m: 0.1, height_m: 0.08 }] };
+
+        // Act
+        let a = ride(&bike, &bare, &kerb, 8.0, 0.6, 2000.0).unwrap();
+        let b = ride(&bike, &with, &kerb, 8.0, 0.6, 2000.0).unwrap();
+
+        // Assert: the insert only adds force, so the tyre squashes no further and strikes no more
+        let peak = |o: &RideOut| o.tyre_deflection_m.iter().cloned().fold(0.0, f64::max);
+        assert!(peak(&b) <= peak(&a) + 1e-9, "{} {}", peak(&a), peak(&b));
+        assert!(b.rim_strikes <= a.rim_strikes);
+    }
+
+    #[test]
+    fn ride_tyre_deflection_on_the_flat_is_the_static_squash() {
+        // Arrange
+        let bike = SimBike::new(&gt_force_linkage(), &gt_force_drivetrain()).unwrap();
+        let r = rear(&bike);
+
+        // Act
+        let o = ride(&bike, &r, &Terrain::default(), 5.0, 0.5, 500.0).unwrap();
+
+        // Assert
+        let want = r.tyre.deflection_under((r.sprung_kg + r.unsprung_kg) * G);
+        assert!((o.tyre_deflection_m[100] - want).abs() < 2e-4, "{} {want}", o.tyre_deflection_m[100]);
+        assert_eq!(o.rim_strikes, 0);
     }
 }

@@ -16,6 +16,7 @@
 //! - [`excite`]: what drives a dynamic run (synthetic bumps).
 //! - [`suspension`]: shock stroke and leverage, air springs, static loads, sag, and the springs fitted to measured sag.
 //! - [`replay`]: a recorded ride (IMU0 in the bike's side plane, the physics estimator's rear travel, GPS speed) as the excitation.
+//! - [`tyre`]: the tyre's radial force (air, casing, insert, rim strike) and the ground it envelops (Pacejka's two-point follower).
 //! - [`ride`]: the rear end riding over terrain (springs, damper, tyre), giving the travel the chain's dynamics run on.
 //! - [`dynamics`]: the chain as one point mass per link (XPBD), with the
 //!   cassette, jockeys, rollers and cage as rotating bodies, the freehub
@@ -29,6 +30,7 @@ pub mod path;
 pub mod replay;
 pub mod ride;
 pub mod suspension;
+pub mod tyre;
 
 /// What went wrong in the simulator.
 #[derive(Debug, Clone, PartialEq)]

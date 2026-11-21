@@ -149,6 +149,6 @@ on the main pivot keeps growth smooth through travel.
 - Clutch free play, and the measured drivetrain (spec §11).
 - Replay (`replay`, done 2026-11-21) re-solves the stretch each run; reuse the
   session's physics derived file. `idl-rs sim` CLI verbs writing a sim result.
-- Tyre (pressure, casing, insert, enveloping) and rider (legs and arms) models.
+- Tyre (`tyre`, done 2026-11-21): measure an MTB tyre and fit it. Rider (legs and arms) model.
 - Two-way coupling with a suspension model (whole-bike spec phase 1), so the
   clutch's effect on the rear and an idler's benefit can be predicted.
