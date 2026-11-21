@@ -6,12 +6,10 @@
 //! The estimator runs through [`estimate_physics`], so its channels are kept
 //! as the session's derived file too. A bike whose calibration has no current
 //! physics fit is fitted on the whole session first (the fit wants a minute
-//! of riding to pick its windows from), which solves the whole session once;
-//! later stretches solve only themselves.
+//! of riding to pick its windows from); only the stretch is solved.
 
 use std::path::Path;
 
-use idl_rs::calibration::linkage::PHYSICS_FIT_VERSION;
 use idl_rs::estimate::physics::pipeline::Cropped;
 use idl_rs::estimate::run::EstimatorInput;
 use idl_rs::sim::excite::Excitation;
@@ -60,9 +58,8 @@ pub fn replay(data_root: &Path, session_id: &str, from_s: f64, to_s: f64, cutoff
 
     // rear travel: fit on the whole session first if the calibration has no current fit
     phase("estimating travel");
-    let fitted = cal.physics.as_ref().is_some_and(|p| p.version == PHYSICS_FIT_VERSION);
     let span_ms = Some(((from_s * 1000.0).floor() as i64, (to_s * 1000.0).ceil() as i64));
-    let physics = estimate_physics(data_root, session_id, &PhysicsOptions { span_ms: if fitted { span_ms } else { None }, ..PhysicsOptions::default() })?;
+    let physics = estimate_physics(data_root, session_id, &PhysicsOptions { span_ms, fit_whole_session: true, ..PhysicsOptions::default() })?;
     let travel: Vec<(f64, f64)> = physics.grid_us.iter().zip(&physics.rear_travel_m).map(|(&t, &s)| (t as f64 / 1e6, s)).collect();
 
     phase("reading IMU0");
