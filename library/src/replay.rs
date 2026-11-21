@@ -17,7 +17,7 @@ use idl_rs::sim::replay::{excitation, Mount, Recording};
 use idl_rs::store::parquet::open_session_lazy;
 use idl_rs::store::session_json::{effective_start_ms, read_session_json};
 
-use crate::bikelog::calibration_for_session;
+use crate::bikelog::{calibration_for_session, read_bike_file};
 use crate::physics::{estimate_physics, PhysicsError, PhysicsErrorKind, PhysicsOptions, PhysicsReport};
 
 /// Longest stretch a replay takes, s.
@@ -32,6 +32,9 @@ pub struct Replay {
     pub physics: PhysicsReport,
     /// Mean ground speed over the stretch, m/s.
     pub mean_speed_mps: f64,
+    /// Share of the stretch's travel the estimator left unsolved or put
+    /// outside the travel (bridged from either side), 0-1.
+    pub unsolved: f64,
 }
 
 fn fail(kind: PhysicsErrorKind, message: impl Into<String>) -> PhysicsError {
@@ -68,10 +71,11 @@ pub fn replay(data_root: &Path, session_id: &str, from_s: f64, to_s: f64, cutoff
     let accel: Vec<[f64; 3]> = input.imu0.accel.iter().map(|a| [a.x, a.y, a.z]).collect();
     let gyro: Vec<[f64; 3]> = input.imu0.gyro.iter().map(|g| [g.x, g.y, g.z]).collect();
     let speed: Vec<(f64, f64)> = input.gps.iter().map(|g| (g.time_s, g.velocity.x.hypot(g.velocity.y))).collect();
-    let rec = Recording { t0_s: input.t0_s, dt_s: input.dt, accel: &accel, gyro: &gyro, travel: &travel, speed: &speed };
-    let excitation = excitation(&rec, &mount, cutoff_hz).map_err(|e| fail(PhysicsErrorKind::Unusable, e.to_string()))?;
+    let travel_max_m = read_bike_file(data_root, &doc.bike_id).ok().and_then(|f| f.linkage.map(|l| l.rear_travel_m)).unwrap_or(0.0);
+    let rec = Recording { t0_s: input.t0_s, dt_s: input.dt, accel: &accel, gyro: &gyro, travel: &travel, travel_max_m, speed: &speed };
+    let (excitation, unsolved) = excitation(&rec, &mount, cutoff_hz).map_err(|e| fail(PhysicsErrorKind::Unusable, e.to_string()))?;
     let mean_speed_mps = excitation.speed_mps.iter().sum::<f64>() / excitation.speed_mps.len() as f64;
-    Ok(Replay { excitation, physics, mean_speed_mps })
+    Ok(Replay { excitation, physics, mean_speed_mps, unsolved })
 }
 
 #[cfg(test)]

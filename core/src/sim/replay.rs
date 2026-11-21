@@ -10,6 +10,17 @@ use super::{SimError, SimErrorKind};
 /// here is real frame motion (spec §5).
 pub const DEFAULT_CUTOFF_HZ: f64 = 100.0;
 
+/// Low-pass cut-off for the estimator's rear travel, Hz: above the wheel's
+/// hop (15-20 Hz) and a hit's rise, below the solver's sample-to-sample
+/// noise.
+pub const TRAVEL_CUTOFF_HZ: f64 = 40.0;
+
+/// How far outside 0..travel the estimator may stray before a sample is
+/// taken as unsolved, m. On a hard hit the pods can clip and the solve
+/// swings to impossible travel (-70 mm, then +80 mm 17 ms later, on a
+/// Beacon descent, 2026-11-21).
+pub const TRAVEL_SLACK_M: f64 = 0.01;
+
 /// How IMU0 sits in the bike: the calibration's directions, in IMU0's axes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Mount {
@@ -34,6 +45,9 @@ pub struct Recording<'a> {
     pub gyro: &'a [[f64; 3]],
     /// Rear travel: (time s, travel m), increasing time; NaN where not solved.
     pub travel: &'a [(f64, f64)],
+    /// The bike's full rear travel, m (0: unknown): solved travel further
+    /// than [`TRAVEL_SLACK_M`] outside 0..this is taken as unsolved.
+    pub travel_max_m: f64,
     /// Ground speed: (time s, m/s), increasing time.
     pub speed: &'a [(f64, f64)],
 }
@@ -66,10 +80,13 @@ fn interp(series: &[(f64, f64)], t: f64) -> Option<f64> {
 /// rate about its right-hand side (nose up positive, the sim's CCW), each
 /// low-passed at `cutoff_hz` (zero phase; skipped at or above 0.45 × the
 /// sample rate), the travel and speed interpolated onto IMU0's grid (travel
-/// bridged across unsolved gaps and held at the ends, never below 0).
+/// outside 0..`travel_max_m` taken as unsolved, bridged across unsolved
+/// gaps, held at the ends, low-passed at [`TRAVEL_CUTOFF_HZ`] and kept in
+/// 0..`travel_max_m`). Also returns the share of the stretch's travel
+/// samples that were unsolved.
 /// Errors: `Excitation` for fewer than two IMU0 samples, a bad period, a
 /// mount without two independent directions, no solved travel or no speed.
-pub fn excitation(rec: &Recording, mount: &Mount, cutoff_hz: f64) -> Result<Excitation, SimError> {
+pub fn excitation(rec: &Recording, mount: &Mount, cutoff_hz: f64) -> Result<(Excitation, f64), SimError> {
     let bad = |m: &str| SimError::new(SimErrorKind::Excitation, m);
     let n = rec.accel.len().min(rec.gyro.len());
     if n < 2 || !(rec.dt_s > 0.0 && rec.dt_s.is_finite()) {
@@ -96,17 +113,41 @@ pub fn excitation(rec: &Recording, mount: &Mount, cutoff_hz: f64) -> Result<Exci
     }
 
     let t_abs = |i: usize| rec.t0_s + i as f64 * rec.dt_s;
-    let travel_m = (0..n)
-        .map(|i| interp(rec.travel, t_abs(i)).map(|s| s.max(0.0)))
+    let max = if rec.travel_max_m > 0.0 { rec.travel_max_m } else { f64::INFINITY };
+    let (t_start, t_end) = (rec.t0_s, t_abs(n - 1));
+    let mut inside = 0usize;
+    let mut unsolved = 0usize;
+    let travel: Vec<(f64, f64)> = rec
+        .travel
+        .iter()
+        .map(|&(t, s)| {
+            let ok = s.is_finite() && s >= -TRAVEL_SLACK_M && s <= max + TRAVEL_SLACK_M;
+            if (t_start..=t_end).contains(&t) {
+                inside += 1;
+                unsolved += usize::from(!ok);
+            }
+            (t, if ok { s } else { f64::NAN })
+        })
+        .collect();
+    let mut travel_m = (0..n)
+        .map(|i| interp(&travel, t_abs(i)))
         .collect::<Option<Vec<f64>>>()
         .ok_or_else(|| bad("no solved rear travel in this stretch (the estimator solves only while riding)"))?;
+    if TRAVEL_CUTOFF_HZ < 0.45 * rate && n > 30 {
+        if let Ok(y) = crate::filters::lowpass(&travel_m, 4, TRAVEL_CUTOFF_HZ, rate) {
+            travel_m = y;
+        }
+    }
+    for s in &mut travel_m {
+        *s = s.clamp(0.0, max);
+    }
     let speed_mps = (0..n)
         .map(|i| interp(rec.speed, t_abs(i)).map(|v| v.max(0.0)))
         .collect::<Option<Vec<f64>>>()
         .ok_or_else(|| bad("no GPS speed in this stretch"))?;
     let exc = Excitation { t_s: (0..n).map(|i| i as f64 * rec.dt_s).collect(), travel_m, fx, fy, omega, speed_mps };
     exc.validate()?;
-    Ok(exc)
+    Ok((exc, if inside > 0 { unsolved as f64 / inside as f64 } else { 0.0 }))
 }
 
 #[cfg(test)]
@@ -123,10 +164,10 @@ mod tests {
         // Arrange
         let accel = vec![[0.0, 0.0, G]; 100];
         let gyro = vec![[0.0; 3]; 100];
-        let rec = Recording { t0_s: 5.0, dt_s: 0.001, accel: &accel, gyro: &gyro, travel: &[(5.0, 0.04)], speed: &[(5.0, 3.0)] };
+        let rec = Recording { t0_s: 5.0, dt_s: 0.001, accel: &accel, gyro: &gyro, travel: &[(5.0, 0.04)], travel_max_m: 0.16, speed: &[(5.0, 3.0)] };
 
         // Act
-        let e = excitation(&rec, &level(), DEFAULT_CUTOFF_HZ).unwrap();
+        let (e, _) = excitation(&rec, &level(), DEFAULT_CUTOFF_HZ).unwrap();
 
         // Assert
         assert!((e.fy[50] - G).abs() < 1e-9 && e.fx[50].abs() < 1e-9);
@@ -140,10 +181,10 @@ mod tests {
         let m = Mount { up: [0.0, 0.0, 1.0], forward: [0.0, 1.0, 0.1], gyro_bias_rad_s: [0.0; 3] };
         let accel = vec![[0.0, 2.0, G]; 10];
         let gyro = vec![[0.0; 3]; 10];
-        let rec = Recording { t0_s: 0.0, dt_s: 0.01, accel: &accel, gyro: &gyro, travel: &[(0.0, 0.0)], speed: &[(0.0, 1.0)] };
+        let rec = Recording { t0_s: 0.0, dt_s: 0.01, accel: &accel, gyro: &gyro, travel: &[(0.0, 0.0)], travel_max_m: 0.16, speed: &[(0.0, 1.0)] };
 
         // Act
-        let e = excitation(&rec, &m, 0.0).unwrap();
+        let (e, _) = excitation(&rec, &m, 0.0).unwrap();
 
         // Assert
         assert!((e.fx[3] - 2.0).abs() < 1e-9 && (e.fy[3] - G).abs() < 1e-9, "{} {}", e.fx[3], e.fy[3]);
@@ -155,10 +196,10 @@ mod tests {
         let m = Mount { gyro_bias_rad_s: [0.0, 0.1, 0.0], ..level() };
         let accel = vec![[0.0, 0.0, G]; 10];
         let gyro = vec![[0.0, -0.9, 0.0]; 10];
-        let rec = Recording { t0_s: 0.0, dt_s: 0.01, accel: &accel, gyro: &gyro, travel: &[(0.0, 0.0)], speed: &[(0.0, 1.0)] };
+        let rec = Recording { t0_s: 0.0, dt_s: 0.01, accel: &accel, gyro: &gyro, travel: &[(0.0, 0.0)], travel_max_m: 0.16, speed: &[(0.0, 1.0)] };
 
         // Act
-        let e = excitation(&rec, &m, 0.0).unwrap();
+        let (e, _) = excitation(&rec, &m, 0.0).unwrap();
 
         // Assert
         assert!((e.omega[4] - 1.0).abs() < 1e-12, "{}", e.omega[4]);
@@ -170,10 +211,10 @@ mod tests {
         let accel = vec![[0.0, 0.0, G]; 11];
         let gyro = vec![[0.0; 3]; 11];
         let travel = [(0.0, -0.01), (0.05, f64::NAN), (0.1, 0.07)];
-        let rec = Recording { t0_s: 0.0, dt_s: 0.01, accel: &accel, gyro: &gyro, travel: &travel, speed: &[(0.0, 1.0), (0.1, 2.0)] };
+        let rec = Recording { t0_s: 0.0, dt_s: 0.01, accel: &accel, gyro: &gyro, travel: &travel, travel_max_m: 0.16, speed: &[(0.0, 1.0), (0.1, 2.0)] };
 
         // Act
-        let e = excitation(&rec, &level(), 0.0).unwrap();
+        let (e, _) = excitation(&rec, &level(), 0.0).unwrap();
 
         // Assert
         assert!((e.travel_m[5] - 0.03).abs() < 1e-9, "{}", e.travel_m[5]);
@@ -186,7 +227,7 @@ mod tests {
         // Arrange
         let accel = vec![[0.0, 0.0, G]; 10];
         let gyro = vec![[0.0; 3]; 10];
-        let rec = |travel: &'static [(f64, f64)], speed: &'static [(f64, f64)]| Recording { t0_s: 0.0, dt_s: 0.01, accel: &accel, gyro: &gyro, travel, speed };
+        let rec = |travel: &'static [(f64, f64)], speed: &'static [(f64, f64)]| Recording { t0_s: 0.0, dt_s: 0.01, accel: &accel, gyro: &gyro, travel, travel_max_m: 0.16, speed };
         let along_up = Mount { forward: [0.0, 0.0, 2.0], ..level() };
 
         // Act
@@ -203,13 +244,30 @@ mod tests {
         // Arrange: 1 kHz, 300 Hz buzz on top of g
         let accel: Vec<[f64; 3]> = (0..2000).map(|i| [0.0, 0.0, G + 5.0 * (std::f64::consts::TAU * 300.0 * i as f64 / 1000.0).sin()]).collect();
         let gyro = vec![[0.0; 3]; 2000];
-        let rec = Recording { t0_s: 0.0, dt_s: 0.001, accel: &accel, gyro: &gyro, travel: &[(0.0, 0.0)], speed: &[(0.0, 1.0)] };
+        let rec = Recording { t0_s: 0.0, dt_s: 0.001, accel: &accel, gyro: &gyro, travel: &[(0.0, 0.0)], travel_max_m: 0.16, speed: &[(0.0, 1.0)] };
 
         // Act
-        let e = excitation(&rec, &level(), DEFAULT_CUTOFF_HZ).unwrap();
+        let (e, _) = excitation(&rec, &level(), DEFAULT_CUTOFF_HZ).unwrap();
 
         // Assert
         let worst = e.fy[200..1800].iter().map(|v| (v - G).abs()).fold(0.0, f64::max);
         assert!(worst < 0.1, "{worst}");
+    }
+
+    #[test]
+    fn excitation_impossible_travel_is_bridged_and_counted() {
+        // Arrange: 1 kHz, the solve swings to -70 mm then 300 mm for 20 ms mid-stretch
+        let n = 1000;
+        let accel = vec![[0.0, 0.0, G]; n];
+        let gyro = vec![[0.0; 3]; n];
+        let travel: Vec<(f64, f64)> = (0..n).map(|i| (i as f64 / 1000.0, if (500..510).contains(&i) { -0.07 } else if (510..520).contains(&i) { 0.3 } else { 0.05 })).collect();
+        let rec = Recording { t0_s: 0.0, dt_s: 0.001, accel: &accel, gyro: &gyro, travel: &travel, travel_max_m: 0.16, speed: &[(0.0, 5.0)] };
+
+        // Act
+        let (e, unsolved) = excitation(&rec, &level(), DEFAULT_CUTOFF_HZ).unwrap();
+
+        // Assert
+        assert!((unsolved - 0.02).abs() < 1e-9, "{unsolved}");
+        assert!(e.travel_m.iter().all(|s| (s - 0.05).abs() < 1e-6), "{}", e.travel_m[505]);
     }
 }
