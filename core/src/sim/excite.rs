@@ -1,6 +1,6 @@
 //! What drives a dynamic run: the front triangle's motion, the rear travel
-//! and the wheel's speed over time (spec §5). Synthetic inputs now; a
-//! recorded ride's IMU0, physics travel and GPS later.
+//! and the wheel's speed over time (spec §5). Synthetic inputs here; a
+//! recorded ride's IMU0, physics travel and GPS in [`super::replay`].
 
 use super::{SimError, SimErrorKind};
 

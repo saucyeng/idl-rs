@@ -111,10 +111,13 @@ fn antialias(input: &mut EstimatorInput) {
 }
 
 /// A lookup that serves its inner lookup's channels cut to `from_us..to_us`.
-struct Cropped<'a> {
-    inner: &'a SessionHandle,
-    from_us: i64,
-    to_us: i64,
+pub struct Cropped<'a> {
+    /// The session.
+    pub inner: &'a SessionHandle,
+    /// First time kept, us since the session's first sample.
+    pub from_us: i64,
+    /// Last time kept, us.
+    pub to_us: i64,
 }
 
 impl ChannelLookup for Cropped<'_> {

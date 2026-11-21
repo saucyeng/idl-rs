@@ -23,6 +23,7 @@ pub mod physics;
 pub mod library_summary;
 pub mod profile;
 pub mod quarantine;
+pub mod replay;
 pub mod scan;
 pub mod session_context;
 /// The filtering and metadata edits behind `session list`/`set-meta`.

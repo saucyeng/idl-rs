@@ -80,6 +80,10 @@ pub struct PhysicsReport {
     pub travel: [TravelSummary; 2],
     /// The derived file written (None on a dry run).
     pub output: Option<PathBuf>,
+    /// Grid times, us since the session's first sample.
+    pub grid_us: Vec<i64>,
+    /// Rear travel per grid sample, m (NaN where not solved).
+    pub rear_travel_m: Vec<f64>,
     /// Wall time, s.
     pub seconds: f64,
 }
@@ -234,6 +238,7 @@ pub fn estimate_physics(data_root: &Path, session_id: &str, opts: &PhysicsOption
 
     let sol = solve_ride(&r, &bk, centre, &cfg);
     let outs = outputs(&sol);
+    let rear_travel_m: Vec<f64> = outs[1].2.iter().map(|v| v / 1000.0).collect();
     let solved = sol.q.iter().filter(|q| q[0].is_finite()).count();
     let travel = [summary(&r, &outs[0].2, &sol.air), summary(&r, &outs[1].2, &sol.air)];
     let geometry = bike_geometry(&bk);
@@ -268,6 +273,8 @@ pub fn estimate_physics(data_root: &Path, session_id: &str, opts: &PhysicsOption
         solved_s: solved as f64 / r.rate(),
         travel,
         output,
+        grid_us: r.grid_us.clone(),
+        rear_travel_m,
         seconds: t0.elapsed().as_secs_f64(),
     })
 }
