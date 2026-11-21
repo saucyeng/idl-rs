@@ -44,6 +44,9 @@ pub struct PhysicsOptions {
     /// Only this stretch of the session, ms from its first sample (both or
     /// neither): less memory, and the bike fit picks its windows inside it.
     pub span_ms: Option<(i64, i64)>,
+    /// With `span_ms`, a bike fit (when one is needed) still picks its
+    /// windows from the whole session; only the solve is cut to the span.
+    pub fit_whole_session: bool,
 }
 
 /// Distribution of one travel channel over the solved samples, mm.
@@ -179,6 +182,13 @@ pub fn estimate_physics(data_root: &Path, session_id: &str, opts: &PhysicsOption
             },
         )
     })?;
+    let current = cal.physics.as_ref().filter(|p| p.version == PHYSICS_FIT_VERSION && !opts.refit);
+    // a fit from the whole session while the solve takes only the span
+    let fit_ride = if current.is_none() && opts.fit_whole_session && span.is_some() {
+        Some(ride_between(&handle, None).map_err(|_| err(PhysicsErrorKind::Unusable, format!("{session_id} cannot be fitted: an IMU is missing")))?)
+    } else {
+        None
+    };
     // the inputs' column hashes (C1 §5) now, then drop the session: its decoded
     // channels would otherwise sit in memory through every solve
     let inputs: Vec<(String, [u8; 32])> = IMU_CHANNELS
@@ -200,7 +210,6 @@ pub fn estimate_physics(data_root: &Path, session_id: &str, opts: &PhysicsOption
     if let Some(t) = opts.threads {
         cfg.threads = t.max(1);
     }
-    let current = cal.physics.as_ref().filter(|p| p.version == PHYSICS_FIT_VERSION && !opts.refit);
     let base = bike(&cal.fit, linkage, current, rear).map_err(|e| {
         err(
             PhysicsErrorKind::Unusable,
@@ -215,7 +224,8 @@ pub fn estimate_physics(data_root: &Path, session_id: &str, opts: &PhysicsOption
     let (bk, new_fit) = if current.is_some() {
         (base, None)
     } else {
-        let rep = fit_bike(&r, &base, centre, &cfg, &[]).map_err(solve_err)?;
+        let fr = fit_ride.as_ref().unwrap_or(&r);
+        let rep = fit_bike(fr, &base, centre, &cfg, &[]).map_err(solve_err)?;
         let fit = PhysicsFit {
             version: PHYSICS_FIT_VERSION,
             fitted_at_ms: now_ms(),
@@ -223,7 +233,7 @@ pub fn estimate_physics(data_root: &Path, session_id: &str, opts: &PhysicsOption
             bend_len_m: rep.geometry[3],
             link_scale: rep.geometry[4],
             session_id: session_id.to_string(),
-            windows_s: rep.windows.iter().map(|&(a, b)| [r.grid_us[a] as f64 / 1e6, r.grid_us[b - 1] as f64 / 1e6]).collect(),
+            windows_s: rep.windows.iter().map(|&(a, b)| [fr.grid_us[a] as f64 / 1e6, fr.grid_us[b - 1] as f64 / 1e6]).collect(),
             iterations: rep.info.iterations as u32,
             converged: rep.info.converged,
         };
@@ -236,6 +246,7 @@ pub fn estimate_physics(data_root: &Path, session_id: &str, opts: &PhysicsOption
         (fitted_bike(&base, &rep), Some(fit))
     };
 
+    drop(fit_ride);
     let sol = solve_ride(&r, &bk, centre, &cfg);
     let outs = outputs(&sol);
     let rear_travel_m: Vec<f64> = outs[1].2.iter().map(|v| v / 1000.0).collect();
