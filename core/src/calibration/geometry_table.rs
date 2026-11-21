@@ -98,7 +98,7 @@ const RULES: &[(&[&str], &[&str], &str)] = &[
     (&["bracket", "height"], &[], "geometry.bb_height_mm"),
     (&["head", "tube"], &["angle"], "geometry.head_tube_mm"),
     (&["seat", "tube"], &["angle"], "geometry.seat_tube_mm"),
-    (&["top", "tube"], &[], "geometry.top_tube_mm"),
+    (&["top", "tube"], &["actual"], "geometry.top_tube_mm"),
     (&["offset"], &[], "geometry.fork_offset_mm"),
     (&["rake"], &[], "geometry.fork_offset_mm"),
     (&["trail"], &[], "geometry.trail_mm"),
@@ -106,6 +106,9 @@ const RULES: &[(&[&str], &[&str], &str)] = &[
     (&["stand", "over"], &[], "geometry.standover_mm"),
     (&["axle", "crown"], &[], "geometry.fork_length_mm"),
     (&["fork", "length"], &[], "geometry.fork_length_mm"),
+    (&["travel", "front"], &[], "fork.travel_mm"),
+    (&["fork", "travel"], &[], "fork.travel_mm"),
+    (&["travel", "rear"], &[], "shock.wheel_travel_mm"),
 ];
 
 /// The vocabulary key for a row label, if one matches.
@@ -127,6 +130,7 @@ fn plausible(key: &str) -> (f64, f64) {
         "geometry.head_tube_mm" => (60.0, 250.0),
         "geometry.bb_height_mm" => (250.0, 400.0),
         "geometry.chainstay_mm" => (380.0, 500.0),
+        "fork.travel_mm" | "shock.wheel_travel_mm" => (80.0, 250.0),
         _ => (250.0, 1500.0),
     }
 }
@@ -446,7 +450,9 @@ mod tests {
         assert_eq!(key_for("Head tube angle"), Some("geometry.head_angle_deg"));
         assert_eq!(key_for("Seat Tube Length"), Some("geometry.seat_tube_mm"));
         assert_eq!(key_for("Effective Top Tube"), Some("geometry.top_tube_mm"));
-        assert_eq!(key_for("Rear Travel"), None);
+        assert_eq!(key_for("Travel rear"), Some("shock.wheel_travel_mm"));
+        assert_eq!(key_for("Top tube actual"), None);
+        assert_eq!(key_for("Front center"), None);
     }
 
     #[test]
@@ -483,5 +489,43 @@ mod tests {
 
         // Assert
         assert_eq!(t.rows[0].values, vec![vec![64.0], vec![64.5]]);
+    }
+
+    #[test]
+    fn parse_gt_site_table_cells_as_whole_words() {
+        // Arrange: GT's own layout, one OCR word per cell (labels whole), a spaced degree sign
+        let mut words = Vec::new();
+        let cell = |t: &str, cx: f64, y: f64| OcrWord { text: t.into(), x: cx - 4.0 * t.len() as f64, y, w: 8.0 * t.len() as f64, h: 9.0 };
+        words.push(cell("Sizes (mm)", 60.0, 20.0));
+        for (i, z) in ["SM", "MD", "LG", "XL"].iter().enumerate() {
+            words.push(cell(z, 210.0 + 92.0 * i as f64, 20.0));
+        }
+        let rows: [(&str, [&str; 4]); 6] = [
+            ("Head tube angle", ["63.5 °"; 4]),
+            ("Top tube horizontal", ["563", "590", "617", "654"]),
+            ("Top tube actual", ["544", "565", "586", "620"]),
+            ("Wheelbase", ["1211/1221", "1240/1250", "1270/1280", "1309/1319"]),
+            ("Bottom bracket drop", ["30"; 4]),
+            ("Travel rear", ["160"; 4]),
+        ];
+        for (r, (label, cells)) in rows.iter().enumerate() {
+            let y = 60.0 + 38.5 * r as f64;
+            words.push(OcrWord { text: (*label).into(), x: 23.0, y, w: 8.0 * label.len() as f64 * 0.6, h: 9.0 });
+            for (i, c) in cells.iter().enumerate() {
+                words.push(cell(c, 210.0 + 92.0 * i as f64, y));
+            }
+        }
+
+        // Act
+        let t = parse(&words).unwrap();
+        let lg: std::collections::BTreeMap<_, _> = t.for_size(2, 1).into_iter().collect();
+
+        // Assert
+        assert_eq!(t.sizes, ["SM", "MD", "LG", "XL"]);
+        assert_eq!(lg["geometry.head_angle_deg"], 63.5);
+        assert_eq!(lg["geometry.top_tube_mm"], 617.0);
+        assert_eq!(lg["geometry.wheelbase_mm"], 1280.0);
+        assert_eq!(lg["geometry.bb_drop_mm"], 30.0);
+        assert_eq!(lg["shock.wheel_travel_mm"], 160.0);
     }
 }
