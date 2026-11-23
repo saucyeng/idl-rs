@@ -1215,8 +1215,11 @@ mod tests {
     /// The estimator's `attitude(...)` selectors added with the bike
     /// calibration (heading and travel direction, slide angle, steering,
     /// understeer).
-    const CALIBRATED_SELECTORS: [&str; 9] =
-        ["heading", "heading_sigma", "course", "slip", "slip_sigma", "steer", "steer_sigma", "steer_needed", "understeer"];
+    /// The older filter's (IEKF) selectors that need the calibration. `steer`
+    /// itself is the physics solver's since 2026-11-23 (C3 §3.16); the filter's
+    /// own steering is the channel `IEKF steer (deg)`, counted as `n_iekf_steer`.
+    const CALIBRATED_SELECTORS: [&str; 8] =
+        ["heading", "heading_sigma", "course", "slip", "slip_sigma", "steer_sigma", "steer_needed", "understeer"];
 
     /// A calibration whose IMU mounts, lever arms and steering axis are the
     /// reference bike's, stated in IMU0's axes as a fitted one is, with a
@@ -1281,6 +1284,7 @@ mod tests {
         let defs: String = CALIBRATED_SELECTORS
             .iter()
             .map(|s| format!("n_{s} = sum(where(attitude(\"{s}\") > -1000, 1, 0))\n"))
+            .chain(std::iter::once("n_iekf_steer = sum(where([IEKF steer (deg)] > -1000, 1, 0))\n".to_string()))
             .collect();
         let wb = root.join("attitude.idl1wb");
         std::fs::write(&wb, format!("---\nid: 3b1d9c4e-7a2f-4e8b-9c1d-5f6a7b8c9d0e\nname: Attitude\n---\n\n```math id=cccccccc\n{defs}```\n")).unwrap();
@@ -1318,6 +1322,7 @@ mod tests {
         for s in CALIBRATED_SELECTORS {
             assert!(counts.get(s).is_some_and(|n| *n > 0.0), "attitude(\"{s}\"): {:?}\n{text}", counts.get(s));
         }
+        assert!(counts.get("iekf_steer").is_some_and(|n| *n > 0.0), "IEKF steer: {:?}\n{text}", counts.get("iekf_steer"));
     }
 
     #[test]
@@ -1331,8 +1336,8 @@ mod tests {
 
         // Assert — the estimator ran (heading is known) but steering is blank.
         assert!(counts.get("heading").is_some_and(|n| *n > 0.0), "{text}");
-        for s in ["steer", "steer_sigma", "steer_needed", "understeer"] {
-            assert_eq!(counts.get(s), Some(&0.0), "attitude(\"{s}\")\n{text}");
+        for s in ["iekf_steer", "steer_sigma", "steer_needed", "understeer"] {
+            assert_eq!(counts.get(s), Some(&0.0), "{s}\n{text}");
         }
     }
 
