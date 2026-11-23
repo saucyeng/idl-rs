@@ -218,8 +218,15 @@ pub struct FrontMatter {
 pub fn parse_front_matter(markdown: &str) -> Result<(FrontMatter, &str), WorkbookError> {
     let missing_id = error::missing_front_matter_id;
 
-    let rest = markdown.strip_prefix("---\n").ok_or_else(missing_id)?;
-    let (yaml_block, body) = rest.split_once("\n---\n").ok_or_else(missing_id)?;
+    // CRLF as well as LF (2026-11-23): a workbook saved on Windows, or a
+    // checkout with `core.autocrlf`, read as "missing a valid 'id'".
+    let rest = markdown.strip_prefix("---\n").or_else(|| markdown.strip_prefix("---\r\n")).ok_or_else(missing_id)?;
+    let (at, len) = ["\n---\n", "\n---\r\n"]
+        .iter()
+        .filter_map(|d| rest.find(d).map(|i| (i, d.len())))
+        .min_by_key(|&(i, _)| i)
+        .ok_or_else(missing_id)?;
+    let (yaml_block, body) = (&rest[..at], &rest[at + len..]);
 
     let front_matter: FrontMatter = serde_yaml_ng::from_str(yaml_block).map_err(|_| missing_id())?;
 
@@ -572,6 +579,21 @@ mod tests {
         // Assert
         assert_eq!(round_tripped.version, 3);
         assert_eq!(round_tripped.id, VALID_ID);
+    }
+
+    #[test]
+    fn parse_front_matter_crlf_line_endings_read_the_same_as_lf() {
+        // Arrange
+        let lf = doc(&format!("id: {VALID_ID}\nname: Fork tuning"));
+        let crlf = lf.replace('\n', "\r\n");
+
+        // Act
+        let (fm, body) = parse_front_matter(&crlf).unwrap();
+
+        // Assert
+        assert_eq!(fm.id, VALID_ID);
+        assert_eq!(fm.name, "Fork tuning");
+        assert_eq!(body, &crlf[crlf.find("\n---\r\n").unwrap() + 6..]);
     }
 
     #[test]
