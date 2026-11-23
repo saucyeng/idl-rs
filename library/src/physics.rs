@@ -18,7 +18,8 @@ use std::time::Instant;
 use idl_rs::calibration::linkage::{PhysicsFit, PHYSICS_FIT_VERSION};
 use idl_rs::estimate::physics::objective::NG;
 use idl_rs::estimate::physics::pipeline::{ride_between, still_bias_centre, PipelineError, Ride};
-use idl_rs::estimate::physics::run::{bike_geometry, fit_bike, fitted_bike, outputs, solve_ride, Config, PHYSICS_ESTIMATOR_VERSION};
+pub use idl_rs::estimate::physics::run::SolveProgress;
+use idl_rs::estimate::physics::run::{bike_geometry, fit_bike, fitted_bike, outputs, solve_ride_with, Config, PHYSICS_ESTIMATOR_VERSION};
 use idl_rs::estimate::physics::setup::{bike, SetupError};
 use idl_rs::estimate::physics::solve::SolveError;
 use idl_rs::math::eval::ChannelLookup;
@@ -104,6 +105,8 @@ pub enum PhysicsErrorKind {
     Solve,
     /// Reading or writing failed.
     Io,
+    /// Stopped through [`SolveProgress::cancel`]; nothing was written.
+    Cancelled,
 }
 
 /// A run's failure, typed (CLAUDE.md §5).
@@ -153,6 +156,19 @@ fn summary(r: &Ride, values: &[f64], air: &[bool]) -> TravelSummary {
 
 /// Runs the physics estimator over `session_id` (see the module docs).
 pub fn estimate_physics(data_root: &Path, session_id: &str, opts: &PhysicsOptions) -> Result<PhysicsReport, PhysicsError> {
+    estimate_physics_with(data_root, session_id, opts, None)
+}
+
+/// [`estimate_physics`], telling `progress` about each solved window and
+/// stopping when its `cancel` is set: then nothing is written and the result
+/// is [`PhysicsErrorKind::Cancelled`]. A bike fit, when one is needed, runs
+/// before the first window is reported and is not interrupted.
+pub fn estimate_physics_with(
+    data_root: &Path,
+    session_id: &str,
+    opts: &PhysicsOptions,
+    progress: Option<&SolveProgress>,
+) -> Result<PhysicsReport, PhysicsError> {
     let t0 = Instant::now();
     let dir = data_root.join("sessions").join(session_id);
     let doc = read_session_json(&dir.join("session.json")).map_err(|e| err(PhysicsErrorKind::NotFound, format!("{session_id}: {e:?}")))?;
@@ -247,7 +263,10 @@ pub fn estimate_physics(data_root: &Path, session_id: &str, opts: &PhysicsOption
     };
 
     drop(fit_ride);
-    let sol = solve_ride(&r, &bk, centre, &cfg);
+    let sol = solve_ride_with(&r, &bk, centre, &cfg, progress);
+    if progress.is_some_and(|p| p.cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(err(PhysicsErrorKind::Cancelled, format!("{session_id}: solve cancelled")));
+    }
     let outs = outputs(&sol);
     let rear_travel_m: Vec<f64> = outs[1].2.iter().map(|v| v / 1000.0).collect();
     let solved = sol.q.iter().filter(|q| q[0].is_finite()).count();

@@ -149,14 +149,39 @@ pub fn plan_windows(mov: &[bool], w: usize, o: usize, min: usize) -> Vec<(usize,
     out
 }
 
+/// Watching a [`solve_ride_with`] run from another thread: told after each
+/// window, and able to stop the rest.
+pub struct SolveProgress<'a> {
+    /// Called after each window with (windows finished, windows planned),
+    /// from the solving threads.
+    pub on_window: &'a (dyn Fn(usize, usize) + Sync),
+    /// Set to stop: windows not yet started end as [`SolveError::Cancelled`].
+    pub cancel: &'a std::sync::atomic::AtomicBool,
+}
+
 /// Solves every riding stretch of `r` with `bike` frozen, windows in parallel.
 pub fn solve_ride(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: &Config) -> Solution {
+    solve_ride_with(r, bike, bias_centre, cfg, None)
+}
+
+/// [`solve_ride`], reporting each finished window to `progress` and
+/// skipping the windows not yet started once its `cancel` is set.
+pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: &Config, progress: Option<&SolveProgress>) -> Solution {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let plan = plan(r, cfg);
+    let finished = AtomicUsize::new(0);
     let solve_one = |&(a, b, _, _): &(usize, usize, usize, usize)| -> Result<(Vec<[f64; NL]>, Option<Vec<bool>>, usize), SolveError> {
+        if progress.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) {
+            return Err(SolveError::Cancelled);
+        }
         let win = window(r, a, b, cfg.air_anchor);
         let air = win.air.clone();
         let obj = Objective::new(bike.clone(), win, Spec::standard(b - a, r.input.dt), cfg.weights.clone(), bias_centre);
-        let (v, info) = gauss_newton(&obj, obj.initial_vars(), cfg.iters, cfg.tol)?;
+        let solved = gauss_newton(&obj, obj.initial_vars(), cfg.iters, cfg.tol);
+        if let Some(p) = progress {
+            (p.on_window)(finished.fetch_add(1, Ordering::Relaxed) + 1, plan.len());
+        }
+        let (v, info) = solved?;
         Ok((latents(&obj, &v), air, info.iterations))
     };
     let threads = cfg.threads.max(1);

@@ -286,6 +286,8 @@ pub enum SolveError {
         /// Row of the band (or n_loc for the globals' block) where it failed.
         row: usize,
     },
+    /// Stopped before this window started ([`super::run::SolveProgress::cancel`]).
+    Cancelled,
 }
 
 /// One window's damped band solved against -g_loc and the border: A^-1 (-g_loc), A^-1 B.

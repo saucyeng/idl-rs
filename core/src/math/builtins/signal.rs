@@ -192,19 +192,31 @@ pub(super) fn cumulative_trapezoid(ctx: &Ctx, ch: ChannelValue) -> Result<Value,
 }
 
 /// The estimator-backed virtual sensors (`wheel_travel`, `wheel_velocity`,
-/// `attitude`, `body_accel`): store reads of the offline geometry-constrained
-/// estimator, which the lookup runs once per session and caches.
+/// `attitude`, `body_accel`). Travel and steer are the physics solver's
+/// ([`crate::session::handle::SessionHandle::SOLVER_CHANNELS`], read where the
+/// ride was solved); the rest are store reads of the older filter (IEKF,
+/// legacy), which the lookup runs once per session and caches.
 pub(super) fn estimator(ctx: &Ctx, arg: String) -> Result<Value, MathEvalError> {
     let name = ctx.name();
     let channel_id = estimator_channel_id(name, &arg)?;
     let ch = ctx.lookup().estimator_channel(channel_id).ok_or_else(|| {
-        err(
-            MathEvalErrorKind::Runtime,
-            format!(
-                "{name}(\"{arg}\"): the suspension/attitude estimator could not run for \
-                 this session — it needs IMU0 accel and gyro channels"
-            ),
-        )
+        if crate::session::handle::SessionHandle::SOLVER_CHANNELS.contains(&channel_id) {
+            err(
+                MathEvalErrorKind::Runtime,
+                format!(
+                    "{name}(\"{arg}\"): this ride has not been solved here — run the physics \
+                     solver over it (Solve in the app, or `idl-rs session estimate-physics`)"
+                ),
+            )
+        } else {
+            err(
+                MathEvalErrorKind::Runtime,
+                format!(
+                    "{name}(\"{arg}\"): the suspension/attitude estimator could not run for \
+                     this session — it needs IMU0 accel and gyro channels"
+                ),
+            )
+        }
     })?;
     Ok(channel(ch.samples.to_vec(), ch.sample_rate_hz, ch.t_us))
 }

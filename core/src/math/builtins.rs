@@ -253,19 +253,19 @@ pub(super) fn register(r: &mut Registry) -> Result<(), RegistryError> {
         example: "lap_delta_dist([Speed])" }, laps::lap_delta_dist)?;
     r.add(BuiltinMeta { name: "attitude", category: "Estimator (diagnostic)", unit_rule: "Fixed(deg)", shape: "[t]", kwargs: &[],
         signature: "attitude(\"roll\"|\"pitch\"|\"heading\"|\"heading_sigma\"|\"course\"|\"slip\"|\"slip_sigma\"|\"steer\"|\"steer_sigma\"|\"steer_needed\"|\"understeer\")",
-        description: "Bike attitude from the estimator, in degrees. `roll` and `pitch` are about the bike's own axes. `heading` is where the frame points and `course` where the rear wheel is travelling, both clockwise from north; `slip` is heading minus course (positive = nose right of travel). `heading_sigma` and `slip_sigma` are the estimator's own 1-sigma uncertainties. `steer` is the bar angle about the steering axis, positive to the left, and needs the bike to have a calibration with a steering axis (blank otherwise). `steer_needed` is the bar angle a bike that does not slide needs for its speed and turn rate, and `understeer` is the measured steering angle less that, on the ground and toward the turn: positive = understeer, negative = oversteer (blank going straight); both also need the bike's wheelbase. Heading, course and slip are blank until the bike first moves, and course and slip below 3 m/s.",
+        description: "Bike attitude, in degrees. `steer` is the physics solver's (the same channel as `[Steer (deg)]`), read where the ride was solved and an error elsewhere; every other selector is the older filter (IEKF), legacy until the solver produces it. `roll` and `pitch` are about the bike's own axes. `heading` is where the frame points and `course` where the rear wheel is travelling, both clockwise from north; `slip` is heading minus course (positive = nose right of travel). `heading_sigma` and `slip_sigma` are the estimator's own 1-sigma uncertainties. `steer` is the bar angle about the steering axis, positive to the left, and needs the bike to have a calibration with a steering axis (blank otherwise). `steer_needed` is the bar angle a bike that does not slide needs for its speed and turn rate, and `understeer` is the measured steering angle less that, on the ground and toward the turn: positive = understeer, negative = oversteer (blank going straight); both also need the bike's wheelbase. Heading, course and slip are blank until the bike first moves, and course and slip below 3 m/s.",
         example: "attitude(\"roll\")" }, signal::estimator)?;
     r.add(BuiltinMeta { name: "body_accel", category: "Estimator (diagnostic)", unit_rule: "Fixed(g)", shape: "[t]", kwargs: &[],
         signature: "body_accel(\"long\"|\"lat\")",
-        description: "Gravity-compensated body-frame acceleration, in g.",
+        description: "Gravity-compensated body-frame acceleration, in g, from the older filter (IEKF, legacy until the physics solver produces it).",
         example: "body_accel(\"long\")" }, signal::estimator)?;
     r.add(BuiltinMeta { name: "wheel_travel", category: "Estimator", unit_rule: "Fixed(mm)", shape: "[t]", kwargs: &[],
         signature: "wheel_travel(\"front\"|\"rear\")",
-        description: "Suspension travel at the named wheel, in mm.",
+        description: "Suspension travel at the named wheel, in mm, from the physics solver: the same channels as `[Front travel (mm)]` and `[Rear travel (mm)]`, read where the ride was solved (Solve in the app, or `idl-rs session estimate-physics`) and an error elsewhere. The older filter's travel (legacy) is `[IEKF front travel (mm)]` once any other estimator builtin has run.",
         example: "wheel_travel(\"front\")" }, signal::estimator)?;
     r.add(BuiltinMeta { name: "wheel_velocity", category: "Estimator", unit_rule: "Fixed(mm/s)", shape: "[t]", kwargs: &[],
         signature: "wheel_velocity(\"front\"|\"rear\")",
-        description: "Suspension velocity at the named wheel, in mm/s.",
+        description: "Suspension velocity at the named wheel, in mm/s, from the older filter (IEKF, legacy until the physics solver produces it; `differentiate(wheel_travel(\"front\"))` is the solver's).",
         example: "wheel_velocity(\"front\")" }, signal::estimator)?;
     r.add(BuiltinMeta { name: "vec", category: "Vector", unit_rule: "AllMatch(0, 1, 2)", shape: "Vec3", kwargs: &[],
         signature: "vec(x, y, z)",

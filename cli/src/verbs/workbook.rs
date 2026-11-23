@@ -494,6 +494,10 @@ fn session_context(ctx: &Ctx, m: &ArgMatches) -> Result<Option<(SessionHandle, M
             if let (Some(root), Some(json)) = (ctx.data_dir.as_deref(), json.as_ref()) {
                 idl_library::bikelog::apply_session_calibration(root, json, &handle);
             }
+            // The physics solver's outputs, under their plain names (`Front travel (mm)`).
+            if let (Some(root), Some(id)) = (ctx.data_dir.as_deref(), dir.file_name().and_then(|n| n.to_str())) {
+                idl_library::estimated::apply_estimated_channels(root, id, &handle);
+            }
             let bounds = idl_library::session_context::whole_session_bounds(&dir)
                 .map_err(|e| CliError::io(format!("sizing {}: {}", dir.display(), e.message)))?;
             (handle, Some(idl_library::session_context::window_lap_context(json.as_ref(), bounds)))

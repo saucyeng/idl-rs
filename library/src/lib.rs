@@ -14,6 +14,7 @@ pub mod blob;
 pub mod catalog;
 pub mod catalog_read;
 pub mod derived;
+pub mod estimated;
 pub mod eval_cache;
 pub mod import;
 pub mod index_job;

@@ -554,9 +554,9 @@ impl SessionHandle {
     ///
     /// [`ChannelLookup::estimator_channel`]: crate::math::eval::ChannelLookup::estimator_channel
     pub const ESTIMATOR_CHANNELS: [&'static str; 17] = [
-        "Front travel (mm)",
+        "IEKF front travel (mm)",
         "Front velocity (mm/s)",
-        "Rear travel (mm)",
+        "IEKF rear travel (mm)",
         "Rear velocity (mm/s)",
         "Roll (deg)",
         "Pitch (deg)",
@@ -567,11 +567,18 @@ impl SessionHandle {
         "Course (deg)",
         "Slip (deg)",
         "Slip uncertainty (deg)",
-        "Steer (deg)",
+        "IEKF steer (deg)",
         "Steer uncertainty (deg)",
         "Steer needed (deg)",
         "Understeer (deg)",
     ];
+
+    /// The estimator builtins' channels the physics solver owns (2026-11-23):
+    /// `wheel_travel` and `attitude("steer")` read these, and they are never
+    /// computed here. The library hands a ride's solves to the handle under
+    /// these names (`idl_library::estimated`); a ride not solved has none.
+    /// The old filter keeps its own as `IEKF front travel (mm)` etc. (legacy).
+    pub const SOLVER_CHANNELS: [&'static str; 3] = ["Front travel (mm)", "Rear travel (mm)", "Steer (deg)"];
 
     /// Run the suspension/attitude estimator once and cache all of
     /// [`Self::ESTIMATOR_CHANNELS`] into the derived store. Returns `false`
@@ -604,9 +611,9 @@ impl SessionHandle {
         // acceleration already g.
         let mm = |v: &[f64]| v.iter().map(|x| x * 1000.0).collect::<Vec<f64>>();
         let store = |id: &str, v: Vec<f64>| self.store_math_with_times(id, rate_hz, v, t_us.clone());
-        store("Front travel (mm)", mm(&est.front_travel));
+        store("IEKF front travel (mm)", mm(&est.front_travel));
         store("Front velocity (mm/s)", mm(&est.front_velocity));
-        store("Rear travel (mm)", mm(&est.rear_travel));
+        store("IEKF rear travel (mm)", mm(&est.rear_travel));
         store("Rear velocity (mm/s)", mm(&est.rear_velocity));
         store("Roll (deg)", est.roll);
         store("Pitch (deg)", est.pitch);
@@ -617,7 +624,7 @@ impl SessionHandle {
         store("Course (deg)", est.course);
         store("Slip (deg)", est.slip);
         store("Slip uncertainty (deg)", est.slip_sigma);
-        store("Steer (deg)", est.steer);
+        store("IEKF steer (deg)", est.steer);
         store("Steer uncertainty (deg)", est.steer_sigma);
         store("Steer needed (deg)", est.steer_needed);
         store("Understeer (deg)", est.understeer);
@@ -1254,6 +1261,10 @@ fn epoch_to_time_one_extrapolated(samples: &[f64], rate: f64, target: f64) -> f6
 
 impl crate::math::eval::ChannelLookup for SessionHandle {
     fn estimator_channel(&self, channel_id: &str) -> Option<crate::math::eval::LookupChannel> {
+        if Self::SOLVER_CHANNELS.contains(&channel_id) {
+            // Read, never computed: present only where the ride was solved.
+            return self.lookup(channel_id);
+        }
         if !Self::ESTIMATOR_CHANNELS.contains(&channel_id) {
             return None;
         }
@@ -2366,8 +2377,6 @@ mod tests {
         use crate::math::eval::ChannelLookup;
         let h = level_parked_handle();
         let selectors = [
-            ("wheel_travel", "front"),
-            ("wheel_travel", "rear"),
             ("wheel_velocity", "front"),
             ("wheel_velocity", "rear"),
             ("body_accel", "long"),
@@ -2379,7 +2388,6 @@ mod tests {
             ("attitude", "course"),
             ("attitude", "slip"),
             ("attitude", "slip_sigma"),
-            ("attitude", "steer"),
             ("attitude", "steer_sigma"),
             ("attitude", "steer_needed"),
             ("attitude", "understeer"),
@@ -2394,6 +2402,34 @@ mod tests {
 
         // Assert
         assert!(missing.is_empty(), "not served: {missing:?}");
+    }
+
+    #[test]
+    fn estimator_channel_solver_channel_not_solved_none_and_the_filter_never_runs() {
+        // Arrange
+        use crate::math::eval::ChannelLookup;
+        let h = level_parked_handle();
+
+        // Act
+        let travel = h.estimator_channel("Front travel (mm)");
+
+        // Assert — absent, and asking did not run the old filter.
+        assert!(travel.is_none());
+        assert!(h.channel_meta("Roll (deg)").is_none(), "the IEKF ran for a solver channel");
+    }
+
+    #[test]
+    fn estimator_channel_solver_channel_stored_by_the_library_is_served() {
+        // Arrange
+        use crate::math::eval::ChannelLookup;
+        let h = level_parked_handle();
+        h.store_math_with_times("Steer (deg)", 100.0, vec![1.0, 2.0], vec![0, 10_000]);
+
+        // Act
+        let steer = h.estimator_channel("Steer (deg)");
+
+        // Assert
+        assert_eq!(steer.map(|c| c.samples.to_vec()), Some(vec![1.0, 2.0]));
     }
 
     #[test]

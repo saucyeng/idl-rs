@@ -33,7 +33,7 @@ impl From<idl_library::physics::PhysicsError> for CliError {
         let kind = match e.kind {
             K::NotFound => ErrorKind::NotFound,
             K::NotCalibrated | K::Unusable => ErrorKind::InvalidInput,
-            K::Solve => ErrorKind::Eval,
+            K::Solve | K::Cancelled => ErrorKind::Eval,
             K::Io => ErrorKind::Io,
         };
         CliError::new(kind, e.message)
