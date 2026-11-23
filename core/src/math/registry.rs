@@ -529,7 +529,14 @@ mod tests {
 
     fn fixture() -> ExampleLookup {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/synth-3lap.idl0");
-        ExampleLookup(SessionHandle::from_path(path).expect("committed fixture is present"))
+        let handle = SessionHandle::from_path(path).expect("committed fixture is present");
+        // A solved ride: the physics solver's channels, as a library opener
+        // hands them over (C3 §3.16), so `wheel_travel`'s example has data.
+        let t_us = handle.lookup("IMU0_AccelZ").expect("the fixture has IMU0").t_us.to_vec();
+        for id in SessionHandle::SOLVER_CHANNELS {
+            handle.store_math_with_times(id, 100.0, vec![0.0; t_us.len()], t_us.clone());
+        }
+        ExampleLookup(handle)
     }
 
     /// Three equal laps of two sectors each over the fixture's span, lap 1
