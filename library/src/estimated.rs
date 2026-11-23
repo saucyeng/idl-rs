@@ -184,6 +184,35 @@ pub fn estimated_channel(data_root: &Path, session_id: &str, name: &str) -> Opti
     load_estimated_channels(data_root, session_id).0.into_iter().find(|m| m.name == name)
 }
 
+/// The runs of finite values in `values` (sampled at `t_us`), as
+/// `(first µs, last µs)`: where a channel has data. Pure.
+pub fn finite_runs(t_us: &[i64], values: &[f64]) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    let mut start: Option<i64> = None;
+    let mut last = 0;
+    for (&t, &v) in t_us.iter().zip(values) {
+        if v.is_finite() {
+            if start.is_none() {
+                start = Some(t);
+            }
+            last = t;
+        } else if let Some(s) = start.take() {
+            out.push((s, last));
+        }
+    }
+    if let Some(s) = start {
+        out.push((s, last));
+    }
+    out
+}
+
+/// Where `session_id` has been solved, µs since its first sample: the runs
+/// of its merged front travel (2026-11-23: so the app solves a selected lap
+/// only when it is not already covered).
+pub fn solved_spans(data_root: &Path, session_id: &str) -> Vec<(i64, i64)> {
+    estimated_channel(data_root, session_id, "Front travel (mm)").map(|m| finite_runs(&m.t_us, &m.values)).unwrap_or_default()
+}
+
 /// Every solver output of `session_id`, merged, and what was read
 /// (`EstimatedLoad::channels` left for the caller to fill).
 pub fn load_estimated_channels(data_root: &Path, session_id: &str) -> (Vec<MergedChannel>, EstimatedLoad) {
@@ -342,6 +371,19 @@ mod tests {
 
         // Assert
         assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn finite_runs_gaps_split_runs_and_the_last_run_closes() {
+        // Arrange
+        let t = [0, 1, 2, 3, 4, 5];
+        let v = [1.0, 2.0, f64::NAN, f64::NAN, 3.0, 4.0];
+
+        // Act
+        let runs = finite_runs(&t, &v);
+
+        // Assert
+        assert_eq!(runs, vec![(0, 1), (4, 5)]);
     }
 
     #[test]
