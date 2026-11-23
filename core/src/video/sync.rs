@@ -239,6 +239,160 @@ pub fn estimate_sync(telemetry: Option<&VideoTelemetry>, info: &Mp4Info, clock: 
     Ok(SyncEstimate { offset_s, confidence, method })
 }
 
+/// The grid the motion sync compares on, s (200 Hz: the camera's `ACCL` rate).
+const IMU_SYNC_STEP_S: f64 = 0.005;
+/// How far either side of the anchor's offset the motion sync looks, s.
+const IMU_SYNC_SEARCH_S: f64 = 3.0;
+/// The moving mean taken off before rectifying, s (keeps vibration, drops
+/// gravity and slow manoeuvres).
+const IMU_SYNC_HIGHPASS_S: f64 = 1.0;
+/// The smoothing of the rectified signal, s.
+const IMU_SYNC_SMOOTH_S: f64 = 0.1;
+/// Pods must agree within this, s, to count together.
+const IMU_SYNC_AGREE_S: f64 = 0.25;
+/// Least median correlation for two or more agreeing pods.
+const IMU_SYNC_MIN_R: f64 = 0.3;
+/// Least correlation when only one pod is there to agree with itself.
+const IMU_SYNC_MIN_R_SINGLE: f64 = 0.4;
+
+/// A motion-sync result (camera IMU spec §2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImuSync {
+    /// The offset, s: `session_time_s = video_time_s + offset_s`.
+    pub offset_s: f64,
+    /// The median best correlation of the pods that agreed, 0..1.
+    pub confidence: f64,
+    /// Each pod's best lag from the anchor, s, and its correlation, in the
+    /// order the pods were given (`None` for a pod with no overlap).
+    pub pods: Vec<Option<(f64, f64)>>,
+}
+
+/// `x` linearly interpolated at `at` (both ascending), NaN outside `t`'s span.
+fn interp_onto(t: &[f64], x: &[f64], at: &[f64]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(at.len());
+    let mut j = 0usize;
+    for &a in at {
+        if t.is_empty() || a < t[0] || a > t[t.len() - 1] {
+            out.push(f64::NAN);
+            continue;
+        }
+        while j + 1 < t.len() && t[j + 1] < a {
+            j += 1;
+        }
+        let (t0, t1) = (t[j], t.get(j + 1).copied().unwrap_or(t[j]));
+        let (x0, x1) = (x[j], x.get(j + 1).copied().unwrap_or(x[j]));
+        out.push(if t1 > t0 { x0 + (x1 - x0) * (a - t0) / (t1 - t0) } else { x0 });
+    }
+    out
+}
+
+/// The centred moving mean of `x` over `n` samples (NaN counted as absent).
+fn moving_mean(x: &[f64], n: usize) -> Vec<f64> {
+    let half = n / 2;
+    let mut sum = vec![0.0; x.len() + 1];
+    let mut cnt = vec![0usize; x.len() + 1];
+    for (i, &v) in x.iter().enumerate() {
+        let ok = v.is_finite();
+        sum[i + 1] = sum[i] + if ok { v } else { 0.0 };
+        cnt[i + 1] = cnt[i] + ok as usize;
+    }
+    (0..x.len())
+        .map(|i| {
+            let (a, b) = (i.saturating_sub(half), (i + half + 1).min(x.len()));
+            let c = cnt[b] - cnt[a];
+            if c == 0 { f64::NAN } else { (sum[b] - sum[a]) / c as f64 }
+        })
+        .collect()
+}
+
+/// The vibration envelope the motion sync compares: `x` minus its 1 s
+/// moving mean, rectified, smoothed over 0.1 s. NaN where `x` is.
+fn vibration_envelope(x: &[f64]) -> Vec<f64> {
+    let hp = (IMU_SYNC_HIGHPASS_S / IMU_SYNC_STEP_S) as usize;
+    let sm = (IMU_SYNC_SMOOTH_S / IMU_SYNC_STEP_S) as usize;
+    let base = moving_mean(x, hp);
+    let rect: Vec<f64> = x.iter().zip(&base).map(|(v, b)| (v - b).abs()).collect();
+    let env = moving_mean(&rect, sm);
+    env.iter().zip(x).map(|(&e, &v)| if v.is_finite() { e } else { f64::NAN }).collect()
+}
+
+/// Pearson correlation of the pairs where both are finite; `None` under 2 s of overlap.
+fn correlation(a: &[f64], b: &[f64]) -> Option<f64> {
+    let (mut n, mut sa, mut sb, mut saa, mut sbb, mut sab) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for (&x, &y) in a.iter().zip(b) {
+        if x.is_finite() && y.is_finite() {
+            n += 1.0;
+            sa += x;
+            sb += y;
+            saa += x * x;
+            sbb += y * y;
+            sab += x * y;
+        }
+    }
+    if n * IMU_SYNC_STEP_S < 2.0 {
+        return None;
+    }
+    let cov = sab / n - (sa / n) * (sb / n);
+    let va = saa / n - (sa / n).powi(2);
+    let vb = sbb / n - (sb / n).powi(2);
+    if va <= 0.0 || vb <= 0.0 { None } else { Some(cov / (va * vb).sqrt()) }
+}
+
+/// Refines a video's offset by its own accelerometer against the logger's
+/// pods (camera IMU spec §2). `camera` is `(video s, |accel| g)`; each of
+/// `pods` is `(session s, |accel| g)`, ascending. The camera's vibration
+/// envelope is slid against each pod's over ±3 s of `anchor_offset_s` in
+/// 5 ms steps. Accepted when two or more pods agree within 0.25 s with a
+/// median correlation ≥ 0.3, or one pod alone reaches 0.4; the offset is the
+/// anchor's plus the agreeing pods' median lag. `None` otherwise, and the
+/// anchor's estimate stands. Pure.
+pub fn refine_offset_by_imu(camera: (&[f64], &[f64]), pods: &[(&[f64], &[f64])], anchor_offset_s: f64) -> Option<ImuSync> {
+    let (ct, cm) = camera;
+    if ct.len() < 2 {
+        return None;
+    }
+    let n = ((ct[ct.len() - 1] - ct[0]) / IMU_SYNC_STEP_S) as usize;
+    let grid: Vec<f64> = (0..n).map(|i| ct[0] + i as f64 * IMU_SYNC_STEP_S).collect();
+    let cam_env = vibration_envelope(&interp_onto(ct, cm, &grid));
+    let max_shift = (IMU_SYNC_SEARCH_S / IMU_SYNC_STEP_S) as isize;
+    let mut results = Vec::with_capacity(pods.len());
+    for &(pt, pm) in pods {
+        // The pod on a session grid wide enough for every shift: index k ↔
+        // session s = grid[0] + anchor + (k − max_shift) · step.
+        let wide: Vec<f64> = (0..n + 2 * max_shift as usize)
+            .map(|k| grid[0] + anchor_offset_s + (k as isize - max_shift) as f64 * IMU_SYNC_STEP_S)
+            .collect();
+        let pod_env = vibration_envelope(&interp_onto(pt, pm, &wide));
+        let mut best: Option<(f64, f64)> = None;
+        for shift in -max_shift..=max_shift {
+            let start = (shift + max_shift) as usize;
+            if let Some(r) = correlation(&cam_env, &pod_env[start..start + n]) {
+                if best.is_none_or(|(_, b)| r > b) {
+                    best = Some((shift as f64 * IMU_SYNC_STEP_S, r));
+                }
+            }
+        }
+        results.push(best);
+    }
+    let found: Vec<(f64, f64)> = results.iter().flatten().copied().collect();
+    if found.is_empty() {
+        return None;
+    }
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        let m = v.len() / 2;
+        if v.len() % 2 == 1 { v[m] } else { (v[m - 1] + v[m]) / 2.0 }
+    };
+    let centre = median(found.iter().map(|p| p.0).collect());
+    let agree: Vec<(f64, f64)> = found.iter().copied().filter(|p| (p.0 - centre).abs() <= IMU_SYNC_AGREE_S).collect();
+    let r = median(agree.iter().map(|p| p.1).collect());
+    let accepted = if found.len() == 1 { r >= IMU_SYNC_MIN_R_SINGLE } else { agree.len() >= 2 && r >= IMU_SYNC_MIN_R };
+    if !accepted {
+        return None;
+    }
+    Some(ImuSync { offset_s: anchor_offset_s + median(agree.iter().map(|p| p.0).collect()), confidence: r, pods: results })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +749,59 @@ mod tests {
 
         // Assert
         assert_eq!(span, Some((8_000, 38_000)));
+    }
+
+    /// A deterministic bursty vibration magnitude, g, at 200 Hz over `secs`.
+    fn bursts(secs: f64, seed: u64) -> (Vec<f64>, Vec<f64>) {
+        let mut x = seed;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % 10_000) as f64 / 10_000.0
+        };
+        let n = (secs * 200.0) as usize;
+        let mut amp = 0.0;
+        let t: Vec<f64> = (0..n).map(|i| i as f64 / 200.0).collect();
+        let m: Vec<f64> = (0..n)
+            .map(|i| {
+                if i % 40 == 0 {
+                    amp = if rnd() < 0.3 { 2.0 * rnd() } else { 0.05 };
+                }
+                1.0 + amp * (rnd() - 0.5)
+            })
+            .collect();
+        (t, m)
+    }
+
+    #[test]
+    fn refine_offset_by_imu_two_pods_seeing_the_camera_1_1_s_late_find_it() {
+        // Arrange — the true offset is the anchor's minus 1.1 s.
+        let (vt, vm) = bursts(60.0, 7);
+        let anchor = 100.0;
+        let truth = anchor - 1.1;
+        let pod_t: Vec<f64> = vt.iter().map(|t| t + truth).collect();
+        let noisy: Vec<f64> = vm.iter().enumerate().map(|(i, m)| m * 3.0 + if i % 2 == 0 { 0.02 } else { -0.02 }).collect();
+
+        // Act
+        let r = refine_offset_by_imu((&vt, &vm), &[(&pod_t, &vm), (&pod_t, &noisy)], anchor).unwrap();
+
+        // Assert
+        assert!((r.offset_s - truth).abs() < 0.011, "{r:?}");
+        assert!(r.confidence > 0.9, "{r:?}");
+    }
+
+    #[test]
+    fn refine_offset_by_imu_unrelated_pods_leave_the_anchor() {
+        // Arrange
+        let (vt, vm) = bursts(60.0, 7);
+        let (pt, pm) = bursts(70.0, 99);
+        let pod_t: Vec<f64> = pt.iter().map(|t| t + 95.0).collect();
+
+        // Act
+        let r = refine_offset_by_imu((&vt, &vm), &[(&pod_t, &pm), (&pod_t, &pm)], 100.0);
+
+        // Assert
+        assert!(r.is_none(), "{r:?}");
     }
 }

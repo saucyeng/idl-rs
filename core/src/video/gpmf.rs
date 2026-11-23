@@ -199,6 +199,164 @@ pub fn parse_gpmf(samples: &[GpmdSample]) -> Result<VideoTelemetry, VideoError> 
     Ok(telemetry)
 }
 
+/// One three-axis camera stream on the video clock (camera IMU spec §3.1).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ImuStream {
+    /// Sample times, s, on the video clock.
+    pub t_video_s: Vec<f64>,
+    /// `[x, y, z]` per sample in the camera's own axes, in the stream's
+    /// channel unit (g for `ACCL`, deg/s for `GYRO`, unitless for `GRAV`).
+    pub xyz: Vec<[f64; 3]>,
+}
+
+/// The camera's own motion from GPMF: `ACCL`, `GYRO` and `GRAV` (camera IMU
+/// spec §3.1). A stream the camera did not record is empty.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CameraImu {
+    /// Specific force, g.
+    pub accel_g: ImuStream,
+    /// Angular rate, deg/s.
+    pub gyro_dps: ImuStream,
+    /// Gravity direction in the camera's frame, unit vector.
+    pub gravity: ImuStream,
+}
+
+/// Standard gravity, m/s², for `ACCL` (m/s²) → g.
+const STANDARD_GRAVITY_MPS2: f64 = 9.80665;
+
+/// One STRM's raw three-axis rows with its scale and axis order.
+#[derive(Default)]
+struct StreamXyz {
+    key: [u8; 4],
+    rows: Vec<[f64; 3]>,
+    scal: Vec<f64>,
+    orin: Option<Vec<u8>>,
+}
+
+/// Which camera axis (0 = X, 1 = Y, 2 = Z) and sign each stored column is,
+/// from an `ORIN` string such as `"ZXY"` (upper case the axis, lower case its
+/// negative). `None` or anything malformed means X, Y, Z as stored.
+fn axis_map(orin: Option<&[u8]>) -> [(usize, f64); 3] {
+    let identity = [(0, 1.0), (1, 1.0), (2, 1.0)];
+    let Some(o) = orin else { return identity };
+    if o.len() < 3 {
+        return identity;
+    }
+    let mut out = [(0usize, 1.0f64); 3];
+    let mut seen = [false; 3];
+    for (col, &c) in o[..3].iter().enumerate() {
+        let (axis, sign) = match c {
+            b'X' => (0, 1.0),
+            b'Y' => (1, 1.0),
+            b'Z' => (2, 1.0),
+            b'x' => (0, -1.0),
+            b'y' => (1, -1.0),
+            b'z' => (2, -1.0),
+            _ => return identity,
+        };
+        if seen[axis] {
+            return identity;
+        }
+        seen[axis] = true;
+        out[col] = (axis, sign);
+    }
+    out
+}
+
+/// Big-endian signed 16-bit rows of three, the shape `ACCL`/`GYRO`/`GRAV` use.
+fn read_i16_rows(value: &[u8], struct_size: usize) -> Vec<[f64; 3]> {
+    if struct_size < 6 {
+        return Vec::new();
+    }
+    value
+        .chunks_exact(struct_size)
+        .map(|row| {
+            let v = |c: usize| i16::from_be_bytes([row[c * 2], row[c * 2 + 1]]) as f64;
+            [v(0), v(1), v(2)]
+        })
+        .collect()
+}
+
+/// Recurse DEVC containers collecting `ACCL`/`GYRO`/`GRAV` STRMs.
+fn collect_imu_streams(payload: &[u8], out: &mut Vec<StreamXyz>) -> Result<(), VideoError> {
+    walk_klv(payload, &mut |klv| {
+        match &klv.key {
+            b"DEVC" => collect_imu_streams(klv.value, out)?,
+            b"STRM" => {
+                let mut s = StreamXyz::default();
+                walk_klv(klv.value, &mut |inner| {
+                    match (&inner.key, inner.type_char) {
+                        (b"ACCL", b's') | (b"GYRO", b's') | (b"GRAV", b's') => {
+                            s.key = inner.key;
+                            s.rows = read_i16_rows(inner.value, inner.struct_size);
+                        }
+                        (b"SCAL", b's') => {
+                            s.scal = inner.value.chunks_exact(2).map(|b| i16::from_be_bytes([b[0], b[1]]) as f64).collect();
+                        }
+                        (b"SCAL", b'l') => {
+                            s.scal = read_i32s(inner.value, 4).into_iter().map(|r| r[0] as f64).collect();
+                        }
+                        (b"ORIN", b'c') => s.orin = Some(inner.value.to_vec()),
+                        _ => {}
+                    }
+                    Ok(())
+                })?;
+                if !s.rows.is_empty() {
+                    out.push(s);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+}
+
+/// Parse every `gpmd` sample's `ACCL`, `GYRO` and `GRAV` into the camera's
+/// motion (camera IMU spec §3.1). A payload's rows spread evenly across its
+/// sample's span on the video clock, as [`parse_gpmf`] spreads GPS rows.
+/// Values are divided by the stream's `SCAL` (one value, or one per column)
+/// and put on the camera's axes by its `ORIN`; `ACCL` becomes g and `GYRO`
+/// deg/s.
+pub fn parse_camera_imu(samples: &[GpmdSample]) -> Result<CameraImu, VideoError> {
+    let mut imu = CameraImu::default();
+    for (i, sample) in samples.iter().enumerate() {
+        if sample.payload.is_empty() {
+            continue;
+        }
+        let span_s = match samples.get(i + 1) {
+            Some(next) => (next.t_video_s - sample.t_video_s).max(0.0),
+            None => samples
+                .get(i.wrapping_sub(1))
+                .map(|prev| (sample.t_video_s - prev.t_video_s).max(0.0))
+                .unwrap_or(1.0),
+        };
+        let mut streams = Vec::new();
+        collect_imu_streams(&sample.payload, &mut streams)?;
+        for s in streams {
+            let (target, unit) = match &s.key {
+                b"ACCL" => (&mut imu.accel_g, 1.0 / STANDARD_GRAVITY_MPS2),
+                b"GYRO" => (&mut imu.gyro_dps, 180.0 / std::f64::consts::PI),
+                _ => (&mut imu.gravity, 1.0),
+            };
+            let scale = |col: usize| {
+                let v = if s.scal.len() >= 3 { s.scal[col] } else { s.scal.first().copied().unwrap_or(1.0) };
+                if v == 0.0 { 1.0 } else { v }
+            };
+            let map = axis_map(s.orin.as_deref());
+            let n = s.rows.len();
+            for (j, row) in s.rows.iter().enumerate() {
+                let mut xyz = [0.0; 3];
+                for (col, &(axis, sign)) in map.iter().enumerate() {
+                    xyz[axis] = sign * row[col] / scale(col) * unit;
+                }
+                target.t_video_s.push(sample.t_video_s + span_s * j as f64 / n as f64);
+                target.xyz.push(xyz);
+            }
+        }
+    }
+    Ok(imu)
+}
+
 /// Recurse DEVC containers collecting GPS-bearing STRMs.
 fn collect_streams(payload: &[u8], out: &mut Vec<StreamGps>) -> Result<(), VideoError> {
     walk_klv(payload, &mut |klv| {
@@ -380,5 +538,49 @@ mod tests {
         assert_eq!(parse_gpsu(b"240607143025.000"), Some(1_717_770_625_000));
         assert_eq!(parse_gpsu(b"700101000000.000"), Some(3_155_760_000_000)); // 2070-01-01
         assert_eq!(parse_gpsu(b"garbage"), None);
+    }
+
+    #[test]
+    fn parse_camera_imu_accl_with_scal_and_orin_lands_on_camera_axes_in_g() {
+        // Arrange — one ACCL row stored as (Z, X, Y) = (9.80665, 0, -9.80665) m/s², SCAL 100.
+        let row: Vec<u8> = [981i16, 0, -981].iter().flat_map(|v| v.to_be_bytes()).collect();
+        let mut strm = Vec::new();
+        strm.extend(klv(b"SCAL", b's', 2, 1, &100i16.to_be_bytes()));
+        strm.extend(klv(b"ORIN", b'c', 1, 3, b"ZXY"));
+        strm.extend(klv(b"ACCL", b's', 6, 1, &row));
+        let payload = nest(b"DEVC", &[nest(b"STRM", &[strm])]);
+        let samples = vec![GpmdSample { t_video_s: 2.0, payload }];
+
+        // Act
+        let imu = parse_camera_imu(&samples).unwrap();
+
+        // Assert — X 0, Y −1 g, Z +1 g, at the sample's own time.
+        assert_eq!(imu.accel_g.t_video_s, vec![2.0]);
+        let [x, y, z] = imu.accel_g.xyz[0];
+        assert!(x.abs() < 1e-9 && (y + 0.99987).abs() < 1e-3 && (z - 0.99987).abs() < 1e-3, "{:?}", imu.accel_g.xyz[0]);
+        assert!(imu.gyro_dps.xyz.is_empty() && imu.gravity.xyz.is_empty());
+    }
+
+    #[test]
+    fn parse_camera_imu_rows_spread_across_the_sample_span() {
+        // Arrange — two GYRO rows in a payload at 1.0 s, the next payload at 2.0 s.
+        let rows: Vec<u8> = [0i16, 0, 0, 0, 0, 0].iter().flat_map(|v| v.to_be_bytes()).collect();
+        let strm = klv(b"GYRO", b's', 6, 2, &rows);
+        let payload = nest(b"DEVC", &[nest(b"STRM", &[strm])]);
+        let samples = vec![GpmdSample { t_video_s: 1.0, payload: payload.clone() }, GpmdSample { t_video_s: 2.0, payload }];
+
+        // Act
+        let imu = parse_camera_imu(&samples).unwrap();
+
+        // Assert
+        assert_eq!(imu.gyro_dps.t_video_s, vec![1.0, 1.5, 2.0, 2.5]);
+    }
+
+    #[test]
+    fn axis_map_lower_case_negates_and_junk_falls_back_to_xyz() {
+        // Arrange / Act / Assert
+        assert_eq!(axis_map(Some(b"zXy")), [(2, -1.0), (0, 1.0), (1, -1.0)]);
+        assert_eq!(axis_map(Some(b"XXY")), [(0, 1.0), (1, 1.0), (2, 1.0)]);
+        assert_eq!(axis_map(None), [(0, 1.0), (1, 1.0), (2, 1.0)]);
     }
 }

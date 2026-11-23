@@ -130,7 +130,8 @@ fn err(kind: PhysicsErrorKind, message: impl Into<String>) -> PhysicsError {
     PhysicsError { kind, message: message.into() }
 }
 
-fn now_ms() -> i64 {
+/// Wall-clock UTC ms.
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 

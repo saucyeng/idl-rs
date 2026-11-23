@@ -168,6 +168,9 @@ pub struct EstimatedLoad {
 /// `handle` under its plain name ([`merge_segments`]). A session never
 /// solved, or with no `derived/` folder, loads nothing.
 pub fn apply_estimated_channels(data_root: &Path, session_id: &str, handle: &SessionHandle) -> EstimatedLoad {
+    // A linked video whose camera channels are missing gets them now
+    // (linked before they existed, or synced in without them).
+    crate::camera::ensure_camera_channels(data_root, session_id, crate::physics::now_ms());
     let (merged, mut load) = load_estimated_channels(data_root, session_id);
     for m in merged {
         load.channels.push(m.name.clone());
@@ -261,7 +264,10 @@ fn read_solved_segment(path: &Path) -> Result<Option<SolvedSegment>, String> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| e.to_string())?;
     let kv = builder.metadata().file_metadata().key_value_metadata().cloned().unwrap_or_default();
     let meta = |key: &str| kv.iter().find(|k| k.key == key).and_then(|k| k.value.clone());
-    if meta("derived_kind").as_deref() != Some(PHYSICS_DERIVED_KIND) {
+    // Physics solves, and a linked video's own motion (`crate::camera`): both
+    // are channels of the ride that do not come from its blob.
+    let kind = meta("derived_kind");
+    if kind.as_deref() != Some(PHYSICS_DERIVED_KIND) && kind.as_deref() != Some(crate::camera::CAMERA_DERIVED_KIND) {
         return Ok(None);
     }
     let computed_at_utc_ms = meta("computed_at_utc_ms").and_then(|v| v.parse().ok()).unwrap_or(0);

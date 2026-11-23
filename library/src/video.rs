@@ -19,7 +19,7 @@ use crate::blob::{blob_exists, blob_path};
 use idl_rs::store::parquet::{read_session_metadata, read_time_axis_bounds};
 use crate::sync::ids::{is_valid_id, IdClass};
 use idl_rs::store::session_json::{effective_start_ms, parse_session_json, read_session_json, SessionJson};
-use idl_rs::video::gpmf::{parse_gpmf, VideoTelemetry};
+use idl_rs::video::gpmf::{parse_camera_imu, parse_gpmf, CameraImu, VideoTelemetry};
 use idl_rs::video::mp4box::{probe_path, Mp4Info};
 use idl_rs::video::sync::{estimate_sync, video_span_utc_ms, SessionClock, SyncEstimate};
 use idl_rs::video::{SessionVideo, SyncMethod, VideoError, VideoErrorKind, VideoLink};
@@ -137,10 +137,11 @@ fn estimate_or_manual(telemetry: Option<&VideoTelemetry>, info: &Mp4Info, clock:
 /// Probes a file: container facts plus GPMF telemetry. A GPMF track that
 /// does not parse is treated as absent, so estimation falls back to the
 /// creation time rather than refusing the file.
-fn probe_file(path: &Path) -> Result<(Mp4Info, Option<VideoTelemetry>), VideoError> {
+fn probe_file(path: &Path) -> Result<(Mp4Info, Option<VideoTelemetry>, Option<CameraImu>), VideoError> {
     let (info, gpmd) = probe_path(path)?;
-    let telemetry = gpmd.and_then(|samples| parse_gpmf(&samples).ok());
-    Ok((info, telemetry))
+    let telemetry = gpmd.as_ref().and_then(|samples| parse_gpmf(samples).ok());
+    let imu = gpmd.and_then(|samples| parse_camera_imu(&samples).ok()).filter(|i| !i.accel_g.xyz.is_empty());
+    Ok((info, telemetry, imu))
 }
 
 /// Streams `source` into `blobs/sha256/…`, hashing as it goes, through a
@@ -248,9 +249,10 @@ pub fn link_video(
 ) -> Result<VideoLink, VideoError> {
     let dir = session_dir(data_root, session_id)?;
     on_progress(LinkProgress { phase: "probing", done: 0, total: None });
-    let (info, telemetry) = probe_file(source)?;
-    let estimate: Result<SyncEstimate, VideoError> =
-        session_clock(data_root, session_id).and_then(|clock| estimate_or_manual(telemetry.as_ref(), &info, &clock));
+    let (info, telemetry, imu) = probe_file(source)?;
+    let estimate: Result<SyncEstimate, VideoError> = session_clock(data_root, session_id)
+        .and_then(|clock| estimate_or_manual(telemetry.as_ref(), &info, &clock))
+        .map(|est| crate::camera::refine_offset(&dir, imu.as_ref(), info.duration_s, est));
     if let Err(e) = &estimate {
         if e.kind != VideoErrorKind::NoOverlap {
             return Err(e.clone());
@@ -296,6 +298,9 @@ pub fn link_video(
         // Nothing links the copy this call made; don't leave it behind.
         let _ = std::fs::remove_file(blob_path(data_root, &sha));
     }
+    if let (Ok(link), Some(imu)) = (&result, &imu) {
+        let _ = crate::camera::write_camera_channels(data_root, session_id, &link.blob_sha256, link.offset_s, imu, now_ms);
+    }
     result
 }
 
@@ -306,13 +311,25 @@ pub fn set_video_offset(data_root: &Path, session_id: &str, blob_sha256: &str, o
     if !offset_s.is_finite() {
         return Err(VideoError::new(VideoErrorKind::InvalidArgument, format!("offset_s must be finite, got {offset_s}")));
     }
-    modify_session_json(data_root, session_id, |doc| {
+    let link = modify_session_json(data_root, session_id, |doc| {
         let entry = live_entry_mut(doc, blob_sha256)?;
         entry.offset_s = offset_s;
         entry.sync_method = SyncMethod::Manual;
         entry.updated_at_ms = now_ms;
         Ok(entry.clone())
-    })
+    })?;
+    rewrite_camera_channels(data_root, session_id, &link, now_ms);
+    Ok(link)
+}
+
+/// Writes `link`'s camera channels at its (new) offset when its blob is on
+/// this device; best effort.
+fn rewrite_camera_channels(data_root: &Path, session_id: &str, link: &VideoLink, now_ms: i64) {
+    if is_sha256_hex(&link.blob_sha256) && blob_exists(data_root, &link.blob_sha256) {
+        if let Some(imu) = crate::camera::read_camera_imu(&blob_path(data_root, &link.blob_sha256)) {
+            let _ = crate::camera::write_camera_channels(data_root, session_id, &link.blob_sha256, link.offset_s, &imu, now_ms);
+        }
+    }
 }
 
 /// Re-runs the estimator for an entry (C3 §3.12 `reestimate_video_offset`)
@@ -327,15 +344,20 @@ pub fn reestimate_video_offset(data_root: &Path, session_id: &str, blob_sha256: 
     if !is_sha256_hex(blob_sha256) || !blob_exists(data_root, blob_sha256) {
         return Err(not_found(format!("video {blob_sha256} is not on this device")));
     }
-    let (info, telemetry) = probe_file(&blob_path(data_root, blob_sha256))?;
+    let (info, telemetry, imu) = probe_file(&blob_path(data_root, blob_sha256))?;
     let est = estimate_or_manual(telemetry.as_ref(), &info, &session_clock(data_root, session_id)?)?;
-    modify_session_json(data_root, session_id, |doc| {
+    let est = crate::camera::refine_offset(&session_dir(data_root, session_id)?, imu.as_ref(), info.duration_s, est);
+    let link = modify_session_json(data_root, session_id, |doc| {
         let entry = live_entry_mut(doc, blob_sha256)?;
         entry.offset_s = est.offset_s;
         entry.sync_method = est.method;
         entry.updated_at_ms = now_ms;
         Ok(entry.clone())
-    })
+    })?;
+    if let Some(imu) = &imu {
+        let _ = crate::camera::write_camera_channels(data_root, session_id, &link.blob_sha256, link.offset_s, imu, now_ms);
+    }
+    Ok(link)
 }
 
 /// Unlinks an entry (C3 §3.12 `unlink_video`), leaving a tombstone. With
@@ -356,6 +378,8 @@ pub fn unlink_video(data_root: &Path, session_id: &str, blob_sha256: &str, delet
         }
         Ok(entry.clone())
     })?;
+    // Its camera channels go with the link (camera IMU spec §3.2).
+    crate::camera::remove_camera_channels(data_root, session_id, blob_sha256);
     if delete_file && is_sha256_hex(blob_sha256) && !live_video_blobs(data_root).contains(blob_sha256) {
         let path = blob_path(data_root, blob_sha256);
         match std::fs::remove_file(&path) {
@@ -455,7 +479,7 @@ pub fn match_videos(data_root: &Path, paths: &[PathBuf]) -> Vec<VideoMatch> {
     paths
         .iter()
         .map(|path| {
-            let span = probe_file(path).map(|(info, telemetry)| video_span_utc_ms(telemetry.as_ref(), &info));
+            let span = probe_file(path).map(|(info, telemetry, _)| video_span_utc_ms(telemetry.as_ref(), &info));
             match span {
                 Err(e) => VideoMatch { path: path.clone(), session_ids: Vec::new(), video_span_utc_ms: None, error: Some(e) },
                 Ok(None) => VideoMatch {

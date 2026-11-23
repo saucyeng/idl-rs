@@ -28,6 +28,9 @@ pub enum SyncMethod {
     /// Set by hand, or linked with no time anchor at all. Never replaced
     /// automatically (video spec §4.3).
     Manual,
+    /// The camera's own accelerometer cross-correlated with the logger's
+    /// pods, around a GPMF or creation-time anchor (camera IMU spec §2).
+    Imu,
 }
 
 /// One video linked to a session: a C1 §6 `videos` entry. The entry's

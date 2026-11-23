@@ -11,6 +11,7 @@
 pub mod agents_md;
 pub mod bikelog;
 pub mod blob;
+pub mod camera;
 pub mod catalog;
 pub mod catalog_read;
 pub mod derived;
