@@ -168,9 +168,28 @@ pub struct EstimatedLoad {
 /// `handle` under its plain name ([`merge_segments`]). A session never
 /// solved, or with no `derived/` folder, loads nothing.
 pub fn apply_estimated_channels(data_root: &Path, session_id: &str, handle: &SessionHandle) -> EstimatedLoad {
+    let (merged, mut load) = load_estimated_channels(data_root, session_id);
+    for m in merged {
+        load.channels.push(m.name.clone());
+        handle.store_math_with_times(&m.name, m.rate_hz, m.values, m.t_us);
+    }
+    load
+}
+
+/// One solver output of `session_id` by its plain name, merged across its
+/// solves, or `None` when the ride has none by that name. For readers that
+/// go to `data.parquet` directly rather than through a session handle (the
+/// overlay readouts' channel lookup, 2026-11-23).
+pub fn estimated_channel(data_root: &Path, session_id: &str, name: &str) -> Option<MergedChannel> {
+    load_estimated_channels(data_root, session_id).0.into_iter().find(|m| m.name == name)
+}
+
+/// Every solver output of `session_id`, merged, and what was read
+/// (`EstimatedLoad::channels` left for the caller to fill).
+pub fn load_estimated_channels(data_root: &Path, session_id: &str) -> (Vec<MergedChannel>, EstimatedLoad) {
     let mut load = EstimatedLoad::default();
     let dir = data_root.join("sessions").join(session_id).join("derived");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return load };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return (Vec::new(), load) };
     let mut segments = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -184,11 +203,7 @@ pub fn apply_estimated_channels(data_root: &Path, session_id: &str, handle: &Ses
         }
     }
     load.solves = segments.len();
-    for merged in merge_segments(&segments) {
-        load.channels.push(merged.name.clone());
-        handle.store_math_with_times(&merged.name, merged.rate_hz, merged.values, merged.t_us);
-    }
-    load
+    (merge_segments(&segments), load)
 }
 
 /// The part of an evaluation cache key that changes when `session_id`'s

@@ -188,6 +188,16 @@ hardware `IMU1_AccelX` is low-g merged with high-g, the raw paths being
 rate is `HR_BPM`, and `HR_RR` holds the strap's beat-to-beat intervals.
 Check a ride's own channel list and rates rather than assuming.
 
+**Current methods.** Use these; the ones in the last column are older and
+kept only until they are replaced.
+
+| Question | Use | Not |
+|---|---|---|
+| Suspension travel, steer, fork bend, frame and rear flex | The physics solver: `idl-rs session estimate-physics <id> --from-ms A --to-ms B` over the run (about 2 s of solving per second of riding), then `[Front travel (mm)]`, `[Rear travel (mm)]`, `[Steer (deg)]`, `wheel_travel(...)`, `attitude("steer")` | `[IEKF front travel (mm)]` and the other `IEKF …` channels |
+| Lean, pitch, heading, slip, braking and cornering g | `attitude(...)`, `body_accel(...)` (the older filter, until the solver covers them), or the frame pod's own axes from the bike's calibration (`up`, `forward` in `bikes/<bike_id>.json`) | Raw `IMU0_Accel*` axes as if they were the bike's: the pod is mounted tilted |
+| Data integrity | Each channel's filled gaps in `data.parquet` (field metadata `gaps`), and the import's FIFO-overrun warnings | Gaps in the recorded timestamps: lost samples are filled on the chip's own clock, so the times stay even |
+| Video sync | The clip's offset from `link_video`, checked against the camera's own accelerometer when the clip has no GPS | The clip's creation time alone (whole seconds, about 1 s out) |
+
 **History.** Compare against earlier rides on the same bike and rides on
 other bikes at the same track (`session list --venue`), and read their
 notes and earlier conclusions.
@@ -334,6 +344,17 @@ mod tests {
         // Assert
         for needle in ["## Analysing a ride", "agent-gaps.md", "--device agent", "IMU1` on the fork", "within the noise"] {
             assert!(text.contains(needle), "primer lacks {needle}");
+        }
+    }
+
+    #[test]
+    fn render_agents_md_names_the_current_methods() {
+        // Arrange + Act
+        let text = render_agents_md("0.0.0");
+
+        // Assert
+        for needle in ["**Current methods.**", "session estimate-physics", "IEKF", "field metadata `gaps`"] {
+            assert!(text.contains(needle), "missing {needle}");
         }
     }
 
