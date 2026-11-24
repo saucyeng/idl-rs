@@ -180,6 +180,7 @@ pub fn window(r: &Ride, i0: usize, i1: usize, air: bool) -> Window {
         mask_fork: mask(1),
         mask_rear: mask(2),
         air: if air { Some(airborne(r, i0, i1).0) } else { None },
+        nav: None,
     }
 }
 

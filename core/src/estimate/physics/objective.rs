@@ -18,11 +18,16 @@
 //! | 23..29 | frame-pod flex prior (rotation, translation) |
 //! | 29..31 | airtime anchor: travel near 0 in free fall |
 //!
+//! With navigation on (`Spec::nav` and `Window::nav`), the [`super::nav`]
+//! rows follow these: attitude and velocity latents that the frame pod's
+//! specific force, the frame-rate latent and GPS constrain.
+//!
 //! plus a second-difference smoothness prior on every latent spline row and
 //! Gaussian priors on the [`NG`] global biases.
 
 use super::bike::{Bike, B_FA, B_LAT, D, F_ROT, F_TRANS, NL, R_ROLL, R_YAW, S};
-use super::la::V3;
+use super::la::{exp, M3, V3};
+use super::nav::{nav_rows, NavJac, NavSample, NavSpec, NavWeights, NavWindow};
 use super::readings::{pod_readings, readings_and_jacobian, Sample, NR, NZ};
 use super::setup::{geometry, with_geometry, Geometry, GEOMETRY_SIGMA};
 use num_dual::{Dual64, HyperDual};
@@ -69,6 +74,8 @@ pub struct Weights {
     pub accel_bias_sigma: f64,
     /// Airtime anchor sigma, m.
     pub air_sigma: f64,
+    /// The navigation rows' noise levels.
+    pub nav: NavWeights,
 }
 
 impl Default for Weights {
@@ -87,6 +94,7 @@ impl Default for Weights {
             gyro_bias_sigma: 0.002,
             accel_bias_sigma: 0.5,
             air_sigma: 0.005,
+            nav: NavWeights::default(),
         }
     }
 }
@@ -104,6 +112,8 @@ pub struct Spec {
     pub init: [f64; NL],
     /// Latent units per coefficient unit.
     pub scale: [f64; NL],
+    /// Attitude and velocity latents (None: the attitude-free model).
+    pub nav: Option<NavSpec>,
 }
 
 impl Spec {
@@ -116,6 +126,7 @@ impl Spec {
             levels: vec![(1, vec![B_FA, B_LAT, R_ROLL, R_YAW]), (2, vec![D, S, 7, 8, 9, 10, 11, 12]), (4, vec![1])],
             init: [0.045, 0.0, 0.0, 0.0, 0.045, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             scale: [0.01, 0.1, 0.001, 0.001, 0.01, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001],
+            nav: None,
         }
     }
 
@@ -161,6 +172,8 @@ pub struct Window {
     pub mask_rear: Vec<bool>,
     /// Airborne samples, where travel is anchored near 0 (None: no anchor).
     pub air: Option<Vec<bool>>,
+    /// GPS fixes and the starting state, for the navigation rows (None: off).
+    pub nav: Option<NavWindow>,
 }
 
 /// The unknowns: spline coefficients (per level, per row) and the globals.
@@ -172,6 +185,10 @@ pub struct Vars {
     pub frame: [Vec<f64>; 3],
     /// Globals: the [`NG`] biases, then (when fitting the bike) the [`NP`] geometry.
     pub glob: Vec<f64>,
+    /// Attitude spline controls, IMU0 -> nav (empty with navigation off).
+    pub att: Vec<M3<f64>>,
+    /// Velocity spline coefficients per nav axis, m/s (empty with navigation off).
+    pub vel: [Vec<f64>; 3],
 }
 
 /// A window's objective: bike, measurements, layout, weights and priors.
@@ -284,7 +301,85 @@ impl Objective {
             c.push(g[n - 1][x]);
             c
         });
-        Vars { lvl, frame, glob: self.glob_centre.clone() }
+        let (att, vel) = self.initial_nav();
+        Vars { lvl, frame, glob: self.glob_centre.clone(), att, vel }
+    }
+
+    /// The navigation layout and measurements, when both are on.
+    pub fn nav(&self) -> Option<(&NavSpec, &NavWindow)> {
+        Some((self.spec.nav.as_ref()?, self.win.nav.as_ref()?))
+    }
+
+    /// Starting attitude controls (the frame gyro, less its bias centre,
+    /// integrated from the start attitude, and carried on past both ends) and
+    /// velocity coefficients (the latest GPS fix, else the start velocity).
+    fn initial_nav(&self) -> (Vec<M3<f64>>, [Vec<f64>; 3]) {
+        let Some((ns, nw)) = self.nav() else {
+            return (Vec::new(), [Vec::new(), Vec::new(), Vec::new()]);
+        };
+        let (n, dt) = (self.spec.n, self.spec.dt);
+        let g = &self.win.frame_gyro;
+        let rate = |t: usize| V3::from_f64(std::array::from_fn(|a| g[t.min(n - 1)][a] - self.glob_centre[a]));
+        // attitude at samples -m .. n + 3m (index offset m)
+        let m = ns.m_att as isize;
+        let (lo, hi) = (-m, n as isize + 3 * m);
+        let mut at = vec![M3::eye(); (hi - lo + 1) as usize];
+        let r0 = M3::from_f64(nw.start.att);
+        at[m as usize] = r0;
+        for t in 1..=(hi as usize) {
+            at[(t as isize - lo) as usize] = at[(t as isize - 1 - lo) as usize] * exp(rate(t - 1).scale(dt));
+        }
+        for t in (lo..0).rev() {
+            at[(t - lo) as usize] = at[(t + 1 - lo) as usize] * exp(rate(0).scale(-dt));
+        }
+        let att = (0..self.spec.n_knots(ns.m_att)).map(|k| at[(((k as isize - 1) * m).clamp(lo, hi) - lo) as usize]).collect();
+        let mut per = Vec::with_capacity(n);
+        let mut last = nw.start.vel;
+        for t in 0..n {
+            if let Some(f) = nw.gps[t] {
+                last = f.v;
+                if !f.up {
+                    last[2] = 0.0;
+                }
+            }
+            per.push(last);
+        }
+        let mv = ns.m_vel as isize;
+        let vel = std::array::from_fn(|a| (0..self.spec.n_knots(ns.m_vel)).map(|k| per[((k as isize - 1) * mv).clamp(0, n as isize - 1) as usize][a]).collect());
+        (att, vel)
+    }
+
+    /// The navigation inputs at sample `t` (`s`: that sample's local inputs, for w0).
+    pub fn nav_sample<'a>(&'a self, v: &Vars, s: &Sample<f64>, t: usize) -> Option<NavSample<'a>> {
+        let (ns, nw) = self.nav()?;
+        let base = t / ns.m_att;
+        let ctrl = std::array::from_fn(|i| v.att[base + i]);
+        let (j, vb) = (t % ns.m_vel, t / ns.m_vel);
+        let b = basis(j, ns.m_vel);
+        let h = ns.m_vel as f64 * self.spec.dt;
+        let mut vel = [0.0; 3];
+        let mut vd = [0.0; 3];
+        for a in 0..3 {
+            let c = &v.vel[a][vb..vb + 4];
+            vel[a] = (0..4).map(|i| b[0][i] * c[i]).sum();
+            vd[a] = (0..4).map(|i| b[1][i] * c[i]).sum::<f64>() / h;
+        }
+        Some(NavSample {
+            ctrl,
+            u: (t % ns.m_att) as f64 / ns.m_att as f64,
+            span_s: ns.m_att as f64 * self.spec.dt,
+            v: vel,
+            vd,
+            w0: s.w0.0,
+            f_meas: self.win.frame_accel[t],
+            gps: nw.gps[t],
+            start: if t == 0 { Some(&nw.start) } else { None },
+        })
+    }
+
+    /// The navigation rows at sample `t` (None with navigation off).
+    pub fn nav_residuals(&self, v: &Vars, s: &Sample<f64>, t: usize, jac: bool) -> Option<NavJac> {
+        Some(nav_rows(&self.nav_sample(v, s, t)?, &self.w.nav, jac))
     }
 
     /// The local inputs at sample `t`: latents and their derivatives, chassis rate and acceleration.
@@ -405,6 +500,9 @@ impl Objective {
         for t in 0..self.spec.n {
             let s = self.sample(v, t);
             l += self.sample_residuals(&ctx, &s, &v.glob, t, false).r.iter().map(|x| x * x).sum::<f64>();
+            if let Some(nj) = self.nav_residuals(v, &s, t, false) {
+                l += nj.r.iter().map(|x| x * x).sum::<f64>();
+            }
         }
         let k = self.smooth_weight();
         for lvl in &v.lvl {

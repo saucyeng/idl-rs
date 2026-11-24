@@ -11,11 +11,25 @@
 
 use super::objective::{basis, Objective, Vars, NROW};
 use super::bike::NL;
+use super::la::{exp, V3};
+use super::nav::NNAV;
+
+/// What a group of coefficients is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    /// A latent row of this spline level.
+    Latent(usize),
+    /// The frame-rate spline, axis `row`.
+    Frame,
+    /// The attitude spline's perturbation, axis `row` (stepped as R <- R Exp(d)).
+    Att,
+    /// The velocity spline, nav axis `row`.
+    Vel,
+}
 
 /// One spline row's place in the unknown vector.
 struct Group {
-    /// None: the frame-rate spline axis `row`; Some(level): a latent row.
-    level: Option<usize>,
+    kind: Kind,
     row: usize,
     m: usize,
     scale: f64,
@@ -41,11 +55,18 @@ impl Layout {
         let mut groups = Vec::new();
         for (li, (m, ix)) in sp.levels.iter().enumerate() {
             for (row, &lat) in ix.iter().enumerate() {
-                groups.push(Group { level: Some(li), row, m: *m, scale: sp.scale[lat], z: [Some(lat), Some(NL + lat), Some(2 * NL + lat)], pos: vec![] });
+                groups.push(Group { kind: Kind::Latent(li), row, m: *m, scale: sp.scale[lat], z: [Some(lat), Some(NL + lat), Some(2 * NL + lat)], pos: vec![] });
             }
         }
         for x in 0..3 {
-            groups.push(Group { level: None, row: x, m: 1, scale: 1.0, z: [Some(3 * NL + x), Some(3 * NL + 3 + x), None], pos: vec![] });
+            groups.push(Group { kind: Kind::Frame, row: x, m: 1, scale: 1.0, z: [Some(3 * NL + x), Some(3 * NL + 3 + x), None], pos: vec![] });
+        }
+        if let Some((ns, _)) = obj.nav() {
+            for (kind, m) in [(Kind::Att, ns.m_att), (Kind::Vel, ns.m_vel)] {
+                for x in 0..3 {
+                    groups.push(Group { kind, row: x, m, scale: 1.0, z: [None; 3], pos: vec![] });
+                }
+            }
         }
         // order every coefficient by when it acts (stable: group order breaks ties)
         let mut keys: Vec<(f64, usize, usize)> = Vec::new();
@@ -82,23 +103,36 @@ impl Layout {
     }
 
     fn coef<'a>(&self, g: &Group, v: &'a Vars) -> &'a [f64] {
-        match g.level {
-            Some(li) => &v.lvl[li][g.row],
-            None => &v.frame[g.row],
+        match g.kind {
+            Kind::Latent(li) => &v.lvl[li][g.row],
+            Kind::Frame => &v.frame[g.row],
+            Kind::Vel => &v.vel[g.row],
+            Kind::Att => &[],
         }
     }
 
     /// `v` stepped by `dl` (local, in layout order) and `dg` (globals).
     pub fn apply(&self, v: &Vars, dl: &[f64], dg: &[f64]) -> Vars {
         let mut out = v.clone();
+        let mut d_att = vec![[0.0; 3]; v.att.len()];
         for g in &self.groups {
-            let c = match g.level {
-                Some(li) => &mut out.lvl[li][g.row],
-                None => &mut out.frame[g.row],
+            let c = match g.kind {
+                Kind::Latent(li) => &mut out.lvl[li][g.row],
+                Kind::Frame => &mut out.frame[g.row],
+                Kind::Vel => &mut out.vel[g.row],
+                Kind::Att => {
+                    for (k, &p) in g.pos.iter().enumerate() {
+                        d_att[k][g.row] = dl[p];
+                    }
+                    continue;
+                }
             };
             for (k, &p) in g.pos.iter().enumerate() {
                 c[k] += dl[p];
             }
+        }
+        for (r, d) in out.att.iter_mut().zip(d_att) {
+            *r = *r * exp(V3::from_f64(d));
         }
         for (g, d) in out.glob.iter_mut().zip(dg) {
             *g += d;
@@ -134,11 +168,15 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
     let sp = &obj.spec;
     let ctx = obj.ctx(&v.glob, true);
     let ncol = lay.groups.len() * 4;
-    let mut a = vec![0.0; NROW * ncol];
+    let nt = NROW + if obj.nav().is_some() { NNAV } else { 0 };
+    let mut a = vec![0.0; nt * ncol];
+    let mut res = vec![0.0; nt];
+    let mut jg = vec![0.0; nt * ng];
     let mut cols = vec![0usize; ncol];
     for t in 0..sp.n {
         let s = obj.sample(v, t);
         let sj = obj.sample_residuals(&ctx, &s, &v.glob, t, true);
+        let nj = obj.nav_residuals(v, &s, t, true);
         // chain d r / d z through the spline basis to the coefficients
         a.iter_mut().for_each(|x| *x = 0.0);
         for (gi, g) in lay.groups.iter().enumerate() {
@@ -158,14 +196,36 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
                 }
             }
         }
+        res[..NROW].copy_from_slice(&sj.r);
         for r in 0..NROW {
-            ne.loss += 0.5 * sj.r[r] * sj.r[r];
+            jg[r * ng..(r + 1) * ng].copy_from_slice(&sj.jg[r][..ng]);
+        }
+        if let Some(nj) = &nj {
+            // navigation rows: attitude columns directly, velocity and frame rate through their basis
+            res[NROW..].copy_from_slice(&nj.r);
+            for (gi, g) in lay.groups.iter().enumerate() {
+                let b = basis(t % g.m, g.m);
+                let h = g.m as f64 * sp.dt;
+                for i in 0..4 {
+                    for r in 0..NNAV {
+                        a[(NROW + r) * ncol + gi * 4 + i] = match g.kind {
+                            Kind::Att => nj.j_att[r][3 * i + g.row],
+                            Kind::Vel => b[0][i] * nj.j_v[r][g.row] + b[1][i] / h * nj.j_v[r][3 + g.row],
+                            Kind::Frame => b[0][i] * nj.j_w0[r][g.row],
+                            Kind::Latent(_) => 0.0,
+                        };
+                    }
+                }
+            }
+        }
+        for r in 0..nt {
+            ne.loss += 0.5 * res[r] * res[r];
         }
         for p in 0..ncol {
             let cp = cols[p];
             let mut gp = 0.0;
-            for r in 0..NROW {
-                gp += a[r * ncol + p] * sj.r[r];
+            for r in 0..nt {
+                gp += a[r * ncol + p] * res[r];
             }
             ne.g_loc[cp] += gp;
             for q in 0..ncol {
@@ -174,27 +234,27 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
                     continue;
                 }
                 let mut h = 0.0;
-                for r in 0..NROW {
+                for r in 0..nt {
                     h += a[r * ncol + p] * a[r * ncol + q];
                 }
                 ne.band[cp * wd + (cq + bw - cp)] += h;
             }
             for gq in 0..ng {
                 let mut h = 0.0;
-                for r in 0..NROW {
-                    h += a[r * ncol + p] * sj.jg[r][gq];
+                for r in 0..nt {
+                    h += a[r * ncol + p] * jg[r * ng + gq];
                 }
                 ne.border[cp * ng + gq] += h;
             }
         }
         for gp in 0..ng {
-            for r in 0..NROW {
-                ne.g_glob[gp] += sj.jg[r][gp] * sj.r[r];
+            for r in 0..nt {
+                ne.g_glob[gp] += jg[r * ng + gp] * res[r];
             }
             for gq in 0..ng {
                 let mut h = 0.0;
-                for r in 0..NROW {
-                    h += sj.jg[r][gp] * sj.jg[r][gq];
+                for r in 0..nt {
+                    h += jg[r * ng + gp] * jg[r * ng + gq];
                 }
                 ne.c[gp * ng + gq] += h;
             }
@@ -203,7 +263,7 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
     // smoothness priors: k (c_i - 2 c_i+1 + c_i+2) on each latent row
     let k = obj.smooth_weight();
     let pw = [k, -2.0 * k, k];
-    for g in lay.groups.iter().filter(|g| g.level.is_some()) {
+    for g in lay.groups.iter().filter(|g| matches!(g.kind, Kind::Latent(_))) {
         let c = lay.coef(g, v);
         for i in 0..c.len() - 2 {
             let r = k * (c[i] - 2.0 * c[i + 1] + c[i + 2]);
@@ -466,6 +526,7 @@ mod tests {
             mask_fork: serde_json::from_value(doc["mask_fork"].clone()).unwrap(),
             mask_rear: serde_json::from_value(doc["mask_rear"].clone()).unwrap(),
             air: Some(serde_json::from_value(doc["air"].clone()).unwrap()),
+            nav: None,
         };
         let n = win.frame_gyro.len();
         let mut centre = [0.0; crate::estimate::physics::objective::NG];
@@ -492,5 +553,92 @@ mod tests {
                   info.iterations, info.seconds.iter().sum::<f64>(), rms(D) * 1e3, rms(S) * 1e3);
         eprintln!("  seconds: normal equations {:.2}, solve {:.2}, loss {:.2}; n_loc {}, band {}", info.seconds[0], info.seconds[1], info.seconds[2], Layout::new(&obj).n_loc, Layout::new(&obj).bw);
         assert!((loss - want_loss).abs() < 0.01 * want_loss, "loss {loss} vs {want_loss}");
+    }
+
+    #[test]
+    fn solve_with_navigation_recovers_a_known_attitude_from_gravity_and_gps() {
+        // Arrange: 2 s of invented frame motion (turning, rolling, speeding up) with every
+        // sensor exactly consistent; the pods read what the bike at its initial latents would,
+        // GPS gives velocity at 10 Hz, and the start attitude is off by 2 deg of tilt and 9 deg of yaw
+        use crate::estimate::physics::la::{exp, V3};
+        use crate::estimate::physics::nav::{GpsFix, NavSpec, NavStart, NavWindow, G_NAV};
+        use crate::estimate::physics::readings::{pod_readings, Sample};
+        use crate::estimate::physics::so3spline::{log, rotation};
+        use num_dual::HyperDual;
+        let doc: serde_json::Value = serde_json::from_str(include_str!("../../../tests/fixtures/physics_window.json")).unwrap();
+        let bike = fixture::bike(&doc["bike"]);
+        let (n, dt) = (800, 1.0 / 400.0);
+        let tau = std::f64::consts::TAU;
+        let rate = |t: f64| V3([0.8 * (tau * 0.6 * t).sin(), 0.4 * (tau * 0.9 * t + 0.5).sin(), 0.5 + 0.3 * (tau * 0.4 * t).cos()]);
+        let rate_d = |t: f64| V3([0.8 * tau * 0.6 * (tau * 0.6 * t).cos(), 0.4 * tau * 0.9 * (tau * 0.9 * t + 0.5).cos(), -0.3 * tau * 0.4 * (tau * 0.4 * t).sin()]);
+        let vel = |t: f64| [6.0 + 2.0 * (tau * 0.5 * t).sin(), 3.0 * (tau * 0.35 * t).cos(), 0.4 * (tau * 1.1 * t).sin()];
+        let acc = |t: f64| [2.0 * tau * 0.5 * (tau * 0.5 * t).cos(), -3.0 * tau * 0.35 * (tau * 0.35 * t).sin(), 0.4 * tau * 1.1 * (tau * 1.1 * t).cos()];
+        let mut truth = Vec::with_capacity(n);
+        let mut r = exp(V3::from_f64([0.1, -0.05, 0.7]));
+        for i in 0..n {
+            truth.push(r);
+            for k in 0..20 {
+                let tm = (i as f64 + (k as f64 + 0.5) / 20.0) * dt;
+                r = r * exp(rate(tm).scale(dt / 20.0));
+            }
+        }
+        let spec0 = Spec::standard(n, dt);
+        let bike_h = bike.map(HyperDual::from_re);
+        let mut win = Window {
+            rate: 400.0,
+            frame_gyro: vec![],
+            frame_accel: vec![],
+            fork_gyro: vec![],
+            fork_accel: vec![],
+            rear_gyro: vec![],
+            rear_accel: vec![],
+            mask_fork: vec![true; n],
+            mask_rear: vec![true; n],
+            air: None,
+            nav: None,
+        };
+        let mut gps = vec![None; n];
+        for i in 0..n {
+            let t = i as f64 * dt;
+            let a = acc(t);
+            let f = truth[i].t() * V3(std::array::from_fn(|k| a[k] - G_NAV[k]));
+            let s = Sample { q: spec0.init, qd: [0.0; NL], qdd: [0.0; NL], w0: rate(t), a0: rate_d(t), f_meas: f };
+            let p = pod_readings(&bike_h, &s);
+            win.frame_gyro.push(rate(t).0);
+            win.frame_accel.push(f.0);
+            win.fork_gyro.push([p[3], p[4], p[5]]);
+            win.fork_accel.push([p[6], p[7], p[8]]);
+            win.rear_gyro.push([p[9], p[10], p[11]]);
+            win.rear_accel.push([p[12], p[13], p[14]]);
+            if i % 40 == 0 {
+                gps[i] = Some(GpsFix { v: vel(t), up: true });
+            }
+        }
+        let v0 = vel(0.0);
+        let start = NavStart { att: (truth[0] * exp(V3::from_f64([0.03, -0.02, 0.15]))).0, att_sigma: [0.2, 0.2, 0.5], vel: [v0[0] + 0.3, v0[1] - 0.2, v0[2] + 0.1], vel_sigma: 1.0 };
+        win.nav = Some(NavWindow { gps, start });
+        let mut spec = spec0;
+        spec.nav = Some(NavSpec::default());
+        let obj = Objective::new(bike, win, spec, Weights::default(), [0.0; crate::estimate::physics::objective::NG]);
+
+        // Act
+        let (v, info) = gauss_newton(&obj, obj.initial_vars(), 30, 1e-6).unwrap();
+
+        // Assert: tilt within 0.1 deg and yaw within 0.5 deg away from the window's ends; travel undisturbed
+        let (mut tilt, mut yaw) = (0.0f64, 0.0f64);
+        for t in 20..n - 20 {
+            let s = obj.sample(&v, t);
+            let ns = obj.nav_sample(&v, &s, t).unwrap();
+            let e = log(rotation(&ns.ctrl, ns.u) * truth[t].t()); // nav-frame error
+            tilt = tilt.max((e.0[0] * e.0[0] + e.0[1] * e.0[1]).sqrt().to_degrees());
+            yaw = yaw.max(e.0[2].abs().to_degrees());
+        }
+        let q = latents(&obj, &v);
+        let travel = q.iter().map(|q| (q[D] - 0.045).abs().max((q[S] - 0.045).abs())).fold(0.0, f64::max);
+        eprintln!("navigation: {} iterations, loss {:.3e}; max tilt error {tilt:.4} deg, yaw {yaw:.4} deg; travel moved {:.3} mm",
+                  info.iterations, info.loss.last().unwrap(), travel * 1e3);
+        assert!(tilt < 0.1, "tilt error {tilt} deg");
+        assert!(yaw < 0.5, "yaw error {yaw} deg");
+        assert!(travel < 1e-3, "travel moved {} mm", travel * 1e3);
     }
 }

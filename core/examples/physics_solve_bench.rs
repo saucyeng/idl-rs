@@ -26,6 +26,7 @@ fn main() {
         mask_fork: serde_json::from_value(doc["mask_fork"].clone()).unwrap(),
         mask_rear: serde_json::from_value(doc["mask_rear"].clone()).unwrap(),
         air: Some(serde_json::from_value(doc["air"].clone()).unwrap()),
+        nav: None,
     };
     let n = win.frame_gyro.len();
     let mut centre = [0.0; NG];
