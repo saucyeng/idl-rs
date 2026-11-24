@@ -686,7 +686,16 @@ mod tests {
         for meta in registry.metas() {
             let example = runnable(meta.example);
             let open = &example[..example.len() - 1];
-            let first = top_level_args(&example).first().map(|a| a.to_string()).unwrap_or_default();
+            // The first positional argument, or every one the example has
+            // when the builtin needs more than one (`transfer(x, y)`).
+            let args = top_level_args(&example);
+            let positional: Vec<&str> = args.iter().filter(|a| !a.contains('=')).cloned().collect();
+            let probe = |first: &str| meta.kwargs.first().map(|k| run(&registry, &lookup, &laps, &format!("{}({first}, {k}={})", meta.name, kwarg_value(meta.name, k))));
+            let one = positional.first().map(|a| a.to_string()).unwrap_or_default();
+            let first = match probe(&one) {
+                Some(Err(e)) if e.kind == MathEvalErrorKind::ArgCount => positional.join(", "),
+                _ => one,
+            };
 
             // Act
             let accepted: Vec<_> = meta.kwargs.iter()

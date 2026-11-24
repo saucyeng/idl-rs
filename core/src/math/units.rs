@@ -745,6 +745,9 @@ fn function_unit_rule(name: &str, arg_count: usize) -> (FnUnitRule, Vec<FnUnitCh
         "deg2rad" => (Fixed("rad"), vec![FnUnitCheck::Expect(0, "deg")]),
         "rad2deg" => (Fixed("deg"), vec![FnUnitCheck::Expect(0, "rad")]),
         "periodogram" | "welch" | "spectrogram" => (spectral_rule(), no_checks),
+        "transfer" => (Quotient(same(1), same(0)), no_checks),
+        "transfer_phase" => (Fixed("deg"), no_checks),
+        "coherence" => (Dimensionless, no_checks),
         // Retired from `hilbert` (R151 item 8, C2 3.8): with no complex type
         // in the language, this was always going to return an envelope, not
         // scipy's analytic signal — the scipy name was a false friend before

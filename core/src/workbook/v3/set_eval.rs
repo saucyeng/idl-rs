@@ -351,7 +351,9 @@ fn reduce(v: &ResolvedValue) -> MemberValue {
         ValueAxis::Time if !v.released && out.samples.len() == 1 && out.sample_rate_hz == 0.0 => {
             MemberValue::Scalar(out.samples[0])
         }
-        ValueAxis::Time => MemberValue::FullRate,
+        // A spectrum is not kept per member: like a full-rate series it is
+        // read where it was evaluated, not across sessions.
+        ValueAxis::Time | ValueAxis::Frequency => MemberValue::FullRate,
     }
 }
 

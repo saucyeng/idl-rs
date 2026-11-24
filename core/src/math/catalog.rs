@@ -115,8 +115,9 @@ mod tests {
         // 69 + 3 = 72; then `lap_number`/`lap_time`/`sector_time`, which C2
         // §3.3 has listed all along and this catalog lacked (R233), 72 + 3 = 75;
         // then `deglitch_pulses` for wheel-pulse channels (2026-11-05), 76;
-        // then `keep` for event lists (2026-11-05), 77.
-        assert_eq!(n, 77);
+        // then `keep` for event lists (2026-11-05), 77; then `transfer`,
+        // `transfer_phase` and `coherence` (2026-11-24), 80.
+        assert_eq!(n, 80);
     }
 
     #[test]
@@ -134,9 +135,10 @@ mod tests {
         // and the lap-shaped trio (see the length test above) are all
         // Implemented, so only that side of the split moved (69/6). R242 then
         // implements `resample`, moving one entry across: 70/5. `deglitch_pulses`
-        // arrives implemented: 71/5; `keep` too: 72/5.
+        // arrives implemented: 71/5; `keep` too: 72/5; the cross-spectral
+        // three (2026-11-24): 75/5.
         assert_eq!(not_implemented, 5);
-        assert_eq!(implemented, 72);
+        assert_eq!(implemented, 75);
     }
 
     #[test]

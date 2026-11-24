@@ -13,6 +13,7 @@ use rustfft::num_complex::Complex;
 ///
 /// Reduces spectral leakage from signal discontinuities at frame boundaries.
 /// Rectangular applies no weighting (equivalent to no window).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FftWindow {
     /// No weighting — maximum frequency resolution, highest leakage.
     Rectangular,
@@ -74,6 +75,7 @@ fn window_weights(window: &FftWindow, n: usize) -> Vec<f64> {
 
 /// How to remove a trend from each segment before the FFT. Suppresses the DC
 /// spike (and, for `Linear`, slow drift) that would otherwise dominate bin 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detrend {
     /// Leave the segment unchanged — bin 0 reflects the segment mean.
     None,
@@ -460,6 +462,74 @@ pub fn welch(
         Scaling::Spectrum => one_sided_scale(&avg_power, win_sum * win_sum, seg),
     };
     WelchResult { freqs_hz: s.freqs_hz, values }
+}
+
+/// Frequency-response estimates of `y` against `x` from [cross_spectral].
+/// Every vector has one entry per bin of [Stft::freqs_hz].
+pub struct CrossResult {
+    /// Bin-centre frequencies in Hz.
+    pub freqs_hz: Vec<f64>,
+    /// H1 gain `|Pxy| / Pxx`, in y's unit per x's unit; `NaN` where x has no
+    /// power.
+    pub gain: Vec<f64>,
+    /// H1 phase `arg(Pxy)` in degrees, (-180, 180]; positive when y leads x.
+    pub phase_deg: Vec<f64>,
+    /// Magnitude-squared coherence `|Pxy|² / (Pxx · Pyy)`, 0..1; `NaN` where
+    /// either signal has no power.
+    pub coherence: Vec<f64>,
+}
+
+/// Welch-averaged cross-spectral estimates of the system that takes `x` to
+/// `y`: the H1 transfer function (gain and phase) and the coherence, which
+/// says how much of y's power at each frequency is linearly explained by x
+/// (near 1: the gain is trustworthy; near 0: y there is unrelated to x).
+/// Same segmentation as [welch] (scipy `csd`/`coherence` conventions:
+/// `Pxy = mean(conj(X)·Y)` over segments). `x` and `y` must share one sample
+/// clock; the longer is truncated to the shorter. Scale factors cancel in
+/// every ratio, so no [Scaling] applies.
+///
+/// `sample_rate_hz` sets the frequency axis; `nperseg`, `noverlap`,
+/// `window`, `detrend` as [welch].
+pub fn cross_spectral(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    sample_rate_hz: f64,
+    window: FftWindow,
+    nperseg: usize,
+    noverlap: usize,
+    detrend: Detrend,
+) -> CrossResult {
+    let n = x.len().min(y.len());
+    let empty = CrossResult { freqs_hz: Vec::new(), gain: Vec::new(), phase_deg: Vec::new(), coherence: Vec::new() };
+    if n == 0 {
+        return empty;
+    }
+    let (mut x, mut y) = (x, y);
+    x.truncate(n);
+    y.truncate(n);
+    let sx = stft(x, sample_rate_hz, window, nperseg, noverlap, detrend);
+    let sy = stft(y, sample_rate_hz, window, nperseg, noverlap, detrend);
+    let n_bins = sx.freqs_hz.len();
+    let mut pxx = vec![0.0_f64; n_bins];
+    let mut pyy = vec![0.0_f64; n_bins];
+    let mut pxy = vec![Complex::new(0.0_f64, 0.0); n_bins];
+    for (fx, fy) in sx.frames.iter().zip(sy.frames.iter()) {
+        for k in 0..n_bins {
+            pxx[k] += fx[k].norm_sqr();
+            pyy[k] += fy[k].norm_sqr();
+            pxy[k] += fx[k].conj() * fy[k];
+        }
+    }
+    let mut gain = Vec::with_capacity(n_bins);
+    let mut phase_deg = Vec::with_capacity(n_bins);
+    let mut coherence = Vec::with_capacity(n_bins);
+    for k in 0..n_bins {
+        let m = pxy[k].norm();
+        gain.push(if pxx[k] > 0.0 { m / pxx[k] } else { f64::NAN });
+        phase_deg.push(pxy[k].arg().to_degrees());
+        coherence.push(if pxx[k] > 0.0 && pyy[k] > 0.0 { (m * m / (pxx[k] * pyy[k])).min(1.0) } else { f64::NAN });
+    }
+    CrossResult { freqs_hz: sx.freqs_hz, gain, phase_deg, coherence }
 }
 
 /// Normalises `power` by `norm` and doubles every one-sided interior bin
@@ -887,5 +957,60 @@ mod tests {
         // Assert
         assert!(result.values.is_empty());
         assert!(result.freqs_hz.is_empty());
+    }
+
+    /// A deterministic broadband signal (xorshift noise), so every bin has power.
+    fn noise(n: usize, seed: u64) -> Vec<f64> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s % 10_000) as f64 / 5_000.0 - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cross_spectral_y_twice_x_delayed_gain_2_coherence_1_phase_lags() {
+        // Arrange — y is x doubled and 2 samples late, at 100 Hz.
+        let x = noise(4096, 7);
+        let mut y = vec![0.0; 2];
+        y.extend(x[..x.len() - 2].iter().map(|v| 2.0 * v));
+
+        // Act
+        let r = cross_spectral(x, y, 100.0, FftWindow::Hann, 256, 128, Detrend::Mean);
+
+        // Assert — at 10 Hz (bin 25.6 → 26 at 0.39 Hz/bin): a 20 ms delay is -72°.
+        let k = 26;
+        assert!((r.gain[k] - 2.0).abs() < 0.05, "gain {}", r.gain[k]);
+        assert!(r.coherence[k] > 0.98, "coherence {}", r.coherence[k]);
+        let expected = -360.0 * r.freqs_hz[k] * 0.02;
+        assert!((r.phase_deg[k] - expected).abs() < 3.0, "phase {} vs {expected}", r.phase_deg[k]);
+    }
+
+    #[test]
+    fn cross_spectral_unrelated_signals_low_coherence() {
+        // Arrange
+        let x = noise(8192, 3);
+        let y = noise(8192, 99);
+
+        // Act
+        let r = cross_spectral(x, y, 100.0, FftWindow::Hann, 256, 128, Detrend::Mean);
+
+        // Assert
+        let mean: f64 = r.coherence[1..].iter().sum::<f64>() / (r.coherence.len() - 1) as f64;
+        assert!(mean < 0.1, "mean coherence {mean}");
+    }
+
+    #[test]
+    fn cross_spectral_zero_x_gain_and_coherence_are_nan() {
+        // Arrange / Act
+        let r = cross_spectral(vec![0.0; 512], noise(512, 5), 100.0, FftWindow::Hann, 256, 128, Detrend::None);
+
+        // Assert
+        assert!(r.gain.iter().all(|g| g.is_nan()));
+        assert!(r.coherence.iter().all(|c| c.is_nan()));
     }
 }

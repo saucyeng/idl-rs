@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::math::eval::{channel, channel_window, describe_channel, err, estimator_channel_id, kwarg_string, parse_fft_averaging, parse_fft_detrend, parse_fft_scaling, parse_fft_window, require_channel, require_scalar, require_string, resample_onto, timed, uniform_rate};
+use crate::math::eval::{channel, channel_window, spectrum_value, describe_channel, err, estimator_channel_id, kwarg_string, parse_fft_averaging, parse_fft_detrend, parse_fft_scaling, parse_fft_window, require_channel, require_scalar, require_string, resample_onto, timed, uniform_rate};
 use crate::math::registry::Ctx;
 use crate::math::value::{ChannelValue, Spacing, Value};
 use crate::math::{MathEvalError, MathEvalErrorKind};
@@ -40,7 +40,7 @@ pub(super) fn periodogram(ctx: &Ctx, ch: ChannelValue) -> Result<Value, MathEval
     // can compute freq[k] = k * sample_rate_hz / n. Bins are not
     // per-sample time — no t_us axis applies (empty, not ch's, per
     // L3-R12).
-    Ok(channel(result.values, ch.sample_rate_hz, Arc::from(&[] as &[i64])))
+    Ok(spectrum_value(result.values, &result.freqs_hz, ch.sample_rate_hz))
 }
 
 /// `welch(ch, window=, nperseg=, noverlap=, detrend=, average=, scaling=)`:
@@ -73,7 +73,77 @@ pub(super) fn welch(ctx: &Ctx, ch: ChannelValue) -> Result<Value, MathEvalError>
         average,
         scaling,
     );
-    Ok(channel(result.values, ch.sample_rate_hz, Arc::from(&[] as &[i64])))
+    Ok(spectrum_value(result.values, &result.freqs_hz, ch.sample_rate_hz))
+}
+
+/// Which [`crate::fft::CrossResult`] column a cross-spectral builtin returns.
+enum CrossOut {
+    Gain,
+    Phase,
+    Coherence,
+}
+
+/// `transfer(x, y, …)`, `transfer_phase(x, y, …)`, `coherence(x, y, …)`:
+/// the Welch-averaged response of `y` to `x` (2026-11-24). `x` and `y` must
+/// share one sample clock — the same rate and, over the selected window, the
+/// same sample count — which `resample(y, x)` gives two channels recorded on
+/// different clocks; nothing resamples implicitly. Kwargs as `welch`.
+fn cross(ctx: &Ctx, x: ChannelValue, y: ChannelValue, out: CrossOut) -> Result<Value, MathEvalError> {
+    let (name, kwargs) = (ctx.name(), ctx.kwargs());
+    let rate = uniform_rate(&x, name)?;
+    let rate_y = uniform_rate(&y, name)?;
+    let (xs, xe) = channel_window(ctx.lap(), &x);
+    let (ys, ye) = channel_window(ctx.lap(), &y);
+    if (rate - rate_y).abs() > 1e-6 * rate.abs().max(1.0) || xe - xs != ye - ys {
+        return Err(err(
+            MathEvalErrorKind::Runtime,
+            format!(
+                "{name}(x, y): x and y must share one sample clock (x: {} samples at {rate:.3} Hz, y: {} at {rate_y:.3} Hz). \
+                 Put y on x's clock first: {name}(x, resample(y, x))",
+                xe - xs,
+                ye - ys
+            ),
+        ));
+    }
+    let n = xe - xs;
+    let window = parse_fft_window(kwarg_string(name, kwargs, "window", "hann")?, name)?;
+    let nperseg = match kwargs.get("nperseg") {
+        Some(v) => require_scalar(v, name)?.round().max(0.0) as usize,
+        None => n.min(256),
+    };
+    let noverlap = match kwargs.get("noverlap") {
+        Some(v) => require_scalar(v, name)?.round().max(0.0) as usize,
+        None => nperseg / 2,
+    };
+    let detrend = parse_fft_detrend(kwarg_string(name, kwargs, "detrend", "constant")?, name)?;
+    // `resample` leaves NaN outside x's span; a NaN in any segment would
+    // poison every bin, so they are zeroed (the segment's detrend then
+    // removes the step's mean).
+    let clean = |s: &[f64]| s.iter().map(|v| if v.is_finite() { *v } else { 0.0 }).collect::<Vec<f64>>();
+    let r = crate::fft::cross_spectral(clean(&x.samples[xs..xe]), clean(&y.samples[ys..ye]), rate, window, nperseg, noverlap, detrend);
+    let values = match out {
+        CrossOut::Gain => r.gain,
+        CrossOut::Phase => r.phase_deg,
+        CrossOut::Coherence => r.coherence,
+    };
+    Ok(spectrum_value(values, &r.freqs_hz, x.sample_rate_hz))
+}
+
+/// `transfer(x, y, …)`: H1 gain of `y` over `x` per frequency, in y's unit
+/// per x's unit. See [`cross`].
+pub(super) fn transfer(ctx: &Ctx, x: ChannelValue, y: ChannelValue) -> Result<Value, MathEvalError> {
+    cross(ctx, x, y, CrossOut::Gain)
+}
+
+/// `transfer_phase(x, y, …)`: H1 phase of `y` against `x`, degrees, positive
+/// when y leads. See [`cross`].
+pub(super) fn transfer_phase(ctx: &Ctx, x: ChannelValue, y: ChannelValue) -> Result<Value, MathEvalError> {
+    cross(ctx, x, y, CrossOut::Phase)
+}
+
+/// `coherence(x, y, …)`: magnitude-squared coherence, 0..1. See [`cross`].
+pub(super) fn coherence(ctx: &Ctx, x: ChannelValue, y: ChannelValue) -> Result<Value, MathEvalError> {
+    cross(ctx, x, y, CrossOut::Coherence)
 }
 
 /// `declip(ch)`: samples lost to clipping reconstructed, in the channel's unit.

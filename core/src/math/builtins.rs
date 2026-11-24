@@ -183,6 +183,18 @@ pub(super) fn register(r: &mut Registry) -> Result<(), RegistryError> {
         signature: "welch(ch, window=\"hann\", nperseg=n, noverlap=n, detrend=\"constant\", average=\"mean\"|\"median\"|\"max\"|\"none\", scaling=\"density\"|\"spectrum\"|\"raw_magnitude\")",
         description: "Segmented, averaged power spectrum -- the spectrum the FFT charts compute. Needs a fixed-rate channel.",
         example: "welch([Fork])" }, signal::welch)?;
+    r.add(BuiltinMeta { name: "transfer", category: "Frequency", unit_rule: "Quotient(SameAsArg(1), SameAsArg(0))", shape: "[f]", kwargs: &["window", "nperseg", "noverlap", "detrend"],
+        signature: "transfer(x, y, window=\"hann\", nperseg=n, noverlap=n, detrend=\"constant\")",
+        description: "Gain from `x` to `y` at each frequency (the H1 estimate |Pxy| / Pxx, Welch-averaged as `welch`): how many units of y come out per unit of x put in. Read it beside `coherence`: where coherence is low, y there is not caused by x and the gain means nothing. `x` and `y` must share one sample clock; put two channels on one with `resample(y, x)`.",
+        example: "transfer([IMU1_AccelZ], resample([IMU0_AccelZ], [IMU1_AccelZ]))" }, signal::transfer)?;
+    r.add(BuiltinMeta { name: "transfer_phase", category: "Frequency", unit_rule: "Fixed(deg)", shape: "[f]", kwargs: &["window", "nperseg", "noverlap", "detrend"],
+        signature: "transfer_phase(x, y, window=\"hann\", nperseg=n, noverlap=n, detrend=\"constant\")",
+        description: "Phase of `y` against `x` at each frequency, in degrees (-180 to 180), positive when y leads. The phase half of `transfer`; same arguments and clock rule.",
+        example: "transfer_phase([IMU1_AccelZ], resample([IMU0_AccelZ], [IMU1_AccelZ]))" }, signal::transfer_phase)?;
+    r.add(BuiltinMeta { name: "coherence", category: "Frequency", unit_rule: "Dimensionless", shape: "[f]", kwargs: &["window", "nperseg", "noverlap", "detrend"],
+        signature: "coherence(x, y, window=\"hann\", nperseg=n, noverlap=n, detrend=\"constant\")",
+        description: "How much of `y` at each frequency is explained by `x`, 0 to 1 (magnitude-squared coherence, as scipy's `coherence`). Near 1 the `transfer` gain there is trustworthy; near 0 it is not. Same arguments and clock rule as `transfer`.",
+        example: "coherence([IMU1_AccelZ], resample([IMU0_AccelZ], [IMU1_AccelZ]))" }, signal::coherence)?;
     r.add_not_implemented(BuiltinMeta { name: "spectrogram", category: "Frequency", unit_rule: "SelectByLiteral(scaling, ...) as `periodogram`, over a `[t,f]` value", shape: "[t,f]", kwargs: &[],
         signature: "spectrogram(ch, window_size, hop_size, window, detrend, scaling)",
         description: "Time-varying spectrum. Not implemented; the signature and shape are fixed by C2 3.6.3.",

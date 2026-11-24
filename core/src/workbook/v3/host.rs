@@ -53,6 +53,7 @@ impl From<ValueAxis> for AxisKind {
         match axis {
             ValueAxis::Time => AxisKind::Time,
             ValueAxis::Lap => AxisKind::Lap,
+            ValueAxis::Frequency => AxisKind::Frequency,
         }
     }
 }
@@ -128,7 +129,10 @@ pub fn to_host_channel(
 ) -> HostChannel {
     let n = t_us.len().min(v.len());
     let t: Vec<f64> = match axis {
-        crate::math::ValueAxis::Time => t_us[..n].iter().map(|&us| us as f64 / 1e6).collect(),
+        // Time is µs → s, Frequency µHz → Hz: the same ÷1e6.
+        crate::math::ValueAxis::Time | crate::math::ValueAxis::Frequency => {
+            t_us[..n].iter().map(|&us| us as f64 / 1e6).collect()
+        }
         crate::math::ValueAxis::Lap => t_us[..n].iter().map(|&n| n as f64).collect(),
     };
     // `AxisKind::None` is the only honest kind for an absent axis — see

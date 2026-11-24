@@ -1155,8 +1155,24 @@ pub(super) fn lap_shaped(
     }
 }
 
+/// A spectrum-shaped (`[f]`) value: `values[k]` at `freqs_hz[k]`, the
+/// frequencies carried as micro-hertz on the axis (see
+/// [`crate::math::value::ValueAxis::Frequency`]). `sample_rate_hz` is the
+/// source channel's, kept as `welch` always has (`f[k] = k · rate / seg`).
+pub(super) fn spectrum_value(values: Vec<f64>, freqs_hz: &[f64], sample_rate_hz: f64) -> Value {
+    let coords: Vec<i64> = freqs_hz.iter().map(|f| (f * 1e6).round() as i64).collect();
+    Value::Channel(ChannelValue {
+        samples: Arc::from(values),
+        sample_rate_hz,
+        channel_id: None,
+        t_us: Arc::from(coords),
+        axis: crate::math::value::ValueAxis::Frequency,
+    })
+}
+
 /// A derived `[t]` channel. The overwhelming majority of results: everything
 /// that operates on session samples stays on the time axis.
+
 pub(super) fn channel(samples: Vec<f64>, sample_rate_hz: f64, t_us: Arc<[i64]>) -> Value {
     channel_shared(Arc::from(samples), sample_rate_hz, t_us)
 }
@@ -1266,6 +1282,25 @@ pub(crate) fn main_lap_window(lap_ctx: &MathLapContext) -> Option<(f64, f64)> {
 /// is the lap's mean, not the session's (C2 §3.6.10). An untimed value is never
 /// windowed (R124.3).
 pub(super) fn channel_window(lap_ctx: &MathLapContext, ch: &ChannelValue) -> (usize, usize) {
+    // A fixed-rate channel that carries its recorded times is windowed by
+    // them (2026-11-24): stepping by `rate` from index 0 assumes the channel
+    // starts at the session's first sample, and a linked camera's channels
+    // (they start where the clip does) or a solve over part of a ride do
+    // not, so a lap window over them came back empty.
+    if let Spacing::Uniform(_) = ch.spacing() {
+        if ch.axis == crate::math::value::ValueAxis::Time && !ch.t_us.is_empty() && ch.t_us.len() == ch.samples.len() {
+            // Half-open `[start, end)`, the convention the rate-stepped
+            // window below has always used for fixed-rate channels.
+            return match main_lap_window(lap_ctx) {
+                None => (0, ch.samples.len()),
+                Some((start_sec, end_sec)) if !(start_sec < end_sec) => (0, 0),
+                Some((start_sec, end_sec)) => {
+                    let (t0, t1) = ((start_sec * 1e6).round() as i64, (end_sec * 1e6).round() as i64);
+                    (ch.t_us.partition_point(|&t| t < t0), ch.t_us.partition_point(|&t| t < t1))
+                }
+            };
+        }
+    }
     match ch.spacing() {
         Spacing::Uniform(rate) => window_index_range(lap_ctx, rate, ch.samples.len()),
         Spacing::Recorded(t_us) => match main_lap_window(lap_ctx) {
@@ -2117,7 +2152,10 @@ mod tests {
                     assert!((got - want).abs() < 1e-9, "{got} vs {want}");
                 }
                 assert_eq!(c.sample_rate_hz, 100.0);
-                assert!(c.t_us.is_empty());
+                // Since 2026-11-24 a spectrum carries its bins' frequencies
+                // (µHz): 8 samples at 100 Hz → 12.5 Hz bins.
+                assert_eq!(c.axis, crate::math::value::ValueAxis::Frequency);
+                assert_eq!(&c.t_us[..2], &[0, 12_500_000]);
             }
             other => panic!("expected a channel: {other:?}"),
         }
@@ -2343,6 +2381,23 @@ mod tests {
         // Assert
         assert!(matches!(windowed, Value::Scalar(x) if (x - 7.5).abs() < 1e-12));
         assert!(matches!(session, Value::Scalar(x) if (x - 5.1).abs() < 1e-12));
+    }
+
+    #[test]
+    fn mean_over_a_lap_window_of_a_fixed_rate_channel_that_starts_late_reads_its_recorded_times() {
+        // Arrange — 10 samples at 1 Hz recorded from 100 s (a camera clip
+        // that starts into the ride); the window [105, 109) is samples
+        // 5..9, values 6, 7, 8, 9. Stepping by rate from index 0 read
+        // [105, 109) as indices 105..109, past the end: nothing.
+        let t: Vec<i64> = (0..10).map(|i| (100 + i) * 1_000_000).collect();
+        let lk = timed(&[("a", vec![1.0, 2.0, 3.0, 10.0, 5.0, 6.0, 7.0, 8.0, 9.0, 0.0], 1.0, t)]);
+        let lap = window_ctx(105.0, 109.0);
+
+        // Act
+        let windowed = eval_with_laps("mean([a])", &lk, &lap);
+
+        // Assert
+        assert!(matches!(windowed, Value::Scalar(x) if (x - 7.5).abs() < 1e-12), "{windowed:?}");
     }
 
     #[test]

@@ -10,8 +10,10 @@ use std::sync::Arc;
 /// selected window, produced only by the lap-shaped builtins (`lap_number()`,
 /// `lap_time()`, `sector_time(i)`).
 ///
-/// §3.6.1's `freq`, `window`, `component` and `index` kinds are deliberately
-/// **not** here: no evaluator path produces them, and a variant nothing can
+/// `[f]` joined 2026-11-24 with the cross-spectral builtins: a spectrum is
+/// charted against hertz. §3.6.1's `window`, `component` and `index` kinds
+/// are deliberately **not** here: no evaluator path produces them, and a
+/// variant nothing can
 /// construct is a claim the code does not back. Adding one is the work of the
 /// lane that makes such a value, not a placeholder to be filled in later.
 ///
@@ -28,16 +30,23 @@ pub enum ValueAxis {
     /// Ordinal lap number, 1-based (C1 `laps[]`). One entry per lap of the
     /// selected window.
     Lap,
+    /// Frequency (2026-11-24): one entry per spectral bin, from `welch`,
+    /// `periodogram`, `transfer`, `transfer_phase` and `coherence`. The
+    /// coordinate vector holds each bin's frequency in **micro-hertz**, so
+    /// the host conversion's ÷1e6 gives hertz exactly as it gives seconds
+    /// for [`ValueAxis::Time`].
+    Frequency,
 }
 
 impl ValueAxis {
-    /// The axis written the way C2 §3.6.1 writes it (`t`, `lap`) — used in
-    /// error messages so a shape mismatch names the two shapes in the same
+    /// The axis written the way C2 §3.6.1 writes it (`t`, `lap`, `f`) — used
+    /// in error messages so a shape mismatch names the two shapes in the same
     /// vocabulary the spec and the graph card's port labels use.
     pub fn symbol(self) -> &'static str {
         match self {
             ValueAxis::Time => "t",
             ValueAxis::Lap => "lap",
+            ValueAxis::Frequency => "f",
         }
     }
 }

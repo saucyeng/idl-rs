@@ -721,7 +721,7 @@ impl Walk<'_, '_> {
             "clip" => (first, OpAlloc::Copied),
             "vec" | "vadd" | "vsub" | "vscale" | "cross" | "normalize" | "rotate_mat" | "rotate_axis"
             | "rotate_euler" => (ValueShape::Vec3 { len: widest.len() }, OpAlloc::Direct),
-            "periodogram" | "welch" => (first, OpAlloc::Copied),
+            "periodogram" | "welch" | "transfer" | "transfer_phase" | "coherence" => (first, OpAlloc::Copied),
             _ => {
                 // Element-wise (`abs`, `pow`, two-argument `min`/`max`,
                 // `clip`, `vx`, `norm`, …): the widest operand's shape.

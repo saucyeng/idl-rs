@@ -12,7 +12,7 @@ curated sources under `docs/reference-src/`, never this file.
 
 ## Math builtins
 
-77 functions a `math` cell's expression can call, grouped by category
+80 functions a `math` cell's expression can call, grouped by category
 (C2 §3.3). A function marked **not implemented** parses and validates —
 it is part of the committed language surface — but evaluating it is an
 error today.
@@ -26,7 +26,7 @@ error today.
 - **Aggregate / elementwise** — [`min`](#min), [`max`](#max)
 - **Trig** — [`sin`](#sin), [`cos`](#cos), [`tan`](#tan), [`asin`](#asin), [`acos`](#acos), [`atan`](#atan), [`atan2`](#atan2), [`sinh`](#sinh), [`cosh`](#cosh), [`tanh`](#tanh)
 - **Trig conversion** — [`deg2rad`](#deg2rad), [`rad2deg`](#rad2deg)
-- **Frequency** — [`periodogram`](#periodogram), [`welch`](#welch), [`spectrogram`](#spectrogram), [`envelope`](#envelope)
+- **Frequency** — [`periodogram`](#periodogram), [`welch`](#welch), [`transfer`](#transfer), [`transfer_phase`](#transfer_phase), [`coherence`](#coherence), [`spectrogram`](#spectrogram), [`envelope`](#envelope)
 - **Correlation** — [`correlate`](#correlate), [`convolve`](#convolve)
 - **Resampling** — [`resample`](#resample), [`deglitch_pulses`](#deglitch_pulses)
 - **Logic** — [`keep`](#keep), [`where`](#where)
@@ -917,6 +917,69 @@ Example:
 
 ```
 result = welch([Fork])
+```
+
+#### transfer
+
+```
+transfer(x, y, window="hann", nperseg=n, noverlap=n, detrend="constant")
+```
+
+Gain from `x` to `y` at each frequency (the H1 estimate |Pxy| / Pxx, Welch-averaged as `welch`): how many units of y come out per unit of x put in. Read it beside `coherence`: where coherence is low, y there is not caused by x and the gain means nothing. `x` and `y` must share one sample clock; put two channels on one with `resample(y, x)`.
+
+| | |
+|---|---|
+| Shape | `[f]` |
+| Unit rule | `Quotient(SameAsArg(1), SameAsArg(0))` |
+| Status | implemented |
+| Arguments | 2 |
+
+Example:
+
+```
+result = transfer([IMU1_AccelZ], resample([IMU0_AccelZ], [IMU1_AccelZ]))
+```
+
+#### transfer_phase
+
+```
+transfer_phase(x, y, window="hann", nperseg=n, noverlap=n, detrend="constant")
+```
+
+Phase of `y` against `x` at each frequency, in degrees (-180 to 180), positive when y leads. The phase half of `transfer`; same arguments and clock rule.
+
+| | |
+|---|---|
+| Shape | `[f]` |
+| Unit rule | `Fixed(deg)` |
+| Status | implemented |
+| Arguments | 2 |
+
+Example:
+
+```
+result = transfer_phase([IMU1_AccelZ], resample([IMU0_AccelZ], [IMU1_AccelZ]))
+```
+
+#### coherence
+
+```
+coherence(x, y, window="hann", nperseg=n, noverlap=n, detrend="constant")
+```
+
+How much of `y` at each frequency is explained by `x`, 0 to 1 (magnitude-squared coherence, as scipy's `coherence`). Near 1 the `transfer` gain there is trustworthy; near 0 it is not. Same arguments and clock rule as `transfer`.
+
+| | |
+|---|---|
+| Shape | `[f]` |
+| Unit rule | `Dimensionless` |
+| Status | implemented |
+| Arguments | 2 |
+
+Example:
+
+```
+result = coherence([IMU1_AccelZ], resample([IMU0_AccelZ], [IMU1_AccelZ]))
 ```
 
 #### spectrogram
