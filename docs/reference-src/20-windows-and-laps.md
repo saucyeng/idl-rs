@@ -5,6 +5,22 @@ selection is a list of *windows*. A window is one span of one session. Two
 windows over the same channel is the ordinary case, not the exotic one: it is
 how you compare one lap against another.
 
+### Opening on a ride
+
+A workbook written for one ride can name it in its front matter, and a lap of
+it if you like:
+
+```
+opens_on:
+  session: d1f49dac92fda7485b97b242faae127f
+  lap: 3
+```
+
+Opening the workbook selects that ride and lap. It is only where the workbook
+starts: pick something else and the workbook follows your selection. Without
+`lap` it opens on the whole ride. A key naming a ride or lap this library does
+not have is ignored, and so is a malformed one.
+
 ### What a window changes
 
 An aggregate (`mean`, `rms`, `percentile`, `count`) is computed over the

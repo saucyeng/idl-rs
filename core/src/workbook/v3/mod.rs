@@ -27,7 +27,7 @@ pub use cell::{CellDoc, CellKindToken};
 pub use constants::merge_constants;
 pub use error::{WorkbookError, WorkbookErrorKind};
 pub use eval::{eval_cells, eval_cells_planned, CellDefResult, CellError, CellEvalResult, EvalCancelled, EvalObserver};
-pub use front_matter::{ConstantRaw, FrontMatter, UnitsPref};
+pub use front_matter::{opens_on, ConstantRaw, FrontMatter, OpensOn, UnitsPref};
 pub use host::{channel, AxisKind, host_constants, host_laps, host_session, to_host_channel, HostChannel, HostChannelView, HostLap, HostSession};
 pub use js_cell::{find_inline_exprs, InlineExpr};
 pub use math_cell::{parse_math_cell_body, rewrite_math_cell_body, MathCellLine};

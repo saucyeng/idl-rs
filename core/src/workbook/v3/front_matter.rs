@@ -275,6 +275,40 @@ pub fn render_front_matter(fm: &FrontMatter) -> String {
     format!("---\n{yaml_block}---\n")
 }
 
+/// The front-matter key naming the ride a workbook opens on (C2 §1, 2026-11-24).
+pub const OPENS_ON_KEY: &str = "opens_on";
+
+/// C2 §1's `opens_on`: the ride, and optionally the lap, a workbook was
+/// written for. A viewer selects it when the workbook is opened; it is a
+/// starting point, not a binding: evaluation still runs over whatever the
+/// viewer has selected, and a selection made afterwards replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpensOn {
+    /// The session id: 32 lowercase hex digits (C1 §2).
+    pub session_id: String,
+    /// The 1-based lap number (`session.json` `laps[].lap_number`); `None`
+    /// opens on the whole ride.
+    pub lap: Option<u32>,
+}
+
+/// Reads `opens_on` from a workbook's unrecognised front-matter keys
+/// (it stays there so every build round-trips it, R135). `None` when it is
+/// absent or malformed: a malformed key leaves the workbook opening on the
+/// viewer's own selection, as if the key were not there, and never fails the
+/// parse.
+pub fn opens_on(unknown: &BTreeMap<String, serde_yaml_ng::Value>) -> Option<OpensOn> {
+    let map = unknown.get(OPENS_ON_KEY)?.as_mapping()?;
+    let session_id = map.get("session")?.as_str()?;
+    if session_id.len() != 32 || !session_id.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+        return None;
+    }
+    let lap = match map.get("lap") {
+        None => None,
+        Some(v) => Some(u32::try_from(v.as_u64()?).ok().filter(|&n| n >= 1)?),
+    };
+    Some(OpensOn { session_id: session_id.to_string(), lap })
+}
+
 /// The front-matter key the maths graph view stores canvas positions under (C2 §3.7.1).
 const GRAPH_KEY: &str = "graph";
 
@@ -396,6 +430,65 @@ mod tests {
         let (back, _) = parse_front_matter(&format!("{rendered}body\n")).unwrap();
 
         assert_eq!(back.unknown.get("graph"), fm.unknown.get("graph"));
+    }
+
+    fn opens_on_of(yaml_tail: &str) -> Option<OpensOn> {
+        let (fm, _) = parse_front_matter(&doc(&format!("id: {VALID_ID}\nname: T\n{yaml_tail}"))).unwrap();
+        opens_on(&fm.unknown)
+    }
+
+    #[test]
+    fn opens_on_session_and_lap_reads_both() {
+        // Arrange
+        let yaml = "opens_on:\n  session: d1f49dac92fda7485b97b242faae127f\n  lap: 3";
+
+        // Act
+        let got = opens_on_of(yaml);
+
+        // Assert
+        assert_eq!(got, Some(OpensOn { session_id: "d1f49dac92fda7485b97b242faae127f".to_string(), lap: Some(3) }));
+    }
+
+    #[test]
+    fn opens_on_without_lap_opens_on_the_whole_ride() {
+        // Arrange
+        let yaml = "opens_on:\n  session: d1f49dac92fda7485b97b242faae127f";
+
+        // Act
+        let got = opens_on_of(yaml);
+
+        // Assert
+        assert_eq!(got.unwrap().lap, None);
+    }
+
+    #[test]
+    fn opens_on_malformed_is_none_and_the_workbook_still_parses() {
+        // Arrange
+        let cases = [
+            "opens_on: yes",
+            "opens_on:\n  session: not-a-session",
+            "opens_on:\n  session: d1f49dac92fda7485b97b242faae127f\n  lap: 0",
+            "opens_on:\n  session: d1f49dac92fda7485b97b242faae127f\n  lap: three",
+        ];
+
+        // Act
+        let got: Vec<Option<OpensOn>> = cases.iter().map(|c| opens_on_of(c)).collect();
+
+        // Assert
+        assert!(got.iter().all(Option::is_none), "{got:?}");
+    }
+
+    #[test]
+    fn opens_on_round_trips_through_render() {
+        // Arrange
+        let text = doc(&format!("id: {VALID_ID}\nname: T\nopens_on:\n  session: d1f49dac92fda7485b97b242faae127f\n  lap: 3"));
+        let (fm, _) = parse_front_matter(&text).unwrap();
+
+        // Act
+        let back = round_trip(&fm);
+
+        // Assert
+        assert_eq!(opens_on(&back.unknown), opens_on(&fm.unknown));
     }
 
     #[test]
