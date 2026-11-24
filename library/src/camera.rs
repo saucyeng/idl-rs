@@ -248,4 +248,26 @@ mod tests {
         assert_eq!(camera_files(&root, "s1").len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn derived_channel_infos_camera_files_list_their_channels_with_units() {
+        // Arrange
+        let root = std::env::temp_dir().join(format!("idl1-camera-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sessions").join("s1")).unwrap();
+        let imu = CameraImu { accel_g: stream(10, 0.005, 0.0), gyro_dps: stream(10, 0.005, 0.0), gravity: ImuStream::default() };
+        write_camera_channels(&root, "s1", &"cd".repeat(32), 5.0, &imu, 1).unwrap();
+
+        // Act
+        let infos = crate::estimated::derived_channel_infos(&root, "s1");
+
+        // Assert
+        let names: Vec<&str> = infos.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Cam_AccelX", "Cam_AccelY", "Cam_AccelZ", "Cam_GyroX", "Cam_GyroY", "Cam_GyroZ"]);
+        assert_eq!(infos[0].unit, "g");
+        assert_eq!(infos[3].unit, "deg/s");
+        assert_eq!(infos[0].sample_count, 10);
+        assert_eq!(infos[0].derived_kind, "camera");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

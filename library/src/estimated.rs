@@ -238,6 +238,62 @@ pub fn load_estimated_channels(data_root: &Path, session_id: &str) -> (Vec<Merge
     (merge_segments(&segments), load)
 }
 
+/// One channel a ride has from its derived files rather than its blob: a
+/// physics solver output or a linked video's motion.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DerivedChannelInfo {
+    /// The name a workbook uses (`Front travel (mm)`, `Cam_AccelX`).
+    pub name: String,
+    /// Nominal rate, Hz.
+    pub nominal_rate_hz: f64,
+    /// Unit, as stored.
+    pub unit: String,
+    /// The file's `derived_kind` (`physics`, `camera`).
+    pub derived_kind: String,
+    /// Samples across this ride's files of that name.
+    pub sample_count: u64,
+}
+
+/// Every channel `session_id` has from derived files, by name, read from
+/// the files' footers only (no column is decoded), so listing a ride's
+/// channels stays cheap (2026-11-23: the notebook marked `[Cam_AccelX]` and
+/// `[Front travel (mm)]` as typos because the catalogue lists only the
+/// blob's channels). Sorted by name.
+pub fn derived_channel_infos(data_root: &Path, session_id: &str) -> Vec<DerivedChannelInfo> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let dir = data_root.join("sessions").join(session_id).join("derived");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut out: Vec<DerivedChannelInfo> = Vec::new();
+    for path in entries.flatten().map(|e| e.path()).filter(|p| p.extension().and_then(|e| e.to_str()) == Some("parquet")) {
+        let Ok(file) = std::fs::File::open(&path) else { continue };
+        let Ok(reader) = SerializedFileReader::new(file) else { continue };
+        let meta = reader.metadata().file_metadata();
+        let kv = meta.key_value_metadata().cloned().unwrap_or_default();
+        let Some(kind) = kv.iter().find(|k| k.key == "derived_kind").and_then(|k| k.value.clone()) else { continue };
+        if kind != PHYSICS_DERIVED_KIND && kind != crate::camera::CAMERA_DERIVED_KIND {
+            continue;
+        }
+        let rows = meta.num_rows().max(0) as u64;
+        let Ok(schema) = parquet::arrow::parquet_to_arrow_schema(meta.schema_descr(), meta.key_value_metadata()) else { continue };
+        for field in schema.fields().iter().filter(|f| f.name() != "t") {
+            let name = estimated_channel_name(field.name());
+            let md = field.metadata();
+            match out.iter_mut().find(|c| c.name == name) {
+                Some(c) => c.sample_count += rows,
+                None => out.push(DerivedChannelInfo {
+                    name,
+                    nominal_rate_hz: md.get("nominal_rate_hz").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                    unit: md.get("unit").cloned().unwrap_or_default(),
+                    derived_kind: kind.clone(),
+                    sample_count: rows,
+                }),
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 /// The part of an evaluation cache key that changes when `session_id`'s
 /// solves do: `solves:` and the sorted names of its derived files, or empty
 /// when it has none. Names only (content-addressed, C1 §5), no file is opened.
