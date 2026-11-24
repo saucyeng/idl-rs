@@ -1753,8 +1753,10 @@ exactly.
 
 ### The three annotations
 
-A trailing `#` comment is an ordinary comment with three exceptions. Each is
-the literal word, a colon, then free text to the end of the line.
+A trailing `#` comment is an ordinary comment with three exceptions. All three
+share the one `#`, in the order `shape:`, `unit:`, `label:`. `shape:` and
+`unit:` take one word each; `label:` takes the rest of the line. A second `#`
+is not a new annotation: after `label:` it becomes part of the label.
 
 | Annotation | What it does |
 |---|---|
@@ -1764,7 +1766,7 @@ the literal word, a colon, then free text to the end of the line.
 
 ```
 fork_velocity = differentiate([Fork])   # label: Fork velocity
-compression = -fork_velocity            # label: Compression  # unit: mm/s
+compression = -fork_velocity            # unit: mm/s label: Compression
 ```
 
 ### Constants
