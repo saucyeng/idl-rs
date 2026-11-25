@@ -19,7 +19,7 @@
 
 use num_dual::{Dual64, HyperDual};
 
-use super::bike::{Bike, Pose, B_FA, B_LAT, D, NL, PSI, R_ROLL, R_YAW, S};
+use super::bike::{Bike, Pose, B_FA, B_LAT, D, F_TWIST, NL, PSI, R_PITCH, R_ROLL, R_YAW, S};
 use super::la::{vee, M3, Real, V3};
 
 /// Readings per sample: frame gyro (3), fork gyro (3), fork accel (3), rear
@@ -78,8 +78,8 @@ fn poses<S: Real>() -> [PoseFn<S>; 3] {
 /// Which pose (0 frame, 1 fork, 2 rear) latent `i` moves: each latent moves exactly one.
 pub const fn owner(i: usize) -> usize {
     match i {
-        D | PSI | B_FA | B_LAT => 1,
-        S | R_ROLL | R_YAW => 2,
+        D | PSI | B_FA | B_LAT | F_TWIST => 1,
+        S | R_ROLL | R_YAW | R_PITCH => 2,
         _ => 0,
     }
 }

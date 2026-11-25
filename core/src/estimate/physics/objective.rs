@@ -25,7 +25,7 @@
 //! plus a second-difference smoothness prior on every latent spline row and
 //! Gaussian priors on the [`NG`] global biases.
 
-use super::bike::{Bike, B_FA, B_LAT, D, F_ROT, F_TRANS, NL, R_ROLL, R_YAW, S};
+use super::bike::{Bike, B_FA, B_LAT, D, F_ROT, F_TRANS, F_TWIST, NL, R_PITCH, R_ROLL, R_YAW, S};
 use super::la::{exp, M3, V3};
 use super::nav::{nav_rows, NavJac, NavSample, NavSpec, NavWeights, NavWindow};
 use super::readings::{pod_readings, readings_and_jacobian, Sample, NR, NZ};
@@ -33,7 +33,7 @@ use super::setup::{geometry, with_geometry, Geometry, GEOMETRY_SIGMA};
 use num_dual::{Dual64, HyperDual};
 
 /// Residual rows per sample (see the module table).
-pub const NROW: usize = 31;
+pub const NROW: usize = 33;
 /// Bias globals: frame gyro bias, fork gyro bias, fork accel bias, rear gyro
 /// bias, rear accel bias (3 each; rad/s and m/s^2), in reading order.
 pub const NG: usize = 15;
@@ -123,9 +123,9 @@ impl Spec {
         Spec {
             n,
             dt,
-            levels: vec![(1, vec![B_FA, B_LAT, R_ROLL, R_YAW]), (2, vec![D, S, 7, 8, 9, 10, 11, 12]), (4, vec![1])],
-            init: [0.045, 0.0, 0.0, 0.0, 0.045, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            scale: [0.01, 0.1, 0.001, 0.001, 0.01, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001],
+            levels: vec![(1, vec![B_FA, B_LAT, R_ROLL, R_YAW, R_PITCH, F_TWIST]), (2, vec![D, S, 7, 8, 9, 10, 11, 12]), (4, vec![1])],
+            init: [0.045, 0.0, 0.0, 0.0, 0.045, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            scale: [0.01, 0.1, 0.001, 0.001, 0.01, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001],
             nav: None,
         }
     }
@@ -475,6 +475,8 @@ impl Objective {
             prior(23 + a, F_ROT + a, w.frame_flex_rot_sigma);
             prior(26 + a, F_TRANS + a, w.frame_flex_trans_sigma);
         }
+        prior(31, R_PITCH, w.rear_flex_sigma);
+        prior(32, F_TWIST, w.bend_sigma);
         if win.air.as_ref().is_some_and(|air| air[t]) {
             prior(29, D, w.air_sigma);
             prior(30, S, w.air_sigma);

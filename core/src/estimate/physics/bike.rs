@@ -6,7 +6,11 @@
 use super::la::{c, exp, rot_axis, M3, Real, V3};
 
 /// Number of latents per sample (see the index constants).
-pub const NL: usize = 13;
+pub const NL: usize = 15;
+/// EXPERIMENT: rear pitch flex in the side plane, rad.
+pub const R_PITCH: usize = 13;
+/// EXPERIMENT: fork lower twist about the leg, rad.
+pub const F_TWIST: usize = 14;
 /// Front travel along the steering axis, m (fork compression; 0 = top-out).
 pub const D: usize = 0;
 /// Steer angle about the steering axis, rad.
@@ -173,7 +177,7 @@ impl<S: Real> Bike<S> {
         let ap = self.fork_mount.t() * a; // steer axis in pod axes
         let e = self.mount_err_fork;
         let mount = self.fork_mount * exp(e - ap.scale(ap.dot(e)));
-        (r_steer * r_bend * mount, p)
+        (r_steer * r_bend * rot_axis(a, q[F_TWIST]) * mount, p)
     }
 
     fn side_to_frame(&self, v: [S; 2]) -> V3<S> {
@@ -197,7 +201,7 @@ impl<S: Real> Bike<S> {
                 (r, *pivot, *pivot + r * (self.rear_lever - *pivot) + dir.unit().scale(s))
             }
         };
-        let r_flex = rot_axis(self.fwd, q[R_ROLL]) * rot_axis(self.up, q[R_YAW]);
+        let r_flex = rot_axis(self.fwd, q[R_ROLL]) * rot_axis(self.up, q[R_YAW]) * rot_axis(self.fwd.cross(self.up).unit(), q[R_PITCH]);
         let p = pivot + r_flex * (p - pivot);
         (r_flex * r * self.rear_mount * exp(self.mount_err_rear), p)
     }
