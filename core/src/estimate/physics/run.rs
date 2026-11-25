@@ -66,9 +66,10 @@ impl Default for Config {
 /// Worker threads for the window solves when none are asked for: every core but two, which are
 /// left for the rest of the machine (at least one; Isaac, 2026-11-25). Each thread holds one
 /// window's normal matrix and its factor: about 140 MB for a 12 s window, about 210 MB with
-/// navigation. This was capped at 4 when the dev machine had 16 GB.
+/// navigation. Phones keep the old cap of 4, set when the dev machine had 16 GB.
 pub fn default_threads() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1))
+    let n = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1));
+    if cfg!(any(target_os = "android", target_os = "ios")) { n.min(4) } else { n }
 }
 
 /// What a bike fit found.
