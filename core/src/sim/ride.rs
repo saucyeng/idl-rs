@@ -45,10 +45,12 @@ impl Damper {
     /// The damping force at the shaft, N, resisting shaft speed `v_mps`
     /// (positive compressing).
     pub fn force_n(&self, v_mps: f64) -> f64 {
-        let (lo, hi) = if v_mps >= 0.0 { (self.lsc_ns_m, self.hsc_ns_m) } else { (self.lsr_ns_m, self.hsr_ns_m) };
-        let s = v_mps.abs();
-        let f = if s <= self.knee_mps { lo * s } else { lo * self.knee_mps + hi * (s - self.knee_mps) };
-        f.copysign(v_mps)
+        self.law().force_n(v_mps, 0.0)
+    }
+
+    /// The shared force law ([`super::laws::DamperLaw`]) with these numbers.
+    pub fn law(&self) -> super::laws::DamperLaw<f64> {
+        super::laws::DamperLaw { lsc_ns_m: self.lsc_ns_m, hsc_ns_m: self.hsc_ns_m, lsr_ns_m: self.lsr_ns_m, hsr_ns_m: self.hsr_ns_m, knee_mps: self.knee_mps }
     }
 }
 

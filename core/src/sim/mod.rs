@@ -17,6 +17,7 @@
 //! - [`suspension`]: shock stroke and leverage, air springs, static loads, sag, and the springs fitted to measured sag.
 //! - [`replay`]: a recorded ride (IMU0 in the bike's side plane, the physics estimator's rear travel, GPS speed) as the excitation.
 //! - [`tyre`]: the tyre's radial force (air, casing, insert, rim strike) and the ground it envelops (Pacejka's two-point follower).
+//! - [`laws`]: the force laws (damper, friction, air spring, tyre, stops) generic over the estimator's `Real`, smoothed or exact.
 //! - [`ride`]: the rear end riding over terrain (springs, damper, tyre), giving the travel the chain's dynamics run on.
 //! - [`dynamics`]: the chain as one point mass per link (XPBD), with the
 //!   cassette, jockeys, rollers and cage as rotating bodies, the freehub
@@ -26,6 +27,7 @@ pub mod bike;
 pub mod dynamics;
 pub mod excite;
 pub mod kinematics;
+pub mod laws;
 pub mod path;
 pub mod replay;
 pub mod ride;

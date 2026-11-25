@@ -110,25 +110,9 @@ impl Tyre {
         if d_m <= 0.0 {
             return TyreForce { force_n: 0.0, on_insert: false, rim_strike: false };
         }
-        let rim = self.rim_strike_m();
-        let mut f = self.stiffness_n_m() * d_m;
-        let mut on_insert = false;
-        if let Some(i) = self.insert {
-            // the gap above the insert closes, then the foam is crushed toward solid
-            let touch = (self.section_height_m - self.casing_thickness_m - i.height_m).max(0.0);
-            let e = d_m - touch;
-            if e > 0.0 {
-                on_insert = true;
-                let e_max = 0.7 * i.height_m;
-                let crush = e.min(0.98 * e_max);
-                f += i.stiffness_n_m * crush / (1.0 - crush / e_max) + if e > crush { RIM_STOP_N_M * (e - crush) } else { 0.0 };
-            }
-        }
-        let rim_strike = d_m > rim;
-        if rim_strike {
-            f += RIM_STOP_N_M * (d_m - rim);
-        }
-        TyreForce { force_n: f, on_insert, rim_strike }
+        let law = super::laws::TyreLaw::<f64>::from_tyre(self);
+        let on_insert = law.insert_touch_m.is_some_and(|touch| d_m > touch);
+        TyreForce { force_n: law.force_n(d_m, 0.0), on_insert, rim_strike: d_m > law.rim_m }
     }
 
     /// Deflection holding `load_n` statically, m.

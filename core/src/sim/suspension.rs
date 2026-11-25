@@ -49,13 +49,7 @@ impl AirSpring {
     /// filled to `gauge_pa` (gauge) at top-out, compressing with polytropic
     /// index `n`.
     pub fn force_n(&self, gauge_pa: f64, x_m: f64, n: f64) -> f64 {
-        let p0 = gauge_pa + ATM_PA;
-        let swept = self.area_m2 * x_m;
-        let pos = (self.positive_m3 - swept).max(0.01 * self.positive_m3);
-        let neg = (self.negative_m3 + swept).max(1e-9);
-        let p_pos = p0 * (self.positive_m3 / pos).powf(n);
-        let p_neg = p0 * (self.negative_m3 / neg).powf(n);
-        self.area_m2 * (p_pos - p_neg)
+        super::laws::air_force_n(self.area_m2, self.positive_m3, self.negative_m3, gauge_pa, x_m, n)
     }
 
     /// The force, N, at stroke `x_m` when the spring sat at `x_ref_m` long
@@ -63,13 +57,7 @@ impl AirSpring {
     /// then moved quickly from it with polytropic index `n`: the spring over
     /// a bump ridden from sag.
     pub fn force_about_n(&self, gauge_pa: f64, x_ref_m: f64, x_m: f64, n: f64) -> f64 {
-        let p0 = gauge_pa + ATM_PA;
-        let a = self.area_m2;
-        let floor = 0.01 * self.positive_m3;
-        let (pos_ref, neg_ref) = ((self.positive_m3 - a * x_ref_m).max(floor), (self.negative_m3 + a * x_ref_m).max(1e-9));
-        let (pp, pn) = (p0 * self.positive_m3 / pos_ref, p0 * self.negative_m3 / neg_ref);
-        let (pos, neg) = ((self.positive_m3 - a * x_m).max(floor), (self.negative_m3 + a * x_m).max(1e-9));
-        a * (pp * (pos_ref / pos).powf(n) - pn * (neg_ref / neg).powf(n))
+        super::laws::air_force_about_n(self.area_m2, self.positive_m3, self.negative_m3, gauge_pa, x_ref_m, x_m, n)
     }
 
     /// The stroke, m, where the spring at `gauge_pa` holds `load_n` (slow,
