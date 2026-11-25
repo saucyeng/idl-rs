@@ -228,21 +228,54 @@ pub fn set_meta(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
         unignore_laps: lap_numbers(m, "unignore-lap")?,
     };
 
-    let report = set_session_meta(root, &id, &patch, ctx.dry_run)?;
+    let bike_id = opt_text(m, "bike-id");
+    let only_bike = bike_id.is_some()
+        && [&patch.venue_name, &patch.rider, &patch.bike, &patch.event_name, &patch.event_session, &patch.long_comment, &patch.tag].iter().all(|f| f.is_none())
+        && patch.ignore_laps.is_empty()
+        && patch.unignore_laps.is_empty();
+    let (mut doc, mut changed, mut written) = if only_bike {
+        let p = root.join("sessions").join(&id).join("session.json");
+        let raw = std::fs::read(&p).map_err(|e| CliError::new(ErrorKind::NotFound, format!("session {id}: reading {}: {e}", p.display())))?;
+        let doc = idl_rs::store::session_json::parse_session_json(&raw).map_err(|e| CliError::new(ErrorKind::Io, format!("session {id}: {}", e.message)))?;
+        (doc, Vec::new(), false)
+    } else {
+        let report = set_session_meta(root, &id, &patch, ctx.dry_run)?;
+        (report.doc, report.changed.iter().map(|s| s.to_string()).collect::<Vec<String>>(), !report.unchanged)
+    };
 
-    let text = match (report.changed.is_empty(), ctx.dry_run) {
+    // the bike link goes through the bike log, as the app's ride form does: the ride's window
+    // decides which log entries it took
+    if let Some(bike_id) = bike_id {
+        // an unknown bike is an error, in a dry run too
+        idl_library::bikelog::read_bike_file(root, &bike_id)?;
+        if doc.bike_id != bike_id {
+            changed.push("bike_id".to_string());
+            if !ctx.dry_run {
+                let summary = list_sessions(root)?
+                    .into_iter()
+                    .find(|s| s.session_id == id)
+                    .ok_or_else(|| CliError::new(ErrorKind::NotFound, format!("session {id} is not in the catalog (run `catalog rebuild`)")))?;
+                let start_ms = summary.timestamp_utc_ms;
+                let end_ms = start_ms + summary.duration_ms.unwrap_or(0);
+                doc = idl_library::bikelog::attach_session(root, &id, &bike_id, start_ms, end_ms)?;
+                written = true;
+            }
+        }
+    }
+
+    let text = match (changed.is_empty(), ctx.dry_run) {
         (true, _) => format!("{id}: already set, nothing written"),
-        (false, true) => format!("would set {id}'s {}", report.changed.join(", ")),
-        (false, false) => format!("set {id}'s {}", report.changed.join(", ")),
+        (false, true) => format!("would set {id}'s {}", changed.join(", ")),
+        (false, false) => format!("set {id}'s {}", changed.join(", ")),
     };
 
     Ok(VerbOutput::new(
         text,
         json!({
             "session_id": id,
-            "changed": report.changed,
-            "written": !report.unchanged,
-            "session": session_json(&report.doc),
+            "changed": changed,
+            "written": written,
+            "session": session_json(&doc),
         }),
     ))
 }
@@ -751,6 +784,51 @@ mod tests {
         assert_eq!(done.data["written"], serde_json::json!(true));
         let parquet = done.data["data_parquet"].as_str().unwrap();
         assert!(std::path::Path::new(parquet).is_file(), "{parquet} was not written");
+    }
+
+    /// A `session set-meta` subcommand's own matches.
+    fn set_meta_matches(argv: &[&str]) -> ArgMatches {
+        let tree = crate::verbs::augment(clap::Command::new("idl-rs"));
+        let mut full = vec!["idl-rs", "session", "set-meta"];
+        full.extend_from_slice(argv);
+        let parsed = tree.try_get_matches_from(full).expect("argv parses");
+        let (_, m) = parsed.subcommand().unwrap();
+        let (_, m) = m.subcommand().unwrap();
+        m.clone()
+    }
+
+    #[test]
+    fn set_meta_bike_id_on_an_imported_ride_sets_the_bike_link_and_name_dry_run_writes_nothing() {
+        // Arrange: one imported ride and one bike
+        let out = temp_dir().join("ride.idl0");
+        let root = temp_dir().join("library");
+        synth(
+            &Ctx { json: false, dry_run: false, data_dir: None },
+            &synth_matches(&["--out", out.to_str().unwrap(), "--laps", "1", "--lap-length-m", "200", "--rate-hz", "100"]),
+        )
+        .unwrap();
+        let real = Ctx { json: false, dry_run: false, data_dir: Some(root.clone()) };
+        let imported = import(&real, &import_matches(&[out.to_str().unwrap()])).unwrap();
+        let parquet = PathBuf::from(imported.data["data_parquet"].as_str().unwrap());
+        let id = parquet.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        let bike = idl_library::bikelog::create_bike(&root, "gt", "GT Force", None, 0).unwrap();
+        let m = set_meta_matches(&[&id, "--bike-id", &bike.bike_id]);
+        let dry = Ctx { json: false, dry_run: true, data_dir: Some(root.clone()) };
+
+        // Act
+        let preview = set_meta(&dry, &m).unwrap();
+        let before = std::fs::read_to_string(root.join("sessions").join(&id).join("session.json")).unwrap();
+        let done = set_meta(&real, &m).unwrap();
+
+        // Assert
+        assert!(preview.text.contains("would set") && preview.text.contains("bike_id"), "{}", preview.text);
+        assert!(!before.contains("\"bike_id\""), "the dry run wrote: {before}");
+        assert_eq!(done.data["written"], serde_json::json!(true));
+        let doc = idl_rs::store::session_json::parse_session_json(&std::fs::read(root.join("sessions").join(&id).join("session.json")).unwrap()).unwrap();
+        assert_eq!(doc.bike_id, bike.bike_id);
+        assert_eq!(doc.bike, "GT Force");
+        assert!(doc.bike_log.is_some());
+        assert!(set_meta(&real, &set_meta_matches(&[&id, "--bike-id", "no-such-bike"])).is_err());
     }
 
     /// A `session calibrate` subcommand's own matches.

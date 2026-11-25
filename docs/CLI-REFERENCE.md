@@ -100,6 +100,7 @@ Set a session's descriptive metadata; omitted fields are left alone.
 | `--venue` | text | Venue name |
 | `--rider` | text | Rider name |
 | `--bike` | text | Bike name |
+| `--bike-id` | text | The bike it was ridden on, as `bike list` prints it: sets the bike, its name and what the ride took from the bike's log (needed by `estimate-physics`) |
 | `--event` | text | Event name |
 | `--event-session` | text | Event session, e.g. `Qualifying 2` |
 | `--notes` | text | Long comment |
@@ -181,7 +182,7 @@ Estimate travel, steer, fork bending and flex with the physics model (no drift: 
 | `--refit` | switch | Fit the bike's geometry from this session again, even if its calibration has a current fit |
 | `--front-travel-mm` | integer | Fork travel, mm; default the bike's (`bike set --front-travel-mm`) |
 | `--rear-travel-mm` | integer | Rear travel, mm; default the bike's linkage |
-| `--threads` | integer | Worker threads; default up to 4 |
+| `--threads` | integer | Worker threads; default every core but two (at most 4 on a phone) |
 | `--from-ms` | integer | Only from here, ms from the session's first sample (with `--to-ms`): less memory, and a first fit uses windows inside it |
 | `--to-ms` | integer | Only to here, ms from the session's first sample |
 | `--nav` | switch | Estimate the bike's attitude and velocity too (roll, pitch, heading, course, slip, speed, body accel; reads GPS). Experimental: being checked against the old estimator |
