@@ -3,7 +3,7 @@
 //! riding in overlapping windows with it frozen, and write the result as a
 //! derived session file of named channels.
 
-use super::bike::{Bike, B_FA, B_LAT, D, F_ROT, F_TRANS, NL, PSI, R_ROLL, R_YAW, S};
+use super::bike::{Bike, B_FA, B_LAT, D, F_ROT, F_TRANS, F_TWIST, NL, PSI, R_ROLL, R_YAW, S};
 use super::la::M3;
 use super::nav::{GpsFix, NavSpec, NavStart, NavWindow};
 use super::objective::{Objective, Spec, Weights, NG};
@@ -15,7 +15,7 @@ use super::solve::{gauss_newton, gauss_newton_multi, latents, SolveError, SolveI
 /// Version of the estimator's output. Bump when the same inputs give
 /// different channels (a model or solver change); stored in the output file
 /// so an older file can be shown as stale.
-pub const PHYSICS_ESTIMATOR_VERSION: u32 = 3; // 2: IMUs low-passed at 0.4 x the grid rate; 3: Huber (k 3) on the sensor rows
+pub const PHYSICS_ESTIMATOR_VERSION: u32 = 4; // 2: IMUs low-passed at 0.4 x the grid rate; 3: Huber (k 3) on the sensor rows; 4: fork torsional vibration
 
 /// How a run is set up.
 #[derive(Clone, Debug)]
@@ -305,7 +305,7 @@ pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
 }
 
 /// The output channels: (id, unit, latent index, scale to the unit).
-pub const OUTPUT_CHANNELS: [(&str, &str, usize, f64); 13] = [
+pub const OUTPUT_CHANNELS: [(&str, &str, usize, f64); 14] = [
     ("Physics front travel (mm)", "mm", D, 1000.0),
     ("Physics rear travel (mm)", "mm", S, 1000.0),
     ("Physics steer (deg)", "deg", PSI, 57.295_779_513_082_32),
@@ -319,6 +319,8 @@ pub const OUTPUT_CHANNELS: [(&str, &str, usize, f64); 13] = [
     ("Physics frame flex X (mm)", "mm", F_TRANS, 1000.0),
     ("Physics frame flex Y (mm)", "mm", F_TRANS + 1, 1000.0),
     ("Physics frame flex Z (mm)", "mm", F_TRANS + 2, 1000.0),
+    // last: readers take the travel channels by position
+    ("Physics fork twist (deg)", "deg", F_TWIST, 57.295_779_513_082_32),
 ];
 
 /// One output channel: id, unit, values per grid sample (NaN where not solved).

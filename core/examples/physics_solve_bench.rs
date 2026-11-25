@@ -50,8 +50,9 @@ fn main() {
     if nav {
         spec.nav = Some(NavSpec::default());
     }
-    // plain least squares, so the final loss compares with the PyTorch solver's
-    let obj = Objective::new(physics_fixture::bike_from(&doc["bike"]), win, spec, Weights { huber: 0.0, ..Weights::default() }, centre);
+    // the PyTorch solver's problem (plain least squares, no fork torsion), so the final loss compares
+    let w = Weights { huber: 0.0, fork_twist_sigma: 1e-9, ..Weights::default() };
+    let obj = Objective::new(physics_fixture::bike_from(&doc["bike"]), win, spec, w, centre);
     let lay = Layout::new(&obj);
     let v0 = obj.initial_vars();
     let t = std::time::Instant::now();

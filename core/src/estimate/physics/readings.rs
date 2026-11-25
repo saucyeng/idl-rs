@@ -19,7 +19,7 @@
 
 use num_dual::{Dual64, HyperDual};
 
-use super::bike::{Bike, Pose, B_FA, B_LAT, D, NL, PSI, R_ROLL, R_YAW, S};
+use super::bike::{Bike, Pose, B_FA, B_LAT, D, F_TWIST, NL, PSI, R_ROLL, R_YAW, S};
 use super::la::{vee, M3, Real, V3};
 
 /// Readings per sample: frame gyro (3), fork gyro (3), fork accel (3), rear
@@ -78,7 +78,7 @@ fn poses<S: Real>() -> [PoseFn<S>; 3] {
 /// Which pose (0 frame, 1 fork, 2 rear) latent `i` moves: each latent moves exactly one.
 pub const fn owner(i: usize) -> usize {
     match i {
-        D | PSI | B_FA | B_LAT => 1,
+        D | PSI | B_FA | B_LAT | F_TWIST => 1,
         S | R_ROLL | R_YAW => 2,
         _ => 0,
     }
@@ -194,16 +194,28 @@ mod tests {
         (crate::estimate::physics::fixture::bike(&doc["bike"]), doc)
     }
 
+    /// Latents in the PyTorch goldens: the first 13 (no fork torsion, which is 0 there).
+    const GL: usize = 13;
+
     fn sample(j: &serde_json::Value) -> Sample<f64> {
         let z: Vec<f64> = serde_json::from_value(j["z"].clone()).unwrap();
         let f: Vec<f64> = serde_json::from_value(j["f_meas"].clone()).unwrap();
+        let pick = |base: usize| -> [f64; NL] { std::array::from_fn(|i| if i < GL { z[base + i] } else { 0.0 }) };
         Sample {
-            q: std::array::from_fn(|i| z[i]),
-            qd: std::array::from_fn(|i| z[NL + i]),
-            qdd: std::array::from_fn(|i| z[2 * NL + i]),
-            w0: V3([z[39], z[40], z[41]]),
-            a0: V3([z[42], z[43], z[44]]),
+            q: pick(0),
+            qd: pick(GL),
+            qdd: pick(2 * GL),
+            w0: V3([z[3 * GL], z[3 * GL + 1], z[3 * GL + 2]]),
+            a0: V3([z[3 * GL + 3], z[3 * GL + 4], z[3 * GL + 5]]),
             f_meas: V3([f[0], f[1], f[2]]),
+        }
+    }
+
+    /// This port's input column for the goldens' column `c` (their layout has [`GL`] latents).
+    fn col(c: usize) -> usize {
+        match c {
+            c if c < 3 * GL => (c / GL) * NL + c % GL,
+            c => 3 * NL + (c - 3 * GL),
         }
     }
 
@@ -224,11 +236,50 @@ mod tests {
             for r in 0..NR {
                 assert!((val[r] - want[r]).abs() <= 1e-9 * (1.0 + want[r].abs()), "reading {r}: {} vs {}", val[r], want[r]);
                 let scale = 1.0 + wj[r].iter().fold(0.0f64, |m, x| m.max(x.abs()));
-                for z in 0..NZ {
-                    assert!((jac[r][z] - wj[r][z]).abs() <= 1e-7 * scale, "d reading {r} / d input {z}: {} vs {}", jac[r][z], wj[r][z]);
+                for z in 0..wj[r].len() {
+                    let c = col(z);
+                    assert!((jac[r][c] - wj[r][z]).abs() <= 1e-7 * scale, "d reading {r} / d input {z}: {} vs {}", jac[r][c], wj[r][z]);
                 }
             }
         }
+    }
+
+    #[test]
+    fn fork_torsion_columns_of_the_jacobian_match_finite_differences_and_move_only_the_fork_pod() {
+        // Arrange: a golden sample with some torsion, its rate and acceleration
+        let (bike, doc) = golden();
+        let bike_h = bike.map(HyperDual::from_re);
+        let bike_dh = bike.map(|x| HyperDual::from_re(Dual64::from(x)));
+        let mut s = sample(&doc["samples"][0]);
+        (s.q[F_TWIST], s.qd[F_TWIST], s.qdd[F_TWIST]) = (0.004, 0.3, 40.0);
+        let h = 1e-7;
+
+        // Act
+        let (_, jac) = readings_and_jacobian(&bike_h, &bike_dh, &s);
+        let fd = |which: usize| -> [f64; NR] {
+            let (mut up, mut dn) = (s.clone(), s.clone());
+            let (u, d) = match which {
+                0 => (&mut up.q, &mut dn.q),
+                1 => (&mut up.qd, &mut dn.qd),
+                _ => (&mut up.qdd, &mut dn.qdd),
+            };
+            u[F_TWIST] += h;
+            d[F_TWIST] -= h;
+            let (a, b) = (pod_readings(&bike_h, &up), pod_readings(&bike_h, &dn));
+            std::array::from_fn(|r| (a[r] - b[r]) / (2.0 * h))
+        };
+
+        // Assert: q, q', q'' columns; frame and rear readings (0..3, 9..15) untouched
+        for (which, base) in [(0, 0), (1, NL), (2, 2 * NL)] {
+            let want = fd(which);
+            for r in 0..NR {
+                assert!((jac[r][base + F_TWIST] - want[r]).abs() <= 1e-5 * (1.0 + want[r].abs()), "reading {r}, column {which}: {} vs {}", jac[r][base + F_TWIST], want[r]);
+                if !(3..9).contains(&r) {
+                    assert_eq!(jac[r][base + F_TWIST], 0.0, "reading {r} moved with fork torsion");
+                }
+            }
+        }
+        assert!(jac[3..6].iter().any(|row| row[F_TWIST + NL].abs() > 0.1), "fork gyro must see the torsion rate");
     }
 
     #[test]

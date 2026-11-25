@@ -564,8 +564,9 @@ mod tests {
                 centre[3 * i + a] = c.as_f64().unwrap_or_else(|| c[a].as_f64().unwrap());
             }
         }
-        // plain least squares, as the PyTorch solver: Huber is this port's addition
-        let obj = Objective::new(bike, win, Spec::standard(n, 1.0 / 400.0), Weights { huber: 0.0, ..Weights::default() }, centre);
+        // the PyTorch solver's problem: plain least squares, no fork torsion (both this port's additions)
+        let w = Weights { huber: 0.0, fork_twist_sigma: 1e-9, ..Weights::default() };
+        let obj = Objective::new(bike, win, Spec::standard(n, 1.0 / 400.0), w, centre);
 
         // Act
         let (v, info) = gauss_newton(&obj, obj.initial_vars(), 30, 1.0).unwrap();

@@ -6,7 +6,7 @@
 use super::la::{c, exp, rot_axis, M3, Real, V3};
 
 /// Number of latents per sample (see the index constants).
-pub const NL: usize = 13;
+pub const NL: usize = 14;
 /// Front travel along the steering axis, m (fork compression; 0 = top-out).
 pub const D: usize = 0;
 /// Steer angle about the steering axis, rad.
@@ -25,6 +25,11 @@ pub const R_YAW: usize = 6;
 pub const F_ROT: usize = 7;
 /// Frame-pod flex vs the rigid chassis: translation (m), latents 10..13.
 pub const F_TRANS: usize = 10;
+/// Fork torsional vibration: the fork pod turning about the leg without the axle moving, rad.
+/// On 11/21 it carried no load-driven part (below 2 Hz 0.004 deg rms, uncorrelated with
+/// braking) and 0.1-0.3 deg rms above 2 Hz; it took the fork gyro's largest misfit (0.062 ->
+/// 0.004 rad/s) that frame-pod flex had been absorbing. Not in the PyTorch reference yet.
+pub const F_TWIST: usize = 13;
 
 /// A planar 4-bar rear end, in the bike's side plane (x toward the front
 /// axle, y up), relative to IMU0, m, at the photo's scale.
@@ -173,7 +178,7 @@ impl<S: Real> Bike<S> {
         let ap = self.fork_mount.t() * a; // steer axis in pod axes
         let e = self.mount_err_fork;
         let mount = self.fork_mount * exp(e - ap.scale(ap.dot(e)));
-        (r_steer * r_bend * mount, p)
+        (r_steer * r_bend * rot_axis(a, q[F_TWIST]) * mount, p)
     }
 
     fn side_to_frame(&self, v: [S; 2]) -> V3<S> {
