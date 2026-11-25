@@ -9,7 +9,7 @@
 //! starts near zero (Marquardt damping brakes hardest on exactly the slow,
 //! nearly flat travel modes; the problem is close to linear).
 
-use super::objective::{basis, Objective, Vars, NROW};
+use super::objective::{basis, huber2, Objective, Vars, NROW, SENSOR_ROWS};
 use super::bike::NL;
 use super::la::{exp, V3};
 use super::nav::NNAV;
@@ -218,8 +218,19 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
                 }
             }
         }
+        // Huber on the sensor rows (iteratively reweighted): a row beyond k sigmas is scaled by
+        // sqrt(k/|r|), so its gradient is the Huber loss's and its curvature the IRLS weight's
+        let k = obj.w.huber;
         for r in 0..nt {
-            ne.loss += 0.5 * res[r] * res[r];
+            if r < SENSOR_ROWS && k > 0.0 && res[r].abs() > k {
+                ne.loss += 0.5 * huber2(res[r], k);
+                let s = (k / res[r].abs()).sqrt();
+                res[r] *= s;
+                a[r * ncol..(r + 1) * ncol].iter_mut().for_each(|x| *x *= s);
+                jg[r * ng..(r + 1) * ng].iter_mut().for_each(|x| *x *= s);
+            } else {
+                ne.loss += 0.5 * res[r] * res[r];
+            }
         }
         for p in 0..ncol {
             let cp = cols[p];
@@ -553,7 +564,8 @@ mod tests {
                 centre[3 * i + a] = c.as_f64().unwrap_or_else(|| c[a].as_f64().unwrap());
             }
         }
-        let obj = Objective::new(bike, win, Spec::standard(n, 1.0 / 400.0), Weights::default(), centre);
+        // plain least squares, as the PyTorch solver: Huber is this port's addition
+        let obj = Objective::new(bike, win, Spec::standard(n, 1.0 / 400.0), Weights { huber: 0.0, ..Weights::default() }, centre);
 
         // Act
         let (v, info) = gauss_newton(&obj, obj.initial_vars(), 30, 1.0).unwrap();

@@ -76,6 +76,20 @@ pub struct Weights {
     pub air_sigma: f64,
     /// The navigation rows' noise levels.
     pub nav: NavWeights,
+    /// Huber threshold on the sensor rows, whitened (sigmas); 0: plain least squares. A reading
+    /// further out than this counts linearly, so one pod's unexplained moment (a big hit) cannot
+    /// drag the shared frame motion, and through it the other pods' latents.
+    pub huber: f64,
+}
+
+/// Rows of [`SampleJac::r`] that are sensor readings ([`NR`]): the rows Huber weighting applies to.
+pub const SENSOR_ROWS: usize = NR;
+
+/// Twice the Huber loss of a whitened residual `x` at threshold `k` (`x^2` inside `k`,
+/// `2k|x| - k^2` beyond), so that half the sum stays the objective; `k <= 0` is plain `x^2`.
+pub fn huber2(x: f64, k: f64) -> f64 {
+    let a = x.abs();
+    if k <= 0.0 || a <= k { x * x } else { 2.0 * k * a - k * k }
 }
 
 impl Default for Weights {
@@ -95,6 +109,9 @@ impl Default for Weights {
             accel_bias_sigma: 0.5,
             air_sigma: 0.005,
             nav: NavWeights::default(),
+            // 2026-11-25, 11/21 lap-2 bottom-out: rear travel min -47 -> +3 mm, front peak 185 -> 175 mm;
+            // an exact-model bottom-out still solves to 170.0
+            huber: 3.0,
         }
     }
 }
@@ -499,7 +516,9 @@ impl Objective {
         let mut l = 0.0;
         for t in 0..self.spec.n {
             let s = self.sample(v, t);
-            l += self.sample_residuals(&ctx, &s, &v.glob, t, false).r.iter().map(|x| x * x).sum::<f64>();
+            let r = self.sample_residuals(&ctx, &s, &v.glob, t, false).r;
+            l += r[..SENSOR_ROWS].iter().map(|&x| huber2(x, self.w.huber)).sum::<f64>();
+            l += r[SENSOR_ROWS..].iter().map(|x| x * x).sum::<f64>();
             if let Some(nj) = self.nav_residuals(v, &s, t, false) {
                 l += nj.r.iter().map(|x| x * x).sum::<f64>();
             }
@@ -520,5 +539,29 @@ impl Objective {
     pub fn prior_loss(&self, v: &Vars) -> f64 {
         let sig = self.glob_sigma();
         0.5 * (0..self.n_glob()).map(|i| ((v.glob[i] - self.glob_centre[i]) / sig[i]).powi(2)).sum::<f64>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn huber2_inside_the_threshold_is_the_square_beyond_it_linear_and_both_join_smoothly() {
+        // Arrange
+        let k = 3.0;
+        let h = 1e-6;
+
+        // Act
+        let (inside, at, beyond) = (huber2(2.0, k), huber2(k, k), huber2(-10.0, k));
+        let slope_below = (huber2(k, k) - huber2(k - h, k)) / h;
+        let slope_above = (huber2(k + h, k) - huber2(k, k)) / h;
+
+        // Assert
+        assert_eq!(inside, 4.0);
+        assert_eq!(at, 9.0);
+        assert_eq!(beyond, 2.0 * 3.0 * 10.0 - 9.0);
+        assert!((slope_below - slope_above).abs() < 1e-4, "{slope_below} vs {slope_above}");
+        assert_eq!(huber2(-10.0, 0.0), 100.0);
     }
 }
