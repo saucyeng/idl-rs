@@ -305,7 +305,9 @@ pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
 }
 
 /// The output channels: (id, unit, latent index, scale to the unit).
-pub const OUTPUT_CHANNELS: [(&str, &str, usize, f64); 13] = [
+pub const OUTPUT_CHANNELS: [(&str, &str, usize, f64); 15] = [
+    ("Physics rear flex pitch (deg)", "deg", 13, 57.295_779_513_082_32),
+    ("Physics fork twist (deg)", "deg", 14, 57.295_779_513_082_32),
     ("Physics front travel (mm)", "mm", D, 1000.0),
     ("Physics rear travel (mm)", "mm", S, 1000.0),
     ("Physics steer (deg)", "deg", PSI, 57.295_779_513_082_32),
