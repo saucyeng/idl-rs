@@ -4,8 +4,11 @@
 //! derived session file of named channels.
 
 use super::bike::{Bike, B_FA, B_LAT, D, F_ROT, F_TRANS, NL, PSI, R_ROLL, R_YAW, S};
+use super::la::M3;
+use super::nav::{GpsFix, NavSpec, NavStart, NavWindow};
 use super::objective::{Objective, Spec, Weights, NG};
-use super::pipeline::{airtime_score, moving, pick_windows, rotation_score, window, Ride};
+use super::pipeline::{airtime_score, bike_axes, first_start, gps_latency, gps_on_grid, moving, pick_windows, rotation_score, window, Ride};
+use super::so3spline::rotation;
 use super::setup::{geometry, with_geometry, Geometry};
 use super::solve::{gauss_newton, gauss_newton_multi, latents, SolveError, SolveInfo};
 
@@ -33,6 +36,9 @@ pub struct Config {
     pub tol: f64,
     /// Anchor travel near 0 in free fall.
     pub air_anchor: bool,
+    /// Estimate attitude and velocity too (spec one-model §2-5): each riding
+    /// stretch's windows then solve in order, each starting from the last.
+    pub nav: bool,
     /// Worker threads for the window solves (1: none).
     pub threads: usize,
     /// Noise levels and priors.
@@ -50,6 +56,7 @@ impl Default for Config {
             iters: 20,
             tol: 1.0,
             air_anchor: true,
+            nav: false,
             threads: std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
             weights: Weights::default(),
         }
@@ -99,7 +106,28 @@ pub struct Solution {
     pub windows: (usize, usize),
     /// Gauss-Newton iterations, summed.
     pub iterations: usize,
+    /// Attitude and velocity per grid sample (empty unless [`Config::nav`]).
+    pub nav: Vec<NavState>,
 }
+
+/// The bike's attitude and velocity at one grid sample (NaN where not solved).
+#[derive(Clone, Copy, Debug)]
+pub struct NavState {
+    /// Bike axes (X forward, Y left, Z up) -> nav (X north, Y west, Z up).
+    pub r: [[f64; 3]; 3],
+    /// Velocity, nav, m/s.
+    pub v: [f64; 3],
+    /// Acceleration, nav, m/s^2.
+    pub vd: [f64; 3],
+}
+
+impl NavState {
+    /// Not solved.
+    pub const NAN: NavState = NavState { r: [[f64::NAN; 3]; 3], v: [f64::NAN; 3], vd: [f64::NAN; 3] };
+}
+
+/// How sure a window is of the state its predecessor hands it: tilt, tilt, heading (rad); velocity (m/s).
+const HANDOFF_SIGMA: ([f64; 3], f64) = ([0.02, 0.02, 0.05], 0.3);
 
 /// The solve windows over the riding stretches: (start, end, keep_start, keep_end).
 fn plan(r: &Ride, cfg: &Config) -> Vec<(usize, usize, usize, usize)> {
@@ -170,30 +198,70 @@ pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
     use std::sync::atomic::{AtomicUsize, Ordering};
     let plan = plan(r, cfg);
     let finished = AtomicUsize::new(0);
-    let solve_one = |&(a, b, _, _): &(usize, usize, usize, usize)| -> Result<(Vec<[f64; NL]>, Option<Vec<bool>>, usize), SolveError> {
-        if progress.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) {
-            return Err(SolveError::Cancelled);
+    let gps: Option<Vec<Option<GpsFix>>> = cfg.nav.then(|| gps_on_grid(r, gps_latency(r, bike)));
+    let axes = bike_axes(bike);
+    // chains of windows solved in order: with navigation on, one riding stretch
+    // (overlapping windows), each window starting from the last; without, every window alone
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    for i in 0..plan.len() {
+        match chains.last_mut() {
+            Some(c) if gps.is_some() && plan[i].0 < plan[*c.last().unwrap()].1 => c.push(i),
+            _ => chains.push(vec![i]),
         }
-        let win = window(r, a, b, cfg.air_anchor);
-        let air = win.air.clone();
-        let obj = Objective::new(bike.clone(), win, Spec::standard(b - a, r.input.dt), cfg.weights.clone(), bias_centre);
-        let solved = gauss_newton(&obj, obj.initial_vars(), cfg.iters, cfg.tol);
-        if let Some(p) = progress {
-            (p.on_window)(finished.fetch_add(1, Ordering::Relaxed) + 1, plan.len());
+    }
+    type WinOut = (Vec<[f64; NL]>, Option<Vec<bool>>, usize, Vec<NavState>);
+    let solve_chain = |chain: &Vec<usize>| -> Vec<(usize, Result<WinOut, SolveError>)> {
+        let mut out = Vec::with_capacity(chain.len());
+        let mut handoff: Option<NavStart> = None;
+        for (ci, &i) in chain.iter().enumerate() {
+            let (a, b, _, _) = plan[i];
+            if progress.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) {
+                out.push((i, Err(SolveError::Cancelled)));
+                continue;
+            }
+            let mut win = window(r, a, b, cfg.air_anchor);
+            let air = win.air.clone();
+            let mut spec = Spec::standard(b - a, r.input.dt);
+            if let Some(g) = &gps {
+                let start = handoff.take().unwrap_or_else(|| first_start(r, bike, g, a));
+                win.nav = Some(NavWindow { gps: g[a..b].to_vec(), start });
+                spec.nav = Some(NavSpec::default());
+            }
+            let obj = Objective::new(bike.clone(), win, spec, cfg.weights.clone(), bias_centre);
+            let solved = gauss_newton(&obj, obj.initial_vars(), cfg.iters, cfg.tol);
+            if let Some(p) = progress {
+                (p.on_window)(finished.fetch_add(1, Ordering::Relaxed) + 1, plan.len());
+            }
+            let res = solved.map(|(v, info)| {
+                let mut states = Vec::new();
+                if obj.nav().is_some() {
+                    let next = chain.get(ci + 1).map(|&n| plan[n].0 - a);
+                    for t in 0..b - a {
+                        let s = obj.sample(&v, t);
+                        let ns = obj.nav_sample(&v, &s, t).expect("navigation on");
+                        let rot: M3<f64> = rotation(&ns.ctrl, ns.u);
+                        states.push(NavState { r: (rot * axes).0, v: ns.v, vd: ns.vd });
+                        if next == Some(t) {
+                            handoff = Some(NavStart { att: rot.0, att_sigma: HANDOFF_SIGMA.0, vel: ns.v, vel_sigma: HANDOFF_SIGMA.1 });
+                        }
+                    }
+                }
+                (latents(&obj, &v), air, info.iterations, states)
+            });
+            out.push((i, res));
         }
-        let (v, info) = solved?;
-        Ok((latents(&obj, &v), air, info.iterations))
+        out
     };
     let threads = cfg.threads.max(1);
-    let mut results: Vec<Option<Result<_, SolveError>>> = (0..plan.len()).map(|_| None).collect();
+    let mut results: Vec<Option<Result<WinOut, SolveError>>> = (0..plan.len()).map(|_| None).collect();
     std::thread::scope(|sc| {
-        let chunks: Vec<Vec<usize>> = (0..threads).map(|t| (t..plan.len()).step_by(threads).collect()).collect();
-        let handles: Vec<_> = chunks
+        let parts: Vec<Vec<usize>> = (0..threads).map(|t| (t..chains.len()).step_by(threads).collect()).collect();
+        let handles: Vec<_> = parts
             .into_iter()
             .map(|idx| {
-                let plan = &plan;
-                let solve_one = &solve_one;
-                sc.spawn(move || idx.into_iter().map(|i| (i, solve_one(&plan[i]))).collect::<Vec<_>>())
+                let chains = &chains;
+                let solve_chain = &solve_chain;
+                sc.spawn(move || idx.into_iter().flat_map(|c| solve_chain(&chains[c])).collect::<Vec<_>>())
             })
             .collect();
         for h in handles {
@@ -202,14 +270,23 @@ pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
             }
         }
     });
-    let mut sol = Solution { q: vec![[f64::NAN; NL]; r.len()], air: vec![false; r.len()], windows: (plan.len(), 0), iterations: 0 };
+    let mut sol = Solution {
+        q: vec![[f64::NAN; NL]; r.len()],
+        air: vec![false; r.len()],
+        windows: (plan.len(), 0),
+        iterations: 0,
+        nav: if gps.is_some() { vec![NavState::NAN; r.len()] } else { Vec::new() },
+    };
     for (&(a, _, ks, ke), res) in plan.iter().zip(results) {
         match res.expect("every window solved") {
-            Ok((q, air, it)) => {
+            Ok((q, air, it, states)) => {
                 sol.iterations += it;
                 for t in ks..ke {
                     sol.q[t] = q[t - a];
                     sol.air[t] = air.as_ref().is_some_and(|m| m[t - a]);
+                    if !states.is_empty() {
+                        sol.nav[t] = states[t - a];
+                    }
                 }
             }
             Err(_) => sol.windows.1 += 1,
@@ -244,7 +321,53 @@ pub fn outputs(sol: &Solution) -> Vec<Output> {
     let mut out: Vec<Output> =
         OUTPUT_CHANNELS.iter().map(|&(id, unit, lat, k)| (id.to_string(), unit.to_string(), sol.q.iter().map(|q| q[lat] * k).collect())).collect();
     out.push(("Physics airborne".to_string(), String::new(), sol.air.iter().map(|&a| a as u8 as f64).collect()));
+    if !sol.nav.is_empty() {
+        let per: Vec<[f64; 8]> = sol.nav.iter().map(nav_outputs).collect();
+        for (k, &(id, unit)) in NAV_CHANNELS.iter().enumerate() {
+            out.push((id.to_string(), unit.to_string(), per.iter().map(|p| p[k]).collect()));
+        }
+    }
     out
+}
+
+/// The navigation output channels (with [`Config::nav`]): id and unit, in [`nav_outputs`]' order.
+pub const NAV_CHANNELS: [(&str, &str); 8] = [
+    ("Physics roll (deg)", "deg"),
+    ("Physics pitch (deg)", "deg"),
+    ("Physics heading (deg)", "deg"),
+    ("Physics course (deg)", "deg"),
+    ("Physics slip (deg)", "deg"),
+    ("Physics speed (m/s)", "m/s"),
+    ("Physics long accel (g)", "g"),
+    ("Physics lat accel (g)", "g"),
+];
+
+/// Below this ground speed course and slip are blank, m/s.
+const COURSE_MIN_SPEED_MPS: f64 = 3.0;
+
+/// One sample's navigation outputs, in [`NAV_CHANNELS`]' order. Conventions as
+/// the IEKF's (`estimate/attitude.rs`): roll + right side down, pitch + nose
+/// up, heading and course degrees clockwise from north, slip = heading -
+/// course (+ nose right of travel), long accel + speeding up, lat + to the right.
+pub fn nav_outputs(s: &NavState) -> [f64; 8] {
+    if !s.r[0][0].is_finite() {
+        return [f64::NAN; 8];
+    }
+    let m = nalgebra::Matrix3::from_fn(|i, j| s.r[i][j]);
+    let q = nalgebra::UnitQuaternion::from_rotation_matrix(&nalgebra::Rotation3::from_matrix_unchecked(m));
+    let (roll, pitch) = crate::estimate::attitude::roll_pitch_deg(&q);
+    let (_, _, yaw) = q.euler_angles();
+    let heading = (-yaw).to_degrees().rem_euclid(360.0); // yaw is about up, toward west
+    let speed = s.v[0].hypot(s.v[1]);
+    let (course, slip) = if speed > COURSE_MIN_SPEED_MPS {
+        let c = (-s.v[1]).atan2(s.v[0]).to_degrees().rem_euclid(360.0);
+        (c, (heading - c + 540.0).rem_euclid(360.0) - 180.0)
+    } else {
+        (f64::NAN, f64::NAN)
+    };
+    let g = crate::estimate::attitude::G_MPS2;
+    let body: [f64; 3] = std::array::from_fn(|j| (0..3).map(|i| s.r[i][j] * s.vd[i]).sum::<f64>() / g); // R^T a
+    [roll, pitch, heading, course, slip, speed, body[0], -body[1]]
 }
 
 #[cfg(test)]

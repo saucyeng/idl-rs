@@ -46,7 +46,7 @@ pub struct NavSpec {
 impl Default for NavSpec {
     fn default() -> Self {
         // 5 ms and 10 ms at 400 Hz: the velocity at the steer's spacing keeps the band as it is
-        NavSpec { m_att: 2, m_vel: 4 }
+        NavSpec { m_att: 1, m_vel: 4 }
     }
 }
 
@@ -66,7 +66,7 @@ pub struct GpsFix {
 pub struct NavStart {
     /// Attitude at the first sample, IMU0 -> nav.
     pub att: [[f64; 3]; 3],
-    /// Prior sigma of each rotation-vector component (nav-error in IMU0 axes), rad.
+    /// Prior sigma of each component of the nav-frame attitude error (north, west, up: the last is heading), rad.
     pub att_sigma: [f64; 3],
     /// Velocity at the first sample, nav, m/s.
     pub vel: [f64; 3],
@@ -157,7 +157,7 @@ fn rows<S: Real>(ctrl: &[M3<S>; 4], s: &NavSample, w: &NavWeights) -> [S; NNAV] 
         }
     }
     if let Some(st) = s.start {
-        let e = log(M3::<S>::from_f64(st.att).t() * r);
+        let e = log(r * M3::<S>::from_f64(st.att).t()); // nav-frame error: z is heading, whatever the mount
         for i in 0..3 {
             out[9 + i] = e.0[i] * (1.0 / st.att_sigma[i]);
             out[12 + i] = c::<S>((s.v[i] - st.vel[i]) / st.vel_sigma);

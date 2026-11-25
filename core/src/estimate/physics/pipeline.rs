@@ -3,6 +3,9 @@
 //! clock), native-rate clip masks, airborne detection, at-rest biases from a
 //! still recording, and the choice of windows. Port of `ml/idlml/data/`.
 
+use super::bike::Bike;
+use super::la::{M3, V3};
+use super::nav::{GpsFix, NavStart};
 use super::objective::{Window, NG};
 use crate::estimate::run::EstimatorInput;
 use crate::math::eval::ChannelLookup;
@@ -348,4 +351,67 @@ pub fn moving(r: &Ride) -> Vec<bool> {
         }
     }
     out
+}
+
+/// GPS fixes on the grid: each fix at the grid sample nearest its time less
+/// `latency_s` (the receiver reports where the bike was a moment ago).
+pub fn gps_on_grid(r: &Ride, latency_s: f64) -> Vec<Option<GpsFix>> {
+    let mut out = vec![None; r.len()];
+    for g in &r.input.gps {
+        let i = r.index_at(g.time_s - latency_s);
+        if i < out.len() {
+            let up = g.up_mps;
+            out[i] = Some(GpsFix { v: [g.velocity.x, g.velocity.y, up.unwrap_or(0.0)], up: up.is_some() });
+        }
+    }
+    out
+}
+
+/// The ride's GPS latency, s: measured by lining the GPS course up with
+/// IMU0's turning about `bike.up`, else 0.2 s (the IEKF's default).
+pub fn gps_latency(r: &Ride, bike: &Bike<f64>) -> f64 {
+    let up = nalgebra::Vector3::new(bike.up.0[0], bike.up.0[1], bike.up.0[2]);
+    crate::estimate::run::fit_gps_latency(&r.input.gps, &r.input.imu0.gyro, up, r.input.t0_s, r.input.dt).unwrap_or(0.2)
+}
+
+/// Bike axes (X forward, Y left, Z up) in IMU0's axes, as the columns of a
+/// rotation bike -> IMU0, from the calibration's up and forward.
+pub fn bike_axes(bike: &Bike<f64>) -> M3<f64> {
+    columns(bike.fwd, bike.up)
+}
+
+/// The rotation whose columns are `fwd` (made perpendicular to `up`), up x fwd, `up`.
+fn columns(fwd: V3<f64>, up: V3<f64>) -> M3<f64> {
+    let u = up.unit();
+    let f = (fwd - u.scale(fwd.dot(u))).unit();
+    let l = u.cross(f);
+    M3(std::array::from_fn(|i| [f.0[i], l.0[i], u.0[i]]))
+}
+
+/// GPS speed above which a fix's course sets the start heading, m/s.
+const COURSE_MIN_SPEED_MPS: f64 = 3.0;
+
+/// The starting state of a riding stretch's first window at grid sample `i0`:
+/// tilt from IMU0's mean specific force over the first 0.25 s (the bike is
+/// barely moving at a stretch's start), heading from the first GPS course
+/// above 3 m/s in the next 10 s with the calibration's forward along it,
+/// velocity from that fix. Without a fix: heading north and velocity 0, held
+/// loosely.
+pub fn first_start(r: &Ride, bike: &Bike<f64>, gps: &[Option<GpsFix>], i0: usize) -> NavStart {
+    let n = ((0.25 * r.rate()) as usize).max(1).min(r.len() - i0);
+    let mut f = V3::<f64>::zero();
+    for v in &r.input.imu0.accel[i0..i0 + n] {
+        f = f + V3([v.x, v.y, v.z]);
+    }
+    let body = columns(bike.fwd, f);
+    let horizon = ((10.0 * r.rate()) as usize).min(r.len() - i0);
+    let fix = gps[i0..i0 + horizon].iter().flatten().find(|g| g.v[0].hypot(g.v[1]) > COURSE_MIN_SPEED_MPS);
+    let (course, vel, yaw_sigma, vel_sigma) = match fix {
+        // course clockwise from north; nav Y is west
+        Some(g) => ((-g.v[1]).atan2(g.v[0]), g.v, 0.3, 1.0),
+        None => (0.0, [0.0; 3], 1.0, 3.0),
+    };
+    let c = V3([course.cos(), -course.sin(), 0.0]);
+    let nav = columns(c, V3([0.0, 0.0, 1.0]));
+    NavStart { att: (nav * body.t()).0, att_sigma: [0.1, 0.1, yaw_sigma], vel, vel_sigma }
 }

@@ -23,7 +23,7 @@ fn main() {
     let handle = SessionHandle::from_bytes(&bytes).expect("parse .idl0");
 
     let roll = handle
-        .estimator_channel("Roll (deg)")
+        .estimator_channel("IEKF roll (deg)")
         .expect("estimator could not run (needs IMU0)");
     let roll_hz = roll.sample_rate_hz;
 

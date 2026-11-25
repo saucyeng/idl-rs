@@ -58,6 +58,7 @@ pub fn estimate_physics(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliErro
             _ => return Err(CliError::usage("--from-ms and --to-ms go together, with --to-ms after --from-ms".to_string())),
         },
         fit_whole_session: false,
+        nav: crate::verbs::switch(m, "nav"),
     };
     let r = idl_library::physics::estimate_physics(root, &id, &opts)?;
     let t = |s: &idl_library::physics::TravelSummary| {

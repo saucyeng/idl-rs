@@ -558,14 +558,14 @@ impl SessionHandle {
         "Front velocity (mm/s)",
         "IEKF rear travel (mm)",
         "Rear velocity (mm/s)",
-        "Roll (deg)",
-        "Pitch (deg)",
+        "IEKF roll (deg)",
+        "IEKF pitch (deg)",
         "Longitudinal accel (g)",
         "Lateral accel (g)",
-        "Heading (deg)",
+        "IEKF heading (deg)",
         "Heading uncertainty (deg)",
-        "Course (deg)",
-        "Slip (deg)",
+        "IEKF course (deg)",
+        "IEKF slip (deg)",
         "Slip uncertainty (deg)",
         "IEKF steer (deg)",
         "Steer uncertainty (deg)",
@@ -585,7 +585,7 @@ impl SessionHandle {
     /// when the session cannot drive it (no IMU0).
     ///
     /// Idempotence is by store presence rather than a dedicated flag: a second
-    /// call sees `Roll (deg)` already resident and returns immediately. Two
+    /// call sees `IEKF roll (deg)` already resident and returns immediately. Two
     /// threads racing the first call would both run it and upsert identical
     /// values — wasteful but correct, and evaluation is sequential per session.
     /// Geometry and tuning are [`crate::estimate::run::session_setup`]'s for the
@@ -593,7 +593,7 @@ impl SessionHandle {
     /// with none, or one that does not apply, `reference_bike()` with IMU0's
     /// mount fitted from the riding.
     fn run_estimator_once(&self) -> bool {
-        if self.with_channel("Roll (deg)", |_| ()).is_some() {
+        if self.with_channel("IEKF roll (deg)", |_| ()).is_some() {
             return true;
         }
         let Some(input) = crate::estimate::run::EstimatorInput::from_lookup(self) else {
@@ -615,14 +615,14 @@ impl SessionHandle {
         store("Front velocity (mm/s)", mm(&est.front_velocity));
         store("IEKF rear travel (mm)", mm(&est.rear_travel));
         store("Rear velocity (mm/s)", mm(&est.rear_velocity));
-        store("Roll (deg)", est.roll);
-        store("Pitch (deg)", est.pitch);
+        store("IEKF roll (deg)", est.roll);
+        store("IEKF pitch (deg)", est.pitch);
         store("Longitudinal accel (g)", est.accel_long);
         store("Lateral accel (g)", est.accel_lat);
-        store("Heading (deg)", est.heading);
+        store("IEKF heading (deg)", est.heading);
         store("Heading uncertainty (deg)", est.heading_sigma);
-        store("Course (deg)", est.course);
-        store("Slip (deg)", est.slip);
+        store("IEKF course (deg)", est.course);
+        store("IEKF slip (deg)", est.slip);
         store("Slip uncertainty (deg)", est.slip_sigma);
         store("IEKF steer (deg)", est.steer);
         store("Steer uncertainty (deg)", est.steer_sigma);
@@ -2356,7 +2356,7 @@ mod tests {
         let h = level_parked_handle();
 
         // Act — ask for one channel.
-        let roll = h.estimator_channel("Roll (deg)");
+        let roll = h.estimator_channel("IEKF roll (deg)");
 
         // Assert — all of them are now resident, so the run happened once and
         // populated the whole set rather than one channel at a time.
@@ -2415,7 +2415,7 @@ mod tests {
 
         // Assert — absent, and asking did not run the old filter.
         assert!(travel.is_none());
-        assert!(h.channel_meta("Roll (deg)").is_none(), "the IEKF ran for a solver channel");
+        assert!(h.channel_meta("IEKF roll (deg)").is_none(), "the IEKF ran for a solver channel");
     }
 
     #[test]
@@ -2439,7 +2439,7 @@ mod tests {
         let h = handle_with(vec![input_channel("GPS_SpeedKmh", 1.0, vec![0.0; 10])]);
 
         // Act + Assert — no IMU0 means the estimator cannot run.
-        assert!(h.estimator_channel("Roll (deg)").is_none());
+        assert!(h.estimator_channel("IEKF roll (deg)").is_none());
     }
 
     #[test]

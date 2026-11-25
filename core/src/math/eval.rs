@@ -1082,12 +1082,12 @@ pub(crate) fn estimator_channel_id(name: &str, arg: &str) -> Result<&'static str
         ("wheel_travel", "rear") => Ok("Rear travel (mm)"),
         ("wheel_velocity", "front") => Ok("Front velocity (mm/s)"),
         ("wheel_velocity", "rear") => Ok("Rear velocity (mm/s)"),
-        ("attitude", "roll") => Ok("Roll (deg)"),
-        ("attitude", "pitch") => Ok("Pitch (deg)"),
-        ("attitude", "heading") => Ok("Heading (deg)"),
+        ("attitude", "roll") => Ok("IEKF roll (deg)"),
+        ("attitude", "pitch") => Ok("IEKF pitch (deg)"),
+        ("attitude", "heading") => Ok("IEKF heading (deg)"),
         ("attitude", "heading_sigma") => Ok("Heading uncertainty (deg)"),
-        ("attitude", "course") => Ok("Course (deg)"),
-        ("attitude", "slip") => Ok("Slip (deg)"),
+        ("attitude", "course") => Ok("IEKF course (deg)"),
+        ("attitude", "slip") => Ok("IEKF slip (deg)"),
         ("attitude", "slip_sigma") => Ok("Slip uncertainty (deg)"),
         ("attitude", "steer") => Ok("Steer (deg)"),
         ("attitude", "steer_sigma") => Ok("Steer uncertainty (deg)"),
@@ -3355,10 +3355,10 @@ mod tests {
         )
         .unwrap();
 
-        // Assert — "Roll (deg)" is 10 chars, so the fake returns [10.0].
+        // Assert — "IEKF roll (deg)" is 15 chars, so the fake returns [15.0].
         match v {
             Value::Channel(c) => {
-                assert_eq!(c.samples.as_ref(), &[10.0]);
+                assert_eq!(c.samples.as_ref(), &[15.0]);
                 assert_eq!(c.sample_rate_hz, 800.0);
             }
             other => panic!("{other:?}"),
@@ -3649,7 +3649,7 @@ mod tests {
         let memo = MemoLookup::new(&FakeEstimator);
 
         // Act
-        let got = memo.estimator_channel("Roll (deg)");
+        let got = memo.estimator_channel("IEKF roll (deg)");
 
         // Assert
         assert!(got.is_some(), "MemoLookup swallowed estimator_channel");

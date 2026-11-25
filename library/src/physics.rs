@@ -48,6 +48,9 @@ pub struct PhysicsOptions {
     /// With `span_ms`, a bike fit (when one is needed) still picks its
     /// windows from the whole session; only the solve is cut to the span.
     pub fit_whole_session: bool,
+    /// Estimate attitude and velocity too (the `Physics roll (deg)`... channels;
+    /// spec one-model). Off while it is checked against the IEKF.
+    pub nav: bool,
 }
 
 /// Distribution of one travel channel over the solved samples, mm.
@@ -135,6 +138,9 @@ pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
+/// The GPS channels navigation reads (`estimate::run::gps_samples_from_lookup`).
+const GPS_CHANNELS: [&str; 4] = ["GPS_SpeedKmh", "GPS_Heading", "GPS_FixQuality", "GPS_Altitude"];
+
 const IMU_CHANNELS: [&str; 18] = [
     "IMU0_AccelX", "IMU0_AccelY", "IMU0_AccelZ", "IMU0_GyroX", "IMU0_GyroY", "IMU0_GyroZ",
     "IMU1_AccelX", "IMU1_AccelY", "IMU1_AccelZ", "IMU1_GyroX", "IMU1_GyroY", "IMU1_GyroZ",
@@ -208,8 +214,10 @@ pub fn estimate_physics_with(
     };
     // the inputs' column hashes (C1 §5) now, then drop the session: its decoded
     // channels would otherwise sit in memory through every solve
+    let gps_inputs: &[&str] = if opts.nav { &GPS_CHANNELS } else { &[] };
     let inputs: Vec<(String, [u8; 32])> = IMU_CHANNELS
         .iter()
+        .chain(gps_inputs)
         .filter_map(|&name| handle.lookup(name).map(|c| (name.to_string(), derived_input_hash(name, &c.t_us, &c.samples))))
         .collect();
     drop(handle);
@@ -227,6 +235,7 @@ pub fn estimate_physics_with(
     if let Some(t) = opts.threads {
         cfg.threads = t.max(1);
     }
+    cfg.nav = opts.nav;
     let base = bike(&cal.fit, linkage, current, rear).map_err(|e| {
         err(
             PhysicsErrorKind::Unusable,
@@ -283,6 +292,7 @@ pub fn estimate_physics_with(
             "travel_m": [front, rear],
             "linkage_updated_at_ms": linkage.map(|l| l.updated_at_ms),
             "air_anchor": cfg.air_anchor,
+            "nav": cfg.nav,
             "window_s": cfg.window_s,
             "overlap_s": cfg.overlap_s,
             "bias_centre": centre.to_vec(),

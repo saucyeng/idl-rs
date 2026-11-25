@@ -670,6 +670,7 @@ pub const COMMANDS: &[CommandRow] = &[
             Flag::value("threads", ValueKind::Integer, "Worker threads; default up to 4"),
             Flag::value("from-ms", ValueKind::Integer, "Only from here, ms from the session's first sample (with `--to-ms`): less memory, and a first fit uses windows inside it"),
             Flag::value("to-ms", ValueKind::Integer, "Only to here, ms from the session's first sample"),
+            Flag::switch("nav", "Estimate the bike's attitude and velocity too (roll, pitch, heading, course, slip, speed, body accel; reads GPS). Experimental: being checked against the old estimator"),
         ],
         core_fn: "idl_library::physics::estimate_physics",
         json_shape: Some("PhysicsReport"),
