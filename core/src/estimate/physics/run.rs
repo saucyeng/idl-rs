@@ -57,10 +57,18 @@ impl Default for Config {
             tol: 1.0,
             air_anchor: true,
             nav: false,
-            threads: std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
+            threads: default_threads(),
             weights: Weights::default(),
         }
     }
+}
+
+/// Worker threads for the window solves when none are asked for: every core but two, which are
+/// left for the rest of the machine (at least one; Isaac, 2026-11-25). Each thread holds one
+/// window's normal matrix and its factor: about 140 MB for a 12 s window, about 210 MB with
+/// navigation. This was capped at 4 when the dev machine had 16 GB.
+pub fn default_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1))
 }
 
 /// What a bike fit found.

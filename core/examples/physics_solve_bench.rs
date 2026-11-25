@@ -7,6 +7,7 @@
 mod physics_fixture;
 
 use idl_rs::estimate::physics::objective::{Objective, Spec, Weights, Window, NG};
+use idl_rs::estimate::physics::nav::{GpsFix, NavSpec, NavStart, NavWindow};
 use idl_rs::estimate::physics::solve::{gauss_newton, normal_equations, solve_damped, Layout};
 
 fn rows(j: &serde_json::Value) -> Vec<[f64; 3]> {
@@ -29,6 +30,15 @@ fn main() {
         nav: None,
     };
     let n = win.frame_gyro.len();
+    // `--nav`: add the navigation latents (attitude, velocity) with a made-up 10 Hz GPS track; the
+    // fixture has no GPS, so the loss is not comparable, only the timing
+    let nav = std::env::args().any(|a| a == "--nav");
+    let mut win = win;
+    if nav {
+        let gps = (0..n).map(|t| (t % 40 == 0).then_some(GpsFix { v: [5.0, 0.0, 0.0], up: true })).collect();
+        let start = NavStart { att: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], att_sigma: [0.3, 0.3, 1.0], vel: [5.0, 0.0, 0.0], vel_sigma: 3.0 };
+        win.nav = Some(NavWindow { gps, start });
+    }
     let mut centre = [0.0; NG];
     for (i, key) in ["frame_bias", "fork.gyro_bias", "fork.accel_bias", "rear.gyro_bias", "rear.accel_bias"].iter().enumerate() {
         let c = &doc["bias_prior"][key];
@@ -36,7 +46,11 @@ fn main() {
             centre[3 * i + a] = c.as_f64().unwrap_or_else(|| c[a].as_f64().unwrap());
         }
     }
-    let obj = Objective::new(physics_fixture::bike_from(&doc["bike"]), win, Spec::standard(n, 1.0 / 400.0), Weights::default(), centre);
+    let mut spec = Spec::standard(n, 1.0 / 400.0);
+    if nav {
+        spec.nav = Some(NavSpec::default());
+    }
+    let obj = Objective::new(physics_fixture::bike_from(&doc["bike"]), win, spec, Weights::default(), centre);
     let lay = Layout::new(&obj);
     let v0 = obj.initial_vars();
     let t = std::time::Instant::now();
@@ -50,6 +64,6 @@ fn main() {
     let total: f64 = info.seconds.iter().sum();
     println!("{n} samples ({:.1} s of ride), {} unknowns, band half-width {}", n as f64 / 400.0, lay.n_loc, lay.bw);
     println!("  {} iterations, {:.2} s: normal equations {:.2}, solve {:.2}, loss {:.2}", info.iterations, total, info.seconds[0], info.seconds[1], info.seconds[2]);
-    println!("  final loss {:.2} (PyTorch {:.2})", info.loss.last().unwrap(), doc["solution"]["loss"].as_f64().unwrap());
+    println!("  final loss {:.2} (PyTorch {:.2}{})", info.loss.last().unwrap(), doc["solution"]["loss"].as_f64().unwrap(), if nav { ", not comparable with --nav" } else { "" });
     println!("  per second of ride: {:.2} s", total / (n as f64 / 400.0));
 }

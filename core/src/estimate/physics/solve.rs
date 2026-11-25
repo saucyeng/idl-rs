@@ -447,7 +447,7 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
     };
     share(&mut vs);
     let total = |vs: &[Vars]| objs.iter().zip(vs).map(|(o, v)| o.data_loss(v)).sum::<f64>() + objs[0].prior_loss(&vs[0]);
-    let mut lam = 1e-10;
+    let (mut lam, mut nu) = (1e-10, 2.0);
     let mut loss = total(&vs);
     let mut info = SolveInfo { loss: vec![loss], iterations: 0, seconds: [0.0; 3], converged: false };
     for it in 0..iters {
@@ -467,17 +467,34 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
                 fs.push(f);
             }
             let xg = solve_globals(&s, &rhs, ng, lays[0].n_loc)?;
-            let cand: Vec<Vars> = vs.iter().zip(&lays).zip(&fs).map(|((v, lay), f)| lay.apply(v, &back_substitute(f, &xg), &xg)).collect();
+            let xls: Vec<Vec<f64>> = fs.iter().map(|f| back_substitute(f, &xg)).collect();
+            // the quadratic model's predicted loss drop, about -g.x / 2 for a small damping
+            let pred = -0.5
+                * (nes.iter().zip(&xls).map(|(ne, xl)| ne.g_loc.iter().zip(xl).map(|(g, x)| g * x).sum::<f64>()).sum::<f64>()
+                    + nes.iter().map(|ne| ne.g_glob.iter().zip(&xg).map(|(g, x)| g * x).sum::<f64>()).sum::<f64>());
+            let cand: Vec<Vars> = vs.iter().zip(&lays).zip(&xls).map(|((v, lay), xl)| lay.apply(v, xl, &xg)).collect();
             info.seconds[1] += t1.elapsed().as_secs_f64();
             let t2 = std::time::Instant::now();
             new = total(&cand);
             info.seconds[2] += t2.elapsed().as_secs_f64();
+            // Nielsen's damping update (as in Madsen, Nielsen & Tingleff, "Methods for non-linear
+            // least squares problems", 2004): a ÷10 after every success overshot, and climbing back
+            // cost up to five rejected factorisations per iteration
             if new < loss {
+                let rho = (loss - new) / pred.max(f64::MIN_POSITIVE);
                 vs = cand;
-                lam = (lam / 10.0).max(1e-12);
+                lam = (lam * (1.0f64 / 3.0).max(1.0 - (2.0 * rho - 1.0).powi(3))).max(1e-12);
+                nu = 2.0;
                 break;
             }
-            lam *= 10.0;
+            // a step that promised less than the tolerance and did not deliver: converged, not
+            // worth raising the damping to the cap one factorisation at a time
+            if pred < tol {
+                lam = f64::INFINITY;
+                break;
+            }
+            lam *= nu;
+            nu *= 2.0;
             if lam > 1e2 {
                 break;
             }
