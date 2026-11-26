@@ -50,6 +50,9 @@ pub struct Config {
     /// Gauss-Newton iteration cap for the identification (cold latents and shared parameters
     /// take longer than a window solve).
     pub force_id_iters: usize,
+    /// Solve only inside these spans, channel time in us (None: all riding). A prototyping
+    /// aid: the force model tried on the descents alone (`IDL_PHYSICS_LAPS`).
+    pub only_us: Option<Vec<(i64, i64)>>,
     /// Worker threads for the window solves (1: none).
     pub threads: usize,
     /// Noise levels and priors.
@@ -72,6 +75,7 @@ impl Default for Config {
             force_id_windows: 6,
             force_id_window_s: 6.0,
             force_id_iters: 60,
+            only_us: None,
             threads: default_threads(),
             weights: Weights::default(),
         }
@@ -162,7 +166,13 @@ const HANDOFF_SIGMA: ([f64; 3], f64) = ([0.02, 0.02, 0.05], 0.3);
 /// The solve windows over the riding stretches: (start, end, keep_start, keep_end).
 fn plan(r: &Ride, cfg: &Config) -> Vec<(usize, usize, usize, usize)> {
     let rate = r.rate();
-    plan_windows(&moving(r), (cfg.window_s * rate) as usize, (cfg.overlap_s * rate) as usize, (2.0 * rate) as usize)
+    let mut mov = moving(r);
+    if let Some(spans) = &cfg.only_us {
+        for (m, t) in mov.iter_mut().zip(&r.grid_us) {
+            *m &= spans.iter().any(|&(a, b)| (a..b).contains(t));
+        }
+    }
+    plan_windows(&mov, (cfg.window_s * rate) as usize, (cfg.overlap_s * rate) as usize, (2.0 * rate) as usize)
 }
 
 /// Solve windows over the `true` stretches of `mov` (stretches shorter than

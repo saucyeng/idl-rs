@@ -47,7 +47,7 @@ use num_dual::Dual64;
 use super::bike::{Bike, B_FA, B_LAT, D, F_TWIST, NL, PSI, R_ROLL, R_YAW, S};
 use super::la::{c, M3, Real, V3};
 use super::readings::{Sample, NZ};
-use crate::sim::laws::{air_force_about_n, friction_n, step, stop_n, DamperLaw, TyreLaw};
+use crate::sim::laws::{air_force_about_n, friction_n, relu, step, stop_n, DamperLaw, TyreLaw};
 
 /// Force latents per sample.
 pub const NFL: usize = 18;
@@ -86,6 +86,10 @@ pub const P_PRESSURE: usize = 12;
 pub const P_TYRE_K: usize = 14;
 /// Tyre radial damping, front then rear: 16..18.
 pub const P_TYRE_C: usize = 16;
+
+/// Width the tyre's normal force is smoothed over at zero, N (a softplus: an airborne tyre
+/// keeps w ln 2, 0.7 N).
+pub const TYRE_SMOOTH_N: f64 = 1.0;
 /// Rider springs (x, y, z, roll, pitch, yaw): 18..24.
 pub const P_RIDER_K: usize = 18;
 /// Rider dampers: 24..30.
@@ -455,7 +459,9 @@ pub fn rows<S: Real>(m: &ForceModel, k: &Kin<S>, x: &ForceIn<S>, meas: &ForceMea
     let tyre = |i: usize, d0: usize| {
         let t = &fb.tyre[i];
         let law = TyreLaw { stiffness_n_m: par(P_TYRE_K + i) * t.stiffness_n_m, insert_touch_m: t.insert_touch_m, insert_n_m: c::<S>(t.insert_n_m), insert_solid_m: t.insert_solid_m, rim_m: t.rim_m, rim_n_m: t.rim_n_m };
-        let n = law.force_n(f[d0], wl) + par(P_TYRE_C + i) * fd[d0] * step(f[d0], wl);
+        // a tyre pushes, never pulls: the spring and damping together kept >= 0 (in fast rebound
+        // the damping term alone would take the total below zero)
+        let n = relu(law.force_n(f[d0], wl) + par(P_TYRE_C + i) * fd[d0] * step(f[d0], wl), TYRE_SMOOTH_N);
         (n, up.scale(n) + fwd.scale(f[d0 + 1]) + lat.scale(f[d0 + 2]))
     };
     let (nf, tf) = tyre(0, DEF_F);

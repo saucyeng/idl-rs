@@ -233,6 +233,15 @@ pub fn estimate_physics_with(
         .chain(gps_inputs)
         .filter_map(|&name| handle.lookup(name).map(|c| (name.to_string(), derived_input_hash(name, &c.t_us, &c.samples))))
         .collect();
+    // IDL_PHYSICS_LAPS (prototyping): solve only the session's laps, its descents
+    let only_us: Option<Vec<(i64, i64)>> = std::env::var_os("IDL_PHYSICS_LAPS").map(|_| {
+        let epochs: Vec<f64> = doc.laps.iter().flat_map(|l| [l.start_timestamp_ms as f64, l.end_timestamp_ms as f64]).collect();
+        let secs = handle.epoch_ms_to_time_secs(&epochs);
+        secs.chunks(2).map(|p| ((p[0] * 1e6) as i64, (p[1] * 1e6) as i64)).collect()
+    });
+    if let Some(sp) = &only_us {
+        eprintln!("IDL_PHYSICS_LAPS: {} laps, {:.0} s", sp.len(), sp.iter().map(|(a, b)| (b - a) as f64 * 1e-6).sum::<f64>());
+    }
     drop(handle);
     // at-rest biases from the calibration's still recording, else IMU0's from the calibration
     let mut centre = [0.0; NG];
@@ -249,6 +258,7 @@ pub fn estimate_physics_with(
         cfg.threads = t.max(1);
     }
     cfg.nav = opts.nav;
+    cfg.only_us = only_us;
     let force_setup = |bk: &idl_rs::estimate::physics::bike::Bike<f64>| -> Result<Option<idl_rs::estimate::physics::forces::ForceModel>, PhysicsError> {
         if !opts.forces {
             return Ok(None);
