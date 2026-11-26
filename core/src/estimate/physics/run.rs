@@ -436,11 +436,22 @@ pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
         for (o, v) in objs.iter().zip(&vs) {
             eprintln!("  window loss by row group: {}", row_group_loss(o, v));
         }
-        match super::solve::globals_sigma(&objs, &vs) {
-            Ok(sig) => {
+        match super::solve::globals_covariance(&objs, &vs) {
+            Ok((cov, ng)) => {
                 let (g0, p) = (objs[0].force_glob0(), objs[0].force_par(&vs[0]));
-                let txt: Vec<String> = super::forces::PAR_NAMES.iter().enumerate().map(|(i, n)| format!("{n} {:.2} (x/ {:.2})", p[i].exp(), sig[g0 + i].exp())).collect();
+                let sig = |i: usize| cov[(g0 + i) * ng + g0 + i].max(0.0).sqrt();
+                let txt: Vec<String> = super::forces::PAR_NAMES.iter().enumerate().map(|(i, n)| format!("{n} {:.2} (x/ {:.2})", p[i].exp(), sig(i).exp())).collect();
                 eprintln!("  force parameters, factor on the nominal (x/ one sigma): {}", txt.join(", "));
+                // the pairs the data cannot tell apart: the strongest correlations
+                let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+                for i in 0..super::forces::NFP {
+                    for j in 0..i {
+                        pairs.push((cov[(g0 + i) * ng + g0 + j] / (sig(i) * sig(j)).max(f64::MIN_POSITIVE), i, j));
+                    }
+                }
+                pairs.sort_by(|a, b| b.0.abs().total_cmp(&a.0.abs()));
+                let names = &super::forces::PAR_NAMES;
+                eprintln!("  strongest correlations: {}", pairs.iter().take(12).map(|(r, i, j)| format!("{} ~ {} {r:+.2}", names[*i], names[*j])).collect::<Vec<_>>().join(", "));
             }
             Err(e) => eprintln!("  force parameter sigmas failed: {e:?}"),
         }

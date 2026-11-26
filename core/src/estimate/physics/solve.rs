@@ -691,6 +691,13 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
 /// Huber-downweighted row counts at its weight there, so it is the Gauss-Newton
 /// approximation about the fit, not a sampled posterior.
 pub fn globals_sigma(objs: &[Objective], vs: &[Vars]) -> Result<Vec<f64>, SolveError> {
+    let (cov, ng) = globals_covariance(objs, vs)?;
+    Ok((0..ng).map(|i| cov[i * ng + i].max(0.0).sqrt()).collect())
+}
+
+/// The shared unknowns' covariance at a multi-window solution, row-major `[ng * ng]`, with
+/// `ng` (see [`globals_sigma`] for what it approximates).
+pub fn globals_covariance(objs: &[Objective], vs: &[Vars]) -> Result<(Vec<f64>, usize), SolveError> {
     let lays: Vec<Layout> = objs.iter().map(Layout::new).collect();
     let ng = objs[0].n_glob();
     let parts = par_map(&(0..objs.len()).collect::<Vec<_>>(), |&w| {
@@ -703,7 +710,7 @@ pub fn globals_sigma(objs: &[Objective], vs: &[Vars]) -> Result<Vec<f64>, SolveE
     }
     let ch = nalgebra::DMatrix::from_row_slice(ng, ng, &s).cholesky().ok_or(SolveError::NotPositiveDefinite { row: lays[0].n_loc })?;
     let inv = ch.inverse();
-    Ok((0..ng).map(|i| inv[(i, i)].max(0.0).sqrt()).collect())
+    Ok(((0..ng * ng).map(|k| inv[(k / ng, k % ng)]).collect(), ng))
 }
 
 /// Starting values for an objective with the force model on: the same window solved with it
