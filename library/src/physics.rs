@@ -233,9 +233,11 @@ pub fn estimate_physics_with(
         .chain(gps_inputs)
         .filter_map(|&name| handle.lookup(name).map(|c| (name.to_string(), derived_input_hash(name, &c.t_us, &c.samples))))
         .collect();
-    // IDL_PHYSICS_LAPS (prototyping): solve only the session's laps, its descents
-    let only_us: Option<Vec<(i64, i64)>> = std::env::var_os("IDL_PHYSICS_LAPS").map(|_| {
-        let epochs: Vec<f64> = doc.laps.iter().flat_map(|l| [l.start_timestamp_ms as f64, l.end_timestamp_ms as f64]).collect();
+    // IDL_PHYSICS_LAPS (prototyping): solve only the session's laps, its descents; a lap number
+    // (IDL_PHYSICS_LAPS=3) keeps that lap alone
+    let only_us: Option<Vec<(i64, i64)>> = std::env::var("IDL_PHYSICS_LAPS").ok().map(|v| {
+        let one: Option<u32> = v.trim().parse().ok();
+        let epochs: Vec<f64> = doc.laps.iter().filter(|l| one.is_none_or(|n| l.lap_number == n)).flat_map(|l| [l.start_timestamp_ms as f64, l.end_timestamp_ms as f64]).collect();
         let secs = handle.epoch_ms_to_time_secs(&epochs);
         secs.chunks(2).map(|p| ((p[0] * 1e6) as i64, (p[1] * 1e6) as i64)).collect()
     });
@@ -259,6 +261,10 @@ pub fn estimate_physics_with(
     }
     cfg.nav = opts.nav;
     cfg.only_us = only_us;
+    // IDL_FORCE_ID_ITERS (prototyping): the force identification's iteration cap
+    if let Some(n) = std::env::var("IDL_FORCE_ID_ITERS").ok().and_then(|v| v.trim().parse().ok()) {
+        cfg.force_id_iters = n;
+    }
     let force_setup = |bk: &idl_rs::estimate::physics::bike::Bike<f64>| -> Result<Option<idl_rs::estimate::physics::forces::ForceModel>, PhysicsError> {
         if !opts.forces {
             return Ok(None);
