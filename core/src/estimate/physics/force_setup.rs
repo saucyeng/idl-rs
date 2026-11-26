@@ -23,9 +23,13 @@ const G: f64 = 9.80665;
 /// and PMC7801088 table 2). Standing, they move with the pedals: the frame carries them.
 pub const LOWER_LEGS_SHARE: f64 = 2.0 * (0.0433 + 0.0137);
 
-/// The standing rider's centre of mass above the bottom bracket, m (an estimate: attack
-/// position, knees and hips bent; the rider pose latent's 0.25 m prior takes the rest).
+/// The standing rider's centre of mass above the bottom bracket without a height, m (an
+/// estimate: attack position, knees and hips bent; the rider pose latent's 0.25 m prior takes
+/// the rest).
 pub const RIDER_CG_ABOVE_BB_M: f64 = 0.85;
+/// ... with `rider.height_m`, as a share of it (an estimate: standing a little upright, as
+/// Isaac rides, 2026-11-25; upright standing puts it near 0.55 of height above the feet).
+pub const RIDER_CG_HEIGHT_SHARE: f64 = 0.5;
 /// ... and ahead of it, m (an estimate: hips over the cranks).
 pub const RIDER_CG_AHEAD_OF_BB_M: f64 = 0.05;
 /// The sprung bike's centre of mass, as the share of the way from the bottom bracket to the
@@ -82,7 +86,8 @@ pub fn force_model(bike: &Bike<f64>, p: &Params, linkage: &Linkage, travel_m: [f
     let (ht, ha) = (need("geometry.head_tube_mm")? / 1000.0, need("geometry.head_angle_deg")?.to_radians());
     let ht_bottom = [bb[0] + reach + ht * ha.cos(), bb[1] + stack - ht * ha.sin()];
     let frame_cg = [bb[0] + FRAME_CG_SHARE * (ht_bottom[0] - bb[0]), bb[1] + FRAME_CG_SHARE * (ht_bottom[1] - bb[1])];
-    let rider_cg = [bb[0] + RIDER_CG_AHEAD_OF_BB_M, bb[1] + RIDER_CG_ABOVE_BB_M];
+    let above_bb = number(p, "rider.height_m").filter(|h| *h > 0.5).map_or(RIDER_CG_ABOVE_BB_M, |h| RIDER_CG_HEIGHT_SHARE * h);
+    let rider_cg = [bb[0] + RIDER_CG_AHEAD_OF_BB_M, bb[1] + above_bb];
 
     let mt = mass_table(p);
     let rider = need("rider.mass_kg")? + number(p, "rider.carried_kg").unwrap_or(0.0);

@@ -1159,4 +1159,27 @@ pub(crate) mod synth {
             check(&format!("parameter {i}"), &|r| j.j_par[r][i], &|e| { let mut g = par; g[i] += e; at(&s, &f, &fd, &fdd, &g) }, 1e-6);
         }
     }
+
+    #[test]
+    fn normal_equations_by_sample_chunks_on_threads_equal_the_serial_ones() {
+        // Arrange: the exact ride with the force model on, at its cold start
+        use crate::estimate::physics::objective::{Objective, Spec, Weights, NG};
+        use crate::estimate::physics::solve::{normal_equations, Layout};
+        let (bike, m) = model();
+        let (n, dt) = (300, 1.0 / 400.0);
+        let truth = ride(&bike, &m, n, dt, 0.5);
+        let serial = Objective::new(bike, window(&truth, 400.0), Spec::standard(n, dt), Weights::default(), [0.0; NG]).with_forces(m);
+        let threaded = Objective { threads: 4, ..Objective { bike: serial.bike.clone(), win: serial.win.clone(), spec: serial.spec.clone(), w: serial.w.clone(), glob_centre: serial.glob_centre.clone(), fit: false, forces: serial.forces.clone(), threads: 1 } };
+        let v = serial.initial_vars();
+        let lay = Layout::new(&serial);
+
+        // Act
+        let (a, b) = (normal_equations(&serial, &lay, &v, true), normal_equations(&threaded, &lay, &v, true));
+
+        // Assert: the same system, to rounding
+        let close = |x: &[f64], y: &[f64]| x.iter().zip(y).all(|(p, q)| (p - q).abs() <= 1e-9 * (1.0 + p.abs().max(q.abs())));
+        assert!(close(&a.band, &b.band) && close(&a.border, &b.border) && close(&a.c, &b.c));
+        assert!(close(&a.g_loc, &b.g_loc) && close(&a.g_glob, &b.g_glob));
+        assert!((a.loss - b.loss).abs() <= 1e-9 * a.loss);
+    }
 }

@@ -232,6 +232,9 @@ pub struct Objective {
     pub fit: bool,
     /// The force model (None: off); its parameters follow the other globals.
     pub forces: Option<ForceModel>,
+    /// Threads one solve of this objective may use (normal equations by sample chunks, the
+    /// border's solves): 1 when many windows already run side by side.
+    pub threads: usize,
 }
 
 /// The bike lifted for one linearisation point: values, values + Jacobian,
@@ -257,7 +260,7 @@ pub struct SampleJac {
 impl Objective {
     /// An objective over `win` with `bike` frozen; `bias_centre`: the biases' prior centres.
     pub fn new(bike: Bike<f64>, win: Window, spec: Spec, w: Weights, bias_centre: [f64; NG]) -> Self {
-        Objective { bike, win, spec, w, glob_centre: bias_centre.to_vec(), fit: false, forces: None }
+        Objective { bike, win, spec, w, glob_centre: bias_centre.to_vec(), fit: false, forces: None, threads: 1 }
     }
 
     /// As [`Self::new`], also estimating the bike's geometry, with a prior
@@ -265,7 +268,7 @@ impl Objective {
     pub fn fitting(bike: Bike<f64>, win: Window, spec: Spec, w: Weights, bias_centre: [f64; NG]) -> Self {
         let mut c = bias_centre.to_vec();
         c.extend(geometry(&bike));
-        Objective { bike, win, spec, w, glob_centre: c, fit: true, forces: None }
+        Objective { bike, win, spec, w, glob_centre: c, fit: true, forces: None, threads: 1 }
     }
 
     /// This objective with the force model on (its parameters' prior centres at 0: the
@@ -457,7 +460,8 @@ impl Objective {
         let sp = &fw.speed_mps;
         let (a, b) = (t.saturating_sub(1), (t + 1).min(n - 1));
         let speed_rate = if b > a { (sp[b] - sp[a]) / ((b - a) as f64 * self.spec.dt) } else { 0.0 };
-        Some(ForceMeas { frame: self.win.frame_accel[t], fork: self.win.fork_accel[t], rear: self.win.rear_accel[t], speed: sp[t], speed_rate })
+        let finite = |x: f64| if x.is_finite() { x } else { 0.0 };
+        Some(ForceMeas { frame: self.win.frame_accel[t], fork: self.win.fork_accel[t], rear: self.win.rear_accel[t], speed: finite(sp[t]), speed_rate: finite(speed_rate) })
     }
 
     /// The force parameters (log multipliers) in `v`.

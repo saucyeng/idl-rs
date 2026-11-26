@@ -112,6 +112,16 @@ impl Layout {
         Layout { groups, n_loc, bw }
     }
 
+    /// Which unknown sits at band row `pos` (a diagnostic: group kind, row, knot).
+    pub fn describe(&self, pos: usize) -> String {
+        for g in &self.groups {
+            if let Some(k) = g.pos.iter().position(|&p| p == pos) {
+                return format!("{:?} row {} knot {k} (spacing {})", g.kind, g.row, g.m);
+            }
+        }
+        format!("row {pos} (beyond the layout)")
+    }
+
     fn coef<'a>(&self, g: &Group, v: &'a Vars) -> &'a [f64] {
         match g.kind {
             Kind::Latent(li) => &v.lvl[li][g.row],
@@ -169,6 +179,19 @@ pub struct Normal {
     pub g_glob: Vec<f64>,
     /// Loss at the linearisation point.
     pub loss: f64,
+    /// Threads its factorisation may use (the border's solves).
+    pub threads: usize,
+}
+
+/// One chunk of samples' share of a [`Normal`], over band rows `lo..` only.
+struct Part {
+    lo: usize,
+    band: Vec<f64>,
+    border: Vec<f64>,
+    c: Vec<f64>,
+    g_loc: Vec<f64>,
+    g_glob: Vec<f64>,
+    loss: f64,
 }
 
 /// Assemble the normal equations at `v`; `global_prior`: include the priors
@@ -176,7 +199,7 @@ pub struct Normal {
 pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: bool) -> Normal {
     let (n, bw, ng) = (lay.n_loc, lay.bw, obj.n_glob());
     let wd = bw + 1;
-    let mut ne = Normal { ng, band: vec![0.0; n * wd], border: vec![0.0; n * ng], c: vec![0.0; ng * ng], g_loc: vec![0.0; n], g_glob: vec![0.0; ng], loss: 0.0 };
+    let mut ne = Normal { ng, band: vec![0.0; n * wd], border: vec![0.0; n * ng], c: vec![0.0; ng * ng], g_loc: vec![0.0; n], g_glob: vec![0.0; ng], loss: 0.0, threads: obj.threads.max(1) };
     let sp = &obj.spec;
     let ctx = obj.ctx(&v.glob, true);
     let ncol = lay.groups.len() * 4;
@@ -185,15 +208,31 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
     let nt = f0 + if obj.force_on().is_some() { NFR } else { 0 };
     let (fg0, nb) = (obj.force_glob0(), ng.min(super::objective::NGMAX));
     let k_force = obj.forces.as_ref().map_or(0.0, |m| m.w.huber);
+    let debug_nan = std::env::var_os("IDL_FORCE_DEBUG").is_some(); // IDL_FORCE_DEBUG: name the first non-finite row
+    // samples in chunks across threads, each into a partial system over the coefficients its
+    // samples touch (rows lo..=hi of the band), added up in order
+    let run = |t0: usize, t1: usize| -> Part {
+    let lo = lay.groups.iter().map(|g| g.pos[t0 / g.m]).min().unwrap_or(0);
+    let hi = lay.groups.iter().map(|g| g.pos[(t1 - 1) / g.m + 3]).max().unwrap_or(0);
+    let rows = hi - lo + 1;
+    let mut ne = Part { lo, band: vec![0.0; rows * wd], border: vec![0.0; rows * ng], c: vec![0.0; ng * ng], g_loc: vec![0.0; rows], g_glob: vec![0.0; ng], loss: 0.0 };
     let mut a = vec![0.0; nt * ncol];
     let mut res = vec![0.0; nt];
     let mut jg = vec![0.0; nt * ng];
     let mut cols = vec![0usize; ncol];
-    for t in 0..sp.n {
+    for t in t0..t1 {
         let s = obj.sample(v, t);
         let sj = obj.sample_residuals(&ctx, &s, &v.glob, t, true);
         let nj = obj.nav_residuals(v, &s, t, true);
         let fj = obj.force_residuals(&ctx, v, &s, t, true);
+        if debug_nan {
+            let bad_core = (0..NROW).find(|&r| !sj.r[r].is_finite() || sj.jz[r].iter().any(|x| !x.is_finite()));
+            let bad_force = fj.as_ref().and_then(|fj| (0..NFR).find(|&r| !fj.r[r].is_finite() || fj.j_core[r].iter().chain(fj.j_frc[r].iter()).chain(fj.j_par[r].iter()).any(|x| !x.is_finite())));
+            if bad_core.is_some() || bad_force.is_some() {
+                let col = fj.as_ref().zip(bad_force).and_then(|(fj, r)| fj.j_core[r].iter().position(|x| !x.is_finite()).map(|c| format!("core column {c}")).or_else(|| fj.j_frc[r].iter().position(|x| !x.is_finite()).map(|c| format!("force column {c}"))).or_else(|| fj.j_par[r].iter().position(|x| !x.is_finite()).map(|c| format!("parameter {c}"))));
+                eprintln!("NaN at sample {t}: pod row {bad_core:?}, force row {bad_force:?} ({col:?}); q D {:.4} S {:.4} D' {:.3} S' {:.3}", s.q[0], s.q[4], s.qd[0], s.qd[4]);
+            }
+        }
         // chain d r / d z through the spline basis to the coefficients
         a.iter_mut().for_each(|x| *x = 0.0);
         for (gi, g) in lay.groups.iter().enumerate() {
@@ -288,7 +327,7 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
             for r in 0..nt {
                 gp += a[r * ncol + p] * res[r];
             }
-            ne.g_loc[cp] += gp;
+            ne.g_loc[cp - lo] += gp;
             for q in 0..ncol {
                 let cq = cols[q];
                 if cq > cp {
@@ -298,14 +337,14 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
                 for r in 0..nt {
                     h += a[r * ncol + p] * a[r * ncol + q];
                 }
-                ne.band[cp * wd + (cq + bw - cp)] += h;
+                ne.band[(cp - lo) * wd + (cq + bw - cp)] += h;
             }
             for gq in 0..ng {
                 let mut h = 0.0;
                 for r in 0..nt {
                     h += a[r * ncol + p] * jg[r * ng + gq];
                 }
-                ne.border[cp * ng + gq] += h;
+                ne.border[(cp - lo) * ng + gq] += h;
             }
         }
         for gp in 0..ng {
@@ -320,6 +359,26 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
                 ne.c[gp * ng + gq] += h;
             }
         }
+    }
+    ne
+    };
+    let threads = obj.threads.max(1).min(sp.n / 64).max(1);
+    let bounds: Vec<(usize, usize)> = (0..threads).map(|i| (i * sp.n / threads, (i + 1) * sp.n / threads)).filter(|b| b.1 > b.0).collect();
+    for p in par_map_n(&bounds, threads, |&(t0, t1)| run(t0, t1)) {
+        for (r, row) in p.band.chunks(wd).enumerate() {
+            let at = (p.lo + r) * wd;
+            ne.band[at..at + wd].iter_mut().zip(row).for_each(|(x, y)| *x += y);
+        }
+        for (r, row) in p.border.chunks(ng.max(1)).enumerate() {
+            let at = (p.lo + r) * ng;
+            ne.border[at..at + ng].iter_mut().zip(row).for_each(|(x, y)| *x += y);
+        }
+        for (r, g) in p.g_loc.iter().enumerate() {
+            ne.g_loc[p.lo + r] += g;
+        }
+        ne.c.iter_mut().zip(&p.c).for_each(|(x, y)| *x += y);
+        ne.g_glob.iter_mut().zip(&p.g_glob).for_each(|(x, y)| *x += y);
+        ne.loss += p.loss;
     }
     // smoothness priors: k (c_i - 2 c_i+1 + c_i+2) on each latent row
     let k0 = obj.smooth_weight();
@@ -429,13 +488,11 @@ fn factor(ne: &Normal, lay: &Layout, lam: f64) -> Result<Factored, SolveError> {
     band_cholesky(&mut l, n, bw)?;
     let mut ar: Vec<f64> = ne.g_loc.iter().map(|g| -g).collect();
     band_solve(&l, n, bw, &mut ar);
-    let ab = (0..ne.ng)
-        .map(|j| {
-            let mut col: Vec<f64> = (0..n).map(|k| ne.border[k * ne.ng + j]).collect();
-            band_solve(&l, n, bw, &mut col);
-            col
-        })
-        .collect();
+    let ab = par_map_n(&(0..ne.ng).collect::<Vec<_>>(), ne.threads, |&j| {
+        let mut col: Vec<f64> = (0..n).map(|k| ne.border[k * ne.ng + j]).collect();
+        band_solve(&l, n, bw, &mut col);
+        col
+    });
     Ok(Factored { ar, ab })
 }
 
@@ -494,8 +551,13 @@ pub fn gauss_newton(obj: &Objective, v: Vars, iters: usize, tol: f64) -> Result<
 
 /// `f` over `items` on up to [`super::run::default_threads`] threads, in order: the windows of a
 /// multi-window solve are independent until their Schur parts are summed.
-fn par_map<T: Sync, U: Send>(items: &[T], f: impl Fn(&T) -> U + Sync) -> Vec<U> {
-    let threads = super::run::default_threads().min(items.len()).max(1);
+pub(crate) fn par_map<T: Sync, U: Send>(items: &[T], f: impl Fn(&T) -> U + Sync) -> Vec<U> {
+    par_map_n(items, super::run::default_threads(), f)
+}
+
+/// [`par_map`] on at most `threads` threads.
+pub(crate) fn par_map_n<T: Sync, U: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> U + Sync) -> Vec<U> {
+    let threads = threads.min(items.len()).max(1);
     if threads == 1 {
         return items.iter().map(&f).collect();
     }
@@ -544,7 +606,14 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
             let mut fs = Vec::with_capacity(objs.len());
             let (mut s, mut rhs) = (vec![0.0; ng * ng], vec![0.0; ng]);
             let parts = par_map(&(0..objs.len()).collect::<Vec<_>>(), |&w| {
-                factor(&nes[w], &lays[w], lam).map(|f| {
+                factor(&nes[w], &lays[w], lam).inspect_err(|e| {
+                    if let (SolveError::NotPositiveDefinite { row }, Some(_)) = (e, std::env::var_os("IDL_FORCE_DEBUG")) {
+                        if *row < lays[w].n_loc {
+                            let d = nes[w].band[row * (lays[w].bw + 1) + lays[w].bw];
+                            eprintln!("window {w}: not positive definite at {} (diagonal {d:.3e}, damping {lam:.1e})", lays[w].describe(*row));
+                        }
+                    }
+                }).map(|f| {
                     let sr = schur_part(&nes[w], &f, lam);
                     (f, sr)
                 })
@@ -610,7 +679,7 @@ pub fn warm_start(obj: &Objective, iters: usize, tol: f64) -> Result<Vars, Solve
         return Ok(v);
     }
     let g0 = obj.force_glob0();
-    let core = Objective { bike: obj.bike.clone(), win: obj.win.clone(), spec: obj.spec.clone(), w: obj.w.clone(), glob_centre: obj.glob_centre[..g0].to_vec(), fit: obj.fit, forces: None };
+    let core = Objective { bike: obj.bike.clone(), win: obj.win.clone(), spec: obj.spec.clone(), w: obj.w.clone(), glob_centre: obj.glob_centre[..g0].to_vec(), fit: obj.fit, forces: None, threads: obj.threads };
     let (vc, _) = gauss_newton(&core, core.initial_vars(), iters, tol)?;
     v.lvl = vc.lvl;
     v.frame = vc.frame;

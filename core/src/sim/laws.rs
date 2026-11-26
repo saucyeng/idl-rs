@@ -98,6 +98,11 @@ pub fn friction_n<S: Real>(f_c_n: S, v_mps: S, v0_mps: f64) -> S {
         let s = v_mps.re();
         return if s > 0.0 { f_c_n } else if s < 0.0 { -f_c_n } else { c(0.0) };
     }
+    // past 20, tanh is 1 to 16 digits; and a dual tanh there divides cosh's infinities (NaN)
+    let u = v_mps.re() / v0_mps;
+    if u.abs() > 20.0 {
+        return f_c_n * u.signum();
+    }
     f_c_n * (v_mps / v0_mps).tanh()
 }
 
@@ -306,5 +311,18 @@ mod tests {
         assert!(on > 0.0);
         assert!(rim > 0.9 * law.rim_n_m * 0.001);
         assert_eq!(law.force_n(-0.01, 0.0), 0.0);
+    }
+
+    #[test]
+    fn friction_dual_at_a_fast_stroke_is_finite_and_flat() {
+        // Arrange: 4 m/s against a 0.01 m/s smoothing (a fork bottoming out)
+        let v = Dual64::from(4.0).derivative();
+
+        // Act
+        let f = friction_n(Dual64::from(30.0), v, 0.01);
+
+        // Assert
+        assert_eq!(f.re, 30.0);
+        assert!(f.eps.is_finite() && f.eps.abs() < 1e-9);
     }
 }

@@ -108,12 +108,13 @@ pub fn fit_bike(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: &Config
     let taken: Vec<(usize, usize)> = exclude.iter().chain(&windows).cloned().collect();
     windows.extend(pick_windows(&rotation_score(r), n, cfg.fit_busy_windows + cfg.fit_air_windows - windows.len(), &taken));
     windows.sort();
+    let inner = (cfg.threads / windows.len().max(1)).max(1);
     let objs: Vec<Objective> = windows
         .iter()
-        .map(|&(a, b)| Objective::fitting(bike.clone(), window(r, a, b, cfg.air_anchor), Spec::standard(b - a, r.input.dt), cfg.weights.clone(), bias_centre))
+        .map(|&(a, b)| Objective { threads: inner, ..Objective::fitting(bike.clone(), window(r, a, b, cfg.air_anchor), Spec::standard(b - a, r.input.dt), cfg.weights.clone(), bias_centre) })
         .collect();
-    let vs = objs.iter().map(|o| warm_start(o, cfg.iters, cfg.tol)).collect::<Result<Vec<_>, _>>()?;
-    let (vs, info) = gauss_newton_multi(&objs, vs, cfg.force_id_iters, cfg.tol)?;
+    let vs = objs.iter().map(Objective::initial_vars).collect();
+    let (vs, info) = gauss_newton_multi(&objs, vs, cfg.iters, cfg.tol)?;
     let geometry: Geometry = std::array::from_fn(|i| vs[0].glob[NG + i]);
     Ok(FitReport { geometry, windows, info })
 }
@@ -232,7 +233,13 @@ pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
     // the force model: its parameters identified first, then frozen for every window
     let speed: Option<Vec<f64>> = cfg.forces.as_ref().map(|_| speed_on_grid(r, gps_latency(r, bike)));
     let force_par = match (&cfg.forces, &speed) {
-        (Some(m), Some(sp)) => identify_forces(r, bike, bias_centre, cfg, m, sp, &plan).ok(),
+        (Some(m), Some(sp)) => identify_forces(r, bike, bias_centre, cfg, m, sp, &plan)
+            .inspect_err(|e| {
+                if std::env::var_os("IDL_FORCE_DEBUG").is_some() {
+                    eprintln!("force identification failed: {e:?}");
+                }
+            })
+            .ok(),
         _ => None,
     };
     let frozen = cfg.forces.as_ref().map(|m| {
@@ -249,6 +256,8 @@ pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
             _ => chains.push(vec![i]),
         }
     }
+    // threads inside each window: what the chains leave over (a short span has few windows)
+    let inner = (cfg.threads.max(1) / chains.len().max(1)).max(1);
     type WinOut = (Vec<[f64; NL]>, Option<Vec<bool>>, usize, Vec<NavState>, Vec<[f64; NFO]>);
     let solve_chain = |chain: &Vec<usize>| -> Vec<(usize, Result<WinOut, SolveError>)> {
         let mut out = Vec::with_capacity(chain.len());
@@ -271,6 +280,7 @@ pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
                 win.forces = Some(ForceWindow { speed_mps: sp[a..b].to_vec() });
             }
             let mut obj = Objective::new(bike.clone(), win, spec, cfg.weights.clone(), bias_centre);
+            obj.threads = inner;
             if let Some(m) = &frozen {
                 obj = obj.with_forces(m.clone());
                 let g0 = obj.force_glob0();
@@ -364,9 +374,10 @@ pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
 const FROZEN_SIGMA: f64 = 1e-3;
 
 /// The ground speed on the grid, m/s: the GPS fixes' horizontal speed (each at its time less
-/// `latency_s`), linear between them, held past the ends; 0 without GPS.
+/// `latency_s`), linear between them, held past the ends; 0 without GPS (fixes without a
+/// speed are skipped: one NaN in the wheels' spin poisons every moment row of the solve).
 pub fn speed_on_grid(r: &Ride, latency_s: f64) -> Vec<f64> {
-    let pts: Vec<(f64, f64)> = r.input.gps.iter().map(|g| (g.time_s - latency_s, g.velocity.x.hypot(g.velocity.y))).collect();
+    let pts: Vec<(f64, f64)> = r.input.gps.iter().map(|g| (g.time_s - latency_s, g.velocity.x.hypot(g.velocity.y))).filter(|p| p.0.is_finite() && p.1.is_finite()).collect();
     r.grid_us
         .iter()
         .map(|&t| {
@@ -397,11 +408,12 @@ pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
             let b = (a + len).min(b0);
             let mut win = window(r, a, b, cfg.air_anchor);
             win.forces = Some(ForceWindow { speed_mps: speed[a..b].to_vec() });
-            Objective::new(bike.clone(), win, Spec::standard(b - a, r.input.dt), cfg.weights.clone(), bias_centre).with_forces(m.clone())
+            let o = Objective::new(bike.clone(), win, Spec::standard(b - a, r.input.dt), cfg.weights.clone(), bias_centre).with_forces(m.clone());
+            Objective { threads: (cfg.threads / k).max(1), ..o }
         })
         .collect();
-    let vs = objs.iter().map(Objective::initial_vars).collect();
-    let (vs, info) = gauss_newton_multi(&objs, vs, cfg.iters, cfg.tol)?;
+    let vs = super::solve::par_map_n(&objs, k, |o| warm_start(o, cfg.iters, cfg.tol)).into_iter().collect::<Result<Vec<_>, _>>()?;
+    let (vs, info) = gauss_newton_multi(&objs, vs, cfg.force_id_iters, cfg.tol)?;
     if std::env::var_os("IDL_FORCE_DEBUG").is_some() {
         eprintln!("force identification: {} windows, {} iterations, loss {:?}", objs.len(), info.iterations, info.loss);
         for (o, v) in objs.iter().zip(&vs) {
