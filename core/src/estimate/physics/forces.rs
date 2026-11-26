@@ -29,6 +29,7 @@
 //! | 14..18 | tyre tangential and lateral priors |
 //! | 18..24 | rider pose priors |
 //! | 24..30 | rider active wrench priors |
+//! | 30..32 | tyre deflection priors (about the static deflection) |
 //!
 //! The parameters ([`NFP`]) are globals, each a log multiplier on a nominal value (positive
 //! by construction, one prior width for factors): both dampers' curves, seal friction, the
@@ -90,8 +91,18 @@ pub const P_RIDER_K: usize = 18;
 /// Rider dampers: 24..30.
 pub const P_RIDER_C: usize = 24;
 
+/// Each force parameter's name, in index order.
+pub const PAR_NAMES: [&str; NFP] = [
+    "fork LSC", "fork HSC", "fork LSR", "fork HSR", "fork knee",
+    "shock LSC", "shock HSC", "shock LSR", "shock HSR", "shock knee",
+    "fork friction", "shock friction", "fork pressure", "shock pressure",
+    "front tyre stiffness", "rear tyre stiffness", "front tyre damping", "rear tyre damping",
+    "rider k fwd", "rider k lat", "rider k up", "rider k roll", "rider k pitch", "rider k yaw",
+    "rider c fwd", "rider c lat", "rider c up", "rider c roll", "rider c pitch", "rider c yaw",
+];
+
 /// Rows per sample (see the module table).
-pub const NFR: usize = 30;
+pub const NFR: usize = 32;
 /// The balance rows (0..NBAL), the ones Huber weighting applies to.
 pub const NBAL: usize = 14;
 
@@ -264,6 +275,9 @@ pub struct ForceWeights {
     pub act_n: f64,
     /// Active moment prior, N m.
     pub act_nm: f64,
+    /// Tyre deflection prior about its static value, m: keeps a solve from parking a tyre in
+    /// rim strike or far off the ground to soak up a misfit.
+    pub defl_m: f64,
     /// Each parameter's prior width, log units (1: a factor of e).
     pub par_sigma: [f64; NFP],
     /// Huber threshold on the balance rows, sigmas (0: plain least squares).
@@ -289,6 +303,7 @@ impl Default for ForceWeights {
             rot_rad: 0.3,
             act_n: 300.0,
             act_nm: 60.0,
+            defl_m: 0.02,
             par_sigma,
             huber: 3.0,
         }
@@ -506,6 +521,8 @@ pub fn rows<S: Real>(m: &ForceModel, k: &Kin<S>, x: &ForceIn<S>, meas: &ForceMea
         r[24 + i] = f[ACT_F + i] * (1.0 / w.act_n);
         r[27 + i] = f[ACT_M + i] * (1.0 / w.act_nm);
     }
+    r[30] = (f[DEF_F] - m.spec.init[DEF_F]) * (1.0 / w.defl_m);
+    r[31] = (f[DEF_R] - m.spec.init[DEF_R]) * (1.0 / w.defl_m);
     (r, Forces { tyre: [tf, tr], normal: [nf, nr], fork, shock, bush: [bush_f, bush_m] })
 }
 
@@ -603,6 +620,37 @@ pub fn force_rows(m: &ForceModel, bike: &Bike<f64>, bike_d: &Bike<Dual64>, s: &S
         }
     }
     out
+}
+
+
+/// The bike at rest: travel where the springs rest, the tyres at their static deflection,
+/// the rider on his legs' static sag, every pod reading gravity alone. Returns each balance
+/// row's misfit in its own unit (N or N m), which a consistent model holds near 0: a check of
+/// a bike's setup (masses, centres, springs, geometry) before any ride.
+pub fn static_misfit(m: &ForceModel, bike: &Bike<f64>) -> [f64; NBAL] {
+    let fb = &m.bike;
+    let g = 9.80665;
+    // rear travel whose shock stroke is the shock's rest stroke
+    let (mut lo, mut hi) = (0.0, fb.travel_max[1]);
+    for _ in 0..60 {
+        let s = 0.5 * (lo + hi);
+        if fb.stroke(s).0 < fb.shock.rest_m { lo = s } else { hi = s }
+    }
+    let mut q = [0.0; NL];
+    q[D] = fb.fork.rest_m;
+    q[S] = 0.5 * (lo + hi);
+    let k = kin(fb, bike, &q);
+    let up_g = fb.up.scale(g);
+    let meas = ForceMeas { frame: up_g.0, fork: (k.rf.t() * up_g).0, rear: (k.rr.t() * up_g).0, speed: 0.0, speed_rate: 0.0 };
+    let mut f = [0.0; NFL];
+    f[DEF_F] = m.spec.init[DEF_F];
+    f[DEF_R] = m.spec.init[DEF_R];
+    f[POS + 2] = -fb.m_rider * g / fb.nominal[P_RIDER_K + 2];
+    let x = ForceIn { d: [q[D], 0.0], s: [q[S], 0.0], w0: V3::zero(), a0: V3::zero(), f, fd: [0.0; NFL], fdd: [0.0; NFL], par: [0.0; NFP] };
+    let r = rows(m, &k, &x, &meas).0;
+    let w = &m.w;
+    let sig = [w.unsprung_n, w.unsprung_n, w.rider_n, w.rider_n, w.rider_n, w.rider_nm, w.rider_nm, w.rider_nm, w.system_n, w.system_n, w.system_n, w.system_nm, w.system_nm, w.system_nm];
+    std::array::from_fn(|i| r[i] * sig[i])
 }
 
 #[cfg(test)]

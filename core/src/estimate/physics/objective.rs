@@ -27,7 +27,7 @@
 
 use super::bike::{Bike, B_FA, B_LAT, D, F_ROT, F_TRANS, F_TWIST, NL, R_ROLL, R_YAW, S};
 use super::la::{exp, M3, V3};
-use super::forces::{force_rows, ForceJac, ForceMeas, ForceModel, ForceWindow, NBAL, NFL, NFP};
+use super::forces::{force_rows, kin, rows as force_rows_at, ForceIn, ForceJac, ForceMeas, ForceModel, ForceWindow, Forces, NBAL, NFL, NFP};
 use super::nav::{nav_rows, NavJac, NavSample, NavSpec, NavWeights, NavWindow};
 use super::readings::{pod_readings, readings_and_jacobian, Sample, NR, NZ};
 use super::setup::{geometry, with_geometry, Geometry, GEOMETRY_SIGMA};
@@ -450,18 +450,40 @@ impl Objective {
         Some(out)
     }
 
-    /// The force rows at sample `t` (None with the force model off). Where either unsprung
-    /// pod is clipped the sample keeps only its priors (its balance rows read 0).
-    pub fn force_residuals(&self, ctx: &Ctx, v: &Vars, s: &Sample<f64>, t: usize, jac: bool) -> Option<ForceJac> {
-        let (m, fw) = self.force_on()?;
-        let f = self.force_inputs(v, t)?;
+    /// The force rows' measurements at sample `t` (None with the force model off).
+    pub fn force_meas(&self, t: usize) -> Option<ForceMeas> {
+        let (_, fw) = self.force_on()?;
         let n = self.spec.n;
         let sp = &fw.speed_mps;
         let (a, b) = (t.saturating_sub(1), (t + 1).min(n - 1));
         let speed_rate = if b > a { (sp[b] - sp[a]) / ((b - a) as f64 * self.spec.dt) } else { 0.0 };
-        let meas = ForceMeas { frame: self.win.frame_accel[t], fork: self.win.fork_accel[t], rear: self.win.rear_accel[t], speed: sp[t], speed_rate };
+        Some(ForceMeas { frame: self.win.frame_accel[t], fork: self.win.fork_accel[t], rear: self.win.rear_accel[t], speed: sp[t], speed_rate })
+    }
+
+    /// The force parameters (log multipliers) in `v`.
+    pub fn force_par(&self, v: &Vars) -> [f64; NFP] {
         let g0 = self.force_glob0();
-        let par: [f64; NFP] = std::array::from_fn(|i| v.glob[g0 + i]);
+        std::array::from_fn(|i| v.glob.get(g0 + i).copied().unwrap_or(0.0))
+    }
+
+    /// The forces the solution implies at sample `t`, and the force latents there (None with
+    /// the force model off).
+    pub fn forces_at(&self, ctx: &Ctx, v: &Vars, t: usize) -> Option<(Forces<f64>, [[f64; NFL]; 3])> {
+        let (m, _) = self.force_on()?;
+        let s = self.sample(v, t);
+        let f = self.force_inputs(v, t)?;
+        let k = kin(&m.bike, &ctx.bike_f, &s.q);
+        let x = ForceIn { d: [s.q[D], s.qd[D]], s: [s.q[S], s.qd[S]], w0: s.w0, a0: s.a0, f: f[0], fd: f[1], fdd: f[2], par: self.force_par(v) };
+        Some((force_rows_at(m, &k, &x, &self.force_meas(t)?).1, f))
+    }
+
+    /// The force rows at sample `t` (None with the force model off). Where either unsprung
+    /// pod is clipped the sample keeps only its priors (its balance rows read 0).
+    pub fn force_residuals(&self, ctx: &Ctx, v: &Vars, s: &Sample<f64>, t: usize, jac: bool) -> Option<ForceJac> {
+        let (m, _) = self.force_on()?;
+        let f = self.force_inputs(v, t)?;
+        let meas = self.force_meas(t)?;
+        let par = self.force_par(v);
         let mut out = force_rows(m, &ctx.bike_f, &ctx.bike_d, s, &f[0], &f[1], &f[2], &par, &meas, jac);
         if !(self.win.mask_fork[t] && self.win.mask_rear[t]) {
             for r in 0..NBAL {

@@ -22,6 +22,7 @@
 pub mod bike;
 #[cfg(test)]
 mod fixture;
+pub mod force_setup;
 pub mod forces;
 pub mod fourbar;
 pub mod la;

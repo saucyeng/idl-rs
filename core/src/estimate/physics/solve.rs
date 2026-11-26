@@ -492,6 +492,28 @@ pub fn gauss_newton(obj: &Objective, v: Vars, iters: usize, tol: f64) -> Result<
     Ok((vs.remove(0), info))
 }
 
+/// `f` over `items` on up to [`super::run::default_threads`] threads, in order: the windows of a
+/// multi-window solve are independent until their Schur parts are summed.
+fn par_map<T: Sync, U: Send>(items: &[T], f: impl Fn(&T) -> U + Sync) -> Vec<U> {
+    let threads = super::run::default_threads().min(items.len()).max(1);
+    if threads == 1 {
+        return items.iter().map(&f).collect();
+    }
+    let f = &f;
+    let mut out: Vec<Option<U>> = (0..items.len()).map(|_| None).collect();
+    std::thread::scope(|sc| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| sc.spawn(move || (t..items.len()).step_by(threads).map(|i| (i, f(&items[i]))).collect::<Vec<_>>()))
+            .collect();
+        for h in handles {
+            for (i, u) in h.join().expect("window thread panicked") {
+                out[i] = Some(u);
+            }
+        }
+    });
+    out.into_iter().map(|u| u.expect("every window done")).collect()
+}
+
 /// Levenberg-Marquardt over several windows that share their globals (sensor
 /// biases and, when fitting, the bike's geometry); the latents are per window.
 /// Each window's band is factored on its own; the shared unknowns come from
@@ -508,22 +530,27 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
         }
     };
     share(&mut vs);
-    let total = |vs: &[Vars]| objs.iter().zip(vs).map(|(o, v)| o.data_loss(v)).sum::<f64>() + objs[0].prior_loss(&vs[0]);
+    let total = |vs: &[Vars]| par_map(&(0..objs.len()).collect::<Vec<_>>(), |&w| objs[w].data_loss(&vs[w])).iter().sum::<f64>() + objs[0].prior_loss(&vs[0]);
     let (mut lam, mut nu) = (1e-10, 2.0);
     let mut loss = total(&vs);
     let mut info = SolveInfo { loss: vec![loss], iterations: 0, seconds: [0.0; 3], converged: false };
     for it in 0..iters {
         let t0 = std::time::Instant::now();
-        let nes: Vec<Normal> = objs.iter().zip(&vs).zip(&lays).enumerate().map(|(w, ((o, v), l))| normal_equations(o, l, v, w == 0)).collect();
+        let nes: Vec<Normal> = par_map(&(0..objs.len()).collect::<Vec<_>>(), |&w| normal_equations(&objs[w], &lays[w], &vs[w], w == 0));
         info.seconds[0] += t0.elapsed().as_secs_f64();
         let mut new;
         loop {
             let t1 = std::time::Instant::now();
             let mut fs = Vec::with_capacity(objs.len());
             let (mut s, mut rhs) = (vec![0.0; ng * ng], vec![0.0; ng]);
-            for (ne, lay) in nes.iter().zip(&lays) {
-                let f = factor(ne, lay, lam)?;
-                let (sw, rw) = schur_part(ne, &f, lam);
+            let parts = par_map(&(0..objs.len()).collect::<Vec<_>>(), |&w| {
+                factor(&nes[w], &lays[w], lam).map(|f| {
+                    let sr = schur_part(&nes[w], &f, lam);
+                    (f, sr)
+                })
+            });
+            for part in parts {
+                let (f, (sw, rw)) = part?;
                 s.iter_mut().zip(&sw).for_each(|(a, b)| *a += b);
                 rhs.iter_mut().zip(&rw).for_each(|(a, b)| *a += b);
                 fs.push(f);
@@ -571,6 +598,26 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
         }
     }
     Ok((vs, info))
+}
+
+/// Starting values for an objective with the force model on: the same window solved with it
+/// off first (travel, flex, the frame rate and the biases from the pods alone), the force
+/// latents at their layout's start. A cold start lets the force rows drag the travel
+/// before the pods have pinned it, and the tyre deflections run off to soak that up.
+pub fn warm_start(obj: &Objective, iters: usize, tol: f64) -> Result<Vars, SolveError> {
+    let mut v = obj.initial_vars();
+    if obj.forces.is_none() {
+        return Ok(v);
+    }
+    let g0 = obj.force_glob0();
+    let core = Objective { bike: obj.bike.clone(), win: obj.win.clone(), spec: obj.spec.clone(), w: obj.w.clone(), glob_centre: obj.glob_centre[..g0].to_vec(), fit: obj.fit, forces: None };
+    let (vc, _) = gauss_newton(&core, core.initial_vars(), iters, tol)?;
+    v.lvl = vc.lvl;
+    v.frame = vc.frame;
+    v.att = vc.att;
+    v.vel = vc.vel;
+    v.glob[..g0].copy_from_slice(&vc.glob);
+    Ok(v)
 }
 
 /// Latent values per sample, [n][NL], SI units.

@@ -40,6 +40,18 @@ impl From<idl_library::physics::PhysicsError> for CliError {
     }
 }
 
+/// `key=value` pairs, comma-separated: numbers as numbers, anything else as text.
+fn parse_params(t: &str) -> Result<idl_rs::calibration::params::Params, CliError> {
+    t.split(',')
+        .filter(|kv| !kv.trim().is_empty())
+        .map(|kv| {
+            let (k, v) = kv.split_once('=').ok_or_else(|| CliError::usage(format!("--params: `{kv}` is not key=value")))?;
+            let v = v.trim();
+            Ok((k.trim().to_string(), v.parse::<f64>().map_or_else(|_| json!(v), |x| json!(x))))
+        })
+        .collect()
+}
+
 /// `session estimate-physics` — the physics estimator over one session
 /// (`idl_library::physics::estimate_physics`).
 pub fn estimate_physics(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliError> {
@@ -59,6 +71,11 @@ pub fn estimate_physics(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliErro
         },
         fit_whole_session: false,
         nav: crate::verbs::switch(m, "nav"),
+        forces: crate::verbs::switch(m, "forces"),
+        param_overrides: match opt_text(m, "params") {
+            Some(t) => parse_params(&t)?,
+            None => Default::default(),
+        },
     };
     let r = idl_library::physics::estimate_physics(root, &id, &opts)?;
     let t = |s: &idl_library::physics::TravelSummary| {
@@ -74,11 +91,19 @@ pub fn estimate_physics(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliErro
         format!("{id}: {:.0} s of riding solved in {} windows ({} failed) with {fit}, {:.0} s", r.solved_s, r.windows.0, r.windows.1, r.seconds),
         line("front", &r.travel[0]),
         line("rear", &r.travel[1]),
+        match &r.force_par {
+            Some(p) => format!("  force parameters (factor on the nominal): {}", p.iter().map(|(n, x)| format!("{n} {:.2}", x.exp())).collect::<Vec<_>>().join(", ")),
+            None => String::new(),
+        },
+        r.force_summary.iter().map(|(n, s)| format!("  {n}: 1% {:.0}  median {:.0}  99% {:.0}", s.p01, s.median, s.p99)).collect::<Vec<_>>().join("\n"),
         match &r.output {
             Some(p) => format!("  wrote {}", p.display()),
             None => "  dry run: nothing written".to_string(),
         },
     ]
+    .into_iter()
+    .filter(|l| !l.is_empty())
+    .collect::<Vec<_>>()
     .join("\n");
     Ok(VerbOutput::new(
         text,
@@ -94,6 +119,7 @@ pub fn estimate_physics(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliErro
             "front_travel": t(&r.travel[0]),
             "rear_travel": t(&r.travel[1]),
             "output": r.output,
+            "force_parameters": r.force_par.as_ref().map(|p| p.iter().map(|(n, x)| json!({ "name": n, "log_multiplier": x })).collect::<Vec<_>>()),
             "seconds": r.seconds,
         }),
     ))

@@ -676,6 +676,8 @@ pub const COMMANDS: &[CommandRow] = &[
             Flag::value("from-ms", ValueKind::Integer, "Only from here, ms from the session's first sample (with `--to-ms`): less memory, and a first fit uses windows inside it"),
             Flag::value("to-ms", ValueKind::Integer, "Only to here, ms from the session's first sample"),
             Flag::switch("nav", "Estimate the bike's attitude and velocity too (roll, pitch, heading, course, slip, speed, body accel; reads GPS). Experimental: being checked against the old estimator"),
+            Flag::switch("forces", "Run the force model too: tyre loads and deflections, fork and shock forces, the rider's force and moment on the bike (`Physics ... (N)` channels); the dampers and the rider's springs are identified on a few windows first and printed. Needs the bike's linkage with shock eyes, masses and pressures. Experimental"),
+            Flag::value("params", ValueKind::Text, "Bike parameters for this run only, never saved: `key=value` pairs separated by commas (e.g. `fork.psi=75,shock.psi=220`), on top of the bike's at the ride's date"),
         ],
         core_fn: "idl_library::physics::estimate_physics",
         json_shape: Some("PhysicsReport"),

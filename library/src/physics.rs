@@ -51,6 +51,13 @@ pub struct PhysicsOptions {
     /// Estimate attitude and velocity too (the `Physics roll (deg)`... channels;
     /// spec one-model). Off while it is checked against the IEKF.
     pub nav: bool,
+    /// Run the force model too (spec force-model F1: tyre loads, suspension forces, the
+    /// rider's wrench; the dampers and the rider identified on a few windows first). Needs
+    /// the bike's linkage with its shock eyes, masses and pressures.
+    pub forces: bool,
+    /// Parameters on top of the bike's at the ride's date, for this run only (never saved):
+    /// a setup the log does not hold yet, or a what-if.
+    pub param_overrides: idl_rs::calibration::params::Params,
 }
 
 /// Distribution of one travel channel over the solved samples, mm.
@@ -91,6 +98,12 @@ pub struct PhysicsReport {
     pub grid_us: Vec<i64>,
     /// Rear travel per grid sample, m (NaN where not solved).
     pub rear_travel_m: Vec<f64>,
+    /// With [`PhysicsOptions::forces`]: the identified force parameters, as
+    /// (name, log multiplier on the model's nominal value).
+    pub force_par: Option<Vec<(String, f64)>>,
+    /// With [`PhysicsOptions::forces`]: each force channel's spread over the solved samples
+    /// (in its own unit; the summary's fields read as that unit, not mm).
+    pub force_summary: Vec<(String, TravelSummary)>,
     /// Wall time, s.
     pub seconds: f64,
 }
@@ -236,6 +249,16 @@ pub fn estimate_physics_with(
         cfg.threads = t.max(1);
     }
     cfg.nav = opts.nav;
+    let force_setup = |bk: &idl_rs::estimate::physics::bike::Bike<f64>| -> Result<Option<idl_rs::estimate::physics::forces::ForceModel>, PhysicsError> {
+        if !opts.forces {
+            return Ok(None);
+        }
+        let l = linkage.ok_or_else(|| err(PhysicsErrorKind::NotCalibrated, format!("{}: the force model needs the bike's linkage", doc.bike_id)))?;
+        let params = idl_rs::calibration::params::overlay(&crate::bikelog::effective_parameters(&file, start_ms), &opts.param_overrides);
+        idl_rs::estimate::physics::force_setup::force_model(bk, &params, l, [front, rear])
+            .map(Some)
+            .map_err(|e| err(PhysicsErrorKind::NotCalibrated, format!("{}: the force model cannot be set up: {e:?}", doc.bike_id)))
+    };
     let base = bike(&cal.fit, linkage, current, rear).map_err(|e| {
         err(
             PhysicsErrorKind::Unusable,
@@ -273,6 +296,11 @@ pub fn estimate_physics_with(
     };
 
     drop(fit_ride);
+    cfg.forces = force_setup(&bk)?;
+    if let (Some(m), Some(_)) = (&cfg.forces, std::env::var_os("IDL_FORCE_DEBUG")) {
+        eprintln!("force model static misfit (N, N m): {:?}", idl_rs::estimate::physics::forces::static_misfit(m, &bk).map(|x| x.round()));
+        eprintln!("force model: {:?}", m.bike);
+    }
     let sol = solve_ride_with(&r, &bk, centre, &cfg, progress);
     if progress.is_some_and(|p| p.cancel.load(std::sync::atomic::Ordering::Relaxed)) {
         return Err(err(PhysicsErrorKind::Cancelled, format!("{session_id}: solve cancelled")));
@@ -281,6 +309,8 @@ pub fn estimate_physics_with(
     let rear_travel_m: Vec<f64> = outs[1].2.iter().map(|v| v / 1000.0).collect();
     let solved = sol.q.iter().filter(|q| q[0].is_finite()).count();
     let travel = [summary(&r, &outs[0].2, &sol.air), summary(&r, &outs[1].2, &sol.air)];
+    let force_ids: Vec<&str> = idl_rs::estimate::physics::run::FORCE_CHANNELS.iter().map(|c| c.0).collect();
+    let force_summary = outs.iter().filter(|o| force_ids.contains(&o.0.as_str())).map(|o| (o.0.clone(), summary(&r, &o.2, &sol.air))).collect();
     let geometry = bike_geometry(&bk);
     let output = if opts.dry_run {
         None
@@ -293,6 +323,8 @@ pub fn estimate_physics_with(
             "linkage_updated_at_ms": linkage.map(|l| l.updated_at_ms),
             "air_anchor": cfg.air_anchor,
             "nav": cfg.nav,
+            "forces": cfg.forces.is_some(),
+            "param_overrides": opts.param_overrides,
             "window_s": cfg.window_s,
             "overlap_s": cfg.overlap_s,
             "bias_centre": centre.to_vec(),
@@ -316,6 +348,8 @@ pub fn estimate_physics_with(
         output,
         grid_us: r.grid_us.clone(),
         rear_travel_m,
+        force_par: sol.force_par.map(|p| idl_rs::estimate::physics::forces::PAR_NAMES.iter().zip(p).map(|(n, x)| (n.to_string(), x)).collect()),
+        force_summary,
         seconds: t0.elapsed().as_secs_f64(),
     })
 }

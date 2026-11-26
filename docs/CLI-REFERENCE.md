@@ -186,6 +186,8 @@ Estimate travel, steer, fork bending and flex with the physics model (no drift: 
 | `--from-ms` | integer | Only from here, ms from the session's first sample (with `--to-ms`): less memory, and a first fit uses windows inside it |
 | `--to-ms` | integer | Only to here, ms from the session's first sample |
 | `--nav` | switch | Estimate the bike's attitude and velocity too (roll, pitch, heading, course, slip, speed, body accel; reads GPS). Experimental: being checked against the old estimator |
+| `--forces` | switch | Run the force model too: tyre loads and deflections, fork and shock forces, the rider's force and moment on the bike (`Physics ... (N)` channels); the dampers and the rider's springs are identified on a few windows first and printed. Needs the bike's linkage with shock eyes, masses and pressures. Experimental |
+| `--params` | text | Bike parameters for this run only, never saved: `key=value` pairs separated by commas (e.g. `fork.psi=75,shock.psi=220`), on top of the bike's at the ride's date |
 | `--data-dir` | path | Data directory root (contract C4 §1's <data>); defaults to $IDL1_DATA_DIR |
 | `--dry-run` | switch | Report what would change and write nothing |
 | `--json` | switch | Emit the result as JSON on stdout (schema_version 1); errors become typed JSON on stderr |
