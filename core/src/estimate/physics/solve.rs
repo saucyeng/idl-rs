@@ -220,6 +220,7 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
     let mut res = vec![0.0; nt];
     let mut jg = vec![0.0; nt * ng];
     let mut cols = vec![0usize; ncol];
+    let (mut nz, mut gz): (Vec<usize>, Vec<usize>) = (Vec::with_capacity(ncol), Vec::with_capacity(ng));
     for t in t0..t1 {
         let s = obj.sample(v, t);
         let sj = obj.sample_residuals(&ctx, &s, &v.glob, t, true);
@@ -321,42 +322,36 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
                 ne.loss += 0.5 * res[r] * res[r];
             }
         }
-        for p in 0..ncol {
-            let cp = cols[p];
-            let mut gp = 0.0;
-            for r in 0..nt {
-                gp += a[r * ncol + p] * res[r];
-            }
-            ne.g_loc[cp - lo] += gp;
-            for q in 0..ncol {
-                let cq = cols[q];
-                if cq > cp {
-                    continue;
+        // accumulate row by row over each row's nonzero columns and globals only: a pod row never
+        // touches a force latent, a force row few of the pods', most rows no parameter
+        for r in 0..nt {
+            let ar = &a[r * ncol..(r + 1) * ncol];
+            let jr = &jg[r * ng..(r + 1) * ng];
+            nz.clear();
+            nz.extend((0..ncol).filter(|&p| ar[p] != 0.0));
+            gz.clear();
+            gz.extend((0..ng).filter(|&g| jr[g] != 0.0));
+            let rr = res[r];
+            for &p in &nz {
+                let (cp, ap) = (cols[p], ar[p]);
+                ne.g_loc[cp - lo] += ap * rr;
+                let diag = (cp - lo) * wd + bw; // band entry (cp, cp); (cp, cq) sits cp - cq before it
+                for &q in &nz {
+                    let cq = cols[q];
+                    if cq <= cp {
+                        ne.band[diag - (cp - cq)] += ap * ar[q];
+                    }
                 }
-                let mut h = 0.0;
-                for r in 0..nt {
-                    h += a[r * ncol + p] * a[r * ncol + q];
+                let brow = (cp - lo) * ng;
+                for &g in &gz {
+                    ne.border[brow + g] += ap * jr[g];
                 }
-                ne.band[(cp - lo) * wd + (cq + bw - cp)] += h;
             }
-            for gq in 0..ng {
-                let mut h = 0.0;
-                for r in 0..nt {
-                    h += a[r * ncol + p] * jg[r * ng + gq];
+            for &gp in &gz {
+                ne.g_glob[gp] += jr[gp] * rr;
+                for &gq in &gz {
+                    ne.c[gp * ng + gq] += jr[gp] * jr[gq];
                 }
-                ne.border[(cp - lo) * ng + gq] += h;
-            }
-        }
-        for gp in 0..ng {
-            for r in 0..nt {
-                ne.g_glob[gp] += jg[r * ng + gp] * res[r];
-            }
-            for gq in 0..ng {
-                let mut h = 0.0;
-                for r in 0..nt {
-                    h += jg[r * ng + gp] * jg[r * ng + gq];
-                }
-                ne.c[gp * ng + gq] += h;
             }
         }
     }
@@ -438,8 +433,8 @@ fn band_cholesky(band: &mut [f64], n: usize, bw: usize) -> Result<(), SolveError
     Ok(())
 }
 
-/// Solve L L^T x = b in place, L the factored band.
-fn band_solve(l: &[f64], n: usize, bw: usize, x: &mut [f64]) {
+/// Solve L x = b in place.
+fn band_forward(l: &[f64], n: usize, bw: usize, x: &mut [f64]) {
     let wd = bw + 1;
     for i in 0..n {
         let lo = i.saturating_sub(bw);
@@ -447,6 +442,11 @@ fn band_solve(l: &[f64], n: usize, bw: usize, x: &mut [f64]) {
         let s: f64 = row.iter().zip(&x[lo..i]).map(|(a, b)| a * b).sum();
         x[i] = (x[i] - s) / l[i * wd + bw];
     }
+}
+
+/// Solve L^T x = b in place.
+fn band_backward(l: &[f64], n: usize, bw: usize, x: &mut [f64]) {
+    let wd = bw + 1;
     for i in (0..n).rev() {
         x[i] /= l[i * wd + bw];
         let xi = x[i];
@@ -471,11 +471,16 @@ pub enum SolveError {
     Cancelled,
 }
 
-/// One window's damped band solved against -g_loc and the border: A^-1 (-g_loc), A^-1 B.
+/// One window's damped band factored, with -g_loc and the border forward-substituted:
+/// A = L L^T, y = L^-1 (-g_loc), W = L^-1 B.
 struct Factored {
-    ar: Vec<f64>,
-    /// A^-1 B, column-major [ng][n_loc].
-    ab: Vec<Vec<f64>>,
+    /// The band's Cholesky factor (lower, the band's layout).
+    l: Vec<f64>,
+    n: usize,
+    bw: usize,
+    y: Vec<f64>,
+    /// L^-1 B, column-major [ng][n_loc].
+    w: Vec<Vec<f64>>,
 }
 
 fn factor(ne: &Normal, lay: &Layout, lam: f64) -> Result<Factored, SolveError> {
@@ -486,28 +491,33 @@ fn factor(ne: &Normal, lay: &Layout, lam: f64) -> Result<Factored, SolveError> {
         l[i * wd + bw] = l[i * wd + bw] * (1.0 + lam) + 1e-9;
     }
     band_cholesky(&mut l, n, bw)?;
-    let mut ar: Vec<f64> = ne.g_loc.iter().map(|g| -g).collect();
-    band_solve(&l, n, bw, &mut ar);
-    let ab = par_map_n(&(0..ne.ng).collect::<Vec<_>>(), ne.threads, |&j| {
+    let mut y: Vec<f64> = ne.g_loc.iter().map(|g| -g).collect();
+    band_forward(&l, n, bw, &mut y);
+    let w = par_map_n(&(0..ne.ng).collect::<Vec<_>>(), ne.threads, |&j| {
         let mut col: Vec<f64> = (0..n).map(|k| ne.border[k * ne.ng + j]).collect();
-        band_solve(&l, n, bw, &mut col);
+        band_forward(&l, n, bw, &mut col);
         col
     });
-    Ok(Factored { ar, ab })
+    Ok(Factored { l, n, bw, y, w })
 }
 
-/// This window's share of the globals' Schur system: (C - B^T A^-1 B, -g - B^T A^-1 (-g_loc)).
+/// This window's share of the globals' Schur system: (C - B^T A^-1 B, -g - B^T A^-1 (-g_loc)),
+/// as C - W^T W and -g - W^T y (symmetric: the upper half computed, rows in parallel).
 fn schur_part(ne: &Normal, f: &Factored, lam: f64) -> (Vec<f64>, Vec<f64>) {
-    let (ng, n) = (ne.ng, ne.g_loc.len());
+    let ng = ne.ng;
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let rows = par_map_n(&(0..ng).collect::<Vec<_>>(), ne.threads, |&i| {
+        let s: Vec<f64> = (i..ng).map(|j| ne.c[i * ng + j] - dot(&f.w[i], &f.w[j]) + if i == j { lam * ne.c[i * ng + i] + 1e-9 } else { 0.0 }).collect();
+        (s, -ne.g_glob[i] - dot(&f.w[i], &f.y))
+    });
     let mut s = vec![0.0; ng * ng];
     let mut rhs = vec![0.0; ng];
-    for i in 0..ng {
-        for j in 0..ng {
-            let bab: f64 = (0..n).map(|k| ne.border[k * ng + i] * f.ab[j][k]).sum();
-            s[i * ng + j] = ne.c[i * ng + j] - bab + if i == j { lam * ne.c[i * ng + i] + 1e-9 } else { 0.0 };
+    for (i, (row, r)) in rows.into_iter().enumerate() {
+        for (k, x) in row.into_iter().enumerate() {
+            s[i * ng + i + k] = x;
+            s[(i + k) * ng + i] = x;
         }
-        let bar: f64 = (0..n).map(|k| ne.border[k * ng + i] * f.ar[k]).sum();
-        rhs[i] = -ne.g_glob[i] - bar;
+        rhs[i] = r;
     }
     (s, rhs)
 }
@@ -518,8 +528,14 @@ fn solve_globals(s: &[f64], rhs: &[f64], ng: usize, n_loc: usize) -> Result<Vec<
     Ok(x.iter().cloned().collect())
 }
 
+/// The locals given the globals: A^-1 (-g_loc - B xg) = L^-T (y - W xg).
 fn back_substitute(f: &Factored, xg: &[f64]) -> Vec<f64> {
-    (0..f.ar.len()).map(|k| f.ar[k] - xg.iter().zip(&f.ab).map(|(x, col)| col[k] * x).sum::<f64>()).collect()
+    let mut x = f.y.clone();
+    for (col, xj) in f.w.iter().zip(xg) {
+        x.iter_mut().zip(col).for_each(|(a, c)| *a -= c * xj);
+    }
+    band_backward(&f.l, f.n, f.bw, &mut x);
+    x
 }
 
 /// (H + lam diag(H)) x = -g for one window's band + border system.
@@ -667,6 +683,27 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
         }
     }
     Ok((vs, info))
+}
+
+/// The shared unknowns' standard deviations at a multi-window solution `vs` (a diagnostic): the
+/// square roots of the diagonal of the inverse of the globals' Schur system, undamped, the
+/// priors counted once. In the globals' units (log multipliers for the force parameters); a
+/// Huber-downweighted row counts at its weight there, so it is the Gauss-Newton
+/// approximation about the fit, not a sampled posterior.
+pub fn globals_sigma(objs: &[Objective], vs: &[Vars]) -> Result<Vec<f64>, SolveError> {
+    let lays: Vec<Layout> = objs.iter().map(Layout::new).collect();
+    let ng = objs[0].n_glob();
+    let parts = par_map(&(0..objs.len()).collect::<Vec<_>>(), |&w| {
+        let ne = normal_equations(&objs[w], &lays[w], &vs[w], w == 0);
+        factor(&ne, &lays[w], 0.0).map(|f| schur_part(&ne, &f, 0.0).0)
+    });
+    let mut s = vec![0.0; ng * ng];
+    for part in parts {
+        s.iter_mut().zip(&part?).for_each(|(a, b)| *a += b);
+    }
+    let ch = nalgebra::DMatrix::from_row_slice(ng, ng, &s).cholesky().ok_or(SolveError::NotPositiveDefinite { row: lays[0].n_loc })?;
+    let inv = ch.inverse();
+    Ok((0..ng).map(|i| inv[(i, i)].max(0.0).sqrt()).collect())
 }
 
 /// Starting values for an objective with the force model on: the same window solved with it
@@ -846,3 +883,4 @@ mod tests {
         assert!(travel < 1e-3, "travel moved {} mm", travel * 1e3);
     }
 }
+

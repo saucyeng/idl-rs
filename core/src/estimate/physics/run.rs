@@ -402,6 +402,7 @@ pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
     if k == 0 {
         return Ok([0.0; NFP]);
     }
+    let t0 = std::time::Instant::now();
     let objs: Vec<Objective> = (0..k)
         .map(|i| {
             let (a, b0, _, _) = plan[i * plan.len() / k];
@@ -412,12 +413,26 @@ pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
             Objective { threads: (cfg.threads / k).max(1), ..o }
         })
         .collect();
+    if std::env::var_os("IDL_FORCE_DEBUG").is_some() {
+        let lay = super::solve::Layout::new(&objs[0]);
+        eprintln!("force identification: window 0 has {} samples, {} local unknowns, band half-width {}, {} globals", objs[0].spec.n, lay.n_loc, lay.bw, objs[0].n_glob());
+    }
     let vs = super::solve::par_map_n(&objs, k, |o| warm_start(o, cfg.iters, cfg.tol)).into_iter().collect::<Result<Vec<_>, _>>()?;
+    let t_warm = t0.elapsed().as_secs_f64();
     let (vs, info) = gauss_newton_multi(&objs, vs, cfg.force_id_iters, cfg.tol)?;
     if std::env::var_os("IDL_FORCE_DEBUG").is_some() {
+        eprintln!("force identification: warm starts {t_warm:.1} s, joint solve {:.1} s (assembly / solve / loss {:.1?} s)", t0.elapsed().as_secs_f64() - t_warm, info.seconds);
         eprintln!("force identification: {} windows, {} iterations, loss {:?}", objs.len(), info.iterations, info.loss);
         for (o, v) in objs.iter().zip(&vs) {
             eprintln!("  window loss by row group: {}", row_group_loss(o, v));
+        }
+        match super::solve::globals_sigma(&objs, &vs) {
+            Ok(sig) => {
+                let (g0, p) = (objs[0].force_glob0(), objs[0].force_par(&vs[0]));
+                let txt: Vec<String> = super::forces::PAR_NAMES.iter().enumerate().map(|(i, n)| format!("{n} {:.2} (x/ {:.2})", p[i].exp(), sig[g0 + i].exp())).collect();
+                eprintln!("  force parameters, factor on the nominal (x/ one sigma): {}", txt.join(", "));
+            }
+            Err(e) => eprintln!("  force parameter sigmas failed: {e:?}"),
         }
     }
     Ok(objs[0].force_par(&vs[0]))
