@@ -166,12 +166,18 @@ impl<S: Real> Bike<S> {
 
     /// The fork pod: steer about the steering axis, travel along it, bending.
     pub fn front_pose(&self, q: &[S; NL]) -> Pose<S> {
+        self.front_at(q, self.fork_lever)
+    }
+
+    /// A point on the fork lowers that sits at `lever` (m, IMU0 axes) at zero latents, with the
+    /// fork pod's rotation: steer, travel, and the bending as the pod feels it.
+    pub fn front_at(&self, q: &[S; NL], lever: V3<S>) -> Pose<S> {
         let a = self.steer_axis.unit();
         let fa = (self.fwd - a.scale(a.dot(self.fwd))).unit();
         let lat = a.cross(fa);
         let (bfa, blat) = (q[B_FA], q[B_LAT]);
         let kl = self.bend_arm(q[D]) * (2.0 / 3.0); // cantilever tip: deflection = 2/3 L angle
-        let x = self.fork_lever + a.scale(q[D]) - lat.cross(a).scale(kl * bfa) - fa.cross(a).scale(kl * blat);
+        let x = lever + a.scale(q[D]) - lat.cross(a).scale(kl * bfa) - fa.cross(a).scale(kl * blat);
         let r_bend = rot_axis(lat, bfa) * rot_axis(fa, blat);
         let r_steer = rot_axis(a, q[PSI]);
         let p = self.steer_point + r_steer * (x - self.steer_point);
@@ -187,6 +193,12 @@ impl<S: Real> Bike<S> {
 
     /// The rear pod.
     pub fn rear_pose(&self, q: &[S; NL]) -> Pose<S> {
+        self.rear_at(q, self.rear_lever)
+    }
+
+    /// A point on the rear member that sits at `lever` (m, IMU0 axes) at zero latents (the
+    /// rear axle, for the force model), with the rear pod's rotation.
+    pub fn rear_at(&self, q: &[S; NL], lever: V3<S>) -> Pose<S> {
         let s = q[S];
         let (r, pivot, p) = match &self.rear {
             Rear::FourBar(fb) => {
@@ -195,11 +207,11 @@ impl<S: Real> Bike<S> {
                 let r = rot_axis(n, phi);
                 let h2 = self.side_to_frame(h2);
                 let h0 = self.side_to_frame(h0);
-                (r, h2, h2 + r * (self.rear_lever - h0))
+                (r, h2, h2 + r * (lever - h0))
             }
             Rear::Generic { axis, pivot, rot_per_m, dir } => {
                 let r = rot_axis(axis.unit(), *rot_per_m * s);
-                (r, *pivot, *pivot + r * (self.rear_lever - *pivot) + dir.unit().scale(s))
+                (r, *pivot, *pivot + r * (lever - *pivot) + dir.unit().scale(s))
             }
         };
         let r_flex = rot_axis(self.fwd, q[R_ROLL]) * rot_axis(self.up, q[R_YAW]);

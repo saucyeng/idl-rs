@@ -28,6 +28,7 @@ fn main() {
         mask_rear: serde_json::from_value(doc["mask_rear"].clone()).unwrap(),
         air: Some(serde_json::from_value(doc["air"].clone()).unwrap()),
         nav: None,
+        forces: None,
     };
     let n = win.frame_gyro.len();
     // `--nav`: add the navigation latents (attitude, velocity) with a made-up 10 Hz GPS track; the

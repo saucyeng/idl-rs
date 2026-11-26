@@ -136,6 +136,7 @@ fn main() {
         mask_rear: vec![true; n],
         air: None,
         nav: None,
+        forces: None,
     };
     let mut w = Weights::default();
     w.wall_sigma = arg("--wall-sigma-mm", w.wall_sigma * 1e3) * 1e-3;

@@ -27,6 +27,7 @@
 
 use super::bike::{Bike, B_FA, B_LAT, D, F_ROT, F_TRANS, F_TWIST, NL, R_ROLL, R_YAW, S};
 use super::la::{exp, M3, V3};
+use super::forces::{force_rows, ForceJac, ForceMeas, ForceModel, ForceWindow, NBAL, NFL, NFP};
 use super::nav::{nav_rows, NavJac, NavSample, NavSpec, NavWeights, NavWindow};
 use super::readings::{pod_readings, readings_and_jacobian, Sample, NR, NZ};
 use super::setup::{geometry, with_geometry, Geometry, GEOMETRY_SIGMA};
@@ -194,6 +195,8 @@ pub struct Window {
     pub air: Option<Vec<bool>>,
     /// GPS fixes and the starting state, for the navigation rows (None: off).
     pub nav: Option<NavWindow>,
+    /// The force rows' extra measurements (None: off).
+    pub forces: Option<ForceWindow>,
 }
 
 /// The unknowns: spline coefficients (per level, per row) and the globals.
@@ -209,6 +212,8 @@ pub struct Vars {
     pub att: Vec<M3<f64>>,
     /// Velocity spline coefficients per nav axis, m/s (empty with navigation off).
     pub vel: [Vec<f64>; 3],
+    /// Force latent spline coefficients, one row per force latent (empty with the force model off).
+    pub frc: Vec<Vec<f64>>,
 }
 
 /// A window's objective: bike, measurements, layout, weights and priors.
@@ -225,11 +230,15 @@ pub struct Objective {
     pub glob_centre: Vec<f64>,
     /// Whether the bike's geometry is estimated too (globals [`NG`]..[`NGMAX`]).
     pub fit: bool,
+    /// The force model (None: off); its parameters follow the other globals.
+    pub forces: Option<ForceModel>,
 }
 
 /// The bike lifted for one linearisation point: values, values + Jacobian,
 /// and, when fitting, the geometry nudged each way for central differences.
 pub struct Ctx {
+    bike_f: Bike<f64>,
+    bike_d: Bike<Dual64>,
     bike_h: Bike<HyperDual<f64>>,
     bike_dh: Bike<HyperDual<Dual64>>,
     fd: Vec<(Bike<HyperDual<f64>>, Bike<HyperDual<f64>>, f64)>,
@@ -248,7 +257,7 @@ pub struct SampleJac {
 impl Objective {
     /// An objective over `win` with `bike` frozen; `bias_centre`: the biases' prior centres.
     pub fn new(bike: Bike<f64>, win: Window, spec: Spec, w: Weights, bias_centre: [f64; NG]) -> Self {
-        Objective { bike, win, spec, w, glob_centre: bias_centre.to_vec(), fit: false }
+        Objective { bike, win, spec, w, glob_centre: bias_centre.to_vec(), fit: false, forces: None }
     }
 
     /// As [`Self::new`], also estimating the bike's geometry, with a prior
@@ -256,22 +265,38 @@ impl Objective {
     pub fn fitting(bike: Bike<f64>, win: Window, spec: Spec, w: Weights, bias_centre: [f64; NG]) -> Self {
         let mut c = bias_centre.to_vec();
         c.extend(geometry(&bike));
-        Objective { bike, win, spec, w, glob_centre: c, fit: true }
+        Objective { bike, win, spec, w, glob_centre: c, fit: true, forces: None }
     }
 
-    /// Number of globals: [`NG`], or [`NGMAX`] when fitting.
+    /// This objective with the force model on (its parameters' prior centres at 0: the
+    /// model's nominal values). The rows run where the window has [`Window::forces`].
+    pub fn with_forces(mut self, m: ForceModel) -> Self {
+        self.glob_centre.truncate(self.force_glob0());
+        self.glob_centre.extend([0.0; NFP]);
+        self.forces = Some(m);
+        self
+    }
+
+    /// Index of the first force parameter among the globals.
+    pub fn force_glob0(&self) -> usize {
+        if self.fit { NGMAX } else { NG }
+    }
+
+    /// Number of globals: [`NG`], or [`NGMAX`] when fitting, plus [`NFP`] with the force model.
     pub fn n_glob(&self) -> usize {
-        if self.fit {
-            NGMAX
-        } else {
-            NG
-        }
+        self.force_glob0() + if self.forces.is_some() { NFP } else { 0 }
+    }
+
+    /// The force model and the window's force measurements, when both are on.
+    pub fn force_on(&self) -> Option<(&ForceModel, &ForceWindow)> {
+        Some((self.forces.as_ref()?, self.win.forces.as_ref()?))
     }
 
     /// Prior sigma of each global.
     pub fn glob_sigma(&self) -> Vec<f64> {
         (0..self.n_glob())
             .map(|i| match i {
+                i if i >= self.force_glob0() => self.forces.as_ref().map_or(1.0, |m| m.w.par_sigma[i - self.force_glob0()]),
                 i if i >= NG => GEOMETRY_SIGMA[i - NG],
                 6..=8 | 12..=14 => self.w.accel_bias_sigma,
                 _ => self.w.gyro_bias_sigma,
@@ -304,7 +329,7 @@ impl Objective {
         } else {
             Vec::new()
         };
-        Ctx { bike_h: b.map(HyperDual::from_re), bike_dh: b.map(|x| HyperDual::from_re(Dual64::from(x))), fd }
+        Ctx { bike_d: b.map(Dual64::from), bike_h: b.map(HyperDual::from_re), bike_f: b.clone(), bike_dh: b.map(|x| HyperDual::from_re(Dual64::from(x))), fd }
     }
 
     /// Starting values: latents at `spec.init`, the frame rate through the
@@ -322,7 +347,11 @@ impl Objective {
             c
         });
         let (att, vel) = self.initial_nav();
-        Vars { lvl, frame, glob: self.glob_centre.clone(), att, vel }
+        let frc = match &self.forces {
+            Some(m) if self.win.forces.is_some() => (0..NFL).map(|i| vec![0.0; self.spec.n_knots(m.spec.m[i])]).collect(),
+            _ => Vec::new(),
+        };
+        Vars { lvl, frame, glob: self.glob_centre.clone(), att, vel, frc }
     }
 
     /// The navigation layout and measurements, when both are on.
@@ -400,6 +429,49 @@ impl Objective {
     /// The navigation rows at sample `t` (None with navigation off).
     pub fn nav_residuals(&self, v: &Vars, s: &Sample<f64>, t: usize, jac: bool) -> Option<NavJac> {
         Some(nav_rows(&self.nav_sample(v, s, t)?, &self.w.nav, jac))
+    }
+
+    /// The force latents at sample `t`: values, rates, second derivatives (SI).
+    pub fn force_inputs(&self, v: &Vars, t: usize) -> Option<[[f64; NFL]; 3]> {
+        let (m, _) = self.force_on()?;
+        let sp = &m.spec;
+        let mut out = [[0.0; NFL]; 3];
+        for i in 0..NFL {
+            let mi = sp.m[i];
+            let (j, base) = (t % mi, t / mi);
+            let b = basis(j, mi);
+            let h = mi as f64 * self.spec.dt;
+            let c = &v.frc[i][base..base + 4];
+            let dot = |w: &[f64; 4]| w[0] * c[0] + w[1] * c[1] + w[2] * c[2] + w[3] * c[3];
+            out[0][i] = sp.init[i] + sp.scale[i] * dot(&b[0]);
+            out[1][i] = sp.scale[i] * dot(&b[1]) / h;
+            out[2][i] = sp.scale[i] * dot(&b[2]) / (h * h);
+        }
+        Some(out)
+    }
+
+    /// The force rows at sample `t` (None with the force model off). Where either unsprung
+    /// pod is clipped the sample keeps only its priors (its balance rows read 0).
+    pub fn force_residuals(&self, ctx: &Ctx, v: &Vars, s: &Sample<f64>, t: usize, jac: bool) -> Option<ForceJac> {
+        let (m, fw) = self.force_on()?;
+        let f = self.force_inputs(v, t)?;
+        let n = self.spec.n;
+        let sp = &fw.speed_mps;
+        let (a, b) = (t.saturating_sub(1), (t + 1).min(n - 1));
+        let speed_rate = if b > a { (sp[b] - sp[a]) / ((b - a) as f64 * self.spec.dt) } else { 0.0 };
+        let meas = ForceMeas { frame: self.win.frame_accel[t], fork: self.win.fork_accel[t], rear: self.win.rear_accel[t], speed: sp[t], speed_rate };
+        let g0 = self.force_glob0();
+        let par: [f64; NFP] = std::array::from_fn(|i| v.glob[g0 + i]);
+        let mut out = force_rows(m, &ctx.bike_f, &ctx.bike_d, s, &f[0], &f[1], &f[2], &par, &meas, jac);
+        if !(self.win.mask_fork[t] && self.win.mask_rear[t]) {
+            for r in 0..NBAL {
+                out.r[r] = 0.0;
+                out.j_core[r] = [0.0; NZ];
+                out.j_frc[r] = [0.0; 3 * NFL];
+                out.j_par[r] = [0.0; NFP];
+            }
+        }
+        Some(out)
     }
 
     /// The local inputs at sample `t`: latents and their derivatives, chassis rate and acceleration.
@@ -526,14 +598,20 @@ impl Objective {
             if let Some(nj) = self.nav_residuals(v, &s, t, false) {
                 l += nj.r.iter().map(|x| x * x).sum::<f64>();
             }
+            if let Some(fj) = self.force_residuals(&ctx, v, &s, t, false) {
+                let k = self.forces.as_ref().map_or(0.0, |m| m.w.huber);
+                l += fj.r[..NBAL].iter().map(|&x| huber2(x, k)).sum::<f64>();
+                l += fj.r[NBAL..].iter().map(|x| x * x).sum::<f64>();
+            }
         }
-        let k = self.smooth_weight();
-        for lvl in &v.lvl {
-            for row in lvl {
-                for i in 0..row.len() - 2 {
-                    let d2 = k * (row[i] - 2.0 * row[i + 1] + row[i + 2]);
-                    l += d2 * d2;
-                }
+        let k0 = self.smooth_weight();
+        let frc_smooth = |i: usize| self.forces.as_ref().map_or(1.0, |m| m.spec.smooth[i].sqrt());
+        let rows = v.lvl.iter().flatten().map(|r| (r, 1.0)).chain(v.frc.iter().enumerate().map(|(i, r)| (r, frc_smooth(i))));
+        for (row, ks) in rows {
+            let k = k0 * ks;
+            for i in 0..row.len() - 2 {
+                let d2 = k * (row[i] - 2.0 * row[i + 1] + row[i + 2]);
+                l += d2 * d2;
             }
         }
         0.5 * l

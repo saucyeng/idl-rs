@@ -12,6 +12,7 @@
 use super::objective::{basis, huber2, Objective, Vars, NROW, SENSOR_ROWS};
 use super::bike::NL;
 use super::la::{exp, V3};
+use super::forces::{NBAL, NFL, NFR};
 use super::nav::NNAV;
 
 /// What a group of coefficients is.
@@ -25,6 +26,8 @@ enum Kind {
     Att,
     /// The velocity spline, nav axis `row`.
     Vel,
+    /// A force latent (`row`: its index).
+    Force,
 }
 
 /// One spline row's place in the unknown vector.
@@ -33,6 +36,8 @@ struct Group {
     row: usize,
     m: usize,
     scale: f64,
+    /// Smoothness weight, times the objective's.
+    smooth: f64,
     /// Local-input columns this row's value, rate and acceleration feed.
     z: [Option<usize>; 3],
     /// Position in the unknown vector of each of the row's coefficients.
@@ -55,17 +60,22 @@ impl Layout {
         let mut groups = Vec::new();
         for (li, (m, ix)) in sp.levels.iter().enumerate() {
             for (row, &lat) in ix.iter().enumerate() {
-                groups.push(Group { kind: Kind::Latent(li), row, m: *m, scale: sp.scale[lat], z: [Some(lat), Some(NL + lat), Some(2 * NL + lat)], pos: vec![] });
+                groups.push(Group { kind: Kind::Latent(li), row, m: *m, scale: sp.scale[lat], smooth: 1.0, z: [Some(lat), Some(NL + lat), Some(2 * NL + lat)], pos: vec![] });
             }
         }
         for x in 0..3 {
-            groups.push(Group { kind: Kind::Frame, row: x, m: 1, scale: 1.0, z: [Some(3 * NL + x), Some(3 * NL + 3 + x), None], pos: vec![] });
+            groups.push(Group { kind: Kind::Frame, row: x, m: 1, scale: 1.0, smooth: 1.0, z: [Some(3 * NL + x), Some(3 * NL + 3 + x), None], pos: vec![] });
         }
         if let Some((ns, _)) = obj.nav() {
             for (kind, m) in [(Kind::Att, ns.m_att), (Kind::Vel, ns.m_vel)] {
                 for x in 0..3 {
-                    groups.push(Group { kind, row: x, m, scale: 1.0, z: [None; 3], pos: vec![] });
+                    groups.push(Group { kind, row: x, m, scale: 1.0, smooth: 1.0, z: [None; 3], pos: vec![] });
                 }
+            }
+        }
+        if let Some((m, _)) = obj.force_on() {
+            for i in 0..NFL {
+                groups.push(Group { kind: Kind::Force, row: i, m: m.spec.m[i], scale: m.spec.scale[i], smooth: m.spec.smooth[i].sqrt(), z: [None; 3], pos: vec![] });
             }
         }
         // order every coefficient by when it acts (stable: group order breaks ties)
@@ -107,6 +117,7 @@ impl Layout {
             Kind::Latent(li) => &v.lvl[li][g.row],
             Kind::Frame => &v.frame[g.row],
             Kind::Vel => &v.vel[g.row],
+            Kind::Force => &v.frc[g.row],
             Kind::Att => &[],
         }
     }
@@ -120,6 +131,7 @@ impl Layout {
                 Kind::Latent(li) => &mut out.lvl[li][g.row],
                 Kind::Frame => &mut out.frame[g.row],
                 Kind::Vel => &mut out.vel[g.row],
+                Kind::Force => &mut out.frc[g.row],
                 Kind::Att => {
                     for (k, &p) in g.pos.iter().enumerate() {
                         d_att[k][g.row] = dl[p];
@@ -168,7 +180,11 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
     let sp = &obj.spec;
     let ctx = obj.ctx(&v.glob, true);
     let ncol = lay.groups.len() * 4;
-    let nt = NROW + if obj.nav().is_some() { NNAV } else { 0 };
+    let nav_rows = if obj.nav().is_some() { NNAV } else { 0 };
+    let f0 = NROW + nav_rows; // first force row
+    let nt = f0 + if obj.force_on().is_some() { NFR } else { 0 };
+    let (fg0, nb) = (obj.force_glob0(), ng.min(super::objective::NGMAX));
+    let k_force = obj.forces.as_ref().map_or(0.0, |m| m.w.huber);
     let mut a = vec![0.0; nt * ncol];
     let mut res = vec![0.0; nt];
     let mut jg = vec![0.0; nt * ng];
@@ -177,6 +193,7 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
         let s = obj.sample(v, t);
         let sj = obj.sample_residuals(&ctx, &s, &v.glob, t, true);
         let nj = obj.nav_residuals(v, &s, t, true);
+        let fj = obj.force_residuals(&ctx, v, &s, t, true);
         // chain d r / d z through the spline basis to the coefficients
         a.iter_mut().for_each(|x| *x = 0.0);
         for (gi, g) in lay.groups.iter().enumerate() {
@@ -197,12 +214,13 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
             }
         }
         res[..NROW].copy_from_slice(&sj.r);
+        jg.iter_mut().for_each(|x| *x = 0.0);
         for r in 0..NROW {
-            jg[r * ng..(r + 1) * ng].copy_from_slice(&sj.jg[r][..ng]);
+            jg[r * ng..r * ng + nb].copy_from_slice(&sj.jg[r][..nb]);
         }
         if let Some(nj) = &nj {
             // navigation rows: attitude columns directly, velocity and frame rate through their basis
-            res[NROW..].copy_from_slice(&nj.r);
+            res[NROW..f0].copy_from_slice(&nj.r);
             for (gi, g) in lay.groups.iter().enumerate() {
                 let b = basis(t % g.m, g.m);
                 let h = g.m as f64 * sp.dt;
@@ -212,17 +230,49 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
                             Kind::Att => nj.j_att[r][3 * i + g.row],
                             Kind::Vel => b[0][i] * nj.j_v[r][g.row] + b[1][i] / h * nj.j_v[r][3 + g.row],
                             Kind::Frame => b[0][i] * nj.j_w0[r][g.row],
-                            Kind::Latent(_) => 0.0,
+                            Kind::Latent(_) | Kind::Force => 0.0,
                         };
                     }
                 }
+            }
+        }
+        if let Some(fj) = &fj {
+            // force rows: core latents and the frame rate through their basis like the pod rows, the
+            // force latents through theirs, the parameters as globals
+            res[f0..].copy_from_slice(&fj.r);
+            for (gi, g) in lay.groups.iter().enumerate() {
+                let (j, base) = (t % g.m, t / g.m);
+                let _ = base;
+                let b = basis(j, g.m);
+                let h = g.m as f64 * sp.dt;
+                let wz = [g.scale, g.scale / h, g.scale / (h * h)];
+                for i in 0..4 {
+                    for d in 0..3 {
+                        let wgt = b[d][i] * wz[d];
+                        let col = match (g.kind, g.z[d]) {
+                            (Kind::Force, _) => Some((true, d * NFL + g.row)),
+                            (Kind::Latent(_) | Kind::Frame, Some(z)) => Some((false, z)),
+                            _ => None,
+                        };
+                        if let Some((frc, z)) = col {
+                            for r in 0..NFR {
+                                let jr = if frc { fj.j_frc[r][z] } else { fj.j_core[r][z] };
+                                a[(f0 + r) * ncol + gi * 4 + i] += jr * wgt;
+                            }
+                        }
+                    }
+                }
+            }
+            for r in 0..NFR {
+                jg[(f0 + r) * ng + fg0..(f0 + r) * ng + fg0 + super::forces::NFP].copy_from_slice(&fj.j_par[r]);
             }
         }
         // Huber on the sensor rows (iteratively reweighted): a row beyond k sigmas is scaled by
         // sqrt(k/|r|), so its gradient is the Huber loss's and its curvature the IRLS weight's
         let k = obj.w.huber;
         for r in 0..nt {
-            if r < SENSOR_ROWS && k > 0.0 && res[r].abs() > k {
+            let k = if r < SENSOR_ROWS { k } else if r >= f0 && r < f0 + NBAL { k_force } else { 0.0 };
+            if k > 0.0 && res[r].abs() > k {
                 ne.loss += 0.5 * huber2(res[r], k);
                 let s = (k / res[r].abs()).sqrt();
                 res[r] *= s;
@@ -272,9 +322,10 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
         }
     }
     // smoothness priors: k (c_i - 2 c_i+1 + c_i+2) on each latent row
-    let k = obj.smooth_weight();
-    let pw = [k, -2.0 * k, k];
-    for g in lay.groups.iter().filter(|g| matches!(g.kind, Kind::Latent(_))) {
+    let k0 = obj.smooth_weight();
+    for g in lay.groups.iter().filter(|g| matches!(g.kind, Kind::Latent(_) | Kind::Force)) {
+        let k = k0 * g.smooth;
+        let pw = [k, -2.0 * k, k];
         let c = lay.coef(g, v);
         for i in 0..c.len() - 2 {
             let r = k * (c[i] - 2.0 * c[i + 1] + c[i + 2]);
@@ -527,6 +578,11 @@ pub fn latents(obj: &Objective, v: &Vars) -> Vec<[f64; NL]> {
     (0..obj.spec.n).map(|t| obj.sample(v, t).q).collect()
 }
 
+/// Force latent values per sample, [n][NFL], SI units (empty with the force model off).
+pub fn force_latents(obj: &Objective, v: &Vars) -> Vec<[f64; NFL]> {
+    (0..obj.spec.n).filter_map(|t| obj.force_inputs(v, t).map(|f| f[0])).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,6 +611,7 @@ mod tests {
             mask_rear: serde_json::from_value(doc["mask_rear"].clone()).unwrap(),
             air: Some(serde_json::from_value(doc["air"].clone()).unwrap()),
             nav: None,
+            forces: None,
         };
         let n = win.frame_gyro.len();
         let mut centre = [0.0; crate::estimate::physics::objective::NG];
@@ -626,6 +683,7 @@ mod tests {
             mask_rear: vec![true; n],
             air: None,
             nav: None,
+            forces: None,
         };
         let mut gps = vec![None; n];
         for i in 0..n {
