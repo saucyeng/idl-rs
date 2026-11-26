@@ -127,9 +127,33 @@ pub struct AirChambers {
 }
 
 impl AirChambers {
-    /// The spring's force, N, at stroke `x_m` with the pressure scaled by `scale`.
+    /// The spring's force, N, at stroke `x_m` with the pressure scaled by `scale`, fast about
+    /// [`AirChambers::rest_at`].
     pub fn force_n<S: Real>(&self, scale: S, x_m: S) -> S {
-        air_force_about_n(self.area_m2, self.positive_m3, self.negative_m3, scale * self.gauge_pa, c(self.rest_m), x_m, 1.4)
+        air_force_about_n(self.area_m2, self.positive_m3, self.negative_m3, scale * self.gauge_pa, self.rest_at(scale), x_m, 1.4)
+    }
+
+    /// The stroke it rests at, m, with the pressure scaled by `scale`: where the slow
+    /// (isothermal) spring carries the static load it carries at `rest_m` unscaled (the same
+    /// rider and bike on a softer or firmer spring sit deeper or higher; the leverage's change
+    /// with the rest is left out). Newton from `rest_m`, so `scale` = 1 gives `rest_m`.
+    pub fn rest_at<S: Real>(&self, scale: S) -> S {
+        let (a, vp, vn) = (self.area_m2, self.positive_m3, self.negative_m3);
+        let iso = |p0: f64, x: f64| p0 * a * (vp / (vp - a * x) - vn / (vn + a * x));
+        let load = iso(self.gauge_pa + crate::sim::suspension::ATM_PA, self.rest_m);
+        let p0 = scale * self.gauge_pa + crate::sim::suspension::ATM_PA;
+        let (lo, hi) = (0.0, 0.95 * vp / a);
+        let mut x: S = c(self.rest_m);
+        for _ in 0..6 {
+            let (pos, neg) = (-(x * a) + vp, x * a + vn);
+            let f = p0 * a * (pos.recip() * vp - neg.recip() * vn) - load;
+            let df = p0 * a * a * (pos.recip() * pos.recip() * vp + neg.recip() * neg.recip() * vn);
+            x = x - f / df;
+            if x.re() < lo || x.re() > hi {
+                return c(self.rest_m.clamp(lo, hi));
+            }
+        }
+        x
     }
 }
 
@@ -985,6 +1009,25 @@ pub(crate) mod synth {
             }
         }
         truth
+    }
+
+    #[test]
+    fn air_spring_rest_softer_spring_sits_deeper_on_the_same_load() {
+        // Arrange: a shock-sized spring resting at 15 mm stroke at 190 psi
+        let ch = AirChambers { area_m2: 22.0e-4, positive_m3: 3.6e-4, negative_m3: 8.4e-5, gauge_pa: 190.0 * 6894.76, rest_m: 0.015 };
+        let iso = |scale: f64, x: f64| crate::sim::laws::air_force_n(ch.area_m2, ch.positive_m3, ch.negative_m3, scale * ch.gauge_pa, x, 1.0);
+
+        // Act
+        let same: f64 = ch.rest_at(1.0);
+        let soft: f64 = ch.rest_at(0.8);
+        let firm: f64 = ch.rest_at(1.25);
+
+        // Assert: the nominal rest unmoved, and each rest carrying the nominal load
+        assert!((same - 0.015).abs() < 1e-12, "{same}");
+        assert!(soft > 0.015 && firm < 0.015, "{soft} {firm}");
+        let load = iso(1.0, 0.015);
+        assert!((iso(0.8, soft) - load).abs() < 1e-6 * load, "{} vs {load}", iso(0.8, soft));
+        assert!((iso(1.25, firm) - load).abs() < 1e-6 * load, "{} vs {load}", iso(1.25, firm));
     }
 
     #[test]
