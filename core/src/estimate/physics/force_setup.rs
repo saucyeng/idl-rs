@@ -152,6 +152,7 @@ pub fn force_model(bike: &Bike<f64>, p: &Params, linkage: &Linkage, drivetrain: 
         m_front: mt.front_unsprung_kg,
         m_rear: mt.rear_unsprung_kg,
         m_rider,
+        m_limbs: share * rider,
         i_frame: FRAME_GYRATION_M2.map(|k| k * m_frame),
         i_rider: RIDER_GYRATION_M2.map(|k| k * m_rider),
         wheel_inertia: [mt.front.inertia_kgm2, mt.rear.inertia_kgm2],

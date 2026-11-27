@@ -73,7 +73,7 @@ pub const ACT_F: usize = 12;
 pub const ACT_M: usize = 15;
 
 /// Force parameters (globals), each a log multiplier on [`ForceBike::nominal`].
-pub const NFP: usize = 36;
+pub const NFP: usize = 37;
 /// Fork damper (LSC, HSC, LSR, HSR, knee): parameters 0..5.
 pub const P_FORK_DAMP: usize = 0;
 /// Shock damper, at the shaft: parameters 5..10.
@@ -100,6 +100,9 @@ pub const P_VOLUME: usize = 30;
 /// The rider's rest pose under braking (back, down), m per g of deceleration: 34..36 (Isaac,
 /// 2026-11-27: he shifts back under braking, a little down, much more back than down).
 pub const P_BRAKE_SHIFT: usize = 34;
+/// The rider's limb mass the frame carries, a factor on [`ForceBike::m_limbs`]: 36 (the share
+/// moves the fitted dampers, so it is fitted rather than guessed).
+pub const P_LIMBS: usize = 36;
 
 /// Each force parameter's name, in index order.
 pub const PAR_NAMES: [&str; NFP] = [
@@ -110,7 +113,7 @@ pub const PAR_NAMES: [&str; NFP] = [
     "rider k fwd", "rider k lat", "rider k up", "rider k roll", "rider k pitch", "rider k yaw",
     "rider c fwd", "rider c lat", "rider c up", "rider c roll", "rider c pitch", "rider c yaw",
     "fork positive volume", "shock positive volume", "fork negative volume", "shock negative volume",
-    "rider back under braking", "rider down under braking",
+    "rider back under braking", "rider down under braking", "limbs on the frame",
 ];
 
 /// Rows per sample (see the module table).
@@ -224,6 +227,9 @@ pub struct ForceBike {
     pub m_rear: f64,
     /// Rider's body, kg.
     pub m_rider: f64,
+    /// The share of the rider's mass in `m_frame` (limbs moving with the bike), kg: scaled by
+    /// [`P_LIMBS`], moved between the frame and the rider's body.
+    pub m_limbs: f64,
     /// Frame inertia about its centre of mass, about (fwd, lat, up), kg m^2.
     pub i_frame: [f64; 3],
     /// Rider's inertia, about (fwd, lat, up), kg m^2.
@@ -368,6 +374,9 @@ impl Default for ForceWeights {
         par_sigma[P_TYRE_K + 1] = 0.3;
         // chamber volumes: the bike file's are estimates (no sag tests); a third either way
         par_sigma[P_VOLUME..P_VOLUME + 4].copy_from_slice(&[0.3; 4]);
+        // the limbs' share: tight until the helmet (F2) sees the rider; free, it runs to 0 and
+        // takes the fork's damping with it (2026-11-27: fork LSR 0.00 on 11/21)
+        par_sigma[P_LIMBS] = 0.2;
         ForceWeights {
             unsprung_n: 20.0,
             rider_n: 50.0,
@@ -577,7 +586,10 @@ pub fn rows<S: Real>(m: &ForceModel, k: &Kin<S>, x: &ForceIn<S>, meas: &ForceMea
     let bush_m = bv(spring(3, ROT - 3), spring(4, ROT - 3), spring(5, ROT - 3));
     let act_f = bv(f[ACT_F], f[ACT_F + 1], f[ACT_F + 2]);
     let act_m = bv(f[ACT_M], f[ACT_M + 1], f[ACT_M + 2]);
-    let rf_res = comps(f_rider.scale(c(fb.m_rider)) - bush_f - act_f);
+    // the limbs' share between the frame and the body, fitted
+    let moved = (par(P_LIMBS) - 1.0) * fb.m_limbs;
+    let (m_frame, m_rider) = (moved + fb.m_frame, -moved + fb.m_rider);
+    let rf_res = comps(f_rider.scale(m_rider) - bush_f - act_f);
     let wb = w0 + thd;
     let ab = a0 + thdd + w0.cross(thd);
     let m_rider_in = inertia(fb.i_rider, ab) + wb.cross(inertia(fb.i_rider, wb));
@@ -585,7 +597,7 @@ pub fn rows<S: Real>(m: &ForceModel, k: &Kin<S>, x: &ForceIn<S>, meas: &ForceMea
     // whole system
     let ps = lift(fb.frame_cg);
     let f_frame = f0 + a0.cross(ps) + w0.cross(w0.cross(ps));
-    let sf = comps(f_frame.scale(c(fb.m_frame)) + uf.scale(c(fb.m_front)) + ur.scale(c(fb.m_rear)) + f_rider.scale(c(fb.m_rider)) - tf - tr);
+    let sf = comps(f_frame.scale(m_frame) + uf.scale(c(fb.m_front)) + ur.scale(c(fb.m_rear)) + f_rider.scale(m_rider) - tf - tr);
     let spin = up.cross(fwd).unit();
     let wheel_h = |i: usize| {
         let h = spin.scale(c(fb.wheel_inertia[i] * meas.speed / fb.wheel_radius[i]));
@@ -594,7 +606,7 @@ pub fn rows<S: Real>(m: &ForceModel, k: &Kin<S>, x: &ForceIn<S>, meas: &ForceMea
     let pcf = k.af - up.scale(-f[DEF_F] + fb.wheel_radius[0]);
     let pcr = k.ar - up.scale(-f[DEF_R] + fb.wheel_radius[1]);
     let sm = comps(
-        ps.cross(f_frame.scale(c(fb.m_frame))) + k.af.cross(uf.scale(c(fb.m_front))) + k.ar.cross(ur.scale(c(fb.m_rear))) + pb.cross(f_rider.scale(c(fb.m_rider)))
+        ps.cross(f_frame.scale(m_frame)) + k.af.cross(uf.scale(c(fb.m_front))) + k.ar.cross(ur.scale(c(fb.m_rear))) + pb.cross(f_rider.scale(m_rider))
             + inertia(fb.i_frame, a0) + w0.cross(inertia(fb.i_frame, w0)) + m_rider_in + wheel_h(0) + wheel_h(1)
             - pcf.cross(tf) - pcr.cross(tr),
     );
@@ -785,6 +797,7 @@ pub(crate) mod synth {
         nominal[P_RIDER_C..P_RIDER_C + 6].copy_from_slice(&[800.0, 600.0, 1200.0, 60.0, 80.0, 40.0]);
         nominal[P_VOLUME..P_VOLUME + 4].copy_from_slice(&[1.0; 4]);
         nominal[P_BRAKE_SHIFT..P_BRAKE_SHIFT + 2].copy_from_slice(&[0.15, 0.03]);
+        nominal[P_LIMBS] = 1.0;
         let tyre = |psi: f64| TyreLaw::<f64>::from_tyre(&Tyre::mtb_29(2.5, psi, true, true));
         let fb = ForceBike {
             up,
@@ -798,6 +811,7 @@ pub(crate) mod synth {
             m_front: 4.0,
             m_rear: 4.5,
             m_rider: 72.0,
+            m_limbs: 0.0,
             i_frame: [0.3, 1.2, 1.0],
             i_rider: [5.0, 6.0, 2.0],
             wheel_inertia: [0.18, 0.2],
@@ -1246,6 +1260,7 @@ pub(crate) mod synth {
         m.bike.axle_member_angle = vec![0.0004, -0.855, -2.83, 4.03];
         m.bike.cage_angle = vec![0.945, 0.870, 2.64, -2.43];
         m.bike.cage_moment_nm = [1.27, 1.58];
+        m.bike.m_limbs = 5.0;
         let t = 30;
         let s = truth.core[t];
         let [mut f, fd, fdd] = truth.f[t];
