@@ -289,6 +289,133 @@ pub fn pick_windows(score: &[f64], n: usize, count: usize, exclude: &[(usize, us
     out
 }
 
+/// How far from a grid sample a camera sample may be and still be read there, us.
+const CAM_NEAR_US: i64 = 3_000;
+/// A gap in the camera's samples longer than this starts a new clip, us.
+const CAM_CLIP_GAP_US: i64 = 1_000_000;
+
+/// One clip's camera mount as the solve takes it ([`camera_on_grid`]).
+#[derive(Debug, Clone)]
+pub struct CameraClip {
+    /// First and last grid sample with a reading.
+    pub samples: (usize, usize),
+    /// Camera axes to the frame pod's: the rotation that best turns the camera's gyro into the
+    /// frame pod's over the clip (Kabsch).
+    pub rotation: M3<f64>,
+    /// Its angle, deg.
+    pub angle_deg: f64,
+    /// Whether the accelerometer's sign was flipped to agree with the frame pod's on gravity.
+    pub accel_flipped: bool,
+    /// RMS of the turned camera gyro against the frame pod's, rad/s (the head's own motion
+    /// and the mount estimate's error together).
+    pub gyro_rms_rad_s: f64,
+}
+
+/// The helmet camera's readings on `r`'s grid (force model F2): `cam` is the camera's
+/// accelerometer X, Y, Z (g) and gyro X, Y, Z (deg/s) as `(t_us, values)` on the session's clock.
+/// Each camera sample goes to the grid sample nearest it (within 3 ms; one grid sample each, so
+/// none counts twice); per clip (gaps over 1 s) the readings are turned into the frame pod's axes
+/// by the rotation that best matches the two gyros' slow motion (1 s averages: the head steadies
+/// itself against the bike's fast roll and pitch but follows its turns) and the mean
+/// accelerometers (gravity), the accelerometer's sign checked first.
+/// Returns the readings (m/s^2, rad/s) and the clips; None without a camera sample on the grid.
+pub fn camera_on_grid(r: &Ride, cam: [(&[i64], &[f64]); 6]) -> Option<(Vec<Option<[f64; 6]>>, Vec<CameraClip>)> {
+    let n = r.len();
+    let mut out: Vec<Option<[f64; 6]>> = vec![None; n];
+    let t_cam = cam[0].0;
+    if t_cam.is_empty() || cam.iter().any(|(t, v)| t.len() != t_cam.len() || v.len() != t_cam.len()) {
+        return None;
+    }
+    for (j, &tc) in t_cam.iter().enumerate() {
+        let k = r.grid_us.partition_point(|&t| t < tc);
+        let best = [k.checked_sub(1), (k < n).then_some(k)].into_iter().flatten().min_by_key(|&i| (r.grid_us[i] - tc).abs());
+        let Some(i) = best.filter(|&i| (r.grid_us[i] - tc).abs() <= CAM_NEAR_US) else { continue };
+        let v: [f64; 6] = std::array::from_fn(|c| cam[c].1[j]);
+        if v.iter().all(|x| x.is_finite()) && out[i].is_none() {
+            out[i] = Some([v[0] * G, v[1] * G, v[2] * G, v[3].to_radians(), v[4].to_radians(), v[5].to_radians()]);
+        }
+    }
+    // clips: runs of readings separated by gaps of more than a second
+    let mut clips = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if out[i].is_none() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut last = i;
+        while i < n && (out[i].is_some() || r.grid_us[i] - r.grid_us[last] <= CAM_CLIP_GAP_US) {
+            if out[i].is_some() {
+                last = i;
+            }
+            i += 1;
+        }
+        clips.push((start, last));
+    }
+    if clips.is_empty() {
+        return None;
+    }
+    let mut info = Vec::new();
+    for &(a, b) in &clips {
+        // the two gyros' and accelerometers' 1 s averages over the clip, at the camera's samples
+        let idx: Vec<usize> = (a..=b).filter(|&t| out[t].is_some()).collect();
+        let half = (0.5 * r.rate()) as usize;
+        let avg = |t: usize| {
+            let (lo, hi) = (t.saturating_sub(half).max(a), (t + half).min(b));
+            let (mut gc, mut gf, mut ac, mut af, mut k) = (nalgebra::Vector3::zeros(), nalgebra::Vector3::zeros(), nalgebra::Vector3::zeros(), nalgebra::Vector3::zeros(), 0.0);
+            for u in lo..=hi {
+                if let Some(v) = out[u] {
+                    gc += nalgebra::Vector3::new(v[3], v[4], v[5]);
+                    ac += nalgebra::Vector3::new(v[0], v[1], v[2]);
+                    gf += r.input.imu0.gyro[u];
+                    af += r.input.imu0.accel[u];
+                    k += 1.0;
+                }
+            }
+            (gc / k, gf / k, ac / k, af / k)
+        };
+        // the accelerometer's sign: gravity dominates both means
+        let (mut acc_cam, mut acc_frame) = (nalgebra::Vector3::<f64>::zeros(), nalgebra::Vector3::<f64>::zeros());
+        for &t in &idx {
+            let v = out[t].expect("a reading");
+            acc_cam += nalgebra::Vector3::new(v[0], v[1], v[2]);
+            acc_frame += r.input.imu0.accel[t];
+        }
+        // Kabsch: R minimising sum |R g_cam - g_frame|^2 over the slow gyros, plus gravity (the
+        // mean accelerometers) weighted as much as all of the gyro pairs
+        let mut h = nalgebra::Matrix3::<f64>::zeros();
+        let mut gyro_w = 0.0;
+        for &t in idx.iter().step_by(4) {
+            let (gc, gf, _, _) = avg(t);
+            h += gc * gf.transpose();
+            gyro_w += gc.norm() * gf.norm();
+        }
+        let (gc0, gf0) = (acc_cam.normalize(), acc_frame.normalize());
+        let mag = (acc_cam.dot(&acc_frame)).signum();
+        h += gc0 * gf0.transpose() * (gyro_w.max(1e-6) * mag);
+        let svd = h.svd(true, true);
+        let (u, vt) = (svd.u?, svd.v_t?);
+        let d = (vt.transpose() * u.transpose()).determinant().signum();
+        let rot = vt.transpose() * nalgebra::Matrix3::from_diagonal(&nalgebra::Vector3::new(1.0, 1.0, d)) * u.transpose();
+        let flipped = mag < 0.0;
+        let sign = if flipped { -1.0 } else { 1.0 };
+        let (mut se, mut cnt) = (0.0, 0usize);
+        for t in a..=b {
+            let Some(v) = out[t] else { continue };
+            let ac = rot * nalgebra::Vector3::new(v[0], v[1], v[2]) * sign;
+            let gc = rot * nalgebra::Vector3::new(v[3], v[4], v[5]);
+            se += (gc - r.input.imu0.gyro[t]).norm_squared();
+            cnt += 1;
+            out[t] = Some([ac[0], ac[1], ac[2], gc[0], gc[1], gc[2]]);
+        }
+        let angle = ((rot.trace() - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees();
+        let m = M3([[rot[(0, 0)], rot[(0, 1)], rot[(0, 2)]], [rot[(1, 0)], rot[(1, 1)], rot[(1, 2)]], [rot[(2, 0)], rot[(2, 1)], rot[(2, 2)]]]);
+        info.push(CameraClip { samples: (a, b), rotation: m, angle_deg: angle, accel_flipped: flipped, gyro_rms_rad_s: (se / cnt.max(1) as f64).sqrt() });
+    }
+    Some((out, info))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

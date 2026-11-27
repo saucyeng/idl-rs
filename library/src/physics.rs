@@ -261,6 +261,31 @@ pub fn estimate_physics_with(
     }
     cfg.nav = opts.nav;
     cfg.only_us = only_us;
+    // the helmet camera (force model F2): its accelerometer and gyro on the grid, each clip
+    // turned into the frame pod's axes
+    if opts.forces {
+        let (chans, _) = crate::estimated::load_estimated_channels(data_root, session_id);
+        let names = ["Cam_AccelX", "Cam_AccelY", "Cam_AccelZ", "Cam_GyroX", "Cam_GyroY", "Cam_GyroZ"];
+        let found: Vec<&crate::estimated::MergedChannel> = names.iter().filter_map(|nm| chans.iter().find(|c| c.name == *nm)).collect();
+        if found.len() == 6 {
+            let cam: [(&[i64], &[f64]); 6] = std::array::from_fn(|i| (found[i].t_us.as_slice(), found[i].values.as_slice()));
+            if let Some((grid, clips)) = idl_rs::estimate::physics::pipeline::camera_on_grid(&r, cam) {
+                if std::env::var_os("IDL_FORCE_DEBUG").is_some() {
+                    for c in &clips {
+                        eprintln!("camera clip: grid {}..{}, mount {:.1} deg from the frame pod's axes, accel flipped {}, gyro rms against the frame {:.2} rad/s", c.samples.0, c.samples.1, c.angle_deg, c.accel_flipped, c.gyro_rms_rad_s);
+                    }
+                }
+                // IDL_PHYSICS_CAMERA_ONLY (prototyping): solve only inside the camera's clips
+                if std::env::var_os("IDL_PHYSICS_CAMERA_ONLY").is_some() {
+                    cfg.only_us = Some(clips.iter().map(|c| (r.grid_us[c.samples.0], r.grid_us[c.samples.1])).collect());
+                }
+                // IDL_FORCE_NO_CAMERA (prototyping): the camera's spans without its rows
+                if std::env::var_os("IDL_FORCE_NO_CAMERA").is_none() {
+                    cfg.camera = Some(grid);
+                }
+            }
+        }
+    }
     // IDL_FORCE_ID_ITERS (prototyping): the force identification's iteration cap
     if let Some(n) = std::env::var("IDL_FORCE_ID_ITERS").ok().and_then(|v| v.trim().parse().ok()) {
         cfg.force_id_iters = n;
@@ -322,6 +347,20 @@ pub fn estimate_physics_with(
             m.spec.smooth[ACT_M + i] = ACTIVE_SMOOTH * (3.0 / hz).powi(4);
         }
         eprintln!("IDL_FORCE_ACTIVE_HZ: the rider's active wrench to {hz} Hz (smoothness {:.0})", ACTIVE_SMOOTH * (3.0 / hz).powi(4));
+    }
+    // IDL_FORCE_SIGMA (prototyping): force parameters' prior widths by name or part of one,
+    // `name=width` pairs, comma separated (IDL_FORCE_SIGMA="limbs=1")
+    if let (Some(m), Ok(v)) = (cfg.forces.as_mut(), std::env::var("IDL_FORCE_SIGMA")) {
+        for pair in v.split(',') {
+            let Some((k, w)) = pair.split_once('=') else { continue };
+            let Ok(w) = w.trim().parse::<f64>() else { continue };
+            for (i, name) in idl_rs::estimate::physics::forces::PAR_NAMES.iter().enumerate() {
+                if name.contains(k.trim()) {
+                    m.w.par_sigma[i] = w;
+                    eprintln!("IDL_FORCE_SIGMA: {name} prior {w}");
+                }
+            }
+        }
     }
     // IDL_FORCE_FREEZE (prototyping): force parameters held at their nominal, by name or part of
     // one, comma separated (IDL_FORCE_FREEZE=friction holds both seals' friction)

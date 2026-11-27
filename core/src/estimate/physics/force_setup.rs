@@ -4,7 +4,7 @@
 //! estimated, never fitted (whole-bike sim spec D3); every estimate here is marked.
 
 use super::bike::{Bike, NL, S};
-use super::forces::{kin, AirChambers, ForceBike, ForceModel, ForceSpec, ForceWeights, NFP, P_FORK_DAMP, P_FRICTION, P_PRESSURE, P_RIDER_C, P_RIDER_K, P_SHOCK_DAMP, P_TYRE_C};
+use super::forces::{kin, AirChambers, Head, ForceBike, ForceModel, ForceSpec, ForceWeights, NFP, P_FORK_DAMP, P_FRICTION, P_PRESSURE, P_RIDER_C, P_RIDER_K, P_SHOCK_DAMP, P_TYRE_C};
 use crate::calibration::drivetrain::Drivetrain;
 use crate::calibration::linkage::Linkage;
 use crate::calibration::params::{mass_table, number, Params};
@@ -108,13 +108,15 @@ pub fn force_model(bike: &Bike<f64>, p: &Params, linkage: &Linkage, drivetrain: 
     let rider = need("rider.mass_kg")? + number(p, "rider.carried_kg").unwrap_or(0.0);
     let sprung = mt.bike_sprung_kg.ok_or_else(|| ForceSetupError::Missing("mass.bike_kg".into()))?;
     let share = LIMBS_ON_FRAME * LIMBS_SHARE;
-    let (m_frame, m_rider) = (sprung + share * rider, (1.0 - share) * rider);
+    // the head (F2) on the body: its share of the rider plus the helmet and camera
+    let m_head = HEAD_SHARE * rider + number(p, "rider.helmet_kg").filter(|v| *v >= 0.0).unwrap_or(HELMET_KG);
+    let (m_frame, m_rider) = (sprung + share * rider, (1.0 - share - HEAD_SHARE) * rider);
     let radius = number(p, "wheels.tyre_radius_m").filter(|v| *v > 0.0).unwrap_or(0.37);
 
     // springs: chambers from the parameters, pressures from the sheet, resting where the
     // static load holds them (the load split from the centres of mass)
-    let total = m_frame + m_rider + mt.front_unsprung_kg + mt.rear_unsprung_kg;
-    let cg_x = (m_frame * frame_cg[0] + m_rider * rider_cg[0] + mt.front_unsprung_kg * pts.front_axle[0] + mt.rear_unsprung_kg * pts.rear_axle[0]) / total;
+    let total = m_frame + m_rider + m_head + mt.front_unsprung_kg + mt.rear_unsprung_kg;
+    let cg_x = (m_frame * frame_cg[0] + (m_rider + m_head) * rider_cg[0] + mt.front_unsprung_kg * pts.front_axle[0] + mt.rear_unsprung_kg * pts.rear_axle[0]) / total;
     let wheelbase = pts.front_axle[0] - pts.rear_axle[0];
     let front_load = total * G * (cg_x - pts.rear_axle[0]) / wheelbase;
     let rear_load = total * G - front_load;
@@ -153,6 +155,13 @@ pub fn force_model(bike: &Bike<f64>, p: &Params, linkage: &Linkage, drivetrain: 
         m_rear: mt.rear_unsprung_kg,
         m_rider,
         m_limbs: share * rider,
+        head: Some(Head {
+            m_kg: m_head,
+            gyration_m: HEAD_GYRATION_M,
+            neck: fwd.scale(NECK_FROM_RIDER_CG_M[0]) + up.scale(NECK_FROM_RIDER_CG_M[1]),
+            cg: fwd.scale(HEAD_CG_FROM_NECK_M[0]) + up.scale(HEAD_CG_FROM_NECK_M[1]),
+            cam: fwd.scale(CAMERA_FROM_NECK_M[0]) + up.scale(CAMERA_FROM_NECK_M[1]),
+        }),
         i_frame: FRAME_GYRATION_M2.map(|k| k * m_frame),
         i_rider: RIDER_GYRATION_M2.map(|k| k * m_rider),
         wheel_inertia: [mt.front.inertia_kgm2, mt.rear.inertia_kgm2],
@@ -185,6 +194,23 @@ pub fn force_model(bike: &Bike<f64>, p: &Params, linkage: &Linkage, drivetrain: 
     let defl = [front_load / fb.tyre[0].stiffness_n_m, rear_load / fb.tyre[1].stiffness_n_m];
     Ok(ForceModel { bike: fb, spec: ForceSpec::standard(defl), w: ForceWeights::default() })
 }
+
+/// Head and neck as a share of body mass: de Leva (1996) males, 6.94 % (not checked against a
+/// source: the copies reachable on 2026-11-27 were blocked; Isaac, 2026-11-27: about 5.5 kg).
+pub const HEAD_SHARE: f64 = 0.0694;
+/// Full-face helmet with the camera when the sheet has no `rider.helmet_kg`, kg (Isaac,
+/// 2026-11-27: about 1.1 kg), on top of `rider.mass_kg`.
+pub const HELMET_KG: f64 = 1.1;
+/// The head's radius of gyration about its centre of mass, m (a sphere; an estimate).
+pub const HEAD_GYRATION_M: f64 = 0.09;
+/// The neck pivot from the rider body's centre of mass, ahead and above, m (an estimate for an
+/// attack position).
+pub const NECK_FROM_RIDER_CG_M: [f64; 2] = [0.20, 0.35];
+/// The head's centre of mass from the neck pivot, ahead and above, m (an estimate).
+pub const HEAD_CG_FROM_NECK_M: [f64; 2] = [0.03, 0.12];
+/// The helmet camera from the neck pivot, ahead and above, m (Isaac, 2026-11-27: front of the
+/// top, above the eyes; the numbers an estimate).
+pub const CAMERA_FROM_NECK_M: [f64; 2] = [0.08, 0.22];
 
 /// The cog the force model takes the rider to descend in, teeth (Isaac, 2026-11-26: "say the
 /// 14T"); the nearest the cassette has.

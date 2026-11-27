@@ -12,7 +12,7 @@
 use super::objective::{basis, huber2, Objective, Vars, NROW, SENSOR_ROWS};
 use super::bike::NL;
 use super::la::{exp, V3};
-use super::forces::{NBAL, NFL, NFR};
+use super::forces::{NFL, NFR};
 use super::nav::NNAV;
 
 /// What a group of coefficients is.
@@ -311,7 +311,7 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
         // sqrt(k/|r|), so its gradient is the Huber loss's and its curvature the IRLS weight's
         let k = obj.w.huber;
         for r in 0..nt {
-            let k = if r < SENSOR_ROWS { k } else if r >= f0 && r < f0 + NBAL { k_force } else { 0.0 };
+            let k = if r < SENSOR_ROWS { k } else if r >= f0 && r < nt && super::forces::huber_row(r - f0) { k_force } else { 0.0 };
             if k > 0.0 && res[r].abs() > k {
                 ne.loss += 0.5 * huber2(res[r], k);
                 let s = (k / res[r].abs()).sqrt();

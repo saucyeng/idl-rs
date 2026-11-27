@@ -30,6 +30,9 @@
 //! | 18..24 | rider pose priors |
 //! | 24..30 | rider active wrench priors |
 //! | 30..32 | tyre deflection priors (about the static deflection) |
+//! | 32..35 | the head's moment about its centre of mass (F2; 0 without a head) |
+//! | 35..41 | the helmet camera's accelerometer and gyro (F2; 0 without a camera sample) |
+//! | 41..47 | the head's rotation and active neck torque priors |
 //!
 //! The parameters ([`NFP`]) are globals, each a log multiplier on a nominal value (positive
 //! by construction, one prior width for factors): both dampers' curves, seal friction, the
@@ -45,12 +48,12 @@
 use num_dual::Dual64;
 
 use super::bike::{Bike, B_FA, B_LAT, D, F_TWIST, NL, PSI, R_ROLL, R_YAW, S};
-use super::la::{c, M3, Real, V3};
+use super::la::{c, exp, M3, Real, V3};
 use super::readings::{Sample, NZ};
 use crate::sim::laws::{air_force_about_n, friction_n, relu, step, stop_n, DamperLaw, TyreLaw};
 
 /// Force latents per sample.
-pub const NFL: usize = 18;
+pub const NFL: usize = 24;
 /// Front tyre radial deflection, m.
 pub const DEF_F: usize = 0;
 /// Front tyre tangential force along the bike's forward axis, N (+ pushes the bike forward).
@@ -71,9 +74,13 @@ pub const ROT: usize = 9;
 pub const ACT_F: usize = 12;
 /// Rider's active moment, bike axes, N m: latents 15..18.
 pub const ACT_M: usize = 15;
+/// The head's rotation against the rider's body (the neck), bike axes, rad (small): 18..21.
+pub const HEAD: usize = 18;
+/// The rider's active neck torque on his head, bike axes, N m: latents 21..24.
+pub const NECK_ACT: usize = 21;
 
 /// Force parameters (globals), each a log multiplier on [`ForceBike::nominal`].
-pub const NFP: usize = 37;
+pub const NFP: usize = 49;
 /// Fork damper (LSC, HSC, LSR, HSR, knee): parameters 0..5.
 pub const P_FORK_DAMP: usize = 0;
 /// Shock damper, at the shaft: parameters 5..10.
@@ -103,6 +110,26 @@ pub const P_BRAKE_SHIFT: usize = 34;
 /// The rider's limb mass the frame carries, a factor on [`ForceBike::m_limbs`]: 36 (the share
 /// moves the fitted dampers, so it is fitted rather than guessed).
 pub const P_LIMBS: usize = 36;
+/// The neck's spring per axis (bike axes), a factor on 20 N m/rad: 37..40.
+pub const P_NECK_K: usize = 37;
+/// The neck's damper per axis, a factor on 1 N m s/rad: 40..43.
+pub const P_NECK_C: usize = 40;
+/// The helmet camera's mount: a small rotation (rad, additive, not a factor) on the per-clip
+/// estimate its readings were turned by: 43..46.
+pub const P_MOUNT: usize = 43;
+/// The helmet camera's gyro bias, rad/s (additive): 46..49.
+pub const P_CAM_BIAS: usize = 46;
+
+/// Whether force parameter `i` is additive (its value used as it is) rather than a log
+/// multiplier on a nominal value.
+pub fn additive(i: usize) -> bool {
+    (P_MOUNT..P_CAM_BIAS + 3).contains(&i)
+}
+
+/// The value parameter `i` prints as: a factor on the nominal, or an additive value.
+pub fn par_display(i: usize, x: f64) -> f64 {
+    if additive(i) { x } else { x.exp() }
+}
 
 /// Each force parameter's name, in index order.
 pub const PAR_NAMES: [&str; NFP] = [
@@ -114,12 +141,21 @@ pub const PAR_NAMES: [&str; NFP] = [
     "rider c fwd", "rider c lat", "rider c up", "rider c roll", "rider c pitch", "rider c yaw",
     "fork positive volume", "shock positive volume", "fork negative volume", "shock negative volume",
     "rider back under braking", "rider down under braking", "limbs on the frame",
+    "neck k roll", "neck k pitch", "neck k yaw", "neck c roll", "neck c pitch", "neck c yaw",
+    "camera mount roll", "camera mount pitch", "camera mount yaw", "camera gyro bias x", "camera gyro bias y", "camera gyro bias z",
 ];
 
 /// Rows per sample (see the module table).
-pub const NFR: usize = 32;
+pub const NFR: usize = 47;
 /// The balance rows (0..NBAL), the ones Huber weighting applies to.
 pub const NBAL: usize = 14;
+/// The head's balance and the camera's rows (32..41), Huber-weighted like the balances.
+pub const CAM_ROWS: (usize, usize) = (32, 41);
+
+/// Whether force row `r` is Huber-weighted (a balance or a camera row, not a prior).
+pub fn huber_row(r: usize) -> bool {
+    r < NBAL || (CAM_ROWS.0..CAM_ROWS.1).contains(&r)
+}
 
 /// The rear's anti-rise at rear travel `s_m`, percent: how much of the extension the load
 /// transfer of a rear-wheel stop would cause the brake's force (its pull at the contact patch
@@ -201,6 +237,21 @@ impl AirChambers {
     }
 }
 
+/// The rider's head on his body (F2): a ball joint at the neck, the helmet camera on the head.
+#[derive(Clone, Debug)]
+pub struct Head {
+    /// Head, neck share and helmet with camera, kg.
+    pub m_kg: f64,
+    /// Radius of gyration about its centre of mass (a sphere), m.
+    pub gyration_m: f64,
+    /// The neck pivot from the rider body's centre of mass at its neutral pose, IMU0 axes, m.
+    pub neck: V3<f64>,
+    /// The head's centre of mass from the neck pivot, IMU0 axes, m.
+    pub cg: V3<f64>,
+    /// The helmet camera from the neck pivot, IMU0 axes, m.
+    pub cam: V3<f64>,
+}
+
 /// The bike and rider as the force rows see them: everything fixed (D3), IMU0 axes, SI.
 #[derive(Clone, Debug)]
 pub struct ForceBike {
@@ -234,6 +285,8 @@ pub struct ForceBike {
     pub i_frame: [f64; 3],
     /// Rider's inertia, about (fwd, lat, up), kg m^2.
     pub i_rider: [f64; 3],
+    /// The head on the rider's body (F2; None: the head is part of the body).
+    pub head: Option<Head>,
     /// Wheels' spin inertia, front and rear, kg m^2.
     pub wheel_inertia: [f64; 2],
     /// Wheels' rolling radius, m.
@@ -319,6 +372,9 @@ impl ForceSpec {
             scale[d + 2] = 100.0;
         }
         for i in 0..3 {
+            m[NECK_ACT + i] = 4;
+            smooth[NECK_ACT + i] = ACTIVE_SMOOTH;
+            scale[NECK_ACT + i] = 1.0;
             m[ACT_F + i] = 4;
             m[ACT_M + i] = 4;
             smooth[ACT_F + i] = ACTIVE_SMOOTH;
@@ -353,6 +409,12 @@ pub struct ForceWeights {
     pub act_n: f64,
     /// Active moment prior, N m.
     pub act_nm: f64,
+    /// The head's moment rows, N m.
+    pub head_nm: f64,
+    /// The helmet camera's accelerometer rows, m/s^2, and gyro rows, rad/s.
+    pub cam: [f64; 2],
+    /// The head's rotation prior against the body, rad, and the active neck torque's, N m.
+    pub head_prior: [f64; 2],
     /// The rider's stroke each way from his neutral pose, m: soft stops past it (Isaac,
     /// 2026-11-27: arms and legs travel about 0.33 m; the body's actuators bounded, not weak).
     pub stroke_m: f64,
@@ -377,6 +439,9 @@ impl Default for ForceWeights {
         // the limbs' share: tight until the helmet (F2) sees the rider; free, it runs to 0 and
         // takes the fork's damping with it (2026-11-27: fork LSR 0.00 on 11/21)
         par_sigma[P_LIMBS] = 0.2;
+        // the camera's mount correction, rad, and its gyro bias, rad/s (additive)
+        par_sigma[P_MOUNT..P_MOUNT + 3].copy_from_slice(&[0.1; 3]);
+        par_sigma[P_CAM_BIAS..P_CAM_BIAS + 3].copy_from_slice(&[0.02; 3]);
         ForceWeights {
             unsprung_n: 20.0,
             rider_n: 50.0,
@@ -389,6 +454,9 @@ impl Default for ForceWeights {
             rot_rad: 0.3,
             act_n: 300.0,
             stroke_m: 0.165,
+            head_nm: 2.0,
+            cam: [2.0, 0.1],
+            head_prior: [0.3, 5.0],
             act_nm: 60.0,
             defl_m: 0.02,
             par_sigma,
@@ -413,6 +481,10 @@ pub struct ForceModel {
 pub struct ForceWindow {
     /// Ground speed per sample (GPS), m/s: the wheels' spin.
     pub speed_mps: Vec<f64>,
+    /// The helmet camera's accelerometer (m/s^2) and gyro (rad/s) per sample, turned by its
+    /// clip's mount estimate into the frame pod's axes at the rider's neutral pose (empty, or
+    /// None at a sample: no camera there).
+    pub cam: Vec<Option<[f64; 6]>>,
 }
 
 /// One sample's measurements the force rows read.
@@ -428,6 +500,8 @@ pub struct ForceMeas {
     pub speed: f64,
     /// Its rate, m/s^2.
     pub speed_rate: f64,
+    /// The helmet camera's reading here ([`ForceWindow::cam`]).
+    pub cam: Option<[f64; 6]>,
 }
 
 /// The kinematics the rows need from the core latents: pod rotations (pod -> IMU0), axle
@@ -589,15 +663,56 @@ pub fn rows<S: Real>(m: &ForceModel, k: &Kin<S>, x: &ForceIn<S>, meas: &ForceMea
     // the limbs' share between the frame and the body, fitted
     let moved = (par(P_LIMBS) - 1.0) * fb.m_limbs;
     let (m_frame, m_rider) = (moved + fb.m_frame, -moved + fb.m_rider);
-    let rf_res = comps(f_rider.scale(m_rider) - bush_f - act_f);
     let wb = w0 + thd;
     let ab = a0 + thdd + w0.cross(thd);
     let m_rider_in = inertia(fb.i_rider, ab) + wb.cross(inertia(fb.i_rider, wb));
-    let rm_res = comps(m_rider_in - bush_m - act_m);
+    // the head (F2): a ball joint at the neck on the body; the neck's force on the head is its
+    // mass times its specific force, its torque a spring and damper plus an active part
+    let sf_at = |p: V3<S>, v: V3<S>, a: V3<S>| f0 + a0.cross(p) + w0.cross(w0.cross(p)) + w0.cross(v).scale(c(2.0)) + a;
+    let mut neck_on_body = (V3::<S>::zero(), V3::<S>::zero());
+    let mut head_sys = (V3::<S>::zero(), V3::<S>::zero());
+    if let Some(h) = &fb.head {
+        let th_b = bv(f[ROT], f[ROT + 1], f[ROT + 2]);
+        let (th_h, thd_h, thdd_h) = (bv(f[HEAD], f[HEAD + 1], f[HEAD + 2]), bv(fd[HEAD], fd[HEAD + 1], fd[HEAD + 2]), bv(fdd[HEAD], fdd[HEAD + 1], fdd[HEAD + 2]));
+        let (rb, rh) = (exp(th_b), exp(th_h));
+        let n0 = rb * lift(h.neck);
+        let (pn, vn, an) = (pb + n0, dpd + thd.cross(n0), dpdd + thdd.cross(n0) + thd.cross(thd.cross(n0)));
+        let (wr, ar) = (thd + thd_h, thdd + thdd_h);
+        let point = |off: V3<f64>| {
+            let o = rb * (rh * lift(off));
+            (pn + o, vn + wr.cross(o), an + ar.cross(o) + wr.cross(wr.cross(o)))
+        };
+        let (ph, vh, ahh) = point(h.cg);
+        let f_neck = sf_at(ph, vh, ahh).scale(c(h.m_kg));
+        let w_h = w0 + wr;
+        let a_h = a0 + ar + w0.cross(wr);
+        let ih = h.m_kg * h.gyration_m * h.gyration_m;
+        let neck = |i: usize| -(par(P_NECK_K + i) * f[HEAD + i] + par(P_NECK_C + i) * fd[HEAD + i]);
+        let tau = bv(neck(0), neck(1), neck(2)) + bv(f[NECK_ACT], f[NECK_ACT + 1], f[NECK_ACT + 2]);
+        let hm = comps(a_h.scale(c(ih)) - tau - (pn - ph).cross(f_neck));
+        for i in 0..3 {
+            r[32 + i] = hm[i] * (1.0 / w.head_nm);
+        }
+        neck_on_body = (f_neck, (pn - pb).cross(f_neck) + tau);
+        head_sys = (f_neck, ph.cross(f_neck) + a_h.scale(c(ih)));
+        if let Some(cm) = meas.cam {
+            let (pc, vc, ac) = point(h.cam);
+            let mount = exp(V3([x.par[P_MOUNT], x.par[P_MOUNT + 1], x.par[P_MOUNT + 2]]));
+            let rc = (rb * rh * mount).t();
+            let acc = rc * sf_at(pc, vc, ac);
+            let gyr = rc * w_h + V3([x.par[P_CAM_BIAS], x.par[P_CAM_BIAS + 1], x.par[P_CAM_BIAS + 2]]);
+            for i in 0..3 {
+                r[35 + i] = (acc.0[i] - cm[i]) * (1.0 / w.cam[0]);
+                r[38 + i] = (gyr.0[i] - cm[3 + i]) * (1.0 / w.cam[1]);
+            }
+        }
+    }
+    let rf_res = comps(f_rider.scale(m_rider) - bush_f - act_f + neck_on_body.0);
+    let rm_res = comps(m_rider_in - bush_m - act_m + neck_on_body.1);
     // whole system
     let ps = lift(fb.frame_cg);
     let f_frame = f0 + a0.cross(ps) + w0.cross(w0.cross(ps));
-    let sf = comps(f_frame.scale(m_frame) + uf.scale(c(fb.m_front)) + ur.scale(c(fb.m_rear)) + f_rider.scale(m_rider) - tf - tr);
+    let sf = comps(f_frame.scale(m_frame) + uf.scale(c(fb.m_front)) + ur.scale(c(fb.m_rear)) + f_rider.scale(m_rider) + head_sys.0 - tf - tr);
     let spin = up.cross(fwd).unit();
     let wheel_h = |i: usize| {
         let h = spin.scale(c(fb.wheel_inertia[i] * meas.speed / fb.wheel_radius[i]));
@@ -607,7 +722,7 @@ pub fn rows<S: Real>(m: &ForceModel, k: &Kin<S>, x: &ForceIn<S>, meas: &ForceMea
     let pcr = k.ar - up.scale(-f[DEF_R] + fb.wheel_radius[1]);
     let sm = comps(
         ps.cross(f_frame.scale(m_frame)) + k.af.cross(uf.scale(c(fb.m_front))) + k.ar.cross(ur.scale(c(fb.m_rear))) + pb.cross(f_rider.scale(m_rider))
-            + inertia(fb.i_frame, a0) + w0.cross(inertia(fb.i_frame, w0)) + m_rider_in + wheel_h(0) + wheel_h(1)
+            + inertia(fb.i_frame, a0) + w0.cross(inertia(fb.i_frame, w0)) + m_rider_in + head_sys.1 + wheel_h(0) + wheel_h(1)
             - pcf.cross(tf) - pcr.cross(tr),
     );
     for i in 0..3 {
@@ -633,6 +748,10 @@ pub fn rows<S: Real>(m: &ForceModel, k: &Kin<S>, x: &ForceIn<S>, meas: &ForceMea
     }
     r[30] = (f[DEF_F] - m.spec.init[DEF_F]) * (1.0 / w.defl_m);
     r[31] = (f[DEF_R] - m.spec.init[DEF_R]) * (1.0 / w.defl_m);
+    for i in 0..3 {
+        r[41 + i] = f[HEAD + i] * (1.0 / w.head_prior[0]);
+        r[44 + i] = f[NECK_ACT + i] * (1.0 / w.head_prior[1]);
+    }
     (r, Forces { tyre: [tf, tr], normal: [nf, nr], fork, shock, bush: [bush_f, bush_m] })
 }
 
@@ -751,11 +870,11 @@ pub fn static_misfit(m: &ForceModel, bike: &Bike<f64>) -> [f64; NBAL] {
     q[S] = 0.5 * (lo + hi);
     let k = kin(fb, bike, &q);
     let up_g = fb.up.scale(g);
-    let meas = ForceMeas { frame: up_g.0, fork: (k.rf.t() * up_g).0, rear: (k.rr.t() * up_g).0, speed: 0.0, speed_rate: 0.0 };
+    let meas = ForceMeas { frame: up_g.0, fork: (k.rf.t() * up_g).0, rear: (k.rr.t() * up_g).0, speed: 0.0, speed_rate: 0.0, cam: None };
     let mut f = [0.0; NFL];
     f[DEF_F] = m.spec.init[DEF_F];
     f[DEF_R] = m.spec.init[DEF_R];
-    f[POS + 2] = -fb.m_rider * g / fb.nominal[P_RIDER_K + 2];
+    f[POS + 2] = -(fb.m_rider + fb.head.as_ref().map_or(0.0, |h| h.m_kg)) * g / fb.nominal[P_RIDER_K + 2];
     let x = ForceIn { d: [q[D], 0.0], s: [q[S], 0.0], w0: V3::zero(), a0: V3::zero(), f, fd: [0.0; NFL], fdd: [0.0; NFL], par: [0.0; NFP] };
     let r = rows(m, &k, &x, &meas).0;
     let w = &m.w;
@@ -814,6 +933,7 @@ pub(crate) mod synth {
             m_limbs: 0.0,
             i_frame: [0.3, 1.2, 1.0],
             i_rider: [5.0, 6.0, 2.0],
+            head: None,
             wheel_inertia: [0.18, 0.2],
             wheel_radius: [0.37, 0.37],
             fork: AirChambers { area_m2: 8.0e-4, positive_m3: 1.6e-4, negative_m3: 8.0e-5, gauge_pa: 0.0, rest_m: 0.05 },
@@ -1001,7 +1121,7 @@ pub(crate) mod synth {
             (f[0][POS + i], f[1][POS + i], f[2][POS + i]) = (st.pose[i], st.pose_rate[i], u[8 + i]);
             f[0][ACT_F + i] = inp.act[i];
         }
-        (core, f, ForceMeas { frame: f0.0, fork: [0.0; 3], rear: [0.0; 3], speed: inp.speed[0], speed_rate: inp.speed[1] })
+        (core, f, ForceMeas { frame: f0.0, fork: [0.0; 3], rear: [0.0; 3], speed: inp.speed[0], speed_rate: inp.speed[1], cam: None })
     }
 
     /// One evaluation at `t` with unknowns `u`.
@@ -1158,7 +1278,7 @@ pub(crate) mod synth {
             mask_rear: vec![true; n],
             air: None,
             nav: None,
-            forces: Some(ForceWindow { speed_mps: truth.speed.iter().map(|s| s[0]).collect() }),
+            forces: Some(ForceWindow { speed_mps: truth.speed.iter().map(|s| s[0]).collect(), cam: vec![] }),
         }
     }
 
@@ -1171,7 +1291,7 @@ pub(crate) mod synth {
         let par: [f64; NFP] = std::array::from_fn(|i| v.glob[g0 + i]);
         let k = kin(&m.bike, &obj.bike, &s.q);
         let x = ForceIn { d: [s.q[D], s.qd[D]], s: [s.q[S], s.qd[S]], w0: s.w0, a0: s.a0, f: f[0], fd: f[1], fdd: f[2], par };
-        let meas = ForceMeas { frame: obj.win.frame_accel[t], fork: obj.win.fork_accel[t], rear: obj.win.rear_accel[t], speed: 0.0, speed_rate: 0.0 };
+        let meas = ForceMeas { frame: obj.win.frame_accel[t], fork: obj.win.fork_accel[t], rear: obj.win.rear_accel[t], speed: 0.0, speed_rate: 0.0, cam: None };
         rows(m, &k, &x, &meas).1.normal
     }
 
@@ -1250,6 +1370,39 @@ pub(crate) mod synth {
         }
     }
 
+    /// A head for a test: the setup's geometry on `fb`'s axes.
+    fn test_head(fb: &ForceBike) -> Head {
+        use super::super::force_setup::{CAMERA_FROM_NECK_M, HEAD_CG_FROM_NECK_M, HEAD_GYRATION_M, NECK_FROM_RIDER_CG_M};
+        let at = |v: [f64; 2]| fb.fwd.scale(v[0]) + fb.up.scale(v[1]);
+        Head { m_kg: 6.6, gyration_m: HEAD_GYRATION_M, neck: at(NECK_FROM_RIDER_CG_M), cg: at(HEAD_CG_FROM_NECK_M), cam: at(CAMERA_FROM_NECK_M) }
+    }
+
+    #[test]
+    fn helmet_camera_still_rider_on_a_turning_bike_reads_the_frames_motion() {
+        // Arrange: the rider and his head at their neutral pose, the bike turning steadily
+        let (bike, mut m) = model();
+        m.bike.head = Some(test_head(&m.bike));
+        let h = m.bike.head.clone().unwrap();
+        let truth = ride(&bike, &m, 40, 1.0 / 400.0, 0.5);
+        let mut s = truth.core[30];
+        s.w0 = V3([0.3, -0.2, 0.5]);
+        s.a0 = V3::zero();
+        let f0 = s.f_meas;
+        let pc = m.bike.rider_cg + h.neck + h.cam;
+        let expect = f0 + s.w0.cross(s.w0.cross(pc));
+        let z = [0.0; NFL];
+        let meas = ForceMeas { frame: f0.0, fork: [0.0; 3], rear: [0.0; 3], speed: 0.0, speed_rate: 0.0, cam: Some([expect.0[0], expect.0[1], expect.0[2], s.w0.0[0], s.w0.0[1], s.w0.0[2]]) };
+        let bike_d = bike.map(Dual64::from);
+
+        // Act
+        let j = force_rows(&m, &bike, &bike_d, &s, &z, &z, &z, &[0.0; NFP], &meas, false);
+
+        // Assert: the camera's six rows read nothing to explain
+        for r in 35..41 {
+            assert!(j.r[r].abs() < 1e-9, "row {r}: {}", j.r[r]);
+        }
+    }
+
     #[test]
     fn force_rows_jacobian_matches_finite_differences() {
         // Arrange: a moving sample of the exact ride, parameters off their nominal; the rear
@@ -1261,12 +1414,20 @@ pub(crate) mod synth {
         m.bike.cage_angle = vec![0.945, 0.870, 2.64, -2.43];
         m.bike.cage_moment_nm = [1.27, 1.58];
         m.bike.m_limbs = 5.0;
+        // and the head turned on its neck, the helmet camera reading something
+        m.bike.head = Some(test_head(&m.bike));
         let t = 30;
         let s = truth.core[t];
-        let [mut f, fd, fdd] = truth.f[t];
+        let [mut f, mut fd, mut fdd] = truth.f[t];
         f[TAN_R] = -300.0;
+        for i in 0..3 {
+            f[HEAD + i] = 0.05 * (i as f64 + 1.0);
+            fd[HEAD + i] = 0.4 - 0.3 * i as f64;
+            fdd[HEAD + i] = 3.0 * (i as f64 - 1.0);
+            f[NECK_ACT + i] = 1.5 - i as f64;
+        }
         let p = truth.readings[t];
-        let meas = ForceMeas { frame: s.f_meas.0, fork: [p[6], p[7], p[8]], rear: [p[12], p[13], p[14]], speed: truth.speed[t][0], speed_rate: truth.speed[t][1] };
+        let meas = ForceMeas { frame: s.f_meas.0, fork: [p[6], p[7], p[8]], rear: [p[12], p[13], p[14]], speed: truth.speed[t][0], speed_rate: truth.speed[t][1], cam: Some([0.5, -1.0, 9.0, 0.1, -0.2, 0.3]) };
         let par: [f64; NFP] = std::array::from_fn(|i| 0.1 * ((i % 5) as f64 - 2.0));
         let bike_d = bike.map(Dual64::from);
         let at = |s: &Sample<f64>, f: &[f64; NFL], fd: &[f64; NFL], fdd: &[f64; NFL], par: &[f64; NFP]| force_rows(&m, &bike, &bike_d, s, f, fd, fdd, par, &meas, false).r;

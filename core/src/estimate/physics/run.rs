@@ -53,6 +53,9 @@ pub struct Config {
     /// Solve only inside these spans, channel time in us (None: all riding). A prototyping
     /// aid: the force model tried on the descents alone (`IDL_PHYSICS_LAPS`).
     pub only_us: Option<Vec<(i64, i64)>>,
+    /// The helmet camera on the ride's grid (F2): accelerometer m/s^2 and gyro rad/s per sample,
+    /// turned into the frame pod's axes by each clip's mount estimate (None: no camera).
+    pub camera: Option<Vec<Option<[f64; 6]>>>,
     /// Worker threads for the window solves (1: none).
     pub threads: usize,
     /// Noise levels and priors.
@@ -76,6 +79,7 @@ impl Default for Config {
             force_id_window_s: 6.0,
             force_id_iters: 60,
             only_us: None,
+            camera: None,
             threads: default_threads(),
             weights: Weights::default(),
         }
@@ -287,7 +291,7 @@ pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
                 spec.nav = Some(NavSpec::default());
             }
             if let Some(sp) = &speed {
-                win.forces = Some(ForceWindow { speed_mps: sp[a..b].to_vec() });
+                win.forces = Some(ForceWindow { speed_mps: sp[a..b].to_vec(), cam: cfg.camera.as_ref().map_or(vec![], |c| c[a..b].to_vec()) });
             }
             let mut obj = Objective::new(bike.clone(), win, spec, cfg.weights.clone(), bias_centre);
             obj.threads = inner;
@@ -418,7 +422,7 @@ pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
             let (a, b0, _, _) = plan[i * plan.len() / k];
             let b = (a + len).min(b0);
             let mut win = window(r, a, b, cfg.air_anchor);
-            win.forces = Some(ForceWindow { speed_mps: speed[a..b].to_vec() });
+            win.forces = Some(ForceWindow { speed_mps: speed[a..b].to_vec(), cam: cfg.camera.as_ref().map_or(vec![], |c| c[a..b].to_vec()) });
             let o = Objective::new(bike.clone(), win, Spec::standard(b - a, r.input.dt), cfg.weights.clone(), bias_centre).with_forces(m.clone());
             Objective { threads: (cfg.threads / k).max(1), ..o }
         })
@@ -440,7 +444,7 @@ pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
             Ok((cov, ng)) => {
                 let (g0, p) = (objs[0].force_glob0(), objs[0].force_par(&vs[0]));
                 let sig = |i: usize| cov[(g0 + i) * ng + g0 + i].max(0.0).sqrt();
-                let txt: Vec<String> = super::forces::PAR_NAMES.iter().enumerate().map(|(i, n)| format!("{n} {:.2} (x/ {:.2})", p[i].exp(), sig(i).exp())).collect();
+                let txt: Vec<String> = super::forces::PAR_NAMES.iter().enumerate().map(|(i, n)| if super::forces::additive(i) { format!("{n} {:+.3} (+- {:.3})", p[i], sig(i)) } else { format!("{n} {:.2} (x/ {:.2})", p[i].exp(), sig(i).exp()) }).collect();
                 eprintln!("  force parameters, factor on the nominal (x/ one sigma): {}", txt.join(", "));
                 // the pairs the data cannot tell apart: the strongest correlations
                 let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
@@ -463,10 +467,10 @@ pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
 /// core priors, then each force row group, then the smoothness.
 pub fn row_group_loss(o: &Objective, v: &Vars) -> String {
     let ctx = o.ctx(&v.glob, false);
-    let groups = [("fork", 0, 1), ("rear", 1, 2), ("riderF", 2, 5), ("riderM", 5, 8), ("sysF fwd", 8, 9), ("sysF lat", 9, 10), ("sysF up", 10, 11), ("sysM", 11, 14), ("tyreT", 14, 18), ("pose", 18, 24), ("act", 24, 30), ("defl", 30, 32)];
+    let groups = [("fork", 0, 1), ("rear", 1, 2), ("riderF", 2, 5), ("riderM", 5, 8), ("sysF fwd", 8, 9), ("sysF lat", 9, 10), ("sysF up", 10, 11), ("sysM", 11, 14), ("tyreT", 14, 18), ("pose", 18, 24), ("act", 24, 30), ("defl", 30, 32), ("head", 32, 35), ("camA", 35, 38), ("camG", 38, 41), ("headP", 41, 47)];
     let k = o.forces.as_ref().map_or(0.0, |m| m.w.huber);
     let (mut sensor, mut prior) = (0.0, 0.0);
-    let mut fg = [0.0; 12];
+    let mut fg = [0.0; 16];
     for t in 0..o.spec.n {
         let s = o.sample(v, t);
         let r = o.sample_residuals(&ctx, &s, &v.glob, t, false).r;
@@ -474,7 +478,7 @@ pub fn row_group_loss(o: &Objective, v: &Vars) -> String {
         prior += r[super::objective::SENSOR_ROWS..].iter().map(|x| x * x).sum::<f64>();
         if let Some(fj) = o.force_residuals(&ctx, v, &s, t, false) {
             for (g, &(_, a, b)) in groups.iter().enumerate() {
-                fg[g] += fj.r[a..b].iter().map(|&x| if b <= super::forces::NBAL { super::objective::huber2(x, k) } else { x * x }).sum::<f64>();
+                fg[g] += (a..b).map(|i| if super::forces::huber_row(i) { super::objective::huber2(fj.r[i], k) } else { fj.r[i] * fj.r[i] }).sum::<f64>();
             }
         }
     }

@@ -461,7 +461,7 @@ impl Objective {
         let (a, b) = (t.saturating_sub(1), (t + 1).min(n - 1));
         let speed_rate = if b > a { (sp[b] - sp[a]) / ((b - a) as f64 * self.spec.dt) } else { 0.0 };
         let finite = |x: f64| if x.is_finite() { x } else { 0.0 };
-        Some(ForceMeas { frame: self.win.frame_accel[t], fork: self.win.fork_accel[t], rear: self.win.rear_accel[t], speed: finite(sp[t]), speed_rate: finite(speed_rate) })
+        Some(ForceMeas { frame: self.win.frame_accel[t], fork: self.win.fork_accel[t], rear: self.win.rear_accel[t], speed: finite(sp[t]), speed_rate: finite(speed_rate), cam: fw.cam.get(t).copied().flatten() })
     }
 
     /// The force parameters (log multipliers) in `v`.
@@ -626,8 +626,7 @@ impl Objective {
             }
             if let Some(fj) = self.force_residuals(&ctx, v, &s, t, false) {
                 let k = self.forces.as_ref().map_or(0.0, |m| m.w.huber);
-                l += fj.r[..NBAL].iter().map(|&x| huber2(x, k)).sum::<f64>();
-                l += fj.r[NBAL..].iter().map(|x| x * x).sum::<f64>();
+                l += fj.r.iter().enumerate().map(|(i, &x)| if super::forces::huber_row(i) { huber2(x, k) } else { x * x }).sum::<f64>();
             }
         }
         let k0 = self.smooth_weight();

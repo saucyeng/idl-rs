@@ -92,7 +92,7 @@ pub fn estimate_physics(ctx: &Ctx, m: &ArgMatches) -> Result<VerbOutput, CliErro
         line("front", &r.travel[0]),
         line("rear", &r.travel[1]),
         match &r.force_par {
-            Some(p) => format!("  force parameters (factor on the nominal): {}", p.iter().map(|(n, x)| format!("{n} {:.2}", x.exp())).collect::<Vec<_>>().join(", ")),
+            Some(p) => format!("  force parameters (factor on the nominal; the camera's mount, rad, and gyro bias, rad/s, as values): {}", p.iter().enumerate().map(|(i, (n, x))| format!("{n} {:.2}", idl_rs::estimate::physics::forces::par_display(i, *x))).collect::<Vec<_>>().join(", ")),
             None => String::new(),
         },
         r.force_summary.iter().map(|(n, s)| format!("  {n}: 1% {:.0}  median {:.0}  99% {:.0}", s.p01, s.median, s.p99)).collect::<Vec<_>>().join("\n"),
