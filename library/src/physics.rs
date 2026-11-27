@@ -392,6 +392,12 @@ pub fn estimate_physics_with(
             }
         }
     }
+    // IDL_FORCE_GROUND (prototyping): the ground tie under both tyres (F4), off by default until
+    // navigation's heights can carry it
+    if let (Some(m), Some(_)) = (cfg.forces.as_mut(), std::env::var_os("IDL_FORCE_GROUND")) {
+        m.w.ground = Some(idl_rs::estimate::physics::ground::GroundWeights::default());
+        eprintln!("IDL_FORCE_GROUND: the ground tie on");
+    }
     if let (Some(m), Some(_)) = (&cfg.forces, std::env::var_os("IDL_FORCE_DEBUG")) {
         eprintln!("force model static misfit (N, N m): {:?}", idl_rs::estimate::physics::forces::static_misfit(m, &bk).map(|x| x.round()));
         eprintln!("force model: {:?}", m.bike);

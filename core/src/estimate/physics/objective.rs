@@ -27,7 +27,7 @@
 
 use super::bike::{Bike, B_FA, B_LAT, D, F_ROT, F_TRANS, F_TWIST, NL, R_ROLL, R_YAW, S};
 use super::la::{exp, M3, V3};
-use super::forces::{force_rows, kin, rows as force_rows_at, ForceIn, ForceJac, ForceMeas, ForceModel, ForceWindow, Forces, NBAL, NFL, NFP};
+use super::forces::{force_rows, kin, rows as force_rows_at, ForceIn, ForceJac, ForceMeas, ForceModel, ForceWindow, Forces, GroundMeas as ForceGround, NBAL, NFL, NFP};
 use super::nav::{nav_rows, NavJac, NavSample, NavSpec, NavWeights, NavWindow};
 use super::readings::{pod_readings, readings_and_jacobian, Sample, NR, NZ};
 use super::setup::{geometry, with_geometry, Geometry, GEOMETRY_SIGMA};
@@ -214,6 +214,9 @@ pub struct Vars {
     pub vel: [Vec<f64>; 3],
     /// Force latent spline coefficients, one row per force latent (empty with the force model off).
     pub frc: Vec<Vec<f64>>,
+    /// The ground profile under both tyres (F4): not a Gauss-Newton unknown, refitted before each
+    /// iteration ([`Objective::refit_ground`]); None until the first refit, or with the tie off.
+    pub ground: Option<super::ground::GroundFit>,
 }
 
 /// A window's objective: bike, measurements, layout, weights and priors.
@@ -354,7 +357,7 @@ impl Objective {
             Some(m) if self.win.forces.is_some() => (0..NFL).map(|i| vec![0.0; self.spec.n_knots(m.spec.m[i])]).collect(),
             _ => Vec::new(),
         };
-        Vars { lvl, frame, glob: self.glob_centre.clone(), att, vel, frc }
+        Vars { lvl, frame, glob: self.glob_centre.clone(), att, vel, frc, ground: None }
     }
 
     /// The navigation layout and measurements, when both are on.
@@ -453,15 +456,87 @@ impl Objective {
         Some(out)
     }
 
-    /// The force rows' measurements at sample `t` (None with the force model off).
-    pub fn force_meas(&self, t: usize) -> Option<ForceMeas> {
+    /// The force rows' measurements at sample `t` (None with the force model off), with the
+    /// ground tie's inputs where the window has them and `v` a ground profile.
+    pub fn force_meas(&self, v: &Vars, t: usize) -> Option<ForceMeas> {
         let (_, fw) = self.force_on()?;
+        let ground = fw.ground.as_ref().zip(v.ground.as_ref()).map(|(gw, gf)| ForceGround {
+            up: gw.up[t],
+            z_m: gw.z_m[t],
+            h_m: std::array::from_fn(|i| gf.height(gw.s_m[t] + gw.offset_m[i])),
+            sigma_m: std::array::from_fn(|i| if gf.on[t][i] { gw.sigma_m[t][i] } else { f64::INFINITY }),
+        });
         let n = self.spec.n;
         let sp = &fw.speed_mps;
         let (a, b) = (t.saturating_sub(1), (t + 1).min(n - 1));
         let speed_rate = if b > a { (sp[b] - sp[a]) / ((b - a) as f64 * self.spec.dt) } else { 0.0 };
         let finite = |x: f64| if x.is_finite() { x } else { 0.0 };
-        Some(ForceMeas { frame: self.win.frame_accel[t], fork: self.win.fork_accel[t], rear: self.win.rear_accel[t], speed: finite(sp[t]), speed_rate: finite(speed_rate), cam: fw.cam.get(t).copied().flatten() })
+        Some(ForceMeas { frame: self.win.frame_accel[t], fork: self.win.fork_accel[t], rear: self.win.rear_accel[t], speed: finite(sp[t]), speed_rate: finite(speed_rate), cam: fw.cam.get(t).copied().flatten(), ground })
+    }
+
+    /// The ground profile under each tyre at sample `t` (F4): its first coefficient, the four
+    /// weights and the tie's 1 / sigma (1/m); None where that tyre's row is off.
+    pub fn tie_basis(&self, v: &Vars, t: usize) -> [Option<(usize, [f64; 4], f64)>; 2] {
+        let none = [None, None];
+        let (Some((_, fw)), Some(gf)) = (self.force_on(), &v.ground) else { return none };
+        let Some(gw) = &fw.ground else { return none };
+        std::array::from_fn(|i| {
+            let sig = gw.sigma_m[t][i];
+            (gf.on[t][i] && sig.is_finite()).then(|| {
+                let (k, w) = gf.span(gw.s_m[t] + gw.offset_m[i]);
+                (k, w, 1.0 / sig)
+            })
+        })
+    }
+
+    /// The ground profile's curvature prior's weight per second difference (1/m^2; F4), None
+    /// without the tie.
+    pub fn ground_curvature_weight(&self) -> Option<f64> {
+        let (m, _) = self.force_on()?;
+        self.has_ground().then(|| 1.0 / m.w.ground.as_ref().map_or(1.0, |g| g.curvature_m).powi(2))
+    }
+
+    /// Half the ground profile's curvature prior (F4; 0 without a profile): counted with the
+    /// tie, since the refit minimises the two together.
+    pub fn ground_prior_loss(&self, v: &Vars) -> f64 {
+        let (Some(wc), Some(g)) = (self.ground_curvature_weight(), &v.ground) else { return 0.0 };
+        0.5 * wc * g.coef.windows(3).map(|c| (c[0] - 2.0 * c[1] + c[2]).powi(2)).sum::<f64>()
+    }
+
+    /// Whether the ground tie (F4) runs in this window: the force model with its settings and
+    /// the window with the tie's inputs.
+    pub fn has_ground(&self) -> bool {
+        self.force_on().is_some_and(|(m, fw)| m.w.ground.is_some() && fw.ground.is_some())
+    }
+
+    /// Refits the ground profile in `v` to both tyres' patch heights at `v` (F4): each tyre that
+    /// carries at least the minimum normal force, where its tie is on, weighted by the tie's
+    /// sigma, Huber like the rows. Nothing without the tie's inputs.
+    pub fn refit_ground(&self, v: &mut Vars) {
+        let Some((m, fw)) = self.force_on() else { return };
+        let (Some(gw), Some(w)) = (&fw.ground, &m.w.ground) else { return };
+        let ctx = self.ctx(&v.glob, false);
+        let par = self.force_par(v);
+        // the patch heights do not depend on the profile: any profile will do for the rows
+        let flat = super::ground::GroundFit { s0_m: 0.0, knot_m: 1.0, coef: vec![0.0; 4], on: vec![[true; 2]; self.spec.n] };
+        let probe = Vars { ground: Some(flat), ..v.clone() };
+        let mut patches = Vec::with_capacity(2 * self.spec.n);
+        let mut on = vec![[false; 2]; self.spec.n];
+        for t in 0..self.spec.n {
+            let s = self.sample(v, t);
+            let Some(f) = self.force_inputs(v, t) else { return };
+            let Some(meas) = self.force_meas(&probe, t) else { return };
+            let k = kin(&m.bike, &ctx.bike_f, &s.q);
+            let x = ForceIn { d: [s.q[D], s.qd[D]], s: [s.q[S], s.qd[S]], w0: s.w0, a0: s.a0, f: f[0], fd: f[1], fdd: f[2], par };
+            let fo = force_rows_at(m, &k, &x, &meas).1;
+            for i in 0..2 {
+                on[t][i] = fo.normal[i] >= w.min_normal_n;
+                if on[t][i] && gw.sigma_m[t][i].is_finite() {
+                    patches.push(super::ground::Patch { s_m: gw.s_m[t] + gw.offset_m[i], z_m: fo.patch_z[i], sigma_m: gw.sigma_m[t][i] });
+                }
+            }
+        }
+        v.ground = super::ground::fit_profile(&patches, w.knot_m, w.curvature_m, m.w.huber).map(|(s0_m, coef)| super::ground::GroundFit { s0_m, knot_m: w.knot_m, coef, on });
     }
 
     /// The force parameters (log multipliers) in `v`.
@@ -478,7 +553,7 @@ impl Objective {
         let f = self.force_inputs(v, t)?;
         let k = kin(&m.bike, &ctx.bike_f, &s.q);
         let x = ForceIn { d: [s.q[D], s.qd[D]], s: [s.q[S], s.qd[S]], w0: s.w0, a0: s.a0, f: f[0], fd: f[1], fdd: f[2], par: self.force_par(v) };
-        Some((force_rows_at(m, &k, &x, &self.force_meas(t)?).1, f))
+        Some((force_rows_at(m, &k, &x, &self.force_meas(v, t)?).1, f))
     }
 
     /// The force rows at sample `t` (None with the force model off). Where either unsprung
@@ -486,7 +561,7 @@ impl Objective {
     pub fn force_residuals(&self, ctx: &Ctx, v: &Vars, s: &Sample<f64>, t: usize, jac: bool) -> Option<ForceJac> {
         let (m, _) = self.force_on()?;
         let f = self.force_inputs(v, t)?;
-        let meas = self.force_meas(t)?;
+        let meas = self.force_meas(v, t)?;
         let par = self.force_par(v);
         let mut out = force_rows(m, &ctx.bike_f, &ctx.bike_d, s, &f[0], &f[1], &f[2], &par, &meas, jac);
         if !(self.win.mask_fork[t] && self.win.mask_rear[t]) {
@@ -629,6 +704,7 @@ impl Objective {
                 l += fj.r.iter().enumerate().map(|(i, &x)| if super::forces::huber_row(i) { huber2(x, k) } else { x * x }).sum::<f64>();
             }
         }
+        l += 2.0 * self.ground_prior_loss(v);
         let k0 = self.smooth_weight();
         let frc_smooth = |i: usize| self.forces.as_ref().map_or(1.0, |m| m.spec.smooth[i].sqrt());
         let rows = v.lvl.iter().flatten().map(|r| (r, 1.0)).chain(v.frc.iter().enumerate().map(|(i, r)| (r, frc_smooth(i))));

@@ -5,6 +5,7 @@
 
 use super::bike::{Bike, B_FA, B_LAT, D, F_ROT, F_TRANS, F_TWIST, NL, PSI, R_ROLL, R_YAW, S};
 use super::forces::{ForceModel, ForceWindow, ACT_F, ACT_M, DEF_F, DEF_R, LAT_F, LAT_R, NFP, TAN_F, TAN_R};
+use super::ground::{ground_window, NavPoint};
 use super::la::{M3, V3};
 use super::nav::{GpsFix, NavSpec, NavStart, NavWindow};
 use super::objective::{Ctx, Objective, Spec, Vars, Weights, NG};
@@ -242,12 +243,15 @@ pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
     use std::sync::atomic::{AtomicUsize, Ordering};
     let plan = plan(r, cfg);
     let finished = AtomicUsize::new(0);
-    let gps: Option<Vec<Option<GpsFix>>> = cfg.nav.then(|| gps_on_grid(r, gps_latency(r, bike)));
+    // the ground tie (F4) needs navigation in every force window, with or without its outputs
+    let ground = cfg.forces.as_ref().is_some_and(|m| m.w.ground.is_some());
+    let gps_all: Option<Vec<Option<GpsFix>>> = (cfg.nav || ground).then(|| gps_on_grid(r, gps_latency(r, bike)));
+    let gps = if cfg.nav { gps_all.clone() } else { None };
     let axes = bike_axes(bike);
     // the force model: its parameters identified first, then frozen for every window
     let speed: Option<Vec<f64>> = cfg.forces.as_ref().map(|_| speed_on_grid(r, gps_latency(r, bike)));
     let force_par = match (&cfg.forces, &speed) {
-        (Some(m), Some(sp)) => identify_forces(r, bike, bias_centre, cfg, m, sp, &plan)
+        (Some(m), Some(sp)) => identify_forces(r, bike, bias_centre, cfg, m, sp, gps_all.as_deref(), &plan)
             .inspect_err(|e| {
                 if std::env::var_os("IDL_FORCE_DEBUG").is_some() {
                     eprintln!("force identification failed: {e:?}");
@@ -289,9 +293,13 @@ pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
                 let start = handoff.take().unwrap_or_else(|| first_start(r, bike, g, a));
                 win.nav = Some(NavWindow { gps: g[a..b].to_vec(), start });
                 spec.nav = Some(NavSpec::default());
+            } else if let (Some(g), true) = (&gps_all, ground) {
+                // navigation for the ground tie alone: each window starts from gravity and the GPS course
+                win.nav = Some(NavWindow { gps: g[a..b].to_vec(), start: first_start(r, bike, g, a) });
+                spec.nav = Some(NavSpec::default());
             }
             if let Some(sp) = &speed {
-                win.forces = Some(ForceWindow { speed_mps: sp[a..b].to_vec(), cam: cfg.camera.as_ref().map_or(vec![], |c| c[a..b].to_vec()) });
+                win.forces = Some(ForceWindow { speed_mps: sp[a..b].to_vec(), cam: cfg.camera.as_ref().map_or(vec![], |c| c[a..b].to_vec()), ground: None });
             }
             let mut obj = Objective::new(bike.clone(), win, spec, cfg.weights.clone(), bias_centre);
             obj.threads = inner;
@@ -300,7 +308,10 @@ pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
                 let g0 = obj.force_glob0();
                 obj.glob_centre[g0..g0 + NFP].copy_from_slice(&force_par.unwrap_or([0.0; NFP]));
             }
-            let solved = warm_start(&obj, cfg.iters, cfg.tol).and_then(|v0| gauss_newton(&obj, v0, cfg.iters, cfg.tol));
+            let solved = ground_start(&obj, cfg.nav, cfg.iters, cfg.tol).and_then(|(o, v0)| {
+                obj = o;
+                gauss_newton(&obj, v0, cfg.iters, cfg.tol)
+            });
             if let Some(p) = progress {
                 (p.on_window)(finished.fetch_add(1, Ordering::Relaxed) + 1, plan.len());
             }
@@ -407,10 +418,127 @@ pub fn speed_on_grid(r: &Ride, latency_s: f64) -> Vec<f64> {
         .collect()
 }
 
+/// A force objective's start (F4): its warm start, which solves navigation too when the window
+/// has it; from that navigation the ground tie's inputs (the frame pod's height, its distance
+/// along the path, the world's up); then, unless `keep_nav`, the objective and its start
+/// without navigation (the force solve stays attitude-free). Without the tie or navigation, the
+/// objective as it is and its warm start.
+pub fn ground_start(obj: &Objective, keep_nav: bool, iters: usize, tol: f64) -> Result<(Objective, Vars), SolveError> {
+    let mut v = warm_start(obj, iters, tol)?;
+    let mut out = Objective { bike: obj.bike.clone(), win: obj.win.clone(), spec: obj.spec.clone(), w: obj.w.clone(), glob_centre: obj.glob_centre.clone(), fit: obj.fit, forces: obj.forces.clone(), threads: obj.threads };
+    let (Some(m), Some(_)) = (&obj.forces, obj.nav()) else { return Ok((out, v)) };
+    let Some(gw) = &m.w.ground else { return Ok((out, v)) };
+    let nav: Vec<NavPoint> = (0..obj.spec.n)
+        .map(|t| {
+            let s = obj.sample(&v, t);
+            let ns = obj.nav_sample(&v, &s, t).expect("navigation on");
+            NavPoint { r: rotation(&ns.ctrl, ns.u), v: ns.v, w0: s.w0 }
+        })
+        .collect();
+    let fb = &m.bike;
+    let offset = [fb.front_axle.dot(fb.fwd), fb.rear_axle.dot(fb.fwd)];
+    if let Some(fw) = out.win.forces.as_mut() {
+        fw.ground = Some(ground_window(&nav, obj.spec.dt, fb.fwd, offset, gw));
+    }
+    if std::env::var_os("IDL_FORCE_DEBUG").is_some() {
+        // how well navigation's heights and the pods-only travel put both patches on one ground
+        let mut probe = v.clone();
+        probe.att.clear();
+        probe.vel = [Vec::new(), Vec::new(), Vec::new()];
+        let mut o2 = Objective { bike: out.bike.clone(), win: out.win.clone(), spec: out.spec.clone(), w: out.w.clone(), glob_centre: out.glob_centre.clone(), fit: out.fit, forces: out.forces.clone(), threads: out.threads };
+        o2.win.nav = None;
+        o2.spec.nav = None;
+        o2.refit_ground(&mut probe);
+        let ctx = o2.ctx(&probe.glob, false);
+        let (mut n, mut ss, mut big, mut sig) = ([0usize; 2], [0.0; 2], [0usize; 2], [0.0; 2]);
+        for t in 0..o2.spec.n {
+            let s = o2.sample(&probe, t);
+            if let Some(fj) = o2.force_residuals(&ctx, &probe, &s, t, false) {
+                let gw = o2.win.forces.as_ref().unwrap().ground.as_ref().unwrap();
+                for i in 0..2 {
+                    let r = fj.r[super::forces::TIE_ROWS.0 + i];
+                    if gw.sigma_m[t][i].is_finite() && r != 0.0 {
+                        n[i] += 1;
+                        ss[i] += r * r;
+                        sig[i] += gw.sigma_m[t][i];
+                        big[i] += (r.abs() > 3.0) as usize;
+                    }
+                }
+            }
+        }
+        // the sigma's terms, mean over moving samples, mm: the turn's offset, the slip's, navigation's drift
+        let (lb, mut terms, mut cnt, mut beta_deg) = (offset[0] - offset[1], [0.0; 3], 0usize, 0.0);
+        let slip_of = |p: &NavPoint| { let f = p.r * fb.fwd; (f.0[0] * p.v[1] - f.0[1] * p.v[0]).atan2(f.0[0] * p.v[0] + f.0[1] * p.v[1]) };
+        let mut sl: Vec<f64> = nav.iter().filter(|p| V3(p.v).norm() >= gw.min_speed_mps).map(slip_of).collect();
+        sl.sort_by(f64::total_cmp);
+        let slip_bias = sl.get(sl.len() / 2).copied().unwrap_or(0.0);
+        for p in &nav {
+            let sp = V3(p.v).norm();
+            if sp < gw.min_speed_mps {
+                continue;
+            }
+            let up = V3([p.r.0[2][0], p.r.0[2][1], p.r.0[2][2]]);
+            let beta = (slip_of(p) - slip_bias).abs().min(std::f64::consts::FRAC_PI_2);
+            terms[0] += gw.cross_slope * lb * lb * p.w0.dot(up).abs() / (2.0 * sp);
+            terms[1] += gw.cross_slope * lb * beta;
+            terms[2] += gw.nav_sigma_mps * lb / sp;
+            beta_deg += beta.to_degrees();
+            cnt += 1;
+        }
+        // the rear against the front's ground, the rear shifted along the path: does a distance
+        // error or a height error make the mismatch?
+        {
+            let gwin = o2.win.forces.as_ref().unwrap().ground.as_ref().unwrap().clone();
+            let mut pz = Vec::with_capacity(o2.spec.n);
+            for t in 0..o2.spec.n {
+                if let Some((fo, _)) = o2.forces_at(&ctx, &probe, t) {
+                    pz.push((t, fo.patch_z));
+                }
+            }
+            let ok = |t: usize| gwin.sigma_m[t][0].is_finite();
+            let front: Vec<super::ground::Patch> = pz.iter().filter(|(t, _)| ok(*t)).map(|(t, z)| super::ground::Patch { s_m: gwin.s_m[*t] + gwin.offset_m[0], z_m: z[0], sigma_m: 0.005 }).collect();
+            if let Some((s0_m, coef)) = super::ground::fit_profile(&front, gw.knot_m, gw.curvature_m, 3.0) {
+                let hf = super::ground::GroundFit { s0_m, knot_m: gw.knot_m, coef, on: Vec::new() };
+                let (lo, hi) = (front.first().map_or(0.0, |p| p.s_m), front.last().map_or(0.0, |p| p.s_m));
+                let mis = |d: f64, med: bool| {
+                    let mut e: Vec<f64> = pz.iter().filter(|(t, _)| ok(*t)).map(|(t, z)| (gwin.s_m[*t] + gwin.offset_m[1] + d, z[1])).filter(|(s, _)| *s > lo && *s < hi).map(|(s, z)| z - hf.height(s)).collect();
+                    if e.is_empty() {
+                        return f64::NAN;
+                    }
+                    let m = e.iter().sum::<f64>() / e.len() as f64;
+                    if med {
+                        e.iter_mut().for_each(|x| *x = (*x - m).abs());
+                        e.sort_by(f64::total_cmp);
+                        return e[e.len() / 2];
+                    }
+                    (e.iter().map(|x| (x - m).powi(2)).sum::<f64>() / e.len() as f64).sqrt()
+                };
+                let best = (-40..=40).map(|i| i as f64 * 0.02).map(|d| (d, mis(d, false))).filter(|x| x.1.is_finite()).min_by(|a, b| a.1.total_cmp(&b.1));
+                if let Some((d, m)) = best {
+                    eprintln!("ground tie, rear on the front's ground: rms {:.1} mm (median |e| {:.1}) as placed; best {:.1} mm (median {:.1}) with the rear {:+.2} m along the path", 1e3 * mis(0.0, false), 1e3 * mis(0.0, true), 1e3 * m, 1e3 * mis(d, true), d);
+                }
+            }
+        }
+        let c = cnt.max(1) as f64;
+        eprintln!("ground tie sigma terms (mean mm): turn {:.1}, slip {:.1} (slip {:.1} deg, less the heading offset {:.1} deg), drift {:.1}", 1e3 * terms[0] / c, 1e3 * terms[1] / c, beta_deg / c, slip_bias.to_degrees(), 1e3 * terms[2] / c);
+        let gw = o2.win.forces.as_ref().unwrap().ground.as_ref().unwrap();
+        eprintln!("ground tie at the warm start: front rms {:.2} sigma ({} rows, {:.0} % past 3), rear rms {:.2} sigma ({} rows, {:.0} % past 3), mean sigma {:.1} mm; height span {:.2} m, distance {:.0} m",
+                  (ss[0] / n[0].max(1) as f64).sqrt(), n[0], 100.0 * big[0] as f64 / n[0].max(1) as f64, (ss[1] / n[1].max(1) as f64).sqrt(), n[1], 100.0 * big[1] as f64 / n[1].max(1) as f64,
+                  1e3 * (sig[0] + sig[1]) / (n[0] + n[1]).max(1) as f64, gw.z_m.iter().cloned().fold(f64::MIN, f64::max) - gw.z_m.iter().cloned().fold(f64::MAX, f64::min), gw.s_m.last().copied().unwrap_or(0.0));
+    }
+    if !keep_nav {
+        out.win.nav = None;
+        out.spec.nav = None;
+        v.att.clear();
+        v.vel = [Vec::new(), Vec::new(), Vec::new()];
+    }
+    Ok((out, v))
+}
+
 /// Identifies the force parameters on [`Config::force_id_windows`] windows spread through
 /// the ride ([`Config::force_id_window_s`] each, from the start of every plan window picked),
 /// solved together with shared parameters (and biases). Returns the log multipliers.
-pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: &Config, m: &ForceModel, speed: &[f64], plan: &[(usize, usize, usize, usize)]) -> Result<[f64; NFP], SolveError> {
+pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: &Config, m: &ForceModel, speed: &[f64], gps: Option<&[Option<GpsFix>]>, plan: &[(usize, usize, usize, usize)]) -> Result<[f64; NFP], SolveError> {
     let len = (cfg.force_id_window_s * r.rate()) as usize;
     let k = cfg.force_id_windows.min(plan.len());
     if k == 0 {
@@ -422,8 +550,13 @@ pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
             let (a, b0, _, _) = plan[i * plan.len() / k];
             let b = (a + len).min(b0);
             let mut win = window(r, a, b, cfg.air_anchor);
-            win.forces = Some(ForceWindow { speed_mps: speed[a..b].to_vec(), cam: cfg.camera.as_ref().map_or(vec![], |c| c[a..b].to_vec()) });
-            let o = Objective::new(bike.clone(), win, Spec::standard(b - a, r.input.dt), cfg.weights.clone(), bias_centre).with_forces(m.clone());
+            win.forces = Some(ForceWindow { speed_mps: speed[a..b].to_vec(), cam: cfg.camera.as_ref().map_or(vec![], |c| c[a..b].to_vec()), ground: None });
+            let mut spec = Spec::standard(b - a, r.input.dt);
+            if let (Some(g), Some(_)) = (gps, &m.w.ground) {
+                win.nav = Some(NavWindow { gps: g[a..b].to_vec(), start: first_start(r, bike, g, a) });
+                spec.nav = Some(NavSpec::default());
+            }
+            let o = Objective::new(bike.clone(), win, spec, cfg.weights.clone(), bias_centre).with_forces(m.clone());
             Objective { threads: (cfg.threads / k).max(1), ..o }
         })
         .collect();
@@ -431,7 +564,7 @@ pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
         let lay = super::solve::Layout::new(&objs[0]);
         eprintln!("force identification: window 0 has {} samples, {} local unknowns, band half-width {}, {} globals", objs[0].spec.n, lay.n_loc, lay.bw, objs[0].n_glob());
     }
-    let vs = super::solve::par_map_n(&objs, k, |o| warm_start(o, cfg.iters, cfg.tol)).into_iter().collect::<Result<Vec<_>, _>>()?;
+    let (objs, vs): (Vec<Objective>, Vec<Vars>) = super::solve::par_map_n(&objs, k, |o| ground_start(o, false, cfg.iters, cfg.tol)).into_iter().collect::<Result<Vec<_>, _>>()?.into_iter().unzip();
     let t_warm = t0.elapsed().as_secs_f64();
     let (vs, info) = gauss_newton_multi(&objs, vs, cfg.force_id_iters, cfg.tol)?;
     if std::env::var_os("IDL_FORCE_DEBUG").is_some() {
@@ -467,10 +600,10 @@ pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
 /// core priors, then each force row group, then the smoothness.
 pub fn row_group_loss(o: &Objective, v: &Vars) -> String {
     let ctx = o.ctx(&v.glob, false);
-    let groups = [("fork", 0, 1), ("rear", 1, 2), ("riderF", 2, 5), ("riderM", 5, 8), ("sysF fwd", 8, 9), ("sysF lat", 9, 10), ("sysF up", 10, 11), ("sysM", 11, 14), ("tyreT", 14, 18), ("pose", 18, 24), ("act", 24, 30), ("defl", 30, 32), ("head", 32, 35), ("camA", 35, 38), ("camG", 38, 41), ("headP", 41, 47)];
+    let groups = [("fork", 0, 1), ("rear", 1, 2), ("riderF", 2, 5), ("riderM", 5, 8), ("sysF fwd", 8, 9), ("sysF lat", 9, 10), ("sysF up", 10, 11), ("sysM", 11, 14), ("tyreT", 14, 18), ("pose", 18, 24), ("act", 24, 30), ("defl", 30, 32), ("head", 32, 35), ("camA", 35, 38), ("camG", 38, 41), ("headP", 41, 47), ("ground", 47, 49)];
     let k = o.forces.as_ref().map_or(0.0, |m| m.w.huber);
     let (mut sensor, mut prior) = (0.0, 0.0);
-    let mut fg = [0.0; 16];
+    let mut fg = [0.0; 17];
     for t in 0..o.spec.n {
         let s = o.sample(v, t);
         let r = o.sample_residuals(&ctx, &s, &v.glob, t, false).r;
@@ -491,7 +624,7 @@ pub fn row_group_loss(o: &Objective, v: &Vars) -> String {
 }
 
 /// The force outputs: count of [`FORCE_CHANNELS`].
-pub const NFO: usize = 22;
+pub const NFO: usize = 23;
 
 /// The force output channels (with [`Config::forces`]): id and unit, in [`force_outputs`]
 /// order. The rider's force and moment are what the bike puts on him (the frame gets the
@@ -519,6 +652,7 @@ pub const FORCE_CHANNELS: [(&str, &str); NFO] = [
     ("Physics rider pump roll (N m)", "N m"),
     ("Physics rider pump pitch (N m)", "N m"),
     ("Physics rider pump yaw (N m)", "N m"),
+    ("Physics ground (mm)", "mm"),
 ];
 
 /// One sample's force outputs, in [`FORCE_CHANNELS`] order (NaN with the force model off).
@@ -537,6 +671,11 @@ pub fn force_outputs(obj: &Objective, ctx: &Ctx, v: &Vars, t: usize) -> [f64; NF
         o[16 + i] = f[0][ACT_F + i];
         o[19 + i] = f[0][ACT_M + i];
     }
+    // the ground under the front patch (F4), window-local: NaN without the tie
+    o[22] = match (obj.win.forces.as_ref().and_then(|w| w.ground.as_ref()), &v.ground) {
+        (Some(gw), Some(gf)) => gf.height(gw.s_m[t] + gw.offset_m[0]) * 1000.0,
+        _ => f64::NAN,
+    };
     o
 }
 

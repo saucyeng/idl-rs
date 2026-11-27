@@ -181,10 +181,27 @@ pub struct Normal {
     pub loss: f64,
     /// Threads its factorisation may use (the border's solves).
     pub threads: usize,
+    /// The ground tie's rows (F4), each with its Jacobian on the locals and on the ground
+    /// profile: what eliminating the profile from the step needs.
+    pub tie: Vec<TieRow>,
+}
+
+/// One ground-tie row of the normal equations (F4), whitened and Huber-scaled as its rows in
+/// the band: d r / d locals (band position, value) and d r / d profile (first coefficient, four
+/// values).
+#[derive(Clone, Debug)]
+pub struct TieRow {
+    /// Nonzero local columns: band position and value.
+    pub cols: Vec<(usize, f64)>,
+    /// The profile's first coefficient this row touches.
+    pub k: usize,
+    /// d r / d those four coefficients.
+    pub a: [f64; 4],
 }
 
 /// One chunk of samples' share of a [`Normal`], over band rows `lo..` only.
 struct Part {
+    tie: Vec<TieRow>,
     lo: usize,
     band: Vec<f64>,
     border: Vec<f64>,
@@ -199,7 +216,8 @@ struct Part {
 pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: bool) -> Normal {
     let (n, bw, ng) = (lay.n_loc, lay.bw, obj.n_glob());
     let wd = bw + 1;
-    let mut ne = Normal { ng, band: vec![0.0; n * wd], border: vec![0.0; n * ng], c: vec![0.0; ng * ng], g_loc: vec![0.0; n], g_glob: vec![0.0; ng], loss: 0.0, threads: obj.threads.max(1) };
+    let mut ne = Normal { ng, band: vec![0.0; n * wd], border: vec![0.0; n * ng], c: vec![0.0; ng * ng], g_loc: vec![0.0; n], g_glob: vec![0.0; ng], loss: 0.0, threads: obj.threads.max(1), tie: Vec::new() };
+    let grounded = obj.has_ground() && v.ground.is_some();
     let sp = &obj.spec;
     let ctx = obj.ctx(&v.glob, true);
     let ncol = lay.groups.len() * 4;
@@ -215,7 +233,7 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
     let lo = lay.groups.iter().map(|g| g.pos[t0 / g.m]).min().unwrap_or(0);
     let hi = lay.groups.iter().map(|g| g.pos[(t1 - 1) / g.m + 3]).max().unwrap_or(0);
     let rows = hi - lo + 1;
-    let mut ne = Part { lo, band: vec![0.0; rows * wd], border: vec![0.0; rows * ng], c: vec![0.0; ng * ng], g_loc: vec![0.0; rows], g_glob: vec![0.0; ng], loss: 0.0 };
+    let mut ne = Part { tie: Vec::new(), lo, band: vec![0.0; rows * wd], border: vec![0.0; rows * ng], c: vec![0.0; ng * ng], g_loc: vec![0.0; rows], g_glob: vec![0.0; ng], loss: 0.0 };
     let mut a = vec![0.0; nt * ncol];
     let mut res = vec![0.0; nt];
     let mut jg = vec![0.0; nt * ng];
@@ -310,16 +328,32 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
         // Huber on the sensor rows (iteratively reweighted): a row beyond k sigmas is scaled by
         // sqrt(k/|r|), so its gradient is the Huber loss's and its curvature the IRLS weight's
         let k = obj.w.huber;
+        let mut tie_scale = [1.0; 2];
         for r in 0..nt {
             let k = if r < SENSOR_ROWS { k } else if r >= f0 && r < nt && super::forces::huber_row(r - f0) { k_force } else { 0.0 };
             if k > 0.0 && res[r].abs() > k {
                 ne.loss += 0.5 * huber2(res[r], k);
                 let s = (k / res[r].abs()).sqrt();
+                if fj.is_some() && (f0 + super::forces::TIE_ROWS.0..f0 + super::forces::TIE_ROWS.1).contains(&r) {
+                    tie_scale[r - f0 - super::forces::TIE_ROWS.0] = s;
+                }
                 res[r] *= s;
                 a[r * ncol..(r + 1) * ncol].iter_mut().for_each(|x| *x *= s);
                 jg[r * ng..(r + 1) * ng].iter_mut().for_each(|x| *x *= s);
             } else {
                 ne.loss += 0.5 * res[r] * res[r];
+            }
+        }
+        // the ground tie's rows, for eliminating the profile from the step (F4)
+        if grounded && fj.is_some() {
+            for (i, b) in obj.tie_basis(v, t).into_iter().enumerate() {
+                if let Some((kk, w, inv_sig)) = b {
+                    let r = f0 + super::forces::TIE_ROWS.0 + i;
+                    let s = tie_scale[i];
+                    let ar = &a[r * ncol..(r + 1) * ncol];
+                    let cols_r: Vec<(usize, f64)> = (0..ncol).filter(|&p| ar[p] != 0.0).map(|p| (cols[p], ar[p])).collect();
+                    ne.tie.push(TieRow { cols: cols_r, k: kk, a: w.map(|x| -x * inv_sig * s) });
+                }
             }
         }
         // accumulate row by row over each row's nonzero columns and globals only: a pod row never
@@ -374,6 +408,7 @@ pub fn normal_equations(obj: &Objective, lay: &Layout, v: &Vars, global_prior: b
         ne.c.iter_mut().zip(&p.c).for_each(|(x, y)| *x += y);
         ne.g_glob.iter_mut().zip(&p.g_glob).for_each(|(x, y)| *x += y);
         ne.loss += p.loss;
+        ne.tie.extend(p.tie);
     }
     // smoothness priors: k (c_i - 2 c_i+1 + c_i+2) on each latent row
     let k0 = obj.smooth_weight();
@@ -608,6 +643,23 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
         }
     };
     share(&mut vs);
+    // the ground profile (F4) is refitted to the latents before each iteration and held through
+    // its step: each half lowers the same loss
+    let idx: Vec<usize> = (0..objs.len()).collect();
+    let grounded = objs.iter().any(|o| o.has_ground());
+    let refit = |vs: &mut Vec<Vars>| {
+        let fits = par_map(&idx, |&w| {
+            let mut v = vs[w].clone();
+            objs[w].refit_ground(&mut v);
+            v.ground
+        });
+        for (v, g) in vs.iter_mut().zip(fits) {
+            v.ground = g;
+        }
+    };
+    if grounded {
+        refit(&mut vs);
+    }
     let total = |vs: &[Vars]| par_map(&(0..objs.len()).collect::<Vec<_>>(), |&w| objs[w].data_loss(&vs[w])).iter().sum::<f64>() + objs[0].prior_loss(&vs[0]);
     let (mut lam, mut nu) = (1e-10, 2.0);
     let mut loss = total(&vs);
@@ -615,6 +667,8 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
     for it in 0..iters {
         let t0 = std::time::Instant::now();
         let nes: Vec<Normal> = par_map(&(0..objs.len()).collect::<Vec<_>>(), |&w| normal_equations(&objs[w], &lays[w], &vs[w], w == 0));
+        // the ground profile's own block (F4), to eliminate it from the step
+        let gms: Vec<Option<super::ground::BandChol>> = if grounded { par_map(&idx, |&w| ground_block(&objs[w], &vs[w], &nes[w])) } else { Vec::new() };
         info.seconds[0] += t0.elapsed().as_secs_f64();
         let mut new;
         loop {
@@ -640,13 +694,21 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
                 rhs.iter_mut().zip(&rw).for_each(|(a, b)| *a += b);
                 fs.push(f);
             }
-            let xg = solve_globals(&s, &rhs, ng, lays[0].n_loc)?;
-            let xls: Vec<Vec<f64>> = fs.iter().map(|f| back_substitute(f, &xg)).collect();
+            let (xls, xg) = if grounded {
+                ground_step(&nes, &fs, &lays, &gms, &s, lam)?
+            } else {
+                let xg = solve_globals(&s, &rhs, ng, lays[0].n_loc)?;
+                (fs.iter().map(|f| back_substitute(f, &xg)).collect(), xg)
+            };
             // the quadratic model's predicted loss drop, about -g.x / 2 for a small damping
             let pred = -0.5
                 * (nes.iter().zip(&xls).map(|(ne, xl)| ne.g_loc.iter().zip(xl).map(|(g, x)| g * x).sum::<f64>()).sum::<f64>()
                     + nes.iter().map(|ne| ne.g_glob.iter().zip(&xg).map(|(g, x)| g * x).sum::<f64>()).sum::<f64>());
-            let cand: Vec<Vars> = vs.iter().zip(&lays).zip(&xls).map(|((v, lay), xl)| lay.apply(v, xl, &xg)).collect();
+            let mut cand: Vec<Vars> = vs.iter().zip(&lays).zip(&xls).map(|((v, lay), xl)| lay.apply(v, xl, &xg)).collect();
+            if grounded {
+                // the step assumed the profile follows both tyres: score it with the profile refitted
+                refit(&mut cand);
+            }
             info.seconds[1] += t1.elapsed().as_secs_f64();
             let t2 = std::time::Instant::now();
             new = total(&cand);
@@ -684,6 +746,166 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
     }
     Ok((vs, info))
 }
+
+/// The ground profile's block of the normal equations (F4): the tie rows' d r / d profile
+/// squared, the profile's curvature prior and its faint pull to the mean, factored. None
+/// without a profile.
+fn ground_block(obj: &Objective, v: &Vars, ne: &Normal) -> Option<super::ground::BandChol> {
+    let (g, wc) = (v.ground.as_ref()?, obj.ground_curvature_weight()?);
+    let (n, wd) = (g.coef.len(), 4);
+    let mut a = vec![0.0; n * wd];
+    for row in &ne.tie {
+        for x in 0..4 {
+            for y in 0..=x {
+                a[(row.k + x) * wd + (x - y)] += row.a[x] * row.a[y];
+            }
+        }
+    }
+    let d2 = [1.0, -2.0, 1.0];
+    for i in 0..n.saturating_sub(2) {
+        for x in 0..3 {
+            for y in 0..=x {
+                a[(i + x) * wd + (x - y)] += wc * d2[x] * d2[y];
+            }
+        }
+    }
+    for i in 0..n {
+        a[i * wd] += super::ground::RIDGE;
+    }
+    super::ground::BandChol::new(a, n, 3)
+}
+
+/// The damped step with the ground profile eliminated (F4): (K - E M^-1 E^T) x = -g, K the
+/// damped band, border and globals' system, E the tie rows' coupling of the locals to the
+/// profile, M the profile's block. The profile couples each tyre's samples to the other's a
+/// wheelbase away, so it is not put in the band: conjugate gradients on the reduced system,
+/// preconditioned by K's own solve (the step without the elimination, where it starts). Each
+/// iteration is one back-substitution per window and a profile solve.
+fn ground_step(nes: &[Normal], fs: &[Factored], lays: &[Layout], gms: &[Option<super::ground::BandChol>], s: &[f64], lam: f64) -> Result<(Vec<Vec<f64>>, Vec<f64>), SolveError> {
+    let ng = nes[0].ng;
+    let nw = nes.len();
+    let chol = nalgebra::DMatrix::from_row_slice(ng, ng, s).cholesky().ok_or(SolveError::NotPositiveDefinite { row: lays[0].n_loc })?;
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let idx: Vec<usize> = (0..nw).collect();
+    // K^-1 b: each window's band, the globals through their Schur system
+    let prec = |bl: &[Vec<f64>], bg: &[f64]| -> (Vec<Vec<f64>>, Vec<f64>) {
+        let ys: Vec<Vec<f64>> = par_map(&idx, |&w| {
+            let mut y = bl[w].clone();
+            band_forward(&fs[w].l, fs[w].n, fs[w].bw, &mut y);
+            y
+        });
+        let mut rg = bg.to_vec();
+        for (f, y) in fs.iter().zip(&ys) {
+            for j in 0..ng {
+                rg[j] -= dot(&f.w[j], y);
+            }
+        }
+        let xg: Vec<f64> = chol.solve(&nalgebra::DVector::from_column_slice(&rg)).iter().cloned().collect();
+        let xl = par_map(&idx, |&w| {
+            let mut x = ys[w].clone();
+            for (col, xj) in fs[w].w.iter().zip(&xg) {
+                x.iter_mut().zip(col).for_each(|(a, c)| *a -= c * xj);
+            }
+            band_backward(&fs[w].l, fs[w].n, fs[w].bw, &mut x);
+            x
+        });
+        (xl, xg)
+    };
+    // (K - E M^-1 E^T) x
+    let op = |xl: &[Vec<f64>], xg: &[f64]| -> (Vec<Vec<f64>>, Vec<f64>) {
+        let parts = par_map(&idx, |&w| {
+            let (ne, lay, x) = (&nes[w], &lays[w], &xl[w]);
+            let (n, bw) = (lay.n_loc, lay.bw);
+            let wd = bw + 1;
+            let mut y = vec![0.0; n];
+            for i in 0..n {
+                let lo = i.saturating_sub(bw);
+                for j in lo..i {
+                    let a = ne.band[i * wd + (j + bw - i)];
+                    y[i] += a * x[j];
+                    y[j] += a * x[i];
+                }
+                y[i] += (ne.band[i * wd + bw] * (1.0 + lam) + 1e-9) * x[i];
+            }
+            let mut yg = vec![0.0; ng];
+            for i in 0..n {
+                let row = &ne.border[i * ng..(i + 1) * ng];
+                y[i] += dot(row, xg);
+                for j in 0..ng {
+                    yg[j] += row[j] * x[i];
+                }
+            }
+            for i in 0..ng {
+                yg[i] += dot(&ne.c[i * ng..(i + 1) * ng], xg) + (lam * ne.c[i * ng + i] + 1e-9) * xg[i];
+            }
+            if let Some(gm) = &gms[w] {
+                let mut z = vec![0.0; gm.len()];
+                let us: Vec<f64> = ne.tie.iter().map(|r| r.cols.iter().map(|&(p, a)| a * x[p]).sum()).collect();
+                for (r, u) in ne.tie.iter().zip(&us) {
+                    for q in 0..4 {
+                        z[r.k + q] += r.a[q] * u;
+                    }
+                }
+                gm.solve(&mut z);
+                for r in &ne.tie {
+                    let c: f64 = (0..4).map(|q| r.a[q] * z[r.k + q]).sum();
+                    for &(p, a) in &r.cols {
+                        y[p] -= a * c;
+                    }
+                }
+            }
+            (y, yg)
+        });
+        let mut yg = vec![0.0; ng];
+        let mut yl = Vec::with_capacity(nw);
+        for (y, g) in parts {
+            yl.push(y);
+            yg.iter_mut().zip(&g).for_each(|(a, b)| *a += b);
+        }
+        (yl, yg)
+    };
+    let inner = |a: &(Vec<Vec<f64>>, Vec<f64>), b: &(Vec<Vec<f64>>, Vec<f64>)| a.0.iter().zip(&b.0).map(|(x, y)| dot(x, y)).sum::<f64>() + dot(&a.1, &b.1);
+    let axpy = |y: &mut (Vec<Vec<f64>>, Vec<f64>), k: f64, x: &(Vec<Vec<f64>>, Vec<f64>)| {
+        for (yw, xw) in y.0.iter_mut().zip(&x.0) {
+            yw.iter_mut().zip(xw).for_each(|(a, b)| *a += k * b);
+        }
+        y.1.iter_mut().zip(&x.1).for_each(|(a, b)| *a += k * b);
+    };
+    let b = (nes.iter().map(|ne| ne.g_loc.iter().map(|g| -g).collect()).collect::<Vec<Vec<f64>>>(), nes.iter().fold(vec![0.0; ng], |mut acc, ne| {
+        acc.iter_mut().zip(&ne.g_glob).for_each(|(a, g)| *a -= g);
+        acc
+    }));
+    let mut x = prec(&b.0, &b.1);
+    let kx = op(&x.0, &x.1);
+    let mut r = b.clone();
+    axpy(&mut r, -1.0, &kx);
+    let mut z = prec(&r.0, &r.1);
+    let mut p = z.clone();
+    let mut rz = inner(&r, &z);
+    let rz0 = inner(&b, &x).abs().max(f64::MIN_POSITIVE);
+    for _ in 0..GROUND_CG_ITERS {
+        if rz <= GROUND_CG_TOL * rz0 {
+            break;
+        }
+        let q = op(&p.0, &p.1);
+        let alpha = rz / inner(&p, &q);
+        axpy(&mut x, alpha, &p);
+        axpy(&mut r, -alpha, &q);
+        z = prec(&r.0, &r.1);
+        let rz1 = inner(&r, &z);
+        let beta = rz1 / rz;
+        rz = rz1;
+        let mut pn = z.clone();
+        axpy(&mut pn, beta, &p);
+        p = pn;
+    }
+    Ok(x)
+}
+
+/// Conjugate-gradient iterations at most per step with the ground eliminated ([`ground_step`]).
+const GROUND_CG_ITERS: usize = 60;
+/// ... and the preconditioned residual, relative to the step's, it stops at.
+const GROUND_CG_TOL: f64 = 1e-8;
 
 /// The shared unknowns' standard deviations at a multi-window solution `vs` (a diagnostic): the
 /// square roots of the diagonal of the inverse of the globals' Schur system, undamped, the

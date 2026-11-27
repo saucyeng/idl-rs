@@ -33,6 +33,7 @@
 //! | 32..35 | the head's moment about its centre of mass (F2; 0 without a head) |
 //! | 35..41 | the helmet camera's accelerometer and gyro (F2; 0 without a camera sample) |
 //! | 41..47 | the head's rotation and active neck torque priors |
+//! | 47..49 | the ground tie (F4): each tyre's patch height against the ground profile, front, rear |
 //!
 //! The parameters ([`NFP`]) are globals, each a log multiplier on a nominal value (positive
 //! by construction, one prior width for factors): both dampers' curves, seal friction, the
@@ -146,15 +147,18 @@ pub const PAR_NAMES: [&str; NFP] = [
 ];
 
 /// Rows per sample (see the module table).
-pub const NFR: usize = 47;
+pub const NFR: usize = 49;
 /// The balance rows (0..NBAL), the ones Huber weighting applies to.
 pub const NBAL: usize = 14;
 /// The head's balance and the camera's rows (32..41), Huber-weighted like the balances.
 pub const CAM_ROWS: (usize, usize) = (32, 41);
+/// The ground tie's rows (F4), front then rear: Huber-weighted, a line change or a rock that
+/// moved costs a capped amount (Isaac, 2026-11-27: the tie is soft).
+pub const TIE_ROWS: (usize, usize) = (47, 49);
 
-/// Whether force row `r` is Huber-weighted (a balance or a camera row, not a prior).
+/// Whether force row `r` is Huber-weighted (a balance, a camera or a ground-tie row, not a prior).
 pub fn huber_row(r: usize) -> bool {
-    r < NBAL || (CAM_ROWS.0..CAM_ROWS.1).contains(&r)
+    r < NBAL || (CAM_ROWS.0..CAM_ROWS.1).contains(&r) || (TIE_ROWS.0..TIE_ROWS.1).contains(&r)
 }
 
 /// The rear's anti-rise at rear travel `s_m`, percent: how much of the extension the load
@@ -425,6 +429,9 @@ pub struct ForceWeights {
     pub par_sigma: [f64; NFP],
     /// Huber threshold on the balance rows, sigmas (0: plain least squares).
     pub huber: f64,
+    /// The ground tie (F4; None: off, the default until navigation's heights carry it: on
+    /// Beacon and 11/21 the tie's sigma comes to 30-80 mm and the patches sit 1-3 of it apart).
+    pub ground: Option<super::ground::GroundWeights>,
 }
 
 impl Default for ForceWeights {
@@ -461,6 +468,7 @@ impl Default for ForceWeights {
             defl_m: 0.02,
             par_sigma,
             huber: 3.0,
+            ground: None,
         }
     }
 }
@@ -485,6 +493,8 @@ pub struct ForceWindow {
     /// clip's mount estimate into the frame pod's axes at the rider's neutral pose (empty, or
     /// None at a sample: no camera there).
     pub cam: Vec<Option<[f64; 6]>>,
+    /// The ground tie's inputs from the window's navigation solve (F4; None: no tie).
+    pub ground: Option<super::ground::GroundWindow>,
 }
 
 /// One sample's measurements the force rows read.
@@ -502,6 +512,22 @@ pub struct ForceMeas {
     pub speed_rate: f64,
     /// The helmet camera's reading here ([`ForceWindow::cam`]).
     pub cam: Option<[f64; 6]>,
+    /// The ground tie's inputs here (F4; None: no tie).
+    pub ground: Option<GroundMeas>,
+}
+
+/// One sample's ground-tie inputs (F4): from the window's navigation solve, and the ground
+/// profile at the current iterate.
+#[derive(Clone, Copy, Debug)]
+pub struct GroundMeas {
+    /// The world's up in IMU0 axes (unit).
+    pub up: [f64; 3],
+    /// The frame pod's height, window-local, m.
+    pub z_m: f64,
+    /// The ground profile's height under the front and the rear patch, m.
+    pub h_m: [f64; 2],
+    /// The tie's sigma per tyre, m (infinite: that tyre's row off).
+    pub sigma_m: [f64; 2],
 }
 
 /// The kinematics the rows need from the core latents: pod rotations (pod -> IMU0), axle
@@ -595,6 +621,9 @@ pub struct Forces<S> {
     pub shock: S,
     /// Bushing force and moment on the rider from the bike (passive), N, N m.
     pub bush: [V3<S>; 2],
+    /// Each patch's height in the world, window-local, front and rear, m (0 without the ground
+    /// tie's inputs).
+    pub patch_z: [S; 2],
 }
 
 /// The rows (whitened) and the forces they used.
@@ -752,7 +781,18 @@ pub fn rows<S: Real>(m: &ForceModel, k: &Kin<S>, x: &ForceIn<S>, meas: &ForceMea
         r[41 + i] = f[HEAD + i] * (1.0 / w.head_prior[0]);
         r[44 + i] = f[NECK_ACT + i] * (1.0 / w.head_prior[1]);
     }
-    (r, Forces { tyre: [tf, tr], normal: [nf, nr], fork, shock, bush: [bush_f, bush_m] })
+    // the ground tie (F4): each patch's height in the world against the ground profile there
+    let mut patch_z = [c::<S>(0.0); 2];
+    if let Some(g) = &meas.ground {
+        let u = V3::<S>::from_f64(g.up);
+        for (i, p) in [pcf, pcr].into_iter().enumerate() {
+            patch_z[i] = p.dot(u) + g.z_m;
+            if g.sigma_m[i].is_finite() {
+                r[TIE_ROWS.0 + i] = (patch_z[i] - g.h_m[i]) * (1.0 / g.sigma_m[i]);
+            }
+        }
+    }
+    (r, Forces { tyre: [tf, tr], normal: [nf, nr], fork, shock, bush: [bush_f, bush_m], patch_z })
 }
 
 /// The force rows at one sample and their Jacobians.
@@ -870,7 +910,7 @@ pub fn static_misfit(m: &ForceModel, bike: &Bike<f64>) -> [f64; NBAL] {
     q[S] = 0.5 * (lo + hi);
     let k = kin(fb, bike, &q);
     let up_g = fb.up.scale(g);
-    let meas = ForceMeas { frame: up_g.0, fork: (k.rf.t() * up_g).0, rear: (k.rr.t() * up_g).0, speed: 0.0, speed_rate: 0.0, cam: None };
+    let meas = ForceMeas { frame: up_g.0, fork: (k.rf.t() * up_g).0, rear: (k.rr.t() * up_g).0, speed: 0.0, speed_rate: 0.0, cam: None, ground: None };
     let mut f = [0.0; NFL];
     f[DEF_F] = m.spec.init[DEF_F];
     f[DEF_R] = m.spec.init[DEF_R];
@@ -954,6 +994,20 @@ pub(crate) mod synth {
         (bike, m)
     }
 
+    /// [`model`] for the road ([`ride_on_road`]): the rider over the middle of the bike (about
+    /// 37 % on the front instead of 17 %: a front that light leaves the ground on every bump),
+    /// the tyres' damping at 600 N s/m (the real rides fit 2-14 times the 100 nominal; at 100 its
+    /// force is under the rows' sigma), exactly at rest.
+    pub fn road_model() -> (Bike<f64>, ForceModel) {
+        let (bike, mut m) = model();
+        m.bike.rider_cg = m.bike.rider_cg + m.bike.fwd.scale(0.25);
+        m.bike.nominal[P_TYRE_C..P_TYRE_C + 2].copy_from_slice(&[600.0, 600.0]);
+        m.w.ground = Some(crate::estimate::physics::ground::GroundWeights::default());
+        balance_statics(&bike, &mut m);
+        exact_statics(&bike, &mut m);
+        (bike, m)
+    }
+
     /// Total weight, N.
     fn weight(fb: &ForceBike) -> f64 {
         (fb.m_frame + fb.m_rider + fb.m_front + fb.m_rear) * 9.80665
@@ -1005,6 +1059,43 @@ pub(crate) mod synth {
             (b0, p0, b1) = (b1, p1, b2);
         }
         set(m, b1);
+    }
+
+    /// Puts `m` exactly at rest, by Newton on the setup check ([`static_misfit`]): the fork's
+    /// and the rear's balance, the system's vertical force and pitch moment, over both springs'
+    /// fill and both tyres' deflection. [`balance_statics`] leaves tens of newtons (the fork
+    /// 48 N, the rear 231 N on [`model`]), which a ride with prescribed deflections never feels
+    /// and one on a road does (the bike settles, pitches and lifts a tyre).
+    fn exact_statics(bike: &Bike<f64>, m: &mut ForceModel) {
+        let rows = [0, 1, 10, 12];
+        let misfit = |m: &ForceModel| {
+            let r = static_misfit(m, bike);
+            nalgebra::Vector4::from_fn(|i, _| r[rows[i]])
+        };
+        // fills in bar (additive: a fill can start near zero), deflections in metres
+        let nudge = |m: &mut ForceModel, x: &nalgebra::Vector4<f64>| {
+            m.bike.fork.gauge_pa = (m.bike.fork.gauge_pa + 1e5 * x[0]).max(0.0);
+            m.bike.shock.gauge_pa = (m.bike.shock.gauge_pa + 1e5 * x[1]).max(0.0);
+            m.spec.init[DEF_F] += x[2];
+            m.spec.init[DEF_R] += x[3];
+        };
+        let steps = [1e-4, 1e-4, 1e-7, 1e-7];
+        for _ in 0..12 {
+            let r0 = misfit(m);
+            if r0.amax() < 1e-6 {
+                break;
+            }
+            let mut j = nalgebra::Matrix4::zeros();
+            for c_ in 0..4 {
+                let mut trial = m.clone();
+                let mut x = nalgebra::Vector4::zeros();
+                x[c_] = steps[c_];
+                nudge(&mut trial, &x);
+                j.set_column(c_, &((misfit(&trial) - r0) / steps[c_]));
+            }
+            let x = -(j.lu().solve(&r0).expect("the setup's rows reach their unknowns"));
+            nudge(m, &x);
+        }
     }
 
     /// Prescribed inputs, ramped in over the settling run (0 before -1 s, 1 from 0 s).
@@ -1062,6 +1153,31 @@ pub(crate) mod synth {
         pub speed: Vec<[f64; 2]>,
         /// What the pods read (frame gyro, fork gyro and accel, rear gyro and accel).
         pub readings: Vec<[f64; 15]>,
+        /// The world's up in IMU0 axes, the frame pod's height (m) and its distance along the
+        /// road (m): what a navigation solve would give the ground tie.
+        pub world: Vec<([f64; 3], f64, f64)>,
+    }
+
+    /// The road of [`ride_on_road`]: (amplitude m, wavelength m, phase rad), ramped in over its
+    /// first metres (at 6 m/s about 4, 7.3 and 11 Hz, the bumps of the prescribed ride).
+    pub const ROAD: [(f64, f64, f64); 3] = [(0.005, 1.5, 0.0), (0.002, 0.82, 1.0), (0.001, 0.55, 0.4)];
+
+    /// The road's height (m) and slope at distance `s` (m).
+    pub fn road(s: f64) -> (f64, f64) {
+        let tau = std::f64::consts::TAU;
+        let x = (s - 2.5) / 0.5;
+        let (r, dr) = (0.5 * (1.0 + x.tanh()), 1.0 / x.cosh().powi(2));
+        let (mut h, mut hs) = (0.0, 0.0);
+        for &(a, l, ph) in &ROAD {
+            h += a * (tau * s / l + ph).sin();
+            hs += a * tau / l * (tau * s / l + ph).cos();
+        }
+        (r * h, r * hs + dr * h)
+    }
+
+    /// Each patch's distance ahead of the frame pod along the road (front, rear), m.
+    pub fn patch_offsets(fb: &ForceBike) -> [f64; 2] {
+        [fb.front_axle.dot(fb.fwd), fb.rear_axle.dot(fb.fwd)]
     }
 
     /// The integrated state.
@@ -1083,6 +1199,17 @@ pub(crate) mod synth {
         ctrl: [f64; 3],
         /// Their rates.
         ctrl_rate: [f64; 3],
+        /// On the road ([`ride_on_road`]): the tyres' deflections from the patch heights over
+        /// it, and the pitch trim off (the road holds the pitch).
+        road: bool,
+        /// IMU0 -> world (Z up).
+        att: M3<f64>,
+        /// The frame pod's world velocity, m/s.
+        vel: V3<f64>,
+        /// Its height, m.
+        z: f64,
+        /// Its distance along the road, m (the ground speed integrated).
+        dist: f64,
     }
 
     impl State {
@@ -1091,19 +1218,87 @@ pub(crate) mod synth {
             let fb = &m.bike;
             let mut pose = [0.0; 6];
             pose[2] = -fb.m_rider * 9.80665 / fb.nominal[P_RIDER_K + 2];
-            State { d: [fb.fork.rest_m, 0.0], s: [0.045, 0.0], w0: V3::zero(), pose, pose_rate: [0.0; 6], ctrl: [0.0; 3], ctrl_rate: [0.0; 3] }
+            let att = M3([fb.fwd.0, fb.lat().0, fb.up.0]);
+            State { d: [fb.fork.rest_m, 0.0], s: [0.045, 0.0], w0: V3::zero(), pose, pose_rate: [0.0; 6], ctrl: [0.0; 3], ctrl_rate: [0.0; 3], road: false, att, vel: V3::zero(), z: 0.0, dist: 0.0 }
+        }
+
+        /// At rest on the flat start of the road: pitched and raised so both tyres sit at
+        /// their static deflections.
+        fn at_rest_on_road(bike: &Bike<f64>, m: &ForceModel) -> State {
+            let fb = &m.bike;
+            let mut st = State { road: true, ..State::at_rest(m) };
+            let mut q = [0.0; NL];
+            (q[D], q[S]) = (st.d[0], st.s[0]);
+            let k = kin(fb, bike, &q);
+            let base = st.att;
+            let lift = |i: usize| fb.wheel_radius[i] - m.spec.init[[DEF_F, DEF_R][i]];
+            // the patch at the loaded radius along the bike's up, on the road: z + u.a = lift (u.up)
+            let miss = |th: f64| {
+                let u = (base * exp(fb.lat().scale(th))).t() * V3([0.0, 0.0, 1.0]);
+                (lift(0) * u.dot(fb.up) - u.dot(k.af)) - (lift(1) * u.dot(fb.up) - u.dot(k.ar))
+            };
+            let (mut a, mut b) = (0.0, 0.01);
+            for _ in 0..20 {
+                let (fa, fb_) = (miss(a), miss(b));
+                if (fb_ - fa).abs() < 1e-15 {
+                    break;
+                }
+                (a, b) = (b, b - fb_ * (b - a) / (fb_ - fa));
+            }
+            st.att = base * exp(fb.lat().scale(b));
+            let u = st.att.t() * V3([0.0, 0.0, 1.0]);
+            st.z = lift(0) * u.dot(fb.up) - u.dot(k.af);
+            st
+        }
+
+        /// The tyres' deflections (m) and their rates on the road, front and rear: each patch
+        /// (the axle less the loaded radius along the bike's up) on the road's height there.
+        fn on_road(&self, bike: &Bike<f64>, m: &ForceModel, speed: f64) -> [[f64; 2]; 2] {
+            let fb = &m.bike;
+            let mut q = [0.0; NL];
+            (q[D], q[S]) = (self.d[0], self.s[0]);
+            let k = kin(fb, bike, &q);
+            let h = 1e-6;
+            let (mut qp, mut qm) = (q, q);
+            qp[D] += h;
+            qm[D] -= h;
+            let daf = (kin(fb, bike, &qp).af - kin(fb, bike, &qm).af).scale(0.5 / h);
+            let u = self.att.t() * V3([0.0, 0.0, 1.0]);
+            let ud = -self.w0.cross(u);
+            let off = patch_offsets(fb);
+            let mut out = [[0.0; 2]; 2];
+            for (i, a, ad) in [(0, k.af, daf.scale(self.d[1])), (1, k.ar, k.dar.scale(self.s[1]))] {
+                let (hh, hs) = road(self.dist + off[i]);
+                let above = self.z + u.dot(a) - hh;
+                let rate = self.vel.0[2] + ud.dot(a) + u.dot(ad) - hs * speed;
+                let (cu, cud) = (u.dot(fb.up), ud.dot(fb.up));
+                out[i] = [fb.wheel_radius[i] - above / cu, -(rate * cu - above * cud) / (cu * cu)];
+            }
+            out
         }
     }
 
     /// The unknowns of a substep, `u`: the frame pod's specific force (3, bike axes), the
     /// chassis angular acceleration (3, bike axes), d'', s'', the rider's pose'' (6).
-    fn sample(m: &ForceModel, t: f64, st: &State, u: &[f64; 14]) -> (Sample<f64>, [[f64; NFL]; 3], ForceMeas) {
+    fn sample(bike: &Bike<f64>, m: &ForceModel, t: f64, st: &State, u: &[f64; 14]) -> (Sample<f64>, [[f64; NFL]; 3], ForceMeas) {
         let fb = &m.bike;
         let mut inp = inputs_at(m, t);
-        inp.defl[0][0] += st.ctrl[0];
-        inp.defl[0][1] += st.ctrl_rate[0];
-        inp.defl[1][0] -= st.ctrl[0];
-        inp.defl[1][1] -= st.ctrl_rate[0];
+        if st.road {
+            // a straight road: the bumps, the brakes and the rider's pumping and pitch, in the
+            // pitch plane where the ground tie works; no side forces to lay the bike over
+            inp.defl = st.on_road(bike, m, inp.speed[0]);
+            for i in 0..2 {
+                inp.tan_lat[i][1] = 0.0;
+            }
+            for i in [1, 3, 5] {
+                inp.act[i] = 0.0;
+            }
+        } else {
+            inp.defl[0][0] += st.ctrl[0];
+            inp.defl[0][1] += st.ctrl_rate[0];
+            inp.defl[1][0] -= st.ctrl[0];
+            inp.defl[1][1] -= st.ctrl_rate[0];
+        }
         inp.tan_lat[0][1] += st.ctrl[1];
         inp.tan_lat[1][1] += st.ctrl[2];
         let bv = |v: &[f64]| fb.fwd.scale(v[0]) + fb.lat().scale(v[1]) + fb.up.scale(v[2]);
@@ -1121,7 +1316,7 @@ pub(crate) mod synth {
             (f[0][POS + i], f[1][POS + i], f[2][POS + i]) = (st.pose[i], st.pose_rate[i], u[8 + i]);
             f[0][ACT_F + i] = inp.act[i];
         }
-        (core, f, ForceMeas { frame: f0.0, fork: [0.0; 3], rear: [0.0; 3], speed: inp.speed[0], speed_rate: inp.speed[1], cam: None })
+        (core, f, ForceMeas { frame: f0.0, fork: [0.0; 3], rear: [0.0; 3], speed: inp.speed[0], speed_rate: inp.speed[1], cam: None, ground: None })
     }
 
     /// One evaluation at `t` with unknowns `u`.
@@ -1135,7 +1330,7 @@ pub(crate) mod synth {
     }
 
     fn eval(bike: &Bike<f64>, m: &ForceModel, bike_h: &Bike<num_dual::HyperDual<f64>>, t: f64, st: &State, u: &[f64; 14]) -> Eval {
-        let (core, f, mut meas) = sample(m, t, st, u);
+        let (core, f, mut meas) = sample(bike, m, t, st, u);
         let p = pod_readings(bike_h, &core);
         meas.fork = [p[6], p[7], p[8]];
         meas.rear = [p[12], p[13], p[14]];
@@ -1165,12 +1360,22 @@ pub(crate) mod synth {
 
     /// Runs the exact-model ride: `n` samples at `dt` after a settling run of `settle_s`.
     pub fn ride(bike: &Bike<f64>, m: &ForceModel, n: usize, dt: f64, settle_s: f64) -> Truth {
+        ride_from(bike, m, State::at_rest(m), n, dt, settle_s)
+    }
+
+    /// [`ride`] over [`ROAD`]: the tyres' deflections from where the patches sit over the road,
+    /// not prescribed; the frame's world attitude, velocity and height integrated with gravity.
+    pub fn ride_on_road(bike: &Bike<f64>, m: &ForceModel, n: usize, dt: f64, settle_s: f64) -> Truth {
+        ride_from(bike, m, State::at_rest_on_road(bike, m), n, dt, settle_s)
+    }
+
+    fn ride_from(bike: &Bike<f64>, m: &ForceModel, start: State, n: usize, dt: f64, settle_s: f64) -> Truth {
         let bike_h = bike.map(num_dual::HyperDual::from_re);
-        let mut st = State::at_rest(m);
+        let mut st = start;
         let sub = 20;
         let h = dt / sub as f64;
         let skip = (settle_s / dt).round() as usize;
-        let mut truth = Truth { core: Vec::with_capacity(n), f: Vec::with_capacity(n), normal: Vec::with_capacity(n), speed: Vec::with_capacity(n), readings: Vec::with_capacity(n) };
+        let mut truth = Truth { core: Vec::with_capacity(n), f: Vec::with_capacity(n), normal: Vec::with_capacity(n), speed: Vec::with_capacity(n), readings: Vec::with_capacity(n), world: Vec::with_capacity(n) };
         let fb = &m.bike;
         // the attitude holder: angular acceleration (bike axes) per unit trim, at rest
         let ang = |st: &State| { let u = solve(bike, m, &bike_h, -10.0, st); nalgebra::Vector3::new(u[3], u[4], u[5]) };
@@ -1182,13 +1387,30 @@ pub(crate) mod synth {
             s2.ctrl[c_] = unit[c_];
             jc.set_column(c_, &((ang(&s2) - a_rest) / unit[c_]));
         }
-        let jinv = jc.try_inverse().expect("the trims reach every axis");
+        // on the road the pitch is the road's: the lateral trims hold roll and yaw alone
+        let jinv = if st.road {
+            let j2 = nalgebra::Matrix2::new(jc[(0, 1)], jc[(0, 2)], jc[(2, 1)], jc[(2, 2)]);
+            let i2 = j2.try_inverse().expect("the lateral trims reach roll and yaw");
+            nalgebra::Matrix3::new(0.0, 0.0, 0.0, i2[(0, 0)], 0.0, i2[(0, 1)], i2[(1, 0)], 0.0, i2[(1, 1)])
+        } else {
+            jc.try_inverse().expect("the trims reach every axis")
+        };
         let hold_s = 0.2;
         for i in 0..skip + n {
             for k_ in 0..sub {
                 let t = (i as f64 - skip as f64) * dt + k_ as f64 * h;
                 let wb = nalgebra::Vector3::new(st.w0.dot(fb.fwd), st.w0.dot(fb.lat()), st.w0.dot(fb.up));
-                let c_new = -(jinv * (wb / hold_s));
+                // on the road the roll angle is held too (a rider steers to stay up; here the
+                // lateral trims do it), critically damped at 1.5 Hz, or the side forces lay the
+                // bike over and lift its tyres
+                let target = if st.road {
+                    let u = st.att.t() * V3([0.0, 0.0, 1.0]);
+                    let (wn, roll) = (std::f64::consts::TAU * 1.5, u.dot(fb.lat()).atan2(u.dot(fb.up)));
+                    nalgebra::Vector3::new(2.0 * wn * wb[0] + wn * wn * roll, 0.0, wb[2] / hold_s)
+                } else {
+                    wb / hold_s
+                };
+                let c_new = -(jinv * target);
                 for c_ in 0..3 {
                     st.ctrl_rate[c_] = (c_new[c_] - st.ctrl[c_]) / h;
                     st.ctrl[c_] = c_new[c_];
@@ -1202,8 +1424,14 @@ pub(crate) mod synth {
                     truth.normal.push(e.forces.normal);
                     truth.speed.push([e.meas.speed, e.meas.speed_rate]);
                     truth.readings.push(e.readings);
+                    truth.world.push(((st.att.t() * V3([0.0, 0.0, 1.0])).0, st.z, st.dist));
                 }
-                // semi-implicit Euler
+                // semi-implicit Euler; the frame's world motion with gravity
+                let f0 = fb.fwd.scale(u[0]) + fb.lat().scale(u[1]) + fb.up.scale(u[2]);
+                st.vel = st.vel + (st.att * f0 + V3([0.0, 0.0, -9.80665])).scale(h);
+                st.z += st.vel.0[2] * h;
+                st.dist += inputs_at(m, t).speed[0] * h;
+                st.att = st.att * exp(st.w0.scale(h));
                 st.w0 = st.w0 + (fb.fwd.scale(u[3]) + fb.lat().scale(u[4]) + fb.up.scale(u[5])).scale(h);
                 st.d[1] += u[6] * h;
                 st.d[0] += st.d[1] * h;
@@ -1278,7 +1506,7 @@ pub(crate) mod synth {
             mask_rear: vec![true; n],
             air: None,
             nav: None,
-            forces: Some(ForceWindow { speed_mps: truth.speed.iter().map(|s| s[0]).collect(), cam: vec![] }),
+            forces: Some(ForceWindow { speed_mps: truth.speed.iter().map(|s| s[0]).collect(), cam: vec![], ground: None }),
         }
     }
 
@@ -1291,7 +1519,7 @@ pub(crate) mod synth {
         let par: [f64; NFP] = std::array::from_fn(|i| v.glob[g0 + i]);
         let k = kin(&m.bike, &obj.bike, &s.q);
         let x = ForceIn { d: [s.q[D], s.qd[D]], s: [s.q[S], s.qd[S]], w0: s.w0, a0: s.a0, f: f[0], fd: f[1], fdd: f[2], par };
-        let meas = ForceMeas { frame: obj.win.frame_accel[t], fork: obj.win.fork_accel[t], rear: obj.win.rear_accel[t], speed: 0.0, speed_rate: 0.0, cam: None };
+        let meas = ForceMeas { frame: obj.win.frame_accel[t], fork: obj.win.fork_accel[t], rear: obj.win.rear_accel[t], speed: 0.0, speed_rate: 0.0, cam: None, ground: None };
         rows(m, &k, &x, &meas).1.normal
     }
 
@@ -1329,13 +1557,22 @@ pub(crate) mod synth {
     /// Starts the damper, tyre and rider numbers wrong (and centres their priors there),
     /// solves `secs` of the exact ride, and returns each start and where it ended (log units).
     fn identify(secs: f64) -> Vec<(&'static str, f64, f64)> {
+        identify_on(secs, false)
+    }
+
+    /// [`identify`], on the road with the ground tie (`road`) or with prescribed deflections.
+    fn identify_on(secs: f64, road: bool) -> Vec<(&'static str, f64, f64)> {
         use crate::estimate::physics::objective::{Objective, Spec, Weights, NG};
         use crate::estimate::physics::solve::gauss_newton;
-        let (bike, m) = model();
+        let (bike, m) = if road { road_model() } else { model() };
         let dt = 1.0 / 400.0;
         let n = (secs / dt).round() as usize;
-        let truth = ride(&bike, &m, n, dt, 1.0);
-        let mut obj = Objective::new(bike, window(&truth, 400.0), Spec::standard(n, dt), Weights::default(), [0.0; NG]).with_forces(m);
+        let truth = if road { ride_on_road(&bike, &m, n, dt, 1.0) } else { ride(&bike, &m, n, dt, 1.0) };
+        let mut win = window(&truth, 400.0);
+        if road {
+            win.forces.as_mut().unwrap().ground = Some(ground_of(&truth, &m));
+        }
+        let mut obj = Objective::new(bike, win, Spec::standard(n, dt), Weights::default(), [0.0; NG]).with_forces(m);
         let g0 = obj.force_glob0();
         let wrong = [
             ("fork LSC", P_FORK_DAMP, 0.4),
@@ -1350,10 +1587,109 @@ pub(crate) mod synth {
         for &(_, i, x) in &wrong {
             obj.glob_centre[g0 + i] = x;
         }
-        let (v, info) = gauss_newton(&obj, obj.initial_vars(), 60, 1e-5).unwrap();
+        // from the pods-only solve, as a ride's windows start (the ground tie moves both tyres'
+        // common height a little per iteration, so a cold start crawls)
+        let v0 = if road { crate::estimate::physics::solve::warm_start(&obj, 40, 1e-4).unwrap() } else { obj.initial_vars() };
+        let (v, info) = gauss_newton(&obj, v0, 60, 1e-5).unwrap();
         let out: Vec<_> = wrong.iter().map(|&(name, i, x)| (name, x, v.glob[g0 + i])).collect();
         eprintln!("identification, {secs} s ({} iterations): {}", info.iterations, out.iter().map(|(n, a, b)| format!("{n} {a:+.2} -> {b:+.3}")).collect::<Vec<_>>().join(", "));
         out
+    }
+
+    /// The ground tie's inputs from an exact ride's world state: a perfect navigation, so a
+    /// tie of 0.5 mm (the real rides' 5 mm is for navigation's drift and line changes, and is
+    /// looser than this gentle road's whole deflection swing).
+    pub fn ground_of(truth: &Truth, m: &ForceModel) -> crate::estimate::physics::ground::GroundWindow {
+        let sigma = 0.0005;
+        crate::estimate::physics::ground::GroundWindow {
+            up: truth.world.iter().map(|w| w.0).collect(),
+            z_m: truth.world.iter().map(|w| w.1).collect(),
+            s_m: truth.world.iter().map(|w| w.2).collect(),
+            sigma_m: vec![[sigma; 2]; truth.world.len()],
+            offset_m: patch_offsets(&m.bike),
+        }
+    }
+
+    #[test]
+    fn exact_ride_on_road_sits_both_patches_on_the_road_and_keeps_both_tyres_on_it() {
+        // Arrange
+        let (bike, m) = road_model();
+
+        // Act
+        let truth = ride_on_road(&bike, &m, 400, 1.0 / 400.0, 1.0);
+
+        // Assert: each patch (the axle less the loaded radius along the bike's up) at the road's
+        // height, which the tie's rows read
+        let fb = &m.bike;
+        let off = patch_offsets(fb);
+        let mut worst: f64 = 0.0;
+        for (t, s) in truth.core.iter().enumerate() {
+            let k = kin(fb, &bike, &s.q);
+            let (u, z, dist) = truth.world[t];
+            for (i, a, d0) in [(0, k.af, DEF_F), (1, k.ar, DEF_R)] {
+                let p = a - fb.up.scale(fb.wheel_radius[i] - truth.f[t][0][d0]);
+                worst = worst.max((z + p.dot(V3(u)) - road(dist + off[i]).0).abs());
+            }
+        }
+        let nmin = truth.normal.iter().fold(f64::MAX, |a, n| a.min(n[0]).min(n[1]));
+        let defl = truth.f.iter().fold((f64::MAX, f64::MIN), |a, f| (a.0.min(f[0][DEF_F]).min(f[0][DEF_R]), a.1.max(f[0][DEF_F]).max(f[0][DEF_R])));
+        eprintln!("road ride: patch off the road {:.2e} m; tyre normal min {nmin:.0} N; deflection {:.1}..{:.1} mm", worst, defl.0 * 1e3, defl.1 * 1e3);
+        assert!(worst < 1e-9, "{worst} m");
+        assert!(nmin > 5.0, "a tyre off the road: {nmin} N");
+    }
+
+    #[test]
+    fn exact_ride_on_road_solve_with_the_ground_tie_recovers_travel_loads_and_the_road() {
+        // Arrange: 1 s on the road, the tie's inputs from the ride's world state; a cold start
+        use crate::estimate::physics::objective::{Objective, Spec, Weights, NG};
+        use crate::estimate::physics::solve::{gauss_newton, latents};
+        let (bike, m) = road_model();
+        let (n, dt) = (400, 1.0 / 400.0);
+        let truth = ride_on_road(&bike, &m, n, dt, 1.0);
+        let mut win = window(&truth, 400.0);
+        let gw = ground_of(&truth, &m);
+        win.forces.as_mut().unwrap().ground = Some(gw.clone());
+        let obj = Objective::new(bike, win, Spec::standard(n, dt), Weights::default(), [0.0; NG]).with_forces(m);
+
+        // Act
+        let v0 = crate::estimate::physics::solve::warm_start(&obj, 40, 1e-4).unwrap();
+        let (v, info) = gauss_newton(&obj, v0, 150, 1e-6).unwrap();
+
+        // Assert: away from the window's ends
+        let q = latents(&obj, &v);
+        let inner = 20..n - 20;
+        let rms = |e: &dyn Fn(usize) -> f64| (inner.clone().map(|t| e(t).powi(2)).sum::<f64>() / inner.len() as f64).sqrt();
+        let d_rms = rms(&|t| q[t][D] - truth.core[t].q[D]);
+        let s_rms = rms(&|t| q[t][S] - truth.core[t].q[S]);
+        let nf = rms(&|t| normal_at(&obj, &v, t)[0] - truth.normal[t][0]);
+        let nr = rms(&|t| normal_at(&obj, &v, t)[1] - truth.normal[t][1]);
+        let g = v.ground.as_ref().expect("a ground profile");
+        let h_rms = rms(&|t| g.height(gw.s_m[t] + gw.offset_m[0]) - road(gw.s_m[t] + gw.offset_m[0]).0);
+        let mean_n = inner.clone().map(|t| truth.normal[t][0] + truth.normal[t][1]).sum::<f64>() / inner.len() as f64;
+        let bias = |e: &dyn Fn(usize) -> f64| inner.clone().map(e).sum::<f64>() / inner.len() as f64;
+        let g0 = obj.force_glob0();
+        eprintln!("road solve bias: travel {:.2} / {:.2} mm, ground {:.2} mm, defl {:.2} / {:.2} mm; pars {:?}", bias(&|t| q[t][D] - truth.core[t].q[D]) * 1e3, bias(&|t| q[t][S] - truth.core[t].q[S]) * 1e3,
+                  bias(&|t| g.height(gw.s_m[t] + gw.offset_m[0]) - road(gw.s_m[t] + gw.offset_m[0]).0) * 1e3,
+                  bias(&|t| crate::estimate::physics::solve::force_latents(&obj, &v)[t][DEF_F] - truth.f[t][0][DEF_F]) * 1e3, bias(&|t| crate::estimate::physics::solve::force_latents(&obj, &v)[t][DEF_R] - truth.f[t][0][DEF_R]) * 1e3,
+                  (0..18).map(|i| (v.glob[g0 + i] * 100.0).round() / 100.0).collect::<Vec<_>>());
+        eprintln!("road solve: {} iterations, loss {:.2} -> {:.2}; travel rms {:.2} / {:.2} mm; tyre load rms {nf:.1} / {nr:.1} N; ground rms {:.2} mm",
+                  info.iterations, info.loss[0], info.loss.last().unwrap(), d_rms * 1e3, s_rms * 1e3, h_rms * 1e3);
+        assert!(d_rms < 0.002 && s_rms < 0.002, "travel rms {d_rms} / {s_rms} m");
+        assert!(nf < 0.05 * mean_n && nr < 0.05 * mean_n, "tyre loads off by {nf} / {nr} N");
+        assert!(h_rms < 0.002, "ground rms {h_rms} m");
+    }
+
+    #[test]
+    fn exact_ride_on_road_identification_with_the_ground_tie_recovers_the_tyre_damping() {
+        // Arrange / Act: 6 s (over 3 s of this gentle road the tyre's damping keeps half its
+        // error: the ground is unknown too, and the prior is centred on the wrong start)
+        let out = identify_on(6.0, true);
+
+        // Assert: the dampers and the rider's vertical as without the tie, and now the front
+        // tyre's damping, which forces alone could not tell (F1: it does not move)
+        for (name, start, end) in out[..6].iter().chain(&out[7..8]) {
+            assert!(end.abs() < 0.3 * start.abs(), "{name}: {start} -> {end}");
+        }
     }
 
     #[test]
@@ -1391,7 +1727,7 @@ pub(crate) mod synth {
         let pc = m.bike.rider_cg + h.neck + h.cam;
         let expect = f0 + s.w0.cross(s.w0.cross(pc));
         let z = [0.0; NFL];
-        let meas = ForceMeas { frame: f0.0, fork: [0.0; 3], rear: [0.0; 3], speed: 0.0, speed_rate: 0.0, cam: Some([expect.0[0], expect.0[1], expect.0[2], s.w0.0[0], s.w0.0[1], s.w0.0[2]]) };
+        let meas = ForceMeas { frame: f0.0, fork: [0.0; 3], rear: [0.0; 3], speed: 0.0, speed_rate: 0.0, cam: Some([expect.0[0], expect.0[1], expect.0[2], s.w0.0[0], s.w0.0[1], s.w0.0[2]]), ground: None };
         let bike_d = bike.map(Dual64::from);
 
         // Act
@@ -1427,7 +1763,7 @@ pub(crate) mod synth {
             f[NECK_ACT + i] = 1.5 - i as f64;
         }
         let p = truth.readings[t];
-        let meas = ForceMeas { frame: s.f_meas.0, fork: [p[6], p[7], p[8]], rear: [p[12], p[13], p[14]], speed: truth.speed[t][0], speed_rate: truth.speed[t][1], cam: Some([0.5, -1.0, 9.0, 0.1, -0.2, 0.3]) };
+        let meas = ForceMeas { frame: s.f_meas.0, fork: [p[6], p[7], p[8]], rear: [p[12], p[13], p[14]], speed: truth.speed[t][0], speed_rate: truth.speed[t][1], cam: Some([0.5, -1.0, 9.0, 0.1, -0.2, 0.3]), ground: Some(GroundMeas { up: [0.1, -0.05, 0.99], z_m: 0.4, h_m: [-0.32, -0.27], sigma_m: [0.005, 0.009] }) };
         let par: [f64; NFP] = std::array::from_fn(|i| 0.1 * ((i % 5) as f64 - 2.0));
         let bike_d = bike.map(Dual64::from);
         let at = |s: &Sample<f64>, f: &[f64; NFL], fd: &[f64; NFL], fdd: &[f64; NFL], par: &[f64; NFP]| force_rows(&m, &bike, &bike_d, s, f, fd, fdd, par, &meas, false).r;
