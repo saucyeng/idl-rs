@@ -435,6 +435,27 @@ pub fn ground_start(obj: &Objective, keep_nav: bool, iters: usize, tol: f64) -> 
             NavPoint { r: rotation(&ns.ctrl, ns.u), v: ns.v, w0: s.w0 }
         })
         .collect();
+    // IDL_GROUND_ACCEL_TAU (prototyping, s): the frame's velocity for the tie from its own
+    // accelerometer (turned to the world by the attitude, gravity removed), pulled to
+    // navigation's over this time constant: fast motion measured, slow motion from navigation
+    let nav = match std::env::var("IDL_GROUND_ACCEL_TAU").ok().and_then(|x| x.parse::<f64>().ok()).filter(|x| *x > 0.0) {
+        Some(tau) => {
+            let dt = obj.spec.dt;
+            let mut vh = V3(nav[0].v);
+            nav.iter()
+                .enumerate()
+                .map(|(t, p)| {
+                    if t > 0 {
+                        let f = V3(obj.win.frame_accel[t - 1]);
+                        let a = nav[t - 1].r * f + V3(super::nav::G_NAV);
+                        vh = vh + (a + (V3(nav[t - 1].v) - vh).scale(1.0 / tau)).scale(dt);
+                    }
+                    NavPoint { v: vh.0, ..*p }
+                })
+                .collect()
+        }
+        None => nav,
+    };
     let fb = &m.bike;
     let offset = [fb.front_axle.dot(fb.fwd), fb.rear_axle.dot(fb.fwd)];
     if let Some(fw) = out.win.forces.as_mut() {
@@ -513,6 +534,83 @@ pub fn ground_start(obj: &Objective, keep_nav: bool, iters: usize, tol: f64) -> 
                     }
                     (e.iter().map(|x| (x - m).powi(2)).sum::<f64>() / e.len() as f64).sqrt()
                 };
+                // the gap by how far apart the turn puts the lines (L^2 |yaw rate| / 2v), and on
+                // the straight by the bike's own pitch rate: line difference or something else
+                {
+                    let lb = offset[0] - offset[1];
+                    let mut bins: [Vec<f64>; 4] = Default::default();
+                    let mut e_all: Vec<(f64, usize)> = Vec::new();
+                    for (t, z) in pz.iter().filter(|(t, _)| ok(*t)) {
+                        let s = gwin.s_m[*t] + gwin.offset_m[1];
+                        if s <= lo || s >= hi {
+                            continue;
+                        }
+                        let p = &nav[*t];
+                        let sp = V3(p.v).norm().max(0.1);
+                        let up = V3([p.r.0[2][0], p.r.0[2][1], p.r.0[2][2]]);
+                        let lat = lb * lb * p.w0.dot(up).abs() / (2.0 * sp);
+                        let b = if lat < 0.02 { 0 } else if lat < 0.05 { 1 } else if lat < 0.10 { 2 } else { 3 };
+                        e_all.push((z[1] - hf.height(s), b));
+                    }
+                    let m = e_all.iter().map(|x| x.0).sum::<f64>() / e_all.len().max(1) as f64;
+                    for (e, b) in e_all {
+                        bins[b].push((e - m).abs());
+                    }
+                    let med = |v: &mut Vec<f64>| {
+                        v.sort_by(f64::total_cmp);
+                        if v.is_empty() { f64::NAN } else { 1e3 * v[v.len() / 2] }
+                    };
+                    let n: Vec<usize> = bins.iter().map(|b| b.len()).collect();
+                    let ms: Vec<f64> = bins.iter_mut().map(med).collect();
+                    eprintln!("ground tie gap by the turn's line offset, median mm (samples): <2 cm {:.0} ({}), 2-5 cm {:.0} ({}), 5-10 cm {:.0} ({}), >10 cm {:.0} ({})", ms[0], n[0], ms[1], n[1], ms[2], n[2], ms[3], n[3]);
+                }
+                // which term the gap follows: the front's travel and pitch and height where the rear
+                // is now (fitted against distance), the rear's own; least squares, each column's
+                // share of the gap's variance and its coefficient
+                {
+                    let prof = |vals: &dyn Fn(usize) -> f64| {
+                        let pts: Vec<super::ground::Patch> = pz.iter().filter(|(t, _)| ok(*t)).map(|(t, _)| super::ground::Patch { s_m: gwin.s_m[*t] + gwin.offset_m[0], z_m: vals(*t), sigma_m: 0.005 }).collect();
+                        super::ground::fit_profile(&pts, gw.knot_m, gw.curvature_m, 0.0).map(|(s0_m, coef)| super::ground::GroundFit { s0_m, knot_m: gw.knot_m, coef, on: Vec::new() })
+                    };
+                    let q: Vec<[f64; NL]> = (0..o2.spec.n).map(|t| o2.sample(&probe, t).q).collect();
+                    let pitch = |t: usize| V3(gwin.up[t]).dot(fb.fwd).asin();
+                    let (fd, fp, fz) = (prof(&|t| q[t][D]), prof(&|t| pitch(t)), prof(&|t| gwin.z_m[t]));
+                    if let (Some(fd), Some(fp), Some(fz)) = (fd, fp, fz) {
+                        let mut rows: Vec<([f64; 5], f64)> = Vec::new();
+                        for (t, z) in pz.iter().filter(|(t, _)| ok(*t)) {
+                            let s = gwin.s_m[*t] + gwin.offset_m[1];
+                            if s <= lo || s >= hi {
+                                continue;
+                            }
+                            rows.push(([fd.height(s), q[*t][S], pitch(*t) - fp.height(s), gwin.z_m[*t] - fz.height(s), 1.0], z[1] - hf.height(s)));
+                        }
+                        let k = 5;
+                        let mut a = nalgebra::DMatrix::<f64>::zeros(k, k);
+                        let mut b = nalgebra::DVector::<f64>::zeros(k);
+                        for (x, e) in &rows {
+                            for i in 0..k {
+                                b[i] += x[i] * e;
+                                for j in 0..k {
+                                    a[(i, j)] += x[i] * x[j];
+                                }
+                            }
+                        }
+                        let mean = |c: usize| rows.iter().map(|r| r.0[c]).sum::<f64>() / rows.len().max(1) as f64;
+                        let em = rows.iter().map(|r| r.1).sum::<f64>() / rows.len().max(1) as f64;
+                        let var = rows.iter().map(|r| (r.1 - em).powi(2)).sum::<f64>() / rows.len().max(1) as f64;
+                        if let Some(c) = a.clone().lu().solve(&b) {
+                            let names = ["front travel", "rear travel", "pitch change", "height change"];
+                            let share: Vec<String> = (0..4).map(|i| {
+                                let m = mean(i);
+                                let cv = rows.iter().map(|r| (r.0[i] - m) * (r.1 - em)).sum::<f64>() / rows.len().max(1) as f64;
+                                let vx = rows.iter().map(|r| (r.0[i] - m).powi(2)).sum::<f64>() / rows.len().max(1) as f64;
+                                format!("{} r2 {:.2} coef {:+.3}", names[i], cv * cv / (vx * var).max(f64::MIN_POSITIVE), c[i])
+                            }).collect();
+                            let res = rows.iter().map(|(x, e)| (e - (0..k).map(|i| c[i] * x[i]).sum::<f64>()).powi(2)).sum::<f64>() / rows.len().max(1) as f64;
+                            eprintln!("ground tie gap {:.1} mm rms, {:.1} after the fit: {}", 1e3 * var.sqrt(), 1e3 * res.sqrt(), share.join(", "));
+                        }
+                    }
+                }
                 let best = (-40..=40).map(|i| i as f64 * 0.02).map(|d| (d, mis(d, false))).filter(|x| x.1.is_finite()).min_by(|a, b| a.1.total_cmp(&b.1));
                 if let Some((d, m)) = best {
                     eprintln!("ground tie, rear on the front's ground: rms {:.1} mm (median |e| {:.1}) as placed; best {:.1} mm (median {:.1}) with the rear {:+.2} m along the path", 1e3 * mis(0.0, false), 1e3 * mis(0.0, true), 1e3 * m, 1e3 * mis(d, true), d);
