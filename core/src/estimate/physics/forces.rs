@@ -73,7 +73,7 @@ pub const ACT_F: usize = 12;
 pub const ACT_M: usize = 15;
 
 /// Force parameters (globals), each a log multiplier on [`ForceBike::nominal`].
-pub const NFP: usize = 34;
+pub const NFP: usize = 36;
 /// Fork damper (LSC, HSC, LSR, HSR, knee): parameters 0..5.
 pub const P_FORK_DAMP: usize = 0;
 /// Shock damper, at the shaft: parameters 5..10.
@@ -97,6 +97,9 @@ pub const P_RIDER_C: usize = 24;
 /// Air chamber volumes (fork positive, shock positive, fork negative, shock negative): 30..34,
 /// factors on the bike file's (the spring's progression and its top-out, not only its force).
 pub const P_VOLUME: usize = 30;
+/// The rider's rest pose under braking (back, down), m per g of deceleration: 34..36 (Isaac,
+/// 2026-11-27: he shifts back under braking, a little down, much more back than down).
+pub const P_BRAKE_SHIFT: usize = 34;
 
 /// Each force parameter's name, in index order.
 pub const PAR_NAMES: [&str; NFP] = [
@@ -107,6 +110,7 @@ pub const PAR_NAMES: [&str; NFP] = [
     "rider k fwd", "rider k lat", "rider k up", "rider k roll", "rider k pitch", "rider k yaw",
     "rider c fwd", "rider c lat", "rider c up", "rider c roll", "rider c pitch", "rider c yaw",
     "fork positive volume", "shock positive volume", "fork negative volume", "shock negative volume",
+    "rider back under braking", "rider down under braking",
 ];
 
 /// Rows per sample (see the module table).
@@ -270,7 +274,7 @@ impl ForceBike {
 }
 
 /// The active wrench's smoothness, times the core latents' ([`ForceSpec::smooth`]).
-pub const ACTIVE_SMOOTH: f64 = 2000.0;
+pub const ACTIVE_SMOOTH: f64 = 259.0;
 
 /// How the force latents are laid out: knot spacing (samples), value at zero coefficients
 /// (SI) and SI units per coefficient unit, per latent.
@@ -289,9 +293,10 @@ pub struct ForceSpec {
 
 impl ForceSpec {
     /// Deflection every sample (the tyre hops at tens of Hz), tyre forces every 4 samples,
-    /// the rider's pose every 2, his active wrench every 4 with a smoothness 2000 times the
-    /// core's (a low-pass near 3 Hz: pumping and weight shifts are slow, and a fast active part
-    /// would absorb what the dampers and the rider's springs do). `static_deflection_m`: where
+    /// the rider's pose every 2, his active wrench every 4 with a smoothness [`ACTIVE_SMOOTH`]
+    /// times the core's (a low-pass near 5 Hz, Isaac 2026-11-27: he works the bars through his
+    /// wrists up to about that; a fast active part could absorb what the dampers do, and the
+    /// rider's stroke, [`ForceWeights::stroke_m`], is what bounds it). `static_deflection_m`: where
     /// each tyre starts.
     pub fn standard(static_deflection_m: [f64; 2]) -> Self {
         let mut m = [2; NFL];
@@ -342,6 +347,9 @@ pub struct ForceWeights {
     pub act_n: f64,
     /// Active moment prior, N m.
     pub act_nm: f64,
+    /// The rider's stroke each way from his neutral pose, m: soft stops past it (Isaac,
+    /// 2026-11-27: arms and legs travel about 0.33 m; the body's actuators bounded, not weak).
+    pub stroke_m: f64,
     /// Tyre deflection prior about its static value, m: keeps a solve from parking a tyre in
     /// rim strike or far off the ground to soak up a misfit.
     pub defl_m: f64,
@@ -368,9 +376,10 @@ impl Default for ForceWeights {
             system_nm: 20.0,
             tyre_tan_n: 500.0,
             // Isaac, 2026-11-25: he shifts fore and aft about as much as up and down
-            pos_m: [0.25, 0.1, 0.25],
+            pos_m: [0.25, 0.2, 0.25],
             rot_rad: 0.3,
             act_n: 300.0,
+            stroke_m: 0.165,
             act_nm: 60.0,
             defl_m: 0.02,
             par_sigma,
@@ -599,8 +608,13 @@ pub fn rows<S: Real>(m: &ForceModel, k: &Kin<S>, x: &ForceIn<S>, meas: &ForceMea
     for (j, lat_) in [TAN_F, LAT_F, TAN_R, LAT_R].into_iter().enumerate() {
         r[14 + j] = f[lat_] * (1.0 / w.tyre_tan_n);
     }
+    // the rider's rest pose slides back (and a little down) as the bike slows (GPS speed's rate)
+    let decel_g = relu(c::<S>(-meas.speed_rate), 0.1) * (1.0 / 9.80665);
+    let rest = [-(par(P_BRAKE_SHIFT) * decel_g), c::<S>(0.0), -(par(P_BRAKE_SHIFT + 1) * decel_g)];
     for i in 0..3 {
-        r[18 + i] = f[POS + i] * (1.0 / w.pos_m[i]);
+        // a soft stop past the stroke: a centimetre beyond it costs as much as a sigma
+        let stop = (relu(f[POS + i] - w.stroke_m, 0.002) - relu(-f[POS + i] - w.stroke_m, 0.002)) * (1.0 / 0.01);
+        r[18 + i] = (f[POS + i] - rest[i]) * (1.0 / w.pos_m[i]) + stop;
         r[21 + i] = f[ROT + i] * (1.0 / w.rot_rad);
         r[24 + i] = f[ACT_F + i] * (1.0 / w.act_n);
         r[27 + i] = f[ACT_M + i] * (1.0 / w.act_nm);
@@ -770,6 +784,7 @@ pub(crate) mod synth {
         nominal[P_RIDER_K..P_RIDER_K + 6].copy_from_slice(&[20_000.0, 15_000.0, 30_000.0, 1500.0, 2000.0, 1000.0]);
         nominal[P_RIDER_C..P_RIDER_C + 6].copy_from_slice(&[800.0, 600.0, 1200.0, 60.0, 80.0, 40.0]);
         nominal[P_VOLUME..P_VOLUME + 4].copy_from_slice(&[1.0; 4]);
+        nominal[P_BRAKE_SHIFT..P_BRAKE_SHIFT + 2].copy_from_slice(&[0.15, 0.03]);
         let tyre = |psi: f64| TyreLaw::<f64>::from_tyre(&Tyre::mtb_29(2.5, psi, true, true));
         let fb = ForceBike {
             up,

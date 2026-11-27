@@ -463,10 +463,10 @@ pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
 /// core priors, then each force row group, then the smoothness.
 pub fn row_group_loss(o: &Objective, v: &Vars) -> String {
     let ctx = o.ctx(&v.glob, false);
-    let groups = [("fork", 0, 1), ("rear", 1, 2), ("riderF", 2, 5), ("riderM", 5, 8), ("sysF", 8, 11), ("sysM", 11, 14), ("tyreT", 14, 18), ("pose", 18, 24), ("act", 24, 30), ("defl", 30, 32)];
+    let groups = [("fork", 0, 1), ("rear", 1, 2), ("riderF", 2, 5), ("riderM", 5, 8), ("sysF fwd", 8, 9), ("sysF lat", 9, 10), ("sysF up", 10, 11), ("sysM", 11, 14), ("tyreT", 14, 18), ("pose", 18, 24), ("act", 24, 30), ("defl", 30, 32)];
     let k = o.forces.as_ref().map_or(0.0, |m| m.w.huber);
     let (mut sensor, mut prior) = (0.0, 0.0);
-    let mut fg = [0.0; 10];
+    let mut fg = [0.0; 12];
     for t in 0..o.spec.n {
         let s = o.sample(v, t);
         let r = o.sample_residuals(&ctx, &s, &v.glob, t, false).r;

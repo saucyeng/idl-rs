@@ -313,6 +313,16 @@ pub fn estimate_physics_with(
 
     drop(fit_ride);
     cfg.forces = force_setup(&bk)?;
+    // IDL_FORCE_ACTIVE_HZ (prototyping): the rider's active wrench's band, Hz, in place of the
+    // standard 3 Hz (its smoothness weight scales as the band to the -4th)
+    if let (Some(m), Some(hz)) = (cfg.forces.as_mut(), std::env::var("IDL_FORCE_ACTIVE_HZ").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|h| *h > 0.0)) {
+        use idl_rs::estimate::physics::forces::{ACTIVE_SMOOTH, ACT_F, ACT_M};
+        for i in 0..3 {
+            m.spec.smooth[ACT_F + i] = ACTIVE_SMOOTH * (3.0 / hz).powi(4);
+            m.spec.smooth[ACT_M + i] = ACTIVE_SMOOTH * (3.0 / hz).powi(4);
+        }
+        eprintln!("IDL_FORCE_ACTIVE_HZ: the rider's active wrench to {hz} Hz (smoothness {:.0})", ACTIVE_SMOOTH * (3.0 / hz).powi(4));
+    }
     // IDL_FORCE_FREEZE (prototyping): force parameters held at their nominal, by name or part of
     // one, comma separated (IDL_FORCE_FREEZE=friction holds both seals' friction)
     if let (Some(m), Ok(v)) = (cfg.forces.as_mut(), std::env::var("IDL_FORCE_FREEZE")) {

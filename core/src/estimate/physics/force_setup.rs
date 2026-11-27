@@ -23,6 +23,17 @@ const G: f64 = 9.80665;
 /// and PMC7801088 table 2). Standing, they move with the pedals: the frame carries them.
 pub const LOWER_LEGS_SHARE: f64 = 2.0 * (0.0433 + 0.0137);
 
+/// The limbs, both sides, as a share of body mass: legs (thigh 14.16 %, shank 4.33 %, foot
+/// 1.37 %: de Leva 1996 males, as reproduced in PMC7801088 table 2) and arms (upper arm 2.71 %,
+/// forearm 1.62 %, hand 0.61 %: de Leva 1996 males, not checked against a source: the copies
+/// reachable on 2026-11-27 were blocked).
+pub const LIMBS_SHARE: f64 = 2.0 * (0.1416 + 0.0433 + 0.0137) + 2.0 * (0.0271 + 0.0162 + 0.0061);
+/// The share of the limbs' mass the frame carries (Isaac, 2026-11-27: the limbs sit between,
+/// isolated from the body and from the frame by the ankles and wrists). 7 % of the rider on the
+/// frame: the fit's best between Beacon's laps (7 %) and 11/21's (3 % or less) in a sweep of 3,
+/// 7, 11, 18 and 25 %; the share moves the fitted dampers, so it is to be fitted in the end.
+pub const LIMBS_ON_FRAME: f64 = 0.07 / LIMBS_SHARE;
+
 /// The standing rider's centre of mass above the bottom bracket without a height, m (an
 /// estimate: attack position, knees and hips bent; the rider pose latent's 0.25 m prior takes
 /// the rest).
@@ -67,6 +78,8 @@ pub fn nominal() -> [f64; NFP] {
     n[P_TYRE_C..P_TYRE_C + 2].copy_from_slice(&[100.0, 100.0]);
     n[P_RIDER_K..P_RIDER_K + 6].copy_from_slice(&[20_000.0, 15_000.0, 30_000.0, 1500.0, 2000.0, 1000.0]);
     n[P_RIDER_C..P_RIDER_C + 6].copy_from_slice(&[800.0, 600.0, 1200.0, 60.0, 80.0, 40.0]);
+    // back 0.15 m, down 0.03 m per g of braking (a guess; fitted)
+    n[super::forces::P_BRAKE_SHIFT..super::forces::P_BRAKE_SHIFT + 2].copy_from_slice(&[0.15, 0.03]);
     n
 }
 
@@ -94,7 +107,8 @@ pub fn force_model(bike: &Bike<f64>, p: &Params, linkage: &Linkage, drivetrain: 
     let mt = mass_table(p);
     let rider = need("rider.mass_kg")? + number(p, "rider.carried_kg").unwrap_or(0.0);
     let sprung = mt.bike_sprung_kg.ok_or_else(|| ForceSetupError::Missing("mass.bike_kg".into()))?;
-    let (m_frame, m_rider) = (sprung + LOWER_LEGS_SHARE * rider, (1.0 - LOWER_LEGS_SHARE) * rider);
+    let share = LIMBS_ON_FRAME * LIMBS_SHARE;
+    let (m_frame, m_rider) = (sprung + share * rider, (1.0 - share) * rider);
     let radius = number(p, "wheels.tyre_radius_m").filter(|v| *v > 0.0).unwrap_or(0.37);
 
     // springs: chambers from the parameters, pressures from the sheet, resting where the
