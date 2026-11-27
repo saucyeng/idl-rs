@@ -104,6 +104,8 @@ pub const PARAMS: &[ParamSpec] = &[
     n("wheels.rear.hub_kg", "Rear hub", "kg", Wheels, false),
     n("wheels.rear.spokes_kg", "Rear spokes and nipples", "kg", Wheels, false),
     n("wheels.rear.rim_kg", "Rear rim", "kg", Wheels, false),
+    n("wheels.front.axle_kg", "Front axle", "kg", Wheels, false),
+    n("wheels.rear.axle_kg", "Rear axle", "kg", Wheels, false),
     n("wheels.rim_radius_m", "Rim radius (to the rim's mass)", "m", Wheels, false),
     n("wheels.tyre_radius_m", "Tyre radius (to the tyre's mass)", "m", Wheels, false),
     t("fork.model", "Fork", Fork),
@@ -156,6 +158,12 @@ pub const PARAMS: &[ParamSpec] = &[
     n("mass.frame_kg", "Frame without shock", "kg", Masses, false),
     n("mass.fork_kg", "Fork", "kg", Masses, false),
     n("mass.shock_kg", "Shock", "kg", Masses, false),
+    n("mass.front_rotor_kg", "Front brake rotor", "kg", Masses, false),
+    n("mass.front_caliper_kg", "Front brake caliper", "kg", Masses, false),
+    n("mass.rear_rotor_kg", "Rear brake rotor", "kg", Masses, false),
+    n("mass.rear_caliper_kg", "Rear brake caliper", "kg", Masses, false),
+    n("mass.cassette_kg", "Cassette", "kg", Masses, false),
+    n("mass.derailleur_kg", "Rear derailleur", "kg", Masses, false),
     n("rider.mass_kg", "Rider in kit", "kg", Rider, false),
     n("rider.height_m", "Rider height", "m", Rider, false),
     n("rider.carried_kg", "Carried (pack, bottles)", "kg", Rider, true),
@@ -264,8 +272,14 @@ pub fn mass_table(p: &Params) -> MassTable {
     let frame = number(p, "mass.frame_kg").unwrap_or(0.0);
     let fork = number(p, "mass.fork_kg").unwrap_or(0.0);
     let shock = number(p, "mass.shock_kg").unwrap_or(0.0);
-    let front_unsprung_kg = front.mass_kg + FORK_LOWERS_SHARE * fork;
-    let rear_unsprung_kg = rear.mass_kg + 0.5 * REAR_TRIANGLE_SHARE * frame;
+    // the parts that move with each wheel besides the wheel itself: axle, rotor and caliper
+    // (on the lowers, and on the member carrying the rear axle), the cassette, the derailleur on
+    // its hanger (Isaac, 2026-11-27: the unsprung side had none of them)
+    let kg = |k: &str| number(p, k).unwrap_or(0.0);
+    let front_parts = kg("wheels.front.axle_kg") + kg("mass.front_rotor_kg") + kg("mass.front_caliper_kg");
+    let rear_parts = kg("wheels.rear.axle_kg") + kg("mass.rear_rotor_kg") + kg("mass.rear_caliper_kg") + kg("mass.cassette_kg") + kg("mass.derailleur_kg");
+    let front_unsprung_kg = front.mass_kg + FORK_LOWERS_SHARE * fork + front_parts;
+    let rear_unsprung_kg = rear.mass_kg + 0.5 * REAR_TRIANGLE_SHARE * frame + rear_parts;
     let bike = number(p, "mass.bike_kg");
     MassTable {
         front,
@@ -273,7 +287,7 @@ pub fn mass_table(p: &Params) -> MassTable {
         front_unsprung_kg,
         rear_unsprung_kg,
         bike_sprung_kg: bike.map(|b| b - front_unsprung_kg - rear_unsprung_kg),
-        rest_kg: bike.map(|b| b - front.mass_kg - rear.mass_kg - frame - fork - shock),
+        rest_kg: bike.map(|b| b - front.mass_kg - rear.mass_kg - frame - fork - shock - front_parts - rear_parts),
         rider_kg: number(p, "rider.mass_kg"),
     }
 }
@@ -353,5 +367,33 @@ mod tests {
         assert!(m.front.inertia_kgm2 > 0.25 && m.front.inertia_kgm2 < 0.31, "{}", m.front.inertia_kgm2);
         assert!((m.front_unsprung_kg - (2.806 + 0.45 * 2.2)).abs() < 1e-9);
         assert!((m.rest_kg.unwrap() - (18.1 - 2.806 - 3.63 - 2.2)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mass_table_brakes_axles_cassette_and_derailleur_ride_with_their_wheel() {
+        // Arrange: only the parts beside the wheels, on an 18.1 kg bike
+        let p: Params = [
+            ("mass.bike_kg", 18.1),
+            ("wheels.front.axle_kg", 0.1),
+            ("mass.front_rotor_kg", 0.2),
+            ("mass.front_caliper_kg", 0.25),
+            ("wheels.rear.axle_kg", 0.1),
+            ("mass.rear_rotor_kg", 0.17),
+            ("mass.rear_caliper_kg", 0.25),
+            ("mass.cassette_kg", 0.4),
+            ("mass.derailleur_kg", 0.3),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), json!(v)))
+        .collect();
+
+        // Act
+        let m = mass_table(&p);
+
+        // Assert: unsprung, not sprung, and not in the wheels' spin
+        assert!((m.front_unsprung_kg - 0.55).abs() < 1e-9, "{}", m.front_unsprung_kg);
+        assert!((m.rear_unsprung_kg - 1.22).abs() < 1e-9, "{}", m.rear_unsprung_kg);
+        assert!((m.bike_sprung_kg.unwrap() - (18.1 - 0.55 - 1.22)).abs() < 1e-9);
+        assert_eq!(m.front.inertia_kgm2, 0.0);
     }
 }

@@ -218,6 +218,25 @@ pub fn estimate_physics_with(
             },
         )
     })?;
+    // IDL_ACCEL_SHIFT_MS (prototyping): every pod's accelerometer advanced against its gyro by
+    // this many ms (linear interpolation on the grid): a test for a filter delay between them
+    let mut r = r;
+    if let Some(ms) = std::env::var("IDL_ACCEL_SHIFT_MS").ok().and_then(|v| v.trim().parse::<f64>().ok()) {
+        let k = ms * 1e-3 / r.input.dt;
+        fn shift_by<T: Copy + std::ops::Mul<f64, Output = T> + std::ops::Add<Output = T>>(a: &mut [T], k: f64) {
+            let src = a.to_vec();
+            let n = src.len();
+            for (i, v) in a.iter_mut().enumerate() {
+                let x = (i as f64 + k).clamp(0.0, (n - 1) as f64);
+                let (j, f) = (x.floor() as usize, x - x.floor());
+                *v = src[j] * (1.0 - f) + src[(j + 1).min(n - 1)] * f;
+            }
+        }
+        shift_by(&mut r.input.imu0.accel, k);
+        if let Some(i) = r.input.imu1.as_mut() { shift_by(&mut i.accel, k) }
+        if let Some(i) = r.input.imu2.as_mut() { shift_by(&mut i.accel, k) }
+        eprintln!("IDL_ACCEL_SHIFT_MS: accelerometers advanced {ms} ms ({k:.2} samples)");
+    }
     let current = cal.physics.as_ref().filter(|p| p.version == PHYSICS_FIT_VERSION && !opts.refit);
     // a fit from the whole session while the solve takes only the span
     let fit_ride = if current.is_none() && opts.fit_whole_session && span.is_some() {
