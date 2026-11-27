@@ -237,6 +237,23 @@ pub fn estimate_physics_with(
         if let Some(i) = r.input.imu2.as_mut() { shift_by(&mut i.accel, k) }
         eprintln!("IDL_ACCEL_SHIFT_MS: accelerometers advanced {ms} ms ({k:.2} samples)");
     }
+    // IDL_GYRO_SHIFT_SAMPLES (prototyping): "imu0,imu1,imu2" whole samples each IMU's gyro is
+    // advanced against its own accelerometer (a test for the firmware pairing an accelerometer
+    // word with the gyro word of the previous time slot)
+    if let Ok(v) = std::env::var("IDL_GYRO_SHIFT_SAMPLES") {
+        let k: Vec<i64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        fn roll<T: Copy>(a: &mut [T], k: i64) {
+            let src = a.to_vec();
+            let n = src.len() as i64;
+            for (i, x) in a.iter_mut().enumerate() {
+                *x = src[(i as i64 + k).clamp(0, n - 1) as usize];
+            }
+        }
+        if let Some(&k0) = k.first() { roll(&mut r.input.imu0.gyro, k0) }
+        if let (Some(&k1), Some(i)) = (k.get(1), r.input.imu1.as_mut()) { roll(&mut i.gyro, k1) }
+        if let (Some(&k2), Some(i)) = (k.get(2), r.input.imu2.as_mut()) { roll(&mut i.gyro, k2) }
+        eprintln!("IDL_GYRO_SHIFT_SAMPLES: gyros advanced {k:?} samples (imu0, imu1, imu2)");
+    }
     let current = cal.physics.as_ref().filter(|p| p.version == PHYSICS_FIT_VERSION && !opts.refit);
     // a fit from the whole session while the solve takes only the span
     let fit_ride = if current.is_none() && opts.fit_whole_session && span.is_some() {

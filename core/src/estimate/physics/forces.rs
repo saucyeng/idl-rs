@@ -81,7 +81,7 @@ pub const HEAD: usize = 18;
 pub const NECK_ACT: usize = 21;
 
 /// Force parameters (globals), each a log multiplier on [`ForceBike::nominal`].
-pub const NFP: usize = 49;
+pub const NFP: usize = 51;
 /// Fork damper (LSC, HSC, LSR, HSR, knee): parameters 0..5.
 pub const P_FORK_DAMP: usize = 0;
 /// Shock damper, at the shaft: parameters 5..10.
@@ -120,11 +120,16 @@ pub const P_NECK_C: usize = 40;
 pub const P_MOUNT: usize = 43;
 /// The helmet camera's gyro bias, rad/s (additive): 46..49.
 pub const P_CAM_BIAS: usize = 46;
+/// Each damper's acceleration coefficient (Dixon, The Shock Absorber Handbook, 2nd ed., §7.11,
+/// PDF p.295-296: F = F_G + K x + C V + (m + C_A) dV/dt, C_A from the oil's compressibility; it
+/// makes the force lag the velocity, "damper lag"), kg, additive on [`ForceBike::damper_mass_kg`]:
+/// the fork's along its axis, the shock's at its shaft: 49..51.
+pub const P_DAMP_MASS: usize = 49;
 
 /// Whether force parameter `i` is additive (its value used as it is) rather than a log
 /// multiplier on a nominal value.
 pub fn additive(i: usize) -> bool {
-    (P_MOUNT..P_CAM_BIAS + 3).contains(&i)
+    (P_MOUNT..P_CAM_BIAS + 3).contains(&i) || (P_DAMP_MASS..P_DAMP_MASS + 2).contains(&i)
 }
 
 /// The value parameter `i` prints as: a factor on the nominal, or an additive value.
@@ -144,6 +149,7 @@ pub const PAR_NAMES: [&str; NFP] = [
     "rider back under braking", "rider down under braking", "limbs on the frame",
     "neck k roll", "neck k pitch", "neck k yaw", "neck c roll", "neck c pitch", "neck c yaw",
     "camera mount roll", "camera mount pitch", "camera mount yaw", "camera gyro bias x", "camera gyro bias y", "camera gyro bias z",
+    "fork damper mass", "shock damper mass",
 ];
 
 /// Rows per sample (see the module table).
@@ -178,6 +184,21 @@ pub fn anti_rise_pct(m: &ForceModel, bike: &Bike<f64>, s_m: f64) -> f64 {
     let h = (cg - fb.rear_axle).dot(fb.up) + r;
     let wb = (fb.front_axle - fb.rear_axle).dot(fb.fwd);
     100.0 * -(k.dar.dot(fb.fwd) + r * dphi) / (h / wb * k.dar.dot(fb.up))
+}
+
+/// A polynomial (lowest power first) and its first and second derivatives at `s`.
+pub fn poly2<S: Real>(coef: &[f64], s: S) -> (S, S, S) {
+    let (mut x, mut dx, mut ddx) = (c::<S>(0.0), c::<S>(0.0), c::<S>(0.0));
+    for (k, &a) in coef.iter().enumerate().rev() {
+        x = x * s + a;
+        if k > 0 {
+            dx = dx * s + a * k as f64;
+        }
+        if k > 1 {
+            ddx = ddx * s + a * (k * (k - 1)) as f64;
+        }
+    }
+    (x, dx, ddx)
 }
 
 /// A polynomial (lowest power first) and its derivative at `s`.
@@ -318,6 +339,9 @@ pub struct ForceBike {
     pub tyre: [TyreLaw<f64>; 2],
     /// Each parameter's value at multiplier 1 (units as the parameter: N s/m, m/s, N, 1, N/m, N m/rad, N m s/rad).
     pub nominal: [f64; NFP],
+    /// The dampers' acceleration coefficients the fitted [`P_DAMP_MASS`] add to, kg (fork along
+    /// its axis, shock at its shaft): 0 on a real bike; an exact ride's truth.
+    pub damper_mass_kg: [f64; 2],
     /// Smoothing widths: speeds (dampers, friction), m/s.
     pub smooth_mps: f64,
     /// Smoothing widths: lengths (tyre contact, stops), m.
@@ -449,6 +473,11 @@ impl Default for ForceWeights {
         // the camera's mount correction, rad, and its gyro bias, rad/s (additive)
         par_sigma[P_MOUNT..P_MOUNT + 3].copy_from_slice(&[0.1; 3]);
         par_sigma[P_CAM_BIAS..P_CAM_BIAS + 3].copy_from_slice(&[0.02; 3]);
+        // the dampers' acceleration coefficients, kg: held at 0 (2026-11-27: freed, Beacon and 11/21
+        // fit under 1 kg at the fork and -1 to -3 kg at the shock's shaft, of opposite signs, for
+        // 1-3 % of loss and no change to the dampers); IDL_FORCE_SIGMA="damper mass=10" frees them
+        par_sigma[P_DAMP_MASS] = 1e-3;
+        par_sigma[P_DAMP_MASS + 1] = 1e-3;
         ForceWeights {
             unsprung_n: 20.0,
             rider_n: 50.0,
@@ -575,10 +604,10 @@ pub fn kin<S: Real>(fb: &ForceBike, bike: &Bike<S>, q: &[S; NL]) -> Kin<S> {
 /// The rows' inputs other than the kinematics.
 #[derive(Clone, Copy, Debug)]
 pub struct ForceIn<S> {
-    /// Front travel, m, and its rate, m/s.
-    pub d: [S; 2],
-    /// Rear travel, m, and its rate, m/s.
-    pub s: [S; 2],
+    /// Front travel, m, its rate, m/s, and its acceleration, m/s^2.
+    pub d: [S; 3],
+    /// Rear travel, m, its rate, m/s, and its acceleration, m/s^2.
+    pub s: [S; 3],
     /// Chassis angular rate, rad/s.
     pub w0: V3<S>,
     /// Chassis angular acceleration, rad/s^2.
@@ -654,12 +683,17 @@ pub fn rows<S: Real>(m: &ForceModel, k: &Kin<S>, x: &ForceIn<S>, meas: &ForceMea
     let (nr, tr) = tyre(1, DEF_R);
     let mut r = [c::<S>(0.0); NFR];
     // front unsprung along the fork axis
-    let fork = fb.fork.force_n(par(P_PRESSURE), [par(P_VOLUME), par(P_VOLUME + 2)], x.d[0]) + damper(P_FORK_DAMP).force_n(x.d[1], wv) + friction_n(par(P_FRICTION), x.d[1], wv) + stop_n(x.d[0], 0.0, fb.travel_max[0], fb.stop_n_m, wl);
+    // each damper's acceleration term (Dixon §7.11): compressibility makes its force lag the velocity
+    let damp_mass = |i: usize| x.par[P_DAMP_MASS + i] + fb.damper_mass_kg[i];
+    let fork = fb.fork.force_n(par(P_PRESSURE), [par(P_VOLUME), par(P_VOLUME + 2)], x.d[0]) + damper(P_FORK_DAMP).force_n(x.d[1], wv) + damp_mass(0) * x.d[2] + friction_n(par(P_FRICTION), x.d[1], wv) + stop_n(x.d[0], 0.0, fb.travel_max[0], fb.stop_n_m, wl);
     let uf = k.rf * V3::<S>::from_f64(meas.fork);
     r[0] = (uf.dot(axis) * fb.m_front - tf.dot(axis) + fork) * (1.0 / w.unsprung_n);
     // rear unsprung along its path: generalised force on the travel coordinate
     let xd = k.dx * x.s[1];
-    let shock = fb.shock.force_n(par(P_PRESSURE + 1), [par(P_VOLUME + 1), par(P_VOLUME + 3)], k.x) + damper(P_SHOCK_DAMP).force_n(xd, wv) + friction_n(par(P_FRICTION + 1), xd, wv);
+    // the shaft's acceleration: x'' = x_s s'' + x_ss s'^2
+    let (_, _, ddx) = poly2(&fb.shock_stroke, x.s[0]);
+    let xdd = k.dx * x.s[2] + ddx * x.s[1] * x.s[1];
+    let shock = fb.shock.force_n(par(P_PRESSURE + 1), [par(P_VOLUME + 1), par(P_VOLUME + 3)], k.x) + damper(P_SHOCK_DAMP).force_n(xd, wv) + damp_mass(1) * xdd + friction_n(par(P_FRICTION + 1), xd, wv);
     // the derailleur's cage takes up the chain's growth: its spring always, its clutch one way
     // (resisting the cage turning forward, which compression does in the descending gear)
     let chain = if fb.cage_angle.is_empty() {
@@ -816,7 +850,7 @@ const Q_USED: [usize; 8] = [D, PSI, B_FA, B_LAT, S, R_ROLL, R_YAW, F_TWIST];
 #[allow(clippy::too_many_arguments)]
 pub fn force_rows(m: &ForceModel, bike: &Bike<f64>, bike_d: &Bike<Dual64>, s: &Sample<f64>, f: &[f64; NFL], fd: &[f64; NFL], fdd: &[f64; NFL], par: &[f64; NFP], meas: &ForceMeas, jac: bool) -> ForceJac {
     let k = kin(&m.bike, bike, &s.q);
-    let x = ForceIn { d: [s.q[D], s.qd[D]], s: [s.q[S], s.qd[S]], w0: s.w0, a0: s.a0, f: *f, fd: *fd, fdd: *fdd, par: *par };
+    let x = ForceIn { d: [s.q[D], s.qd[D], s.qdd[D]], s: [s.q[S], s.qd[S], s.qdd[S]], w0: s.w0, a0: s.a0, f: *f, fd: *fd, fdd: *fdd, par: *par };
     let (r, _) = rows(m, &k, &x, meas);
     let mut out = ForceJac { r, j_core: Box::new([[0.0; NZ]; NFR]), j_frc: Box::new([[0.0; 3 * NFL]; NFR]), j_par: [[0.0; NFP]; NFR] };
     if !jac {
@@ -843,15 +877,17 @@ pub fn force_rows(m: &ForceModel, bike: &Bike<f64>, bike_d: &Bike<Dual64>, s: &S
         }
     }
     for (j, which) in [(D, 0), (S, 1)] {
-        let mut xj = xc;
-        if which == 0 {
-            xj.d[1] = one(s.qd[D]);
-        } else {
-            xj.s[1] = one(s.qd[S]);
-        }
-        let y = run(&kc, &xj);
-        for r in 0..NFR {
-            out.j_core[r][NL + j] = y[r];
+        for order in 1..3 {
+            let mut xj = xc;
+            if which == 0 {
+                xj.d[order] = one([s.q[D], s.qd[D], s.qdd[D]][order]);
+            } else {
+                xj.s[order] = one([s.q[S], s.qd[S], s.qdd[S]][order]);
+            }
+            let y = run(&kc, &xj);
+            for r in 0..NFR {
+                out.j_core[r][order * NL + j] = y[r];
+            }
         }
     }
     for i in 0..3 {
@@ -915,7 +951,7 @@ pub fn static_misfit(m: &ForceModel, bike: &Bike<f64>) -> [f64; NBAL] {
     f[DEF_F] = m.spec.init[DEF_F];
     f[DEF_R] = m.spec.init[DEF_R];
     f[POS + 2] = -(fb.m_rider + fb.head.as_ref().map_or(0.0, |h| h.m_kg)) * g / fb.nominal[P_RIDER_K + 2];
-    let x = ForceIn { d: [q[D], 0.0], s: [q[S], 0.0], w0: V3::zero(), a0: V3::zero(), f, fd: [0.0; NFL], fdd: [0.0; NFL], par: [0.0; NFP] };
+    let x = ForceIn { d: [q[D], 0.0, 0.0], s: [q[S], 0.0, 0.0], w0: V3::zero(), a0: V3::zero(), f, fd: [0.0; NFL], fdd: [0.0; NFL], par: [0.0; NFP] };
     let r = rows(m, &k, &x, &meas).0;
     let w = &m.w;
     let sig = [w.unsprung_n, w.unsprung_n, w.rider_n, w.rider_n, w.rider_n, w.rider_nm, w.rider_nm, w.rider_nm, w.system_n, w.system_n, w.system_n, w.system_nm, w.system_nm, w.system_nm];
@@ -988,6 +1024,7 @@ pub(crate) mod synth {
             nominal,
             smooth_mps: 0.01,
             smooth_m: 0.001,
+            damper_mass_kg: [0.0; 2],
         };
         let mut m = ForceModel { bike: fb, spec: ForceSpec::standard([0.0; 2]), w: ForceWeights::default() };
         balance_statics(&bike, &mut m);
@@ -1335,7 +1372,7 @@ pub(crate) mod synth {
         meas.fork = [p[6], p[7], p[8]];
         meas.rear = [p[12], p[13], p[14]];
         let k = kin(&m.bike, bike, &core.q);
-        let x = ForceIn { d: [core.q[D], core.qd[D]], s: [core.q[S], core.qd[S]], w0: core.w0, a0: core.a0, f: f[0], fd: f[1], fdd: f[2], par: [0.0; NFP] };
+        let x = ForceIn { d: [core.q[D], core.qd[D], core.qdd[D]], s: [core.q[S], core.qd[S], core.qdd[S]], w0: core.w0, a0: core.a0, f: f[0], fd: f[1], fdd: f[2], par: [0.0; NFP] };
         let (r, forces) = rows(m, &k, &x, &meas);
         Eval { r, forces, core, f, meas, readings: p }
     }
@@ -1518,7 +1555,7 @@ pub(crate) mod synth {
         let g0 = obj.force_glob0();
         let par: [f64; NFP] = std::array::from_fn(|i| v.glob[g0 + i]);
         let k = kin(&m.bike, &obj.bike, &s.q);
-        let x = ForceIn { d: [s.q[D], s.qd[D]], s: [s.q[S], s.qd[S]], w0: s.w0, a0: s.a0, f: f[0], fd: f[1], fdd: f[2], par };
+        let x = ForceIn { d: [s.q[D], s.qd[D], s.qdd[D]], s: [s.q[S], s.qd[S], s.qdd[S]], w0: s.w0, a0: s.a0, f: f[0], fd: f[1], fdd: f[2], par };
         let meas = ForceMeas { frame: obj.win.frame_accel[t], fork: obj.win.fork_accel[t], rear: obj.win.rear_accel[t], speed: 0.0, speed_rate: 0.0, cam: None, ground: None };
         rows(m, &k, &x, &meas).1.normal
     }
@@ -1557,20 +1594,29 @@ pub(crate) mod synth {
     /// Starts the damper, tyre and rider numbers wrong (and centres their priors there),
     /// solves `secs` of the exact ride, and returns each start and where it ended (log units).
     fn identify(secs: f64) -> Vec<(&'static str, f64, f64)> {
-        identify_on(secs, false)
+        identify_on(secs, false, false)
     }
 
     /// [`identify`], on the road with the ground tie (`road`) or with prescribed deflections.
-    fn identify_on(secs: f64, road: bool) -> Vec<(&'static str, f64, f64)> {
+    /// `lag`: the dampers with an acceleration term (fork 3 kg, shock 40 kg at its shaft), the
+    /// fit started without it (the last two entries).
+    fn identify_on(secs: f64, road: bool, lag: bool) -> Vec<(&'static str, f64, f64)> {
         use crate::estimate::physics::objective::{Objective, Spec, Weights, NG};
         use crate::estimate::physics::solve::gauss_newton;
-        let (bike, m) = if road { road_model() } else { model() };
+        let (bike, mut m) = if road { road_model() } else { model() };
+        if lag {
+            m.bike.damper_mass_kg = [3.0, 40.0];
+        }
         let dt = 1.0 / 400.0;
         let n = (secs / dt).round() as usize;
         let truth = if road { ride_on_road(&bike, &m, n, dt, 1.0) } else { ride(&bike, &m, n, dt, 1.0) };
         let mut win = window(&truth, 400.0);
         if road {
             win.forces.as_mut().unwrap().ground = Some(ground_of(&truth, &m));
+        }
+        if lag {
+            m.w.par_sigma[P_DAMP_MASS] = 10.0;
+            m.w.par_sigma[P_DAMP_MASS + 1] = 50.0;
         }
         let mut obj = Objective::new(bike, win, Spec::standard(n, dt), Weights::default(), [0.0; NG]).with_forces(m);
         let g0 = obj.force_glob0();
@@ -1583,8 +1629,11 @@ pub(crate) mod synth {
             ("rider vertical c", P_RIDER_C + 2, -0.5),
             ("rider pitch k", P_RIDER_K + 4, 0.4),
             ("front tyre damping", P_TYRE_C, -0.5),
+            ("fork damper mass", P_DAMP_MASS, -3.0),
+            ("shock damper mass", P_DAMP_MASS + 1, -40.0),
         ];
-        for &(_, i, x) in &wrong {
+        let wrong = if lag { &wrong[..] } else { &wrong[..8] };
+        for &(_, i, x) in wrong {
             obj.glob_centre[g0 + i] = x;
         }
         // from the pods-only solve, as a ride's windows start (the ground tie moves both tyres'
@@ -1683,7 +1732,7 @@ pub(crate) mod synth {
     fn exact_ride_on_road_identification_with_the_ground_tie_recovers_the_tyre_damping() {
         // Arrange / Act: 6 s (over 3 s of this gentle road the tyre's damping keeps half its
         // error: the ground is unknown too, and the prior is centred on the wrong start)
-        let out = identify_on(6.0, true);
+        let out = identify_on(6.0, true, false);
 
         // Assert: the dampers and the rider's vertical as without the tie, and now the front
         // tyre's damping, which forces alone could not tell (F1: it does not move)
@@ -1711,7 +1760,7 @@ pub(crate) mod synth {
         // carry nothing here (no head, no camera, no steady braking) and stay closed
         let open = |w: &mut ForceWeights| {
             for i in 0..NFP {
-                w.par_sigma[i] = if i >= P_NECK_K || i == P_LIMBS || (P_BRAKE_SHIFT..P_BRAKE_SHIFT + 2).contains(&i) { 1e-3 } else { 10.0 };
+                w.par_sigma[i] = if (P_NECK_K..P_DAMP_MASS).contains(&i) || i == P_LIMBS || (P_BRAKE_SHIFT..P_BRAKE_SHIFT + 2).contains(&i) { 1e-3 } else { 10.0 };
             }
         };
         let case = |road: bool, rider_known: bool, defl_known: bool| -> (Vec<f64>, Vec<f64>, usize) {
@@ -1767,6 +1816,20 @@ pub(crate) mod synth {
         }
         pairs.sort_by(|a, b| b.0.abs().total_cmp(&a.0.abs()));
         eprintln!("  strongest correlations, rider and deflection free: {}", pairs.iter().take(14).map(|(r, i, j)| format!("{} ~ {} {r:+.2}", PAR_NAMES[*i], PAR_NAMES[*j])).collect::<Vec<_>>().join(", "));
+    }
+
+    #[test]
+    fn exact_ride_identification_with_lagging_dampers_recovers_their_acceleration_terms() {
+        // Arrange / Act: dampers with Dixon's acceleration term, the fit started without it
+        let out = identify_on(3.0, false, true);
+
+        // Assert: the shock's term, the shock's two damper numbers and the fork's LSC within 30 %
+        // of their error. The fork's term and its LSR trade on this gentle ride (3 s, fork speeds
+        // under its knee; the observability map puts the fork's low-speed end at x/ 2 here, against
+        // 2-11 % on Beacon and 11/21): fork damper mass -3.0 -> -2.7, fork LSR -0.40 -> -0.32
+        for (name, start, end) in [&out[0], &out[2], &out[3], &out[9]] {
+            assert!(end.abs() < 0.3 * start.abs(), "{name}: {start} -> {end}");
+        }
     }
 
     #[test]
@@ -1827,6 +1890,9 @@ pub(crate) mod synth {
         m.bike.cage_angle = vec![0.945, 0.870, 2.64, -2.43];
         m.bike.cage_moment_nm = [1.27, 1.58];
         m.bike.m_limbs = 5.0;
+        // the dampers' lag (an acceleration coefficient each) on a progressive shock stroke
+        m.bike.damper_mass_kg = [2.0, 30.0];
+        m.bike.shock_stroke = vec![0.0, 1.0 / 2.6, 0.3];
         // and the head turned on its neck, the helmet camera reading something
         m.bike.head = Some(test_head(&m.bike));
         let t = 30;
@@ -1861,6 +1927,7 @@ pub(crate) mod synth {
         }
         for i in [D, S] {
             check(&format!("q' {i}"), &|r| j.j_core[r][NL + i], &|h| { let mut s2 = s; s2.qd[i] += h; at(&s2, &f, &fd, &fdd, &par) }, 1e-6);
+            check(&format!("q'' {i}"), &|r| j.j_core[r][2 * NL + i], &|h| { let mut s2 = s; s2.qdd[i] += h; at(&s2, &f, &fd, &fdd, &par) }, 1e-4);
         }
         for i in 0..3 {
             check(&format!("w0 {i}"), &|r| j.j_core[r][3 * NL + i], &|h| { let mut s2 = s; s2.w0.0[i] += h; at(&s2, &f, &fd, &fdd, &par) }, 1e-6);

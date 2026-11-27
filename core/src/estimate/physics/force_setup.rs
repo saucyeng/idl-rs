@@ -178,6 +178,7 @@ pub fn force_model(bike: &Bike<f64>, p: &Params, linkage: &Linkage, drivetrain: 
         nominal: nominal(),
         smooth_mps: 0.01,
         smooth_m: 0.001,
+        damper_mass_kg: [0.0; 2],
     };
     // the shock rests where the rear's static load holds it, through the leverage
     let mut q = [0.0; NL];

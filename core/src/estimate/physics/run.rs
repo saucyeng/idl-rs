@@ -664,6 +664,21 @@ pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
     }
     let (objs, vs): (Vec<Objective>, Vec<Vars>) = super::solve::par_map_n(&objs, k, |o| ground_start(o, false, cfg.iters, cfg.tol)).into_iter().collect::<Result<Vec<_>, _>>()?.into_iter().unzip();
     let t_warm = t0.elapsed().as_secs_f64();
+    if std::env::var_os("IDL_FORCE_DEBUG").is_some() {
+        // the pods' own fit at the warm starts, by pod: frame gyro, fork pod, rear pod
+        let mut by = [0.0; 3];
+        for (o, v) in objs.iter().zip(&vs) {
+            let ctx = o.ctx(&v.glob, false);
+            for t in 0..o.spec.n {
+                let s = o.sample(v, t);
+                let r = o.sample_residuals(&ctx, &s, &v.glob, t, false).r;
+                for (i, (a, b)) in [(0, 3), (3, 9), (9, 15)].into_iter().enumerate() {
+                    by[i] += 0.5 * r[a..b].iter().map(|&x| super::objective::huber2(x, o.w.huber)).sum::<f64>();
+                }
+            }
+        }
+        eprintln!("warm-start pod loss: frame gyro {:.0}, fork pod {:.0}, rear pod {:.0}, total {:.0}", by[0], by[1], by[2], by.iter().sum::<f64>());
+    }
     let (vs, info) = gauss_newton_multi(&objs, vs, cfg.force_id_iters, cfg.tol)?;
     if std::env::var_os("IDL_FORCE_DEBUG").is_some() {
         eprintln!("force identification: warm starts {t_warm:.1} s, joint solve {:.1} s (assembly / solve / loss {:.1?} s)", t0.elapsed().as_secs_f64() - t_warm, info.seconds);
@@ -917,7 +932,7 @@ pub fn bike_geometry(bike: &Bike<f64>) -> Geometry {
 /// priors closed), and both; printed as factors (x/: 1.05 is 5 %, 22026 not determined). The
 /// information a parameter gets depends on the motion it sees, which here is the ride's.
 pub fn observability_map(objs: &[Objective], vs: &[Vars]) {
-    use super::forces::{NFP, PAR_NAMES, P_BRAKE_SHIFT, P_LIMBS, P_NECK_K};
+    use super::forces::{NFP, PAR_NAMES, P_BRAKE_SHIFT, P_DAMP_MASS, P_LIMBS, P_NECK_K};
     let cases = [("free", false, false), ("rider known", true, false), ("deflection known", false, true), ("both known", true, true)];
     let mut table: Vec<Vec<f64>> = Vec::new();
     for &(name, rider, defl) in &cases {
@@ -926,7 +941,7 @@ pub fn observability_map(objs: &[Objective], vs: &[Vars]) {
             .map(|o| {
                 let mut m = o.forces.clone().expect("a force fit");
                 for i in 0..NFP {
-                    m.w.par_sigma[i] = if i >= P_NECK_K || i == P_LIMBS || (P_BRAKE_SHIFT..P_BRAKE_SHIFT + 2).contains(&i) { 1e-3 } else { 10.0 };
+                    m.w.par_sigma[i] = if (P_NECK_K..P_DAMP_MASS).contains(&i) || i == P_LIMBS || (P_BRAKE_SHIFT..P_BRAKE_SHIFT + 2).contains(&i) { 1e-3 } else { 10.0 };
                 }
                 if rider {
                     m.w.pos_m = [1e-5; 3];
@@ -956,7 +971,7 @@ pub fn observability_map(objs: &[Objective], vs: &[Vars]) {
     }
     eprintln!("observability map (x/ one sigma from the data alone):");
     eprintln!("  {:<24}{}", "parameter", cases.iter().map(|c| format!("{:>18}", c.0)).collect::<String>());
-    for i in 0..P_NECK_K {
+    for i in (0..P_NECK_K).chain(P_DAMP_MASS..NFP) {
         if i == P_LIMBS || (P_BRAKE_SHIFT..P_BRAKE_SHIFT + 2).contains(&i) {
             continue;
         }

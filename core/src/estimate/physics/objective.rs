@@ -527,7 +527,7 @@ impl Objective {
             let Some(f) = self.force_inputs(v, t) else { return };
             let Some(meas) = self.force_meas(&probe, t) else { return };
             let k = kin(&m.bike, &ctx.bike_f, &s.q);
-            let x = ForceIn { d: [s.q[D], s.qd[D]], s: [s.q[S], s.qd[S]], w0: s.w0, a0: s.a0, f: f[0], fd: f[1], fdd: f[2], par };
+            let x = ForceIn { d: [s.q[D], s.qd[D], s.qdd[D]], s: [s.q[S], s.qd[S], s.qdd[S]], w0: s.w0, a0: s.a0, f: f[0], fd: f[1], fdd: f[2], par };
             let fo = force_rows_at(m, &k, &x, &meas).1;
             for i in 0..2 {
                 on[t][i] = fo.normal[i] >= w.min_normal_n;
@@ -552,7 +552,7 @@ impl Objective {
         let s = self.sample(v, t);
         let f = self.force_inputs(v, t)?;
         let k = kin(&m.bike, &ctx.bike_f, &s.q);
-        let x = ForceIn { d: [s.q[D], s.qd[D]], s: [s.q[S], s.qd[S]], w0: s.w0, a0: s.a0, f: f[0], fd: f[1], fdd: f[2], par: self.force_par(v) };
+        let x = ForceIn { d: [s.q[D], s.qd[D], s.qdd[D]], s: [s.q[S], s.qd[S], s.qdd[S]], w0: s.w0, a0: s.a0, f: f[0], fd: f[1], fdd: f[2], par: self.force_par(v) };
         Some((force_rows_at(m, &k, &x, &self.force_meas(v, t)?).1, f))
     }
 
