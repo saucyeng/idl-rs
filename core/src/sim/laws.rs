@@ -111,10 +111,11 @@ pub fn friction_n<S: Real>(f_c_n: S, v_mps: S, v0_mps: f64) -> S {
 ///
 /// `area_m2` piston area, `positive_m3` / `negative_m3` the chambers at
 /// top-out (spacers out), compressing with polytropic index `n`.
-pub fn air_force_n<S: Real>(area_m2: f64, positive_m3: f64, negative_m3: f64, gauge_pa: S, x_m: S, n: f64) -> S {
+pub fn air_force_n<S: Real>(area_m2: f64, positive_m3: impl Into<S>, negative_m3: impl Into<S>, gauge_pa: S, x_m: S, n: f64) -> S {
+    let (positive_m3, negative_m3): (S, S) = (positive_m3.into(), negative_m3.into());
     let p0 = gauge_pa + super::suspension::ATM_PA;
     let swept = x_m * area_m2;
-    let pos = floor(-swept + positive_m3, 0.01 * positive_m3);
+    let pos = floor(-swept + positive_m3, 0.01 * positive_m3.re());
     let neg = floor(swept + negative_m3, 1e-9);
     let p_pos = p0 * (pos.recip() * positive_m3).powf(n);
     let p_neg = p0 * (neg.recip() * negative_m3).powf(n);
@@ -125,9 +126,10 @@ pub fn air_force_n<S: Real>(area_m2: f64, positive_m3: f64, negative_m3: f64, ga
 /// (isothermal from top-out there), then moved quickly with index `n`: the
 /// spring over a bump ridden from sag. The law of
 /// [`super::suspension::AirSpring::force_about_n`].
-pub fn air_force_about_n<S: Real>(area_m2: f64, positive_m3: f64, negative_m3: f64, gauge_pa: S, x_ref_m: S, x_m: S, n: f64) -> S {
+pub fn air_force_about_n<S: Real>(area_m2: f64, positive_m3: impl Into<S>, negative_m3: impl Into<S>, gauge_pa: S, x_ref_m: S, x_m: S, n: f64) -> S {
+    let (positive_m3, negative_m3): (S, S) = (positive_m3.into(), negative_m3.into());
     let p0 = gauge_pa + super::suspension::ATM_PA;
-    let lo = 0.01 * positive_m3;
+    let lo = 0.01 * positive_m3.re();
     let (pos_ref, neg_ref) = (floor(-(x_ref_m * area_m2) + positive_m3, lo), floor(x_ref_m * area_m2 + negative_m3, 1e-9));
     let (pp, pn) = (p0 * positive_m3 / pos_ref, p0 * negative_m3 / neg_ref);
     let (pos, neg) = (floor(-(x_m * area_m2) + positive_m3, lo), floor(x_m * area_m2 + negative_m3, 1e-9));

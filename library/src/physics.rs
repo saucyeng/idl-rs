@@ -313,6 +313,17 @@ pub fn estimate_physics_with(
 
     drop(fit_ride);
     cfg.forces = force_setup(&bk)?;
+    // IDL_FORCE_FREEZE (prototyping): force parameters held at their nominal, by name or part of
+    // one, comma separated (IDL_FORCE_FREEZE=friction holds both seals' friction)
+    if let (Some(m), Ok(v)) = (cfg.forces.as_mut(), std::env::var("IDL_FORCE_FREEZE")) {
+        let keys: Vec<&str> = v.split(',').map(str::trim).filter(|k| !k.is_empty()).collect();
+        for (i, name) in idl_rs::estimate::physics::forces::PAR_NAMES.iter().enumerate() {
+            if keys.iter().any(|k| name.contains(k)) {
+                m.w.par_sigma[i] = idl_rs::estimate::physics::run::FROZEN_SIGMA;
+                eprintln!("IDL_FORCE_FREEZE: {name} held at its nominal");
+            }
+        }
+    }
     if let (Some(m), Some(_)) = (&cfg.forces, std::env::var_os("IDL_FORCE_DEBUG")) {
         eprintln!("force model static misfit (N, N m): {:?}", idl_rs::estimate::physics::forces::static_misfit(m, &bk).map(|x| x.round()));
         eprintln!("force model: {:?}", m.bike);

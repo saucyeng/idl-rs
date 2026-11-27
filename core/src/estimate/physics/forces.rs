@@ -73,7 +73,7 @@ pub const ACT_F: usize = 12;
 pub const ACT_M: usize = 15;
 
 /// Force parameters (globals), each a log multiplier on [`ForceBike::nominal`].
-pub const NFP: usize = 30;
+pub const NFP: usize = 34;
 /// Fork damper (LSC, HSC, LSR, HSR, knee): parameters 0..5.
 pub const P_FORK_DAMP: usize = 0;
 /// Shock damper, at the shaft: parameters 5..10.
@@ -94,6 +94,9 @@ pub const TYRE_SMOOTH_N: f64 = 1.0;
 pub const P_RIDER_K: usize = 18;
 /// Rider dampers: 24..30.
 pub const P_RIDER_C: usize = 24;
+/// Air chamber volumes (fork positive, shock positive, fork negative, shock negative): 30..34,
+/// factors on the bike file's (the spring's progression and its top-out, not only its force).
+pub const P_VOLUME: usize = 30;
 
 /// Each force parameter's name, in index order.
 pub const PAR_NAMES: [&str; NFP] = [
@@ -103,6 +106,7 @@ pub const PAR_NAMES: [&str; NFP] = [
     "front tyre stiffness", "rear tyre stiffness", "front tyre damping", "rear tyre damping",
     "rider k fwd", "rider k lat", "rider k up", "rider k roll", "rider k pitch", "rider k yaw",
     "rider c fwd", "rider c lat", "rider c up", "rider c roll", "rider c pitch", "rider c yaw",
+    "fork positive volume", "shock positive volume", "fork negative volume", "shock negative volume",
 ];
 
 /// Rows per sample (see the module table).
@@ -127,22 +131,24 @@ pub struct AirChambers {
 }
 
 impl AirChambers {
-    /// The spring's force, N, at stroke `x_m` with the pressure scaled by `scale`, fast about
-    /// [`AirChambers::rest_at`].
-    pub fn force_n<S: Real>(&self, scale: S, x_m: S) -> S {
-        air_force_about_n(self.area_m2, self.positive_m3, self.negative_m3, scale * self.gauge_pa, self.rest_at(scale), x_m, 1.4)
+    /// The spring's force, N, at stroke `x_m` with the pressure scaled by `scale` and the
+    /// chambers' volumes by `vol` (positive, negative), fast about [`AirChambers::rest_at`].
+    pub fn force_n<S: Real>(&self, scale: S, vol: [S; 2], x_m: S) -> S {
+        let (vp, vn) = (vol[0] * self.positive_m3, vol[1] * self.negative_m3);
+        air_force_about_n(self.area_m2, vp, vn, scale * self.gauge_pa, self.rest_at(scale, vol), x_m, 1.4)
     }
 
     /// The stroke it rests at, m, with the pressure scaled by `scale`: where the slow
     /// (isothermal) spring carries the static load it carries at `rest_m` unscaled (the same
     /// rider and bike on a softer or firmer spring sit deeper or higher; the leverage's change
-    /// with the rest is left out). Newton from `rest_m`, so `scale` = 1 gives `rest_m`.
-    pub fn rest_at<S: Real>(&self, scale: S) -> S {
-        let (a, vp, vn) = (self.area_m2, self.positive_m3, self.negative_m3);
-        let iso = |p0: f64, x: f64| p0 * a * (vp / (vp - a * x) - vn / (vn + a * x));
-        let load = iso(self.gauge_pa + crate::sim::suspension::ATM_PA, self.rest_m);
+    /// with the rest is left out). The same with the chambers' volumes scaled by `vol`.
+    /// Newton from `rest_m`, so unit factors give `rest_m`.
+    pub fn rest_at<S: Real>(&self, scale: S, vol: [S; 2]) -> S {
+        let (a, vp0, vn0) = (self.area_m2, self.positive_m3, self.negative_m3);
+        let load = (self.gauge_pa + crate::sim::suspension::ATM_PA) * a * (vp0 / (vp0 - a * self.rest_m) - vn0 / (vn0 + a * self.rest_m));
+        let (vp, vn) = (vol[0] * vp0, vol[1] * vn0);
         let p0 = scale * self.gauge_pa + crate::sim::suspension::ATM_PA;
-        let (lo, hi) = (0.0, 0.95 * vp / a);
+        let (lo, hi) = (0.0, 0.95 * vp.re() / a);
         let mut x: S = c(self.rest_m);
         for _ in 0..6 {
             let (pos, neg) = (-(x * a) + vp, x * a + vn);
@@ -319,6 +325,8 @@ impl Default for ForceWeights {
         par_sigma[P_PRESSURE + 1] = 0.05;
         par_sigma[P_TYRE_K] = 0.3;
         par_sigma[P_TYRE_K + 1] = 0.3;
+        // chamber volumes: the bike file's are estimates (no sag tests); a third either way
+        par_sigma[P_VOLUME..P_VOLUME + 4].copy_from_slice(&[0.3; 4]);
         ForceWeights {
             unsprung_n: 20.0,
             rider_n: 50.0,
@@ -492,12 +500,12 @@ pub fn rows<S: Real>(m: &ForceModel, k: &Kin<S>, x: &ForceIn<S>, meas: &ForceMea
     let (nr, tr) = tyre(1, DEF_R);
     let mut r = [c::<S>(0.0); NFR];
     // front unsprung along the fork axis
-    let fork = fb.fork.force_n(par(P_PRESSURE), x.d[0]) + damper(P_FORK_DAMP).force_n(x.d[1], wv) + friction_n(par(P_FRICTION), x.d[1], wv) + stop_n(x.d[0], 0.0, fb.travel_max[0], fb.stop_n_m, wl);
+    let fork = fb.fork.force_n(par(P_PRESSURE), [par(P_VOLUME), par(P_VOLUME + 2)], x.d[0]) + damper(P_FORK_DAMP).force_n(x.d[1], wv) + friction_n(par(P_FRICTION), x.d[1], wv) + stop_n(x.d[0], 0.0, fb.travel_max[0], fb.stop_n_m, wl);
     let uf = k.rf * V3::<S>::from_f64(meas.fork);
     r[0] = (uf.dot(axis) * fb.m_front - tf.dot(axis) + fork) * (1.0 / w.unsprung_n);
     // rear unsprung along its path: generalised force on the travel coordinate
     let xd = k.dx * x.s[1];
-    let shock = fb.shock.force_n(par(P_PRESSURE + 1), k.x) + damper(P_SHOCK_DAMP).force_n(xd, wv) + friction_n(par(P_FRICTION + 1), xd, wv);
+    let shock = fb.shock.force_n(par(P_PRESSURE + 1), [par(P_VOLUME + 1), par(P_VOLUME + 3)], k.x) + damper(P_SHOCK_DAMP).force_n(xd, wv) + friction_n(par(P_FRICTION + 1), xd, wv);
     let wheel = shock * k.dx + stop_n(x.s[0], 0.0, fb.travel_max[1], fb.stop_n_m, wl);
     let ur = k.rr * V3::<S>::from_f64(meas.rear);
     r[1] = (ur.dot(k.dar) * fb.m_rear - tr.dot(k.dar) + wheel) * (1.0 / w.unsprung_n);
@@ -715,6 +723,7 @@ pub(crate) mod synth {
         nominal[P_TYRE_C..P_TYRE_C + 2].copy_from_slice(&[100.0, 100.0]);
         nominal[P_RIDER_K..P_RIDER_K + 6].copy_from_slice(&[20_000.0, 15_000.0, 30_000.0, 1500.0, 2000.0, 1000.0]);
         nominal[P_RIDER_C..P_RIDER_C + 6].copy_from_slice(&[800.0, 600.0, 1200.0, 60.0, 80.0, 40.0]);
+        nominal[P_VOLUME..P_VOLUME + 4].copy_from_slice(&[1.0; 4]);
         let tyre = |psi: f64| TyreLaw::<f64>::from_tyre(&Tyre::mtb_29(2.5, psi, true, true));
         let fb = ForceBike {
             up,
@@ -1018,9 +1027,9 @@ pub(crate) mod synth {
         let iso = |scale: f64, x: f64| crate::sim::laws::air_force_n(ch.area_m2, ch.positive_m3, ch.negative_m3, scale * ch.gauge_pa, x, 1.0);
 
         // Act
-        let same: f64 = ch.rest_at(1.0);
-        let soft: f64 = ch.rest_at(0.8);
-        let firm: f64 = ch.rest_at(1.25);
+        let same: f64 = ch.rest_at(1.0, [1.0; 2]);
+        let soft: f64 = ch.rest_at(0.8, [1.0; 2]);
+        let firm: f64 = ch.rest_at(1.25, [1.0; 2]);
 
         // Assert: the nominal rest unmoved, and each rest carrying the nominal load
         assert!((same - 0.015).abs() < 1e-12, "{same}");

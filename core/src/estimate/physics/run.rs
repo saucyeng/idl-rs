@@ -381,7 +381,7 @@ pub fn solve_ride_with(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
 
 
 /// The force parameters' prior width once identified, log units: frozen for the window solves.
-const FROZEN_SIGMA: f64 = 1e-3;
+pub const FROZEN_SIGMA: f64 = 1e-3;
 
 /// The ground speed on the grid, m/s: the GPS fixes' horizontal speed (each at its time less
 /// `latency_s`), linear between them, held past the ends; 0 without GPS (fixes without a
