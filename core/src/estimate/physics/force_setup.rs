@@ -72,7 +72,9 @@ pub fn nominal() -> [f64; NFP] {
 
 /// The force model of the bike `bike` (the estimator's, from its calibration and linkage)
 /// with parameters `p` and its linkage; `travel_m`: front and rear travel at the stops.
-pub fn force_model(bike: &Bike<f64>, p: &Params, linkage: &Linkage, travel_m: [f64; 2]) -> Result<ForceModel, ForceSetupError> {
+/// `drivetrain`: the bike's, for the derailleur cage's share of the rear's force in
+/// [`DESCENT_COG_TEETH`] (None: left out).
+pub fn force_model(bike: &Bike<f64>, p: &Params, linkage: &Linkage, drivetrain: Option<&Drivetrain>, travel_m: [f64; 2]) -> Result<ForceModel, ForceSetupError> {
     let need = |k: &str| number(p, k).filter(|v| *v > 0.0).ok_or_else(|| ForceSetupError::Missing(k.to_string()));
     let pts = &linkage.points_m;
     let up = bike.up.unit();
@@ -115,9 +117,15 @@ pub fn force_model(bike: &Bike<f64>, p: &Params, linkage: &Linkage, travel_m: [f
     // the shock's stroke against rear travel, a cubic through the linkage
     let xs: Vec<f64> = (0..=32).map(|i| travel_m[1] * i as f64 / 32.0).collect();
     let ys: Vec<f64> = xs.iter().map(|&s| stroke_at(s)).collect::<Result<_, _>>()?;
-    let a = nalgebra::DMatrix::from_fn(xs.len(), 4, |i, j| xs[i].powi(j as i32));
-    let coef = a.svd(true, true).solve(&nalgebra::DVector::from_column_slice(&ys), 1e-14).map_err(|e| ForceSetupError::Linkage(e.to_string()))?;
-    let shock_coef: Vec<f64> = coef.iter().cloned().collect();
+    let shock_coef = cubic(&xs, &ys)?;
+    // the axle's member's angle through travel (the rear caliper's mount)
+    let member: Vec<f64> = xs.iter().map(|&s| sim.pose(s).seatstay_rad).collect();
+    let member_coef = cubic(&xs, &member)?;
+    // the cage's angle through travel in the descending gear, and its moments
+    let (cage_coef, cage_moment) = match drivetrain {
+        Some(dt) => cage_curve(linkage, dt)?,
+        None => (vec![], [0.0; 2]),
+    };
     let mut fb = ForceBike {
         up,
         fwd,
@@ -137,6 +145,9 @@ pub fn force_model(bike: &Bike<f64>, p: &Params, linkage: &Linkage, travel_m: [f
         fork: AirChambers { area_m2: fork_spring.area_m2, positive_m3: fork_spring.positive_m3, negative_m3: fork_spring.negative_m3, gauge_pa: fork_gauge, rest_m: fork_rest },
         shock: AirChambers { area_m2: shock_spring.area_m2, positive_m3: shock_spring.positive_m3, negative_m3: shock_spring.negative_m3, gauge_pa: shock_gauge, rest_m: 0.0 },
         shock_stroke: shock_coef,
+        axle_member_angle: member_coef,
+        cage_angle: cage_coef,
+        cage_moment_nm: cage_moment,
         travel_max: travel_m,
         stop_n_m: 2.0e6,
         tyre: [tyre(p, "front_tyre")?, tyre(p, "rear_tyre")?],
@@ -158,6 +169,31 @@ pub fn force_model(bike: &Bike<f64>, p: &Params, linkage: &Linkage, travel_m: [f
     fb.shock.rest_m = fb.stroke(rest_s).0;
     let defl = [front_load / fb.tyre[0].stiffness_n_m, rear_load / fb.tyre[1].stiffness_n_m];
     Ok(ForceModel { bike: fb, spec: ForceSpec::standard(defl), w: ForceWeights::default() })
+}
+
+/// The cog the force model takes the rider to descend in, teeth (Isaac, 2026-11-26: "say the
+/// 14T"); the nearest the cassette has.
+pub const DESCENT_COG_TEETH: u32 = 14;
+
+/// A cubic (lowest power first) through `(xs, ys)` by least squares.
+fn cubic(xs: &[f64], ys: &[f64]) -> Result<Vec<f64>, ForceSetupError> {
+    let a = nalgebra::DMatrix::from_fn(xs.len(), 4, |i, j| xs[i].powi(j as i32));
+    let coef = a.svd(true, true).solve(&nalgebra::DVector::from_column_slice(ys), 1e-14).map_err(|e| ForceSetupError::Linkage(e.to_string()))?;
+    Ok(coef.iter().cloned().collect())
+}
+
+/// The derailleur cage's angle (rad, forward) against rear travel in [`DESCENT_COG_TEETH`], as
+/// a cubic, and its spring's and clutch's moments (N m), from the sim's chain loop.
+fn cage_curve(linkage: &Linkage, dt: &Drivetrain) -> Result<(Vec<f64>, [f64; 2]), ForceSetupError> {
+    let sim = SimBike::new(linkage, dt).map_err(|e| ForceSetupError::Linkage(format!("{e:?}")))?;
+    let gear = (0..dt.cassette_teeth.len()).min_by_key(|&g| dt.cassette_teeth[g].abs_diff(DESCENT_COG_TEETH)).ok_or_else(|| ForceSetupError::Linkage("no cassette".into()))?;
+    let enabled = |i: usize| dt.rollers[i].enabled;
+    let gc = crate::sim::kinematics::gear_curves(&sim, gear, 33, &enabled).map_err(|e| ForceSetupError::Linkage(format!("{e:?}")))?;
+    let xs: Vec<f64> = gc.travel_mm.iter().map(|t| t * 1e-3).collect();
+    let ys: Vec<f64> = gc.cage_deg.iter().map(|d| d.to_radians()).collect();
+    let coef = cubic(&xs, &ys)?;
+    let mid = gc.cage_deg[gc.cage_deg.len() / 2];
+    Ok((coef, [dt.derailleur.spring_torque(mid), dt.derailleur.clutch_torque_nm]))
 }
 
 /// The tyre `key` (`front_tyre` or `rear_tyre`): width, pressure, a DH casing when its model

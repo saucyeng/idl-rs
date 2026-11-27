@@ -271,7 +271,7 @@ pub fn estimate_physics_with(
         }
         let l = linkage.ok_or_else(|| err(PhysicsErrorKind::NotCalibrated, format!("{}: the force model needs the bike's linkage", doc.bike_id)))?;
         let params = idl_rs::calibration::params::overlay(&crate::bikelog::effective_parameters(&file, start_ms), &opts.param_overrides);
-        idl_rs::estimate::physics::force_setup::force_model(bk, &params, l, [front, rear])
+        idl_rs::estimate::physics::force_setup::force_model(bk, &params, l, file.drivetrain.as_ref(), [front, rear])
             .map(Some)
             .map_err(|e| err(PhysicsErrorKind::NotCalibrated, format!("{}: the force model cannot be set up: {e:?}", doc.bike_id)))
     };
@@ -327,6 +327,8 @@ pub fn estimate_physics_with(
     if let (Some(m), Some(_)) = (&cfg.forces, std::env::var_os("IDL_FORCE_DEBUG")) {
         eprintln!("force model static misfit (N, N m): {:?}", idl_rs::estimate::physics::forces::static_misfit(m, &bk).map(|x| x.round()));
         eprintln!("force model: {:?}", m.bike);
+        let rest = m.bike.travel_max[1] * 0.3;
+        eprintln!("force model: rear anti-rise {:.0} % at top-out, {:.0} % at 30 % travel, {:.0} % at 70 %", idl_rs::estimate::physics::forces::anti_rise_pct(m, &bk, 0.0), idl_rs::estimate::physics::forces::anti_rise_pct(m, &bk, rest), idl_rs::estimate::physics::forces::anti_rise_pct(m, &bk, m.bike.travel_max[1] * 0.7));
     }
     let sol = solve_ride_with(&r, &bk, centre, &cfg, progress);
     if progress.is_some_and(|p| p.cancel.load(std::sync::atomic::Ordering::Relaxed)) {

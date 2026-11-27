@@ -114,6 +114,37 @@ pub const NFR: usize = 32;
 /// The balance rows (0..NBAL), the ones Huber weighting applies to.
 pub const NBAL: usize = 14;
 
+/// The rear's anti-rise at rear travel `s_m`, percent: how much of the extension the load
+/// transfer of a rear-wheel stop would cause the brake's force (its pull at the contact patch
+/// through the axle's path, and its torque on the axle's member) holds back; 100: the rear
+/// neither rises nor squats. From the bike's centre of mass (frame and rider) over the rear
+/// contact patch and its wheelbase.
+pub fn anti_rise_pct(m: &ForceModel, bike: &Bike<f64>, s_m: f64) -> f64 {
+    let fb = &m.bike;
+    let mut q = [0.0; NL];
+    q[S] = s_m;
+    let k = kin(fb, bike, &q);
+    let (_, dphi) = poly(&fb.axle_member_angle, s_m);
+    let r = fb.wheel_radius[1];
+    let mass = fb.m_frame + fb.m_rider;
+    let cg = (fb.frame_cg.scale(fb.m_frame) + fb.rider_cg.scale(fb.m_rider)).scale(1.0 / mass);
+    let h = (cg - fb.rear_axle).dot(fb.up) + r;
+    let wb = (fb.front_axle - fb.rear_axle).dot(fb.fwd);
+    100.0 * -(k.dar.dot(fb.fwd) + r * dphi) / (h / wb * k.dar.dot(fb.up))
+}
+
+/// A polynomial (lowest power first) and its derivative at `s`.
+pub fn poly<S: Real>(coef: &[f64], s: S) -> (S, S) {
+    let (mut x, mut dx) = (c::<S>(0.0), c::<S>(0.0));
+    for (k, &a) in coef.iter().enumerate().rev() {
+        x = x * s + a;
+        if k > 0 {
+            dx = dx * s + a * k as f64;
+        }
+    }
+    (x, dx)
+}
+
 /// An air spring's chambers and fill: [`crate::sim::suspension::AirSpring`]'s law, fast
 /// (adiabatic) about the stroke it rests at.
 #[derive(Clone, Debug)]
@@ -203,6 +234,15 @@ pub struct ForceBike {
     pub shock: AirChambers,
     /// Shock stroke against rear travel, polynomial (m -> m), lowest power first.
     pub shock_stroke: Vec<f64>,
+    /// The rear axle's member's angle against rear travel, polynomial (m -> rad, CCW with x
+    /// forward and y up), lowest power first. The rear brake's caliper is taken to sit on that
+    /// member (the GT Force's on its seatstay, which carries the axle): its torque reacts there.
+    pub axle_member_angle: Vec<f64>,
+    /// The derailleur cage's angle against rear travel in the descending gear, polynomial
+    /// (m -> rad, forward: the slack direction), lowest power first; empty: no drivetrain.
+    pub cage_angle: Vec<f64>,
+    /// The cage's moments, N m: its spring (always) and its clutch (against turning forward).
+    pub cage_moment_nm: [f64; 2],
     /// Front and rear travel at the stops, m.
     pub travel_max: [f64; 2],
     /// The travel stops' stiffness, N/m.
@@ -225,14 +265,7 @@ impl ForceBike {
 
     /// The shock's stroke (m) and its rate with rear travel at travel `s` (m).
     pub fn stroke<S: Real>(&self, s: S) -> (S, S) {
-        let (mut x, mut dx) = (c::<S>(0.0), c::<S>(0.0));
-        for (k, &a) in self.shock_stroke.iter().enumerate().rev() {
-            x = x * s + a;
-            if k > 0 {
-                dx = dx * s + a * k as f64;
-            }
-        }
-        (x, dx)
+        poly(&self.shock_stroke, s)
     }
 }
 
@@ -506,9 +539,22 @@ pub fn rows<S: Real>(m: &ForceModel, k: &Kin<S>, x: &ForceIn<S>, meas: &ForceMea
     // rear unsprung along its path: generalised force on the travel coordinate
     let xd = k.dx * x.s[1];
     let shock = fb.shock.force_n(par(P_PRESSURE + 1), [par(P_VOLUME + 1), par(P_VOLUME + 3)], k.x) + damper(P_SHOCK_DAMP).force_n(xd, wv) + friction_n(par(P_FRICTION + 1), xd, wv);
-    let wheel = shock * k.dx + stop_n(x.s[0], 0.0, fb.travel_max[1], fb.stop_n_m, wl);
+    // the derailleur's cage takes up the chain's growth: its spring always, its clutch one way
+    // (resisting the cage turning forward, which compression does in the descending gear)
+    let chain = if fb.cage_angle.is_empty() {
+        c::<S>(0.0)
+    } else {
+        let (_, dcage) = poly(&fb.cage_angle, x.s[0]);
+        dcage * (step(dcage * x.s[1], wv) * fb.cage_moment_nm[1] + fb.cage_moment_nm[0])
+    };
+    let wheel = shock * k.dx + chain + stop_n(x.s[0], 0.0, fb.travel_max[1], fb.stop_n_m, wl);
+    // the rear brake's torque on the axle's member: braking pulls back at the contact patch, a
+    // wheel-radius below the axle, and the caliper holds that moment against the member (the
+    // tyre's force itself acts at the axle); a forward force is the chain's, not the brake's
+    let (_, dphi) = poly(&fb.axle_member_angle, x.s[0]);
+    let brake = -(relu(-tr.dot(fwd), TYRE_SMOOTH_N) * (-f[DEF_R] + fb.wheel_radius[1])) * dphi;
     let ur = k.rr * V3::<S>::from_f64(meas.rear);
-    r[1] = (ur.dot(k.dar) * fb.m_rear - tr.dot(k.dar) + wheel) * (1.0 / w.unsprung_n);
+    r[1] = (ur.dot(k.dar) * fb.m_rear - tr.dot(k.dar) - brake + wheel) * (1.0 / w.unsprung_n);
     // rider
     let dp = bv(f[POS], f[POS + 1], f[POS + 2]);
     let dpd = bv(fd[POS], fd[POS + 1], fd[POS + 2]);
@@ -744,6 +790,9 @@ pub(crate) mod synth {
             fork: AirChambers { area_m2: 8.0e-4, positive_m3: 1.6e-4, negative_m3: 8.0e-5, gauge_pa: 0.0, rest_m: 0.05 },
             shock: AirChambers { area_m2: 9.5e-4, positive_m3: 1.6e-4, negative_m3: 9.0e-5, gauge_pa: 0.0, rest_m: 0.045 / 2.6 },
             shock_stroke: vec![0.0, 1.0 / 2.6],
+            axle_member_angle: vec![],
+            cage_angle: vec![],
+            cage_moment_nm: [0.0; 2],
             travel_max: [0.17, 0.16],
             stop_n_m: 2.0e6,
             tyre: [tyre(24.0), tyre(28.0)],
@@ -1174,12 +1223,18 @@ pub(crate) mod synth {
 
     #[test]
     fn force_rows_jacobian_matches_finite_differences() {
-        // Arrange: a moving sample of the exact ride, parameters off their nominal
-        let (bike, m) = model();
+        // Arrange: a moving sample of the exact ride, parameters off their nominal; the rear
+        // braking hard, with the caliper on a rotating axle member and a derailleur cage taking
+        // up the chain (the GT Force's curves), so their terms are in the rows
+        let (bike, mut m) = model();
         let truth = ride(&bike, &m, 40, 1.0 / 400.0, 0.5);
+        m.bike.axle_member_angle = vec![0.0004, -0.855, -2.83, 4.03];
+        m.bike.cage_angle = vec![0.945, 0.870, 2.64, -2.43];
+        m.bike.cage_moment_nm = [1.27, 1.58];
         let t = 30;
         let s = truth.core[t];
-        let [f, fd, fdd] = truth.f[t];
+        let [mut f, fd, fdd] = truth.f[t];
+        f[TAN_R] = -300.0;
         let p = truth.readings[t];
         let meas = ForceMeas { frame: s.f_meas.0, fork: [p[6], p[7], p[8]], rear: [p[12], p[13], p[14]], speed: truth.speed[t][0], speed_rate: truth.speed[t][1] };
         let par: [f64; NFP] = std::array::from_fn(|i| 0.1 * ((i % 5) as f64 - 2.0));
