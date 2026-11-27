@@ -691,6 +691,9 @@ pub fn identify_forces(r: &Ride, bike: &Bike<f64>, bias_centre: [f64; NG], cfg: 
             Err(e) => eprintln!("  force parameter sigmas failed: {e:?}"),
         }
     }
+    if std::env::var_os("IDL_FORCE_OBSMAP").is_some() {
+        observability_map(&objs, &vs);
+    }
     Ok(objs[0].force_par(&vs[0]))
 }
 
@@ -906,4 +909,57 @@ pub fn fitted_bike(bike: &Bike<f64>, report: &FitReport) -> Bike<f64> {
 /// The geometry `bike` runs with.
 pub fn bike_geometry(bike: &Bike<f64>) -> Geometry {
     geometry(bike)
+}
+
+/// The observability map on a fit's windows (`IDL_FORCE_OBSMAP`, prototyping): each force
+/// parameter's sigma from the data alone (its prior opened to 10 in log; the reduced Hessian at
+/// the fit), with the rider and the tyres' deflection free, either taken as measured (their
+/// priors closed), and both; printed as factors (x/: 1.05 is 5 %, 22026 not determined). The
+/// information a parameter gets depends on the motion it sees, which here is the ride's.
+pub fn observability_map(objs: &[Objective], vs: &[Vars]) {
+    use super::forces::{NFP, PAR_NAMES, P_BRAKE_SHIFT, P_LIMBS, P_NECK_K};
+    let cases = [("free", false, false), ("rider known", true, false), ("deflection known", false, true), ("both known", true, true)];
+    let mut table: Vec<Vec<f64>> = Vec::new();
+    for &(name, rider, defl) in &cases {
+        let os: Vec<Objective> = objs
+            .iter()
+            .map(|o| {
+                let mut m = o.forces.clone().expect("a force fit");
+                for i in 0..NFP {
+                    m.w.par_sigma[i] = if i >= P_NECK_K || i == P_LIMBS || (P_BRAKE_SHIFT..P_BRAKE_SHIFT + 2).contains(&i) { 1e-3 } else { 10.0 };
+                }
+                if rider {
+                    m.w.pos_m = [1e-5; 3];
+                    m.w.rot_rad = 1e-5;
+                    m.w.act_n = 1e-3;
+                    m.w.act_nm = 1e-4;
+                }
+                if defl {
+                    m.w.defl_m = 1e-7;
+                }
+                let mut glob_centre = o.glob_centre.clone();
+                let g0 = o.force_glob0();
+                glob_centre[g0..g0 + NFP].copy_from_slice(&o.force_par(&vs[0]));
+                Objective { bike: o.bike.clone(), win: o.win.clone(), spec: o.spec.clone(), w: o.w.clone(), glob_centre, fit: o.fit, forces: Some(m), threads: o.threads }
+            })
+            .collect();
+        match super::solve::globals_covariance(&os, vs) {
+            Ok((cov, ng)) => {
+                let g0 = os[0].force_glob0();
+                table.push((0..NFP).map(|i| cov[(g0 + i) * ng + g0 + i].max(0.0).sqrt().exp()).collect());
+            }
+            Err(e) => {
+                eprintln!("observability map, {name}: {e:?}");
+                table.push(vec![f64::NAN; NFP]);
+            }
+        }
+    }
+    eprintln!("observability map (x/ one sigma from the data alone):");
+    eprintln!("  {:<24}{}", "parameter", cases.iter().map(|c| format!("{:>18}", c.0)).collect::<String>());
+    for i in 0..P_NECK_K {
+        if i == P_LIMBS || (P_BRAKE_SHIFT..P_BRAKE_SHIFT + 2).contains(&i) {
+            continue;
+        }
+        eprintln!("  {:<24}{}", PAR_NAMES[i], table.iter().map(|t| format!("{:>18.3}", t[i])).collect::<String>());
+    }
 }

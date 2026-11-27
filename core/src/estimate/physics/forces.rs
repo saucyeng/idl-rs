@@ -1692,6 +1692,83 @@ pub(crate) mod synth {
         }
     }
 
+    /// The observability map (a diagnostic, `--ignored --nocapture`): on exact rides, each force
+    /// parameter's sigma from the data alone (its prior opened to 10 in log; the reduced
+    /// Hessian at a solve near the truth) when the rider and the tyres' deflection are free, when
+    /// either or both are taken as measured (their priors closed), and on the road with an exact
+    /// ground tie; then the strongest correlations of the first case. Sigma is a factor (x/):
+    /// 1.05 is 5 %, 10 is not determined.
+    #[test]
+    #[ignore]
+    fn observability_map_of_the_force_parameters() {
+        use crate::estimate::physics::objective::{Objective, Spec, Weights, NG};
+        use crate::estimate::physics::solve::{gauss_newton, globals_covariance, warm_start};
+        let shown = [P_FORK_DAMP, P_FORK_DAMP + 1, P_FORK_DAMP + 2, P_FORK_DAMP + 3, P_FORK_DAMP + 4, P_SHOCK_DAMP, P_SHOCK_DAMP + 1, P_SHOCK_DAMP + 2, P_SHOCK_DAMP + 3, P_SHOCK_DAMP + 4,
+                     P_FRICTION, P_FRICTION + 1, P_PRESSURE, P_PRESSURE + 1, P_TYRE_K, P_TYRE_K + 1, P_TYRE_C, P_TYRE_C + 1, P_RIDER_K + 2, P_RIDER_C + 2, P_RIDER_K + 4, P_RIDER_C + 4];
+        let dt = 1.0 / 400.0;
+        let n = 1200;
+        // open the data-bearing parameters' priors; the head's, the camera's and the braking shift
+        // carry nothing here (no head, no camera, no steady braking) and stay closed
+        let open = |w: &mut ForceWeights| {
+            for i in 0..NFP {
+                w.par_sigma[i] = if i >= P_NECK_K || i == P_LIMBS || (P_BRAKE_SHIFT..P_BRAKE_SHIFT + 2).contains(&i) { 1e-3 } else { 10.0 };
+            }
+        };
+        let case = |road: bool, rider_known: bool, defl_known: bool| -> (Vec<f64>, Vec<f64>, usize) {
+            let (bike, mut m) = if road { road_model() } else { model() };
+            let truth = if road { ride_on_road(&bike, &m, n, dt, 1.0) } else { ride(&bike, &m, n, dt, 1.0) };
+            let mut win = window(&truth, 400.0);
+            if road {
+                win.forces.as_mut().unwrap().ground = Some(ground_of(&truth, &m));
+            }
+            // solve near the truth with the standard priors, then read the information there
+            let obj = Objective::new(bike.clone(), win.clone(), Spec::standard(n, dt), Weights::default(), [0.0; NG]).with_forces(m.clone());
+            let v0 = warm_start(&obj, 40, 1e-4).unwrap();
+            let (v, _) = gauss_newton(&obj, v0, 30, 1e-4).unwrap();
+            open(&mut m.w);
+            if rider_known {
+                m.w.pos_m = [1e-5; 3];
+                m.w.rot_rad = 1e-5;
+                m.w.act_n = 1e-3;
+                m.w.act_nm = 1e-4;
+            }
+            if defl_known {
+                m.w.defl_m = 1e-7;
+            }
+            let o2 = Objective::new(bike, win, Spec::standard(n, dt), Weights::default(), [0.0; NG]).with_forces(m);
+            let (cov, ng) = globals_covariance(std::slice::from_ref(&o2), std::slice::from_ref(&v)).unwrap();
+            let g0 = o2.force_glob0();
+            let sig = (0..NFP).map(|i| cov[(g0 + i) * ng + g0 + i].max(0.0).sqrt()).collect();
+            (sig, cov, g0)
+        };
+        let cases = [("rider, deflection free", false, false, false), ("rider known", false, true, false), ("deflection known", false, false, true), ("both known", false, true, true), ("road, exact ground tie", true, false, false)];
+        let mut table: Vec<Vec<f64>> = Vec::new();
+        let mut first: Option<(Vec<f64>, Vec<f64>, usize)> = None;
+        for &(_, road, rk, dk) in &cases {
+            let c = case(road, rk, dk);
+            table.push(c.0.clone());
+            if first.is_none() {
+                first = Some(c);
+            }
+        }
+        eprintln!("observability map, sigma as a factor (x/), 3 s exact rides:");
+        eprintln!("  {:<22} {}", "parameter", cases.iter().map(|c| format!("{:>24}", c.0)).collect::<String>());
+        for &i in &shown {
+            eprintln!("  {:<22} {}", PAR_NAMES[i], table.iter().map(|t| format!("{:>24.3}", t[i].exp())).collect::<String>());
+        }
+        let (sig, cov, g0) = first.unwrap();
+        let ng = (cov.len() as f64).sqrt() as usize;
+        let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+        for a in 0..shown.len() {
+            for b in 0..a {
+                let (i, j) = (shown[a], shown[b]);
+                pairs.push((cov[(g0 + i) * ng + g0 + j] / (sig[i] * sig[j]).max(f64::MIN_POSITIVE), i, j));
+            }
+        }
+        pairs.sort_by(|a, b| b.0.abs().total_cmp(&a.0.abs()));
+        eprintln!("  strongest correlations, rider and deflection free: {}", pairs.iter().take(14).map(|(r, i, j)| format!("{} ~ {} {r:+.2}", PAR_NAMES[*i], PAR_NAMES[*j])).collect::<Vec<_>>().join(", "));
+    }
+
     #[test]
     fn exact_ride_identification_three_seconds_recovers_the_dampers_and_the_rider_vertical() {
         // Arrange / Act
