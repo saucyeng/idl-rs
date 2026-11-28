@@ -627,6 +627,14 @@ pub(crate) fn par_map_n<T: Sync, U: Send>(items: &[T], threads: usize, f: impl F
     out.into_iter().map(|u| u.expect("every window done")).collect()
 }
 
+/// The damping a rejected step retries with at least (on the diagonal's scale; 1e-4 over-damped
+/// the golden window, 1e-8 left it short of PyTorch's minimum in 30 iterations).
+const LM_FIRST_DAMPING: f64 = 1e-6;
+/// The most the damping grows per rejected step.
+const LM_MAX_GROWTH: f64 = 8.0;
+/// The most one step moves a force parameter, log units (a factor of 1.65).
+const LM_MAX_PAR_STEP: f64 = 0.5;
+
 /// Levenberg-Marquardt over several windows that share their globals (sensor
 /// biases and, when fitting, the bike's geometry); the latents are per window.
 /// Each window's band is factored on its own; the shared unknowns come from
@@ -700,10 +708,23 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
                 let xg = solve_globals(&s, &rhs, ng, lays[0].n_loc)?;
                 (fs.iter().map(|f| back_substitute(f, &xg)).collect(), xg)
             };
-            // the quadratic model's predicted loss drop, about -g.x / 2 for a small damping
-            let pred = -0.5
-                * (nes.iter().zip(&xls).map(|(ne, xl)| ne.g_loc.iter().zip(xl).map(|(g, x)| g * x).sum::<f64>()).sum::<f64>()
-                    + nes.iter().map(|ne| ne.g_glob.iter().zip(&xg).map(|(g, x)| g * x).sum::<f64>()).sum::<f64>());
+            // a trust region on the force parameters: no step moves one by more than
+            // LM_MAX_PAR_STEP (the whole step scaled, its direction kept); from a cold start one
+            // step could throw the shock's HSC to 800x and the fit into another basin
+            let (mut xls, mut xg) = (xls, xg);
+            let fg0 = objs[0].force_glob0();
+            // the log-scale factors only: an additive parameter (kg, rad) has its own units
+            let big = xg.iter().enumerate().skip(fg0).filter(|(i, _)| !super::forces::additive(i - fg0)).fold(0.0f64, |m, (_, x)| m.max(x.abs()));
+            let alpha = if objs[0].forces.is_some() && big > LM_MAX_PAR_STEP { LM_MAX_PAR_STEP / big } else { 1.0 };
+            if alpha < 1.0 {
+                xls.iter_mut().flatten().for_each(|x| *x *= alpha);
+                xg.iter_mut().for_each(|x| *x *= alpha);
+            }
+            // the quadratic model's predicted loss drop: -(a - a^2/2) g.x for a step a x of the
+            // model's minimiser x (-g.x / 2 at a = 1)
+            let gx = nes.iter().zip(&xls).map(|(ne, xl)| ne.g_loc.iter().zip(xl).map(|(g, x)| g * x).sum::<f64>()).sum::<f64>()
+                + nes.iter().map(|ne| ne.g_glob.iter().zip(&xg).map(|(g, x)| g * x).sum::<f64>()).sum::<f64>();
+            let pred = -(1.0 - 0.5 * alpha) * gx;
             let mut cand: Vec<Vars> = vs.iter().zip(&lays).zip(&xls).map(|((v, lay), xl)| lay.apply(v, xl, &xg)).collect();
             if grounded {
                 // the step assumed the profile follows both tyres: score it with the profile refitted
@@ -729,8 +750,14 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
                 lam = f64::INFINITY;
                 break;
             }
-            lam *= nu;
-            nu *= 2.0;
+            if std::env::var_os("IDL_SOLVE_DEBUG").is_some() {
+                eprintln!("  LM iteration {it}: step rejected, loss {loss:.1} -> {new:.1}, predicted gain {pred:.3e}, damping {lam:.1e}");
+            }
+            // from a tiny damping straight to one that changes the step, then up by at most 8x a
+            // time: doubling the factor each rejection jumped 0.28 -> 140 past the cap and skipped
+            // the range where a damped step works (11/21, 2026-11-27: stopped at 6 iterations)
+            lam = (lam * nu).max(LM_FIRST_DAMPING);
+            nu = (nu * 2.0).min(LM_MAX_GROWTH);
             if lam > 1e2 {
                 break;
             }
@@ -740,6 +767,9 @@ pub fn gauss_newton_multi(objs: &[Objective], mut vs: Vec<Vars>, iters: usize, t
         info.loss.push(loss);
         info.iterations = it + 1;
         if gain < tol || lam > 1e2 {
+            if std::env::var_os("IDL_SOLVE_DEBUG").is_some() {
+                eprintln!("  LM stops after {} iterations: gain {gain:.3e}, damping {lam:.1e}", it + 1);
+            }
             info.converged = true;
             break;
         }
